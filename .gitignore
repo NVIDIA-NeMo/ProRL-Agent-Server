@@ -1,51 +1,31 @@
-# log and data files
-*.model
-*.pkl
-#*.ipynb
-output
-output_2048
-result
-*.pt
-tests/data/asr
-.DS_Store
-bert.pt.json
-work
-runs
-fastspeech_output
-.hydra
-.bash_history.local
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
-**.pyc
 
 # C extensions
 *.so
 
 # Distribution / packaging
-.idea
 .Python
-wandb
 build/
 develop-eggs/
 dist/
 downloads/
 eggs/
 .eggs/
-lib/
+./lib/
 lib64/
-#parts/
+parts/
 sdist/
 var/
 wheels/
-pip-wheel-metadata/
 share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
 MANIFEST
+requirements.txt
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -67,17 +47,19 @@ htmlcov/
 nosetests.xml
 coverage.xml
 *.cover
+*.py,cover
 .hypothesis/
 .pytest_cache/
+cover/
 
 # Translations
 *.mo
 *.pot
 
 # Django stuff:
-*.log
 local_settings.py
 db.sqlite3
+db.sqlite3-journal
 
 # Flask stuff:
 instance/
@@ -87,50 +69,67 @@ instance/
 .scrapy
 
 # Sphinx documentation
-docs/_build
-docs/apidocs
+docs/_build/
 
 # PyBuilder
+.pybuilder/
 target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
-
-# Override Jupyter in Github Language states for more accurate estimate of repo code.
-# Reference: https://github.com/github/linguist/blob/master/docs/overrides.md#generated-code
-*.ipynb linguist-generated
 
 # IPython
 profile_default/
 ipython_config.py
 
 # pyenv
+#   For a library or package, you might want to ignore these files since the code is
+#   intended to run in multiple environments; otherwise, check them in:
 .python-version
 
 # pipenv
 #   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
 #   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don’t work, or not
+#   having no cross-platform support, pipenv may install dependencies that don't work, or not
 #   install all needed dependencies.
 #Pipfile.lock
 
-# celery beat schedule file
+# poetry
+#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
+#   This is especially recommended for binary packages to ensure reproducibility, and is more
+#   commonly ignored for libraries.
+#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
+# poetry.lock
+
+# pdm
+#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
+#pdm.lock
+#   pdm stores project-wide configurations in .pdm.toml, but it is recommended to not include it
+#   in version control.
+#   https://pdm.fming.dev/#use-with-ide
+.pdm.toml
+
+# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
+__pypackages__/
+
+# Celery stuff
 celerybeat-schedule
+celerybeat.pid
 
 # SageMath parsed files
 *.sage.py
 
 # Environments
 .env
+frontend/.env
 .venv
 env/
 venv/
 ENV/
 env.bak/
+.env.bak
 venv.bak/
-
-# VSCode project settins
-.vscode/
+*venv/
 
 # Spyder project settings
 .spyderproject
@@ -141,8 +140,6 @@ venv.bak/
 
 # mkdocs documentation
 /site
-/docs/html
-/docs/docs_zh/zh
 
 # mypy
 .mypy_cache/
@@ -152,33 +149,107 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# Emacs backup files
-*~
+# pytype static type analyzer
+.pytype/
 
-cifar-10-batches-py
-*.tar.gz
+# Cython debug symbols
+cython_debug/
 
-# Test data.
-tests/.data
-tests/data
+# PyCharm
+#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
+#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
+#  and can be added to the global gitignore or merged into this file.  For a more nuclear
+#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
+.idea/
 
-# outputs folder
-examples/*/outputs
-examples/*/NeMo_experiments
-examples/*/nemo_experiments
-examples/*/.hydra
-examples/*/wandb
-examples/*/data
-wandb
-dump.py
+# VS Code: Ignore all but certain files that specify repo-specific settings.
+# https://stackoverflow.com/questions/32964920/should-i-commit-the-vscode-folder-to-source-control
+.vscode/**/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/tasks.json
 
-docs/sources/source/test_build/
+# VS Code extensions/forks:
+.cursorignore
+.rooignore
+.clineignore
+.windsurfignore
+.cursorrules
+.roorules
+.clinerules
+.windsurfrules
+.cursor/rules
+.roo/rules
+.cline/rules
+.windsurf/rules
 
-# Checkpoints, config files and temporary files created in tutorials.
-examples/neural_graphs/*.chkpt
-examples/neural_graphs/*.yml
+# evaluation
+evaluation/evaluation_outputs
+evaluation/outputs
+evaluation/swe_bench/eval_workspace*
+evaluation/SWE-bench/data
+evaluation/webarena/scripts/webarena_env.sh
+evaluation/bird/data
+evaluation/gaia/data
+evaluation/gorilla/data
+evaluation/toolqa/data
+evaluation/scienceagentbench/benchmark
+evaluation/commit0_bench/repos
 
-.hydra/
-nemo_experiments/
+# openhands resolver
+output/
 
-slurm*.out
+# frontend
+
+# dependencies
+frontend/.pnp
+frontend/bun.lockb
+frontend/yarn.lock
+.pnp.js
+
+# testing
+frontend/coverage
+test_results*
+/_test_files_tmp/
+
+# production
+frontend/build
+frontend/dist
+
+# misc
+.DS_Store
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+logs
+
+# agent
+.envrc
+/workspace
+/_test_workspace
+/debug
+cache
+
+# configuration
+config.toml
+config.toml_
+config.toml.bak
+
+# swe-bench-eval
+image_build_logs
+run_instance_logs
+
+runtime_*.tar
+
+# docker build
+containers/runtime/Dockerfile
+containers/runtime/project.tar.gz
+containers/runtime/code
+**/node_modules/

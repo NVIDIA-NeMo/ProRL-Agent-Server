@@ -1,0 +1,27 @@
+{
+    // force *nix line endings so files don't look modified in container run from Windows clone
+    "files.eol": "\n",
+    "files.trimTrailingWhitespace": true,
+    "files.insertFinalNewline": true,
+    "python.testing.pytestArgs": [
+        "tests"
+    ],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true,
+    "python.envFile": "${workspaceFolder}/.env",
+    "terminal.integrated.env.linux": {
+        "TEST_RUNTIME": "singularity",
+        "RUN_AS_OPENHANDS": "False",
+        "DEBUG": "true"
+    },
+    "terminal.integrated.env.windows": {
+        "TEST_RUNTIME": "singularity",
+        "RUN_AS_OPENHANDS": "False",
+        "DEBUG": "true"
+    },
+    "terminal.integrated.env.osx": {
+        "TEST_RUNTIME": "singularity",
+        "RUN_AS_OPENHANDS": "False",
+        "DEBUG": "true"
+    }
+}
