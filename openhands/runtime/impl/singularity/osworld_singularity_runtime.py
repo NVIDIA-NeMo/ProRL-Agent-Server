@@ -238,8 +238,8 @@ class OSWorldSingularityRuntime(SingularityRuntime):
         )
         
         cmd.extend([
-            '-m', '2G',
-            '-smp', '2',
+            '-m', '8G',
+            '-smp', '8',
             '-drive', f'file={vm_image_container_path},if=ide',
             '-netdev', portfwd,
             '-device', 'virtio-net-pci,netdev=net0',
@@ -432,7 +432,8 @@ class OSWorldSingularityRuntime(SingularityRuntime):
             try:
                 # Try to connect to OSWorld server
                 response = httpx.get(
-                    f'http://localhost:{self._vm_server_port}/screenshot',
+                    #f'http://localhost:{self._vm_server_port}/screenshot',
+                    f'{self.osworld_vm_url}/terminal',
                     timeout=5.0
                 )
                 if response.status_code == 200:
@@ -543,6 +544,7 @@ class OSWorldSingularityRuntime(SingularityRuntime):
                     os.kill(self.qemu_pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                self.qemu_pid = None
             except Exception as e:
                 self.log('warning', f'Failed to stop QEMU VM: {e}')
         
