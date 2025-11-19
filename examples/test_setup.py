@@ -160,7 +160,7 @@ if __name__ == '__main__':
     examples_path = '/home/jayliu/OSWorld/evaluation_examples/examples'
     output_path = '/home/jayliu/ProRL-Agent-Server/results'
     categories = os.listdir(examples_path)
-    categories = ['gimp']
+    #categories = ['os']
     for category in categories:
         print(f"Running {category}...")
         examples = os.listdir(os.path.join(examples_path, category))

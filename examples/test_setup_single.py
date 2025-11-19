@@ -33,7 +33,7 @@ from openhands.runtime.impl.singularity.osworld_singularity_runtime import (
     OSWorldSingularityRuntime,
 )
 from openhands.storage import get_file_store
-from examples.setup import SetupController
+from examples.setup import SetupController, Evaluator
 
 
 async def main(config_path, results_dir):
@@ -118,11 +118,13 @@ async def main(config_path, results_dir):
         client_password="password",
         runtime=runtime  # Pass your runtime object here
     )
+    
     import pdb; pdb.set_trace()
     with open(config_path, 'r') as f:
         setup_config = json.load(f)
     assert 'config' in setup_config, "Setup config not found in setup JSON"
     await setup_controller.setup(setup_config['config'])
+    #evaluator = Evaluator(setup_config)
 
     #await asyncio.sleep(5)
 
@@ -138,9 +140,16 @@ async def main(config_path, results_dir):
 
     get_final_state()
 
+    await asyncio.sleep(3)
+
     screenshot = runtime.get_vm_screenshot()
     with open(os.path.join(results_dir, 'screenshot.png'), 'wb') as f:
         f.write(screenshot)
+    
+    print("Start Working. Continue to evaluate...")
+    import pdb; pdb.set_trace()
+    
+    #evaluator.evaluate(setup_controller)
     
     print("Cleaning up...")
     runtime.close()
@@ -181,8 +190,8 @@ if __name__ == '__main__':
     # You can modify these to test different examples
     tasks = [
         {
-            'category': 'gimp',
-            'example': '045bf3ff-9077-4b86-b483-a1040a949cff.json'
+            'category': 'os',
+            'example': '5ced85fc-fa1a-4217-95fd-0fb530545ce2.json'
         },
     ]
     # Prepare arguments for each process

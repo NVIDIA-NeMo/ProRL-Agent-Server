@@ -113,6 +113,7 @@ class SetupController:
         self.screen_width: int = screen_width
         self.screen_height: int = screen_height
         self.runtime = runtime  # Runtime object for interacting with the environment
+        self.additional_wait_time = 3
 
     def reset_cache_dir(self, cache_dir: str):
         self.cache_dir = cache_dir
@@ -375,12 +376,12 @@ class SetupController:
             response = requests.post(self.http_server + "/setup" + "/open_file", headers=headers, data=payload, timeout=1810)
             response.raise_for_status()  # This will raise an exception for 4xx and 5xx status codes
             logger.info("Command executed successfully: %s", response.text)
+            time.sleep(self.additional_wait_time)
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to open file '{path}'. An error occurred while trying to send the request or the server responded with an error: {e}")
             raise Exception(f"Failed to open file '{path}'. An error occurred while trying to send the request or the server responded with an error: {e}") from e
 
     def _ensure_launch_command_finish(self, command):
-        additional_wait_time = 3
         if isinstance(command, list):
             if len(command) < 1:
                 return True
@@ -400,19 +401,16 @@ class SetupController:
             action = OSWorldInteractiveAction(method='run_bash_script', params={'script': 'wmctrl -l'})
             observation = self.runtime.run_action(action)
             if '– GIMP' in get_last_observation(observation.content):
-                time.sleep(additional_wait_time)
                 return True
             elif 'Convert to RGB Working Space?' in get_last_observation(observation.content):
                 # Weird error message, so we assume the command is successful
                 # TODO: FIX THIS IN QEMU image.
-                time.sleep(additional_wait_time)
                 return True
             elif len(original_command) < 2 and 'GNU Image Manipulation Program' in get_last_observation(observation.content):
                 # Here no file name is provided, so we simply expect window to launch
                 return True
             elif 'yicun.raw' in command and 'GIMP Message' in get_last_observation(observation.content):
                 # special case for dbbf4b99-2253-4b10-9274-45f246af2466.json
-                time.sleep(additional_wait_time)
                 return True
             return False
 
@@ -479,7 +477,10 @@ class SetupController:
         elif 'vlc' in command:
             action = OSWorldInteractiveAction(method='run_bash_script', params={'script': 'wmctrl -l'})
             observation = self.runtime.run_action(action)
-            if '- VLC media player' in get_last_observation(observation.content):
+            if 'mp3' in command or 'mp4' in command:
+                if '- VLC media player' in get_last_observation(observation.content):
+                    return True
+            elif 'VLC media player' in get_last_observation(observation.content):
                 return True
             return False
 
@@ -527,10 +528,18 @@ class SetupController:
         ensure_launch_retries = 0
         while not self._ensure_launch_command_finish(command):
             logger.info("Waiting for command to finish...")
-            time.sleep(5)
+            time.sleep(self.additional_wait_time)
             ensure_launch_retries += 1
             if ensure_launch_retries >= 10:
                 raise Exception("Failed to ensure launch command finish after multiple retries")
+            
+        # Sleep additional time to ensure window is launched
+        if isinstance(command, list):
+            command = ' '.join(command)
+        for key_commands in ['google-chrome', 'code', 'libreoffice', 'nautilus', 'vlc', 'thunderbird']:
+            if key_commands in command:
+                time.sleep(self.additional_wait_time)
+                break
 
     def _execute_setup(
             self,
@@ -709,6 +718,7 @@ class SetupController:
                 logger.info("Command executed successfully: %s", response.text)
             else:
                 logger.error(f"Failed to activate window {window_name}. Status code: %s", response.text)
+            time.sleep(self.additional_wait_time)
         except requests.exceptions.RequestException as e:
             logger.error("An error occurred while trying to send the request: %s", e)
 
@@ -1116,3 +1126,117 @@ class SetupController:
                 logger.error("An error occurred while trying to send the request: %s", e)
 
             self._execute_setup(["sudo chown -R user:user /home/user/.config/google-chrome/Default/History"], shell=True)
+
+
+class Evaluator:
+    def __init__(self, task_config: Dict[str, Any]):
+        """Set evaluator information from task config"""
+        # evaluator dict
+        # func -> metric function string, or list of metric function strings
+        # conj -> conjunction of multiple metrics if func is a list with length > 1, "and"/"or"
+        # result -> result getter config, or list of result getter configs
+        # expected (optional) -> expected getter config, or list of expected getter configs
+        # options (optional) -> metric options, or list of metric options
+        # if func is a str list, then result, expected (if exists), options (if exists) should also be lists of the same length
+        # even if one of the metrics does not need expected or options field, it should be included in the list with None
+        self.evaluator = task_config["evaluator"]
+        self.metric = [getattr(metrics, func) for func in self.evaluator["func"]] \
+            if isinstance(self.evaluator["func"], list) \
+            else getattr(metrics, self.evaluator["func"])
+        self.metric_conj: str = self.evaluator.get("conj", "and")  # take conjunction of multiple metrics
+        if "result" in self.evaluator and len(self.evaluator["result"]) > 0:
+            self.result_getter: Getter = [getattr(getters, "get_{:}".format(res["type"])) for res in
+                                          self.evaluator["result"]] \
+                if isinstance(self.evaluator["result"], list) \
+                else getattr(getters, "get_{:}".format(self.evaluator["result"]["type"]))
+        else:
+            self.result_getter = [None] * len(self.metric) \
+                if isinstance(self.metric, list) \
+                else None
+
+        if "expected" in self.evaluator and len(self.evaluator["expected"]) > 0:
+            self.expected_getter: Getter = [getattr(getters, "get_{:}".format(exp["type"])) if exp else None for exp in
+                                            self.evaluator["expected"]] \
+                if isinstance(self.evaluator["expected"], list) \
+                else getattr(getters, "get_{:}".format(self.evaluator["expected"]["type"]))
+        else:
+            self.expected_getter = [None] * len(self.metric) \
+                if isinstance(self.metric, list) \
+                else None
+        self.metric_options: Union[List[Dict[str, Any]], Dict[str, Any]] = [opt if opt else {} for opt in
+                                                                            self.evaluator["options"]] \
+            if isinstance(self.evaluator.get("options", {}), list) \
+            else self.evaluator["options"] \
+            if "options" in self.evaluator \
+            else [{}] * len(self.metric) \
+            if isinstance(self.metric, list) \
+            else {}
+
+        assert (not isinstance(self.evaluator["func"], list)
+                or (len(self.metric) == len(self.result_getter) == len(self.expected_getter) == len(
+                    self.metric_options)))
+
+    def evaluate(self, setup_controller, action_history = []):
+        """
+        Evaluate whether the task is successfully completed.
+        """
+
+        postconfig = self.evaluator.get("postconfig", [])
+        setup_controller.setup(postconfig)
+
+        if self.evaluator['func'] == "infeasible":
+            if len(action_history) > 0:
+                last_action = action_history[-1]
+                if last_action == "FAIL" or (type(last_action) == dict and last_action.get('action_type') == 'FAIL'):
+                    return 1
+            return 0
+        else:
+            if len(action_history) > 0:
+                last_action = action_history[-1]
+                if last_action == "FAIL" or (type(last_action) == dict and last_action.get('action_type') == 'FAIL'):
+                    return 0
+
+        if type(self.metric) == list:
+            # Multiple metrics to evaluate whether the task is successfully completed
+            results = []
+            assert len(self.metric) == len(self.result_getter), "The number of metrics and result getters must be the same"
+            if "expected" in self.evaluator:
+                assert len(self.metric) == len(self.expected_getter), "The number of metrics and expected getters must be the same"
+            for idx, metric in enumerate(self.metric):
+                try:
+                    config = self.evaluator["result"][idx]
+                    result_state = self.result_getter[idx](self, config)
+                except FileNotFoundError:
+                    logger.error("File not found!")
+                    if self.metric_conj == 'and':
+                        return 0
+
+                if "expected" in self.evaluator and self.expected_getter and self.evaluator["expected"]:
+                    expected_state = self.expected_getter[idx](self, self.evaluator["expected"][idx])
+                    metric: int = metric(result_state, expected_state, **self.metric_options[idx])
+                else:
+                    metric: int = metric(result_state, **self.metric_options[idx])
+
+                if self.metric_conj == 'and' and float(metric) == 0.0:
+                    return 0
+                elif self.metric_conj == 'or' and float(metric) == 1.0:
+                    return 1
+                else:
+                    results.append(metric)
+
+            return sum(results) / len(results) if self.metric_conj == 'and' else max(results)
+        else:
+            # Single metric to evaluate whether the task is successfully completed
+            try:
+                result_state = self.result_getter(self, self.evaluator["result"])
+            except FileNotFoundError:
+                logger.error("File not found!")
+                return 0
+
+            if "expected" in self.evaluator and self.expected_getter and self.evaluator["expected"]:
+                expected_state = self.expected_getter(self, self.evaluator["expected"])
+                metric: float = self.metric(result_state, expected_state, **self.metric_options)
+            else:
+                metric: float = self.metric(result_state, **self.metric_options)
+
+        return metric
