@@ -33,8 +33,9 @@ from openhands.runtime.impl.singularity.osworld_singularity_runtime import (
     OSWorldSingularityRuntime,
 )
 from openhands.storage import get_file_store
-from examples.setup import SetupController, Evaluator
 
+from openhands.nvidia.os_world.controllers.setup import SetupController
+from openhands.nvidia.os_world.evaluate import Evaluator
 
 async def main(config_path, results_dir):
     """Main example function."""
@@ -124,7 +125,7 @@ async def main(config_path, results_dir):
         setup_config = json.load(f)
     assert 'config' in setup_config, "Setup config not found in setup JSON"
     await setup_controller.setup(setup_config['config'])
-    #evaluator = Evaluator(setup_config)
+    evaluator = Evaluator(setup_config, setup_controller)
 
     #await asyncio.sleep(5)
 
@@ -149,8 +150,10 @@ async def main(config_path, results_dir):
     print("Start Working. Continue to evaluate...")
     import pdb; pdb.set_trace()
     
-    #evaluator.evaluate(setup_controller)
+    result = await evaluator.evaluate()
     
+    print(f"Evaluation result: {result}")
+    import pdb; pdb.set_trace()
     print("Cleaning up...")
     runtime.close()
     print("✓ Runtime closed")
@@ -177,8 +180,8 @@ def run_main_wrapper(config_path, results_dir, example_name):
 
 if __name__ == '__main__':
     # Configuration
-    examples_path = '/home/jayliu/OSWorld/evaluation_examples/examples'
-    output_path = '/home/jayliu/ProRL-Agent-Server/two_results'
+    examples_path = '/root/OSWorld/evaluation_examples/examples'
+    output_path = '/root/ProRL-Agent-Server/two_results'
     
     # ============= CONCURRENCY CONTROL =============
     # Set the maximum number of concurrent processes
@@ -190,8 +193,8 @@ if __name__ == '__main__':
     # You can modify these to test different examples
     tasks = [
         {
-            'category': 'os',
-            'example': '5ced85fc-fa1a-4217-95fd-0fb530545ce2.json'
+            'category': 'vs_code',
+            'example': '0512bb38-d531-4acf-9e7e-0add90816068.json'
         },
     ]
     # Prepare arguments for each process

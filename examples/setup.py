@@ -26,8 +26,7 @@ import tldextract
 
 from openhands.events.action.os import OSWorldInteractiveAction
 from openhands.core.logger import openhands_logger as logger
-from openhands.runtime.impl.singularity.osworld_singularity_runtime import OSWorldSingularityRuntime, OSWORLD_CHROMIUM_PORT_RANGE
-from openhands.runtime.utils import find_available_tcp_port
+from openhands.nvidia.os_world.controllers.python import PythonController
 
 import dotenv
 # Load environment variables from .env file
@@ -37,6 +36,7 @@ FILE_PATH = os.path.dirname(os.path.abspath(__file__))
 
 MAX_RETRIES = 20
 
+from openhands.nvidia.os_world import metrics, getters
 
 # Utility function copied from desktop_env.evaluators.metrics.utils
 def compare_urls(url1, url2, full=True):
@@ -992,7 +992,7 @@ class SetupController:
 
             return browser, context
 
-    def _execute_python_command(self, command: str):
+    def execute_python_command(self, command: str):
         """
         Taken from OSWorld/desktop_env/controllers/python.py
         Executes a python command on the server.
@@ -1088,20 +1088,20 @@ class SetupController:
             os_type = self.runtime.os_type
 
             if os_type == 'windows':
-                chrome_history_path = self._execute_python_command(
+                chrome_history_path = self.execute_python_command(
                     """import os; print(os.path.join(os.getenv('USERPROFILE'), "AppData", "Local", "Google", "Chrome", "User Data", "Default", "History"))""")[
                     'output'].strip()
             elif os_type == 'darwin':
-                chrome_history_path = self._execute_python_command(
+                chrome_history_path = self.execute_python_command(
                     """import os; print(os.path.join(os.getenv('HOME'), "Library", "Application Support", "Google", "Chrome", "Default", "History"))""")[
                     'output'].strip()
             elif os_type == 'linux':
                 if "arm" in platform.machine():
-                    chrome_history_path = self._execute_python_command(
+                    chrome_history_path = self.execute_python_command(
                         "import os; print(os.path.join(os.getenv('HOME'), 'snap', 'chromium', 'common', 'chromium', 'Default', 'History'))")[
                         'output'].strip()
                 else:
-                    chrome_history_path = self._execute_python_command(
+                    chrome_history_path = self.execute_python_command(
                         "import os; print(os.path.join(os.getenv('HOME'), '.config', 'google-chrome', 'Default', 'History'))")[
                         'output'].strip()
             else:
@@ -1129,7 +1129,22 @@ class SetupController:
 
 
 class Evaluator:
-    def __init__(self, task_config: Dict[str, Any]):
+    def __init__(self, task_config: Dict[str, Any], controller):
+        self.setup_controller = controller
+        self.vm_ip = controller.vm_ip
+        self.server_port = controller.server_port
+        self.chromium_port = controller.chromium_port
+        self.vlc_port = controller.vlc_port
+        self.http_server = controller.http_server
+        self.http_server_setup_root = controller.http_server_setup_root
+        self.cache_dir = controller.cache_dir
+        self.client_password = controller.client_password
+        self.screen_width = controller.screen_width
+        self.screen_height = controller.screen_height
+        self.vm_platform = 'Linux'
+
+        self.controller = PythonController(self.vm_ip, self.server_port)
+
         """Set evaluator information from task config"""
         # evaluator dict
         # func -> metric function string, or list of metric function strings
@@ -1145,7 +1160,7 @@ class Evaluator:
             else getattr(metrics, self.evaluator["func"])
         self.metric_conj: str = self.evaluator.get("conj", "and")  # take conjunction of multiple metrics
         if "result" in self.evaluator and len(self.evaluator["result"]) > 0:
-            self.result_getter: Getter = [getattr(getters, "get_{:}".format(res["type"])) for res in
+            self.result_getter = [getattr(getters, "get_{:}".format(res["type"])) for res in
                                           self.evaluator["result"]] \
                 if isinstance(self.evaluator["result"], list) \
                 else getattr(getters, "get_{:}".format(self.evaluator["result"]["type"]))
@@ -1155,7 +1170,7 @@ class Evaluator:
                 else None
 
         if "expected" in self.evaluator and len(self.evaluator["expected"]) > 0:
-            self.expected_getter: Getter = [getattr(getters, "get_{:}".format(exp["type"])) if exp else None for exp in
+            self.expected_getter = [getattr(getters, "get_{:}".format(exp["type"])) if exp else None for exp in
                                             self.evaluator["expected"]] \
                 if isinstance(self.evaluator["expected"], list) \
                 else getattr(getters, "get_{:}".format(self.evaluator["expected"]["type"]))
@@ -1176,13 +1191,13 @@ class Evaluator:
                 or (len(self.metric) == len(self.result_getter) == len(self.expected_getter) == len(
                     self.metric_options)))
 
-    def evaluate(self, setup_controller, action_history = []):
+    async def evaluate(self, action_history = []):
         """
         Evaluate whether the task is successfully completed.
         """
 
         postconfig = self.evaluator.get("postconfig", [])
-        setup_controller.setup(postconfig)
+        await self.setup_controller.setup(postconfig)
 
         if self.evaluator['func'] == "infeasible":
             if len(action_history) > 0:
