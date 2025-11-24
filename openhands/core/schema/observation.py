@@ -2,6 +2,10 @@ from enum import Enum
 
 
 class ObservationType(str, Enum):
+    OSWORLD = 'osworld'
+    """The output of a OSWorld action
+    """
+
     READ = 'read'
     """The content of a file
     """

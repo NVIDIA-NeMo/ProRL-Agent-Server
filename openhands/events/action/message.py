@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Any
 
+from openpyxl.descriptors.base import NoneSet
+
 import openhands
 from openhands.core.schema import ActionType
 from openhands.events.action.action import Action, ActionSecurityRisk
@@ -13,6 +15,7 @@ class MessageAction(Action):
     wait_for_response: bool = False
     action: str = ActionType.MESSAGE
     security_risk: ActionSecurityRisk | None = None
+    accessibility_tree: str | None = None
 
     @property
     def message(self) -> str:

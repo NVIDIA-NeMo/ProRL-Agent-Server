@@ -12,6 +12,7 @@ from evaluation.utils.shared import (  # type: ignore
 )
 from pathlib import Path
 
+from openhands.agenthub.gui_agent.osworld_agent import OSWorldAgent
 from openhands.core.config.llm_config import LLMConfig
 from openhands.runtime.base import Runtime
 from openhands.core.config.condenser_config import NoOpCondenserConfig
@@ -33,15 +34,16 @@ from openhands.nvidia.logger import nvidia_logger as logger
 from openhands.core.logger import openhands_logger as openhands_logger
 from evaluation.utils.shared import codeact_user_response, is_fatal_evaluation_error
 
-from openhands.nvidia.utils import process_messages_from_agent_state, is_last_action_finish, get_messages_from_partial_result
+from openhands.nvidia.utils import is_last_action_finish
 import json
-from openhands.nvidia.reward import Reward
 from openhands.nvidia.registry import JobDetails, _DEFAULT_AGENT_CONFIG
 from openhands.nvidia.utils import get_instance_id
 from openhands.nvidia.controller import run_controller_with_controller
 
 from openhands.nvidia.os_world.controllers.setup import SetupController
 from openhands.nvidia.os_world.evaluate import Evaluator
+
+from openhands.utils.ast_process import simplify_accessibility_tree
 
 
 def get_config(
@@ -88,53 +90,36 @@ def get_config(
         ensure_thinking_end_properly=agent_config['ensure_thinking_end_properly'], # set to true only if using text based server for training.
         action_timeout=30.0, # 30 seconds per action
         strict_loop_detector=agent_config['strict_loop_detector'], # set to true only if training
+        enable_vision=False,
+        enable_a11y_tree=True,
     )
     config.set_agent_config(agent_config)
     return config
 
-def get_instruction(instance: pd.Series | dict, metadata: EvalMetadata) -> MessageAction:
+def get_instruction(instance: pd.Series | dict, metadata: EvalMetadata, runtime: Runtime) -> MessageAction:
+    """
+    We keep all information here. screenshot and a11y tree will be processed in agent.
+    """
 
-    def obtain_problem_statement(instance: dict) -> str:
-        if isinstance(instance['prompt'], list):
-            problem_statement = instance['prompt'][0]['content']
-        elif isinstance(instance['prompt'], str):
-            problem_statement = json.loads(instance['prompt'])[0]['content']
-        else:
-            raise ValueError(f'Invalid prompt type: {type(instance["prompt"])}')
-        # Remove boxed instructions from problem statement
-        if " Let's think step by step and output the final answer within \\boxed{}." in problem_statement:
-            problem_statement = problem_statement.replace(" Let's think step by step and output the final answer within \\boxed{}.", "")
-        return problem_statement
+    include_screenshot = True #runtime.config.agents['agent'].enable_vision
+    include_a11y_tree = True #runtime.config.agents['agent'].enable_a11y_tree
+    instruction = f"""Work on the following task accourding to the UI screenshot.
 
-    instruction = f"""
-Your task is to solve challenging math problems using the `execute_ipython_cell` tool, which gives you access to a full IPython environment. You are allowed and expected to use code to explore, solve, and verify your answers.
-
-Environment:
-- Libraries already imported: `math`, `cmath`, `numpy`, `sympy`, `scipy`
-- You can also install additional libraries using `%pip install <library>` if necessary.
-
-Instructions:
-1. Read and understand the problem statement. Fist use the `think` tool to log down your thoughts and plan for solving the problem.
-2. Plan your solution using a combination of reasoning and code. Always try to solve the problem using code. Also plan about how to verify your solution.
-3. In subsequent steps after planning, use tools to execute your plan. Use `execute_ipython_cell` to run calculations, manipulate symbols, or perform verification.
-4. Use code to verify your answer. If your answer is not correct, iterate your plan with the `think` tool and continue solving the problem until you are confident in your answer is correct.
-5. Finally, when you are confident in your answer:
-    - Only call the `finish` tool if you are confident in your answer and you have verified your answer with the `execute_ipython_cell` tool.
-    - Terminate the conversation by calling the `finish` tool.
-    - Put your final answer within \\boxed{{}} in the message with the `finish` tool.
-    
-
-Important Guidelines:
-- Always first use the `think` tool to log down your thoughts and plan for solving the problem.
-- Always try to use the `execute_ipython_cell` tool to solve the problem, especially for calculations, symbolic reasoning, or simulations.
-- Always verify your answer with code and the `execute_ipython_cell` tool.
-- Only use the `finish` tool is you are confident the answer is correct. If you think there is a mistake, iterate your plan with the `think` tool and continue solving the problem.
-- Put your final answer within \\boxed{{}} in the message with the `finish` tool.
-
-Now begin solving the following problem:
-{obtain_problem_statement(instance)}
+Instruction: {instance['instruction']}
 """
-    return MessageAction(content=instruction)
+    
+    if include_a11y_tree:
+        accessibility_tree = runtime.get_vm_accessibility_tree()
+        if accessibility_tree:
+            accessibility_tree = simplify_accessibility_tree(accessibility_tree)
+
+    image_url = None
+    if include_screenshot:
+        image = runtime.get_vm_screenshot()
+        if image:
+            image_url = [f'data:image/png;base64,{image}']
+
+    return MessageAction(content=instruction, image_urls=image_url, accessibility_tree=accessibility_tree)
 
 def create_runtime(config: OpenHandsConfig, sid: str | None = None) -> Runtime:
     vm_image_path = os.getenv('OSWORLD_VM_IMAGE_PATH', './OS_images/Ubuntu.qcow2')
@@ -171,7 +156,7 @@ async def initialize_agents(
         raise ValueError('LLM config is None, cannot initialize.')
 
     metadata = EvalMetadata(
-        agent_class="CodeActAgent",
+        agent_class="OSWorldAgent",
         llm_config=llm_config,
         agent_config=None,
         max_iterations=agent_config['max_iterations'],
@@ -233,7 +218,7 @@ async def run_agent(
     config = job_details.config
     instance = job_details.instance
 
-    message_action = get_instruction(instance, metadata)
+    message_action = get_instruction(instance, metadata, runtime)
     try:
         agent = create_agent(config)
         job_details.agent = agent
@@ -286,3 +271,213 @@ async def evaluate_agent(run_results: dict, instance: dict, runtime: Runtime):
         return {'resolved': False, 'reward': score}
     except:
         return {'resolved': False, 'reward': 0}
+
+def process_messages_from_agent_state(
+    agent: OSWorldAgent,
+    state: State,
+    job_details: JobDetails | None = None,
+) -> dict:
+    """
+    This has been modified for OSWorldAgent to account for vision input.
+    We removed logic related to <think> and </think> tags.
+    The content logic for assistant turns will always contain 3 items:
+    - a text item with the instruction (this might have accessibility tree already embedded)
+    - a image item with the screenshot
+    - a text item with the accessibility tree
+    
+    logic for token_level_generation has not been checked or tested. Not supported for OSWorldAgent at the moment.
+    """
+    if job_details is not None:
+        assert job_details.llm_config is not None, (
+            'llm_config is required in job_details.'
+        )
+        token_level_generation = job_details.llm_config.token_level_generation
+        assert token_level_generation is False, 'token_level_generation is not supported for OSWorldAgent at the moment.'
+    else:
+        logger.warning(
+            'No job_details provided in process_messages_from_agent_state. Assuming token_level_generation is False.'
+        )
+        token_level_generation = False
+
+    initial_user_message = agent._get_initial_user_message(state.history)
+    messages = agent._get_messages_from_agent_state(state.history, initial_user_message)
+
+    while len(messages) > 0 and messages[-1]['role'] != 'assistant':
+        messages = messages[:-1]
+
+    tools = agent.tools
+    return {
+        'messages': messages,
+        'tools': tools,
+        'end_properly': not state.get_last_agent_format_error(),
+    }
+
+###############################################################################
+# Begin of exception handling
+# Used to override default process_messages_from_agent_state for OSWorldAgent
+###############################################################################
+def get_messages_from_partial_result(job_details: JobDetails) -> dict:
+    if job_details.agent is None or job_details.controller is None:
+        return {'messages': [], 'tools': [], 'end_properly': True}
+    controller = job_details.controller
+    state = controller.get_state()
+    assert state is not None, (
+        'Error in get_messages_from_partial_result: state is None.'
+    )
+    return process_messages_from_agent_state(job_details.agent, state, job_details)
+
+def initialize_exception(job_details: JobDetails, e: Exception):
+    tb = traceback.format_exc()
+    instance_id = (
+        job_details.instance.get('instance_id', None)
+        if job_details.instance is not None
+        else None
+    )
+    trajectory_id = (
+        job_details.instance.get('trajectory_id', None)
+        if job_details.instance is not None
+        else None
+    )
+    return {
+        'instance_id': instance_id,
+        'trajectory_id': trajectory_id,
+        'git_patch': None,
+        'success': False,
+        'error': f'Error in init: {str(e)}',
+        'traceback': tb,
+        'finish': False,
+        'messages': [],
+        'tools': [],
+        'end_properly': False,
+        'resolved': False,
+        'critical_error': 'init',
+    }
+
+
+def run_exception(job_details: JobDetails, e: Exception):
+    tb = traceback.format_exc()
+    instance_id = (
+        job_details.instance.get('instance_id', None)
+        if job_details.instance is not None
+        else None
+    )
+    trajectory_id = (
+        job_details.instance.get('trajectory_id', None)
+        if job_details.instance is not None
+        else None
+    )
+    git_patch = (
+        job_details.run_results.get('git_patch', None)
+        if job_details.run_results is not None
+        else None
+    )
+    success = (
+        job_details.run_results.get('success', False)
+        if job_details.run_results is not None
+        else False
+    )
+    finish = (
+        job_details.run_results.get('finish', False)
+        if job_details.run_results is not None
+        else False
+    )
+    messages = (
+        job_details.run_results.get('messages', [])
+        if job_details.run_results is not None
+        else []
+    )
+    tools = (
+        job_details.run_results.get('tools', [])
+        if job_details.run_results is not None
+        else []
+    )
+    end_properly = (
+        job_details.run_results.get('end_properly', True)
+        if job_details.run_results is not None
+        else True
+    )
+    if len(messages) == 0:
+        partial_result = get_messages_from_partial_result(job_details)
+        messages = partial_result['messages']
+        tools = partial_result['tools']
+        end_properly = partial_result['end_properly']
+    return {
+        'instance_id': instance_id,
+        'trajectory_id': trajectory_id,
+        'git_patch': git_patch,
+        'success': success,
+        'error': f'Error in run agent: {str(e)}',
+        'traceback': tb,
+        'finish': finish,
+        'messages': messages,
+        'tools': tools,
+        'end_properly': end_properly,
+        'resolved': False,
+        'critical_error': 'run',
+    }
+
+
+def eval_exception(job_details: JobDetails, e: Exception):
+    tb = traceback.format_exc()
+    instance_id = (
+        job_details.instance.get('instance_id', None)
+        if job_details.instance is not None
+        else None
+    )
+    trajectory_id = (
+        job_details.instance.get('trajectory_id', None)
+        if job_details.instance is not None
+        else None
+    )
+    git_patch = (
+        job_details.run_results.get('git_patch', None)
+        if job_details.run_results is not None
+        else None
+    )
+    success = (
+        job_details.run_results.get('success', False)
+        if job_details.run_results is not None
+        else False
+    )
+    finish = (
+        job_details.run_results.get('finish', False)
+        if job_details.run_results is not None
+        else False
+    )
+    messages = (
+        job_details.run_results.get('messages', [])
+        if job_details.run_results is not None
+        else []
+    )
+    tools = (
+        job_details.run_results.get('tools', [])
+        if job_details.run_results is not None
+        else []
+    )
+    end_properly = (
+        job_details.run_results.get('end_properly', True)
+        if job_details.run_results is not None
+        else True
+    )
+    if len(messages) == 0:
+        partial_result = get_messages_from_partial_result(job_details)
+        messages = partial_result['messages']
+        tools = partial_result['tools']
+        end_properly = partial_result['end_properly']
+    return {
+        'instance_id': instance_id,
+        'trajectory_id': trajectory_id,
+        'git_patch': git_patch,
+        'success': success,
+        'error': f'Error in eval: {str(e)}',
+        'traceback': tb,
+        'finish': finish,
+        'messages': messages,
+        'tools': tools,
+        'end_properly': end_properly,
+        'resolved': False,
+        'critical_error': 'eval',
+    }
+###############################################################################
+# End of exception handling
+###############################################################################

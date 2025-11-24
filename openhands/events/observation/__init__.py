@@ -25,6 +25,7 @@ from openhands.events.observation.mcp import MCPObservation
 from openhands.events.observation.observation import Observation
 from openhands.events.observation.reject import UserRejectObservation
 from openhands.events.observation.success import SuccessObservation
+from openhands.events.observation.osworld import OSWorldOutputObservation
 
 __all__ = [
     'Observation',
@@ -46,4 +47,5 @@ __all__ = [
     'RecallObservation',
     'RecallType',
     'MCPObservation',
+    'OSWorldOutputObservation',
 ]

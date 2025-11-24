@@ -7,6 +7,7 @@ from openhands.core.config.llm_config import LLMConfig
 from openhands.core.logger import openhands_logger as logger
 from openhands.nvidia.os_world.osworld_utils import (
     initialize_agents,
+    run_agent,
     evaluate_agent,
 )
 from openhands.nvidia.registry import JobDetails
@@ -16,14 +17,14 @@ from openhands.nvidia.timer import PausableTimer
 async def run(instance):
     max_iterations = 35
     sampling_params = {
-        'model': 'hosted_vllm/Qwen/Qwen3-8B',
-        'api_key': 'mykey',
+        'model': 'deepseek/deepseek-chat',
+        'api_key': 'sk-697e5dc7145849a3b2ad1595718b35f2',
         'modify_params': False,
         'log_completions': True,
         'native_tool_calling': True,
         'temperature': 0.6,
     }
-    llm_config = LLMConfig(base_url='http://127.0.0.1:8000/v1', **sampling_params)
+    llm_config = LLMConfig(base_url='https://api.deepseek.com/chat/completions', **sampling_params)
 
 
     job_details = JobDetails(
@@ -43,10 +44,10 @@ async def run(instance):
     job_details.metadata = metadata
     job_details.config = config
 
-    run_results = {} #await run_agent(job_details)
     import pdb; pdb.set_trace()
+    run_results = await run_agent(job_details)   
 
-
+    import pdb; pdb.set_trace()
     eval_results = await evaluate_agent({}, instance, runtime)
     return eval_results
 
@@ -56,6 +57,7 @@ if __name__ == '__main__':
         "id": "06fe7178-4491-4589-810f-2e2bc9502122",
         "snapshot": "chrome",
         "instruction": "Can you make my computer bring back the last tab I shut down?",
+        #"instruction": "Go on to ArXiv and search for 'ProRL' paper from Nvidia. Open the pdf.",
         "source": "https://www.wikihow.com/Switch-Tabs-in-Chrome",
         "config": [
         {
