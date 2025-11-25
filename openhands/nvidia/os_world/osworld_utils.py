@@ -267,7 +267,8 @@ async def evaluate_agent(run_results: dict, instance: dict, runtime: Runtime):
     try:
         evaluator = Evaluator(instance, runtime.setup_controller)
         score = await evaluator.evaluate(run_results['messages'])
-        if score > 0.99:
+        # Some evaluation metrics are fuzzy matching such as pdf comparison
+        if score > 0.95:
             return {'resolved': True, 'reward': score}
         return {'resolved': False, 'reward': score}
     except:

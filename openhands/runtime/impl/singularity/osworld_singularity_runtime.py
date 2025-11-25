@@ -241,8 +241,8 @@ class OSWorldSingularityRuntime(SingularityRuntime):
         )
         
         cmd.extend([
-            '-m', '8G',
-            '-smp', '8',
+            '-m', '2G',
+            '-smp', '2',
             '-drive', f'file={vm_image_container_path},if=ide',
             '-netdev', portfwd,
             '-device', 'virtio-net-pci,netdev=net0',

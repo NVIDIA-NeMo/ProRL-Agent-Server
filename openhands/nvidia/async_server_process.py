@@ -231,7 +231,7 @@ class Worker:
                     )
                     self.job_details.run_results = run_results
                     # Close runtime (automatically in "others" phase - doesn't count toward timeout)
-                    if data_source != 'osworld' and self.job_details.runtime:
+                    if dataset_type != 'osworld' and self.job_details.runtime:
                         self._cleanup_job_runtime(self.job_details.runtime, self.job_id)
                         self.job_details.runtime = None
 
