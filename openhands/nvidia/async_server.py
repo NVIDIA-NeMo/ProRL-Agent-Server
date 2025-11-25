@@ -430,7 +430,8 @@ class OpenHandsServer:
                         )
                         job_details.run_results = run_results
                         # Close runtime (automatically in "others" phase - doesn't count toward timeout)
-                        if job_details.runtime:
+                        # OSWorld runtime is closed in evaluate function
+                        if dataset_type != 'osworld' and job_details.runtime:
                             self._cleanup_job_runtime(job_details.runtime, job_id)
                             job_details.runtime = None
                         # Push to evaluation queue (automatically "others" phase)
@@ -454,6 +455,10 @@ class OpenHandsServer:
                             job_details.eval_results = eval_report
                         if job_details.event is not None:
                             job_details.event.set()
+                        # Close runtime if needed
+                        if job_details.runtime:
+                            self._cleanup_job_runtime(job_details.runtime, job_id)
+                            job_details.runtime = None
 
             except TimeoutError as e:
                 logger.warning(

@@ -231,7 +231,7 @@ class Worker:
                     )
                     self.job_details.run_results = run_results
                     # Close runtime (automatically in "others" phase - doesn't count toward timeout)
-                    if self.job_details.runtime:
+                    if data_source != 'osworld' and self.job_details.runtime:
                         self._cleanup_job_runtime(self.job_details.runtime, self.job_id)
                         self.job_details.runtime = None
 
@@ -253,6 +253,9 @@ class Worker:
                         self.job_details.eval_results = eval_report
                     if self.job_details.event is not None:
                         self.job_details.event.set()
+                    if self.job_details.runtime:
+                        self._cleanup_job_runtime(self.job_details.runtime, self.job_id)
+                        self.job_details.runtime = None
 
         except TimeoutError as e:
             self.job_details.timeout_error = True
