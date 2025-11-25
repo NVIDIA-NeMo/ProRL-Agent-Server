@@ -28,6 +28,7 @@ from openhands.core.exceptions import (
     AgentToolCallError,
     AgentLengthError,
 )
+from openhands.nvidia.os_world.accessibility_tree_wrap.heuristic_retrieve import linearize_accessibility_tree
 
 from openhands.agenthub.gui_agent.prompts.osworld import OSWORLD_OBSERVATION_FEEDBACK_PROMPT, ERROR_OBSERVATION_FEEDBACK_PROMPT
 
@@ -62,7 +63,8 @@ def convert_message_action_to_message(
     ) -> Message:
     text_content = action.content
     if include_a11y_tree:
-        text_content += f"\n\nAccessibility Tree: {action.accessibility_tree}"
+        accessibility_tree = linearize_accessibility_tree(action.accessibility_tree)
+        text_content += f"\n\nAccessibility Tree:\n{accessibility_tree}"
     content = [TextContent(text=text_content)]
     if include_screenshot:
         content.append(ImageContent(image_urls=action.image_urls))
@@ -80,7 +82,8 @@ def convert_observation_to_message(
     if isinstance(observation, OSWorldOutputObservation):
         prompt_text = OSWORLD_OBSERVATION_FEEDBACK_PROMPT.format(instruction=instruction)
         if include_a11y_tree:
-            prompt_text += f"\n\nAccessibility Tree: {observation.accessibility_tree}"
+            accessibility_tree = linearize_accessibility_tree(observation.accessibility_tree)
+            prompt_text += f"\n\nAccessibility Tree:\n{accessibility_tree}"
         content = [TextContent(text=prompt_text)]
         if include_screenshot:
             content.append(ImageContent(image_urls=observation.image_urls))
@@ -95,7 +98,7 @@ def convert_observation_to_message(
         return Message(
             role='tool', # or user?
             content=[TextContent(text=observation.content)],
-            tool_call_id=observation.tool_call_id,
+            tool_call_id=observation.error_id,
             name=observation.name,
         )
 
@@ -105,7 +108,8 @@ def convert_message_action_to_message_full_state(
     ) -> Message:
     test_content = action.content
     if include_a11y_tree:
-        test_content += f"\n\nAccessibility Tree: {action.accessibility_tree}"
+        accessibility_tree = linearize_accessibility_tree(action.accessibility_tree)
+        test_content += f"\n\nAccessibility Tree:\n{accessibility_tree}"
     content = [TextContent(text=action.content)]
     content.append(ImageContent(image_urls=action.image_urls))
     content.append(TextContent(text=action.accessibility_tree))
@@ -122,7 +126,8 @@ def convert_observation_to_message_full_state(
     if isinstance(observation, OSWorldOutputObservation):
         prompt_text = OSWORLD_OBSERVATION_FEEDBACK_PROMPT.format(instruction=instruction)
         if include_a11y_tree:
-            prompt_text += f"\n\nAccessibility Tree: {observation.accessibility_tree}"
+            accessibility_tree = linearize_accessibility_tree(observation.accessibility_tree)
+            prompt_text += f"\n\nAccessibility Tree:\n{accessibility_tree}"
         content = [TextContent(text=prompt_text)]
         
         # We always add screenshot and accessibility tree to the message
@@ -139,7 +144,7 @@ def convert_observation_to_message_full_state(
         return Message(
             role='tool', # or user?
             content=[TextContent(text=observation.content)],
-            tool_call_id=observation.tool_call_id,
+            tool_call_id=observation.error_id,
             name=observation.name,
         )
 
@@ -303,6 +308,7 @@ class OSWorldAgent(Agent):
     ) -> list[dict]:
         """This message although similar to _get_messages, is used to process the messages from the agent state.
         Key difference is to preserve all the content items in the message, including image and accessibility tree.
+        Also will add AgentFinishAction to the messages.
         Used in process_messages_from_agent_state.
 
         Args:
@@ -324,7 +330,7 @@ class OSWorldAgent(Agent):
 
         # Build history prompts (alternating assistant/user messages)
         for event in events:
-            if isinstance(event, OSWorldInteractiveAction):
+            if isinstance(event, OSWorldInteractiveAction) or isinstance(event, AgentFinishAction):
                 messages.append(convert_action_to_message(event))
             elif isinstance(event, MessageAction):
                 messages.append(convert_message_action_to_message_full_state(event, include_a11y_tree=include_a11y_tree))
