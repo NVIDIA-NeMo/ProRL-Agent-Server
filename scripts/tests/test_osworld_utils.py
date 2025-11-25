@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 import numpy as np
 import pandas as pd
@@ -18,7 +19,7 @@ async def run(instance):
     max_iterations = 35
     sampling_params = {
         'model': 'deepseek/deepseek-chat',
-        'api_key': 'sk-697e5dc7145849a3b2ad1595718b35f2',
+        'api_key': os.getenv('DEEPSEEK_API_KEY', ''),
         'modify_params': False,
         'log_completions': True,
         'native_tool_calling': True,
