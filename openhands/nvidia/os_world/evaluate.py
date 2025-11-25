@@ -78,21 +78,29 @@ class Evaluator:
         Evaluate whether the task is successfully completed.
         """
 
-        postconfig = self.evaluator.get("postconfig", [])
-        await self.setup_controller.setup(postconfig)
+        def last_action_is_fail(last_action):
+            try:
+                function_type = last_action['tool_calls'][0]['function']['name']
+                return function_type == 'fail'
+            except:
+                return False
 
-        # TODO: special handling for infeasible tasks, might be different to OpenHands
+        # Special handling for infeasible tasks
+        # TODO: Currently working on litellm json dumped format. Might need to be modified for other formats.
         if self.evaluator['func'] == "infeasible":
             if len(action_history) > 0:
                 last_action = action_history[-1]
-                if last_action == "FAIL" or (type(last_action) == dict and last_action.get('action_type') == 'FAIL'):
+                if last_action_is_fail(last_action):
                     return 1
             return 0
         else:
             if len(action_history) > 0:
                 last_action = action_history[-1]
-                if last_action == "FAIL" or (type(last_action) == dict and last_action.get('action_type') == 'FAIL'):
+                if last_action_is_fail(last_action):
                     return 0
+
+        postconfig = self.evaluator.get("postconfig", [])
+        await self.setup_controller.setup(postconfig)
 
         if type(self.metric) == list:
             # Multiple metrics to evaluate whether the task is successfully completed

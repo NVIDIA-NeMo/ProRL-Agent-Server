@@ -61,12 +61,10 @@ class OSWorldHandler(AgentHandler):
             reward: Optional[Reward] = None,
         ) -> dict[str, Any]:
 
-        if reward is None:
-            raise ValueError('Reward is required for evaluation of math problems.')
-
         return await evaluate_agent(
             run_results=job_details.run_results,
             instance=job_details.instance,
+            runtime=job_details.runtime,
         )
 
     def init_exception(self, job_details: JobDetails, exception: Exception) -> dict[str, Any]:

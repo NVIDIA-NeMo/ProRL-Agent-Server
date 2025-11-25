@@ -36,7 +36,6 @@ from openhands.runtime.plugins import PluginRequirement
 from openhands.runtime.utils import find_available_tcp_port
 from openhands.runtime.utils.command import DEFAULT_MAIN_MODULE
 
-from openhands.utils.ast_process import simplify_accessibility_tree
 from openhands.events.tool import ToolCallMetadata
 
 # Port ranges for OSWorld VM services
@@ -595,7 +594,7 @@ class OSWorldSingularityRuntime(SingularityRuntime):
         try:
             response = httpx.get(
                 f'{self.osworld_vm_url}/screenshot',
-                timeout=10.0
+                timeout=30.0
             )
             if response.status_code == 200:
                 return response.content
@@ -613,7 +612,7 @@ class OSWorldSingularityRuntime(SingularityRuntime):
         try:
             response = httpx.get(
                 f'{self.osworld_vm_url}/accessibility',
-                timeout=10.0
+                timeout=30.0
             )
             if response.status_code == 200:
                 at = response.json().get('AT', '')
@@ -955,7 +954,7 @@ class OSWorldSingularityRuntime(SingularityRuntime):
 
             if include_a11y_tree:
                 accessibility_tree = self.get_vm_accessibility_tree()
-                accessibility_tree = simplify_accessibility_tree(accessibility_tree)
+                #accessibility_tree = linearize_accessibility_tree(accessibility_tree)
             else:
                 accessibility_tree = None
 
@@ -968,10 +967,11 @@ class OSWorldSingularityRuntime(SingularityRuntime):
             )
         else:
             error_msg = result.get('error', result.get('message', 'Unknown error'))
+            logger.error(f"Error in agentic action: action_data={action_data}, error={error_msg}")
             return ErrorObservation(
                 content=f"Error: {error_msg}",
                 command=str(action_data),
-                tool_call_id=tool_call_metadata.tool_call_id,
+                error_id=tool_call_metadata.tool_call_id,
                 name=tool_call_metadata.function_name,
             )
     

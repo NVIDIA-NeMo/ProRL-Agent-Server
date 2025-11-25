@@ -4,6 +4,7 @@ from openhands.nvidia.math_coder.prorl_handler import ProRLHandler
 from openhands.nvidia.registry import add_name_mapping, register_agent_handler
 from openhands.nvidia.stem_agent.stem_handler import STEMHandler
 from openhands.nvidia.swe_agent.swe_agent_handler import SweAgentHandler
+from openhands.nvidia.os_world.osworld_handler import OSWorldHandler
 
 register_agent_handler(SweAgentHandler())
 register_agent_handler(MathHandler())
@@ -27,6 +28,7 @@ for prorl_dataset in [
     add_name_mapping(prorl_dataset, 'prorl', reasoning=True)
 register_agent_handler(STEMHandler())
 register_agent_handler(GuiAgentHandler())
+register_agent_handler(OSWorldHandler())
 
 for code_dataset in ['codecontests', 'apps', 'codeforces', 'taco']:
     add_name_mapping(code_dataset, 'deepcoder')

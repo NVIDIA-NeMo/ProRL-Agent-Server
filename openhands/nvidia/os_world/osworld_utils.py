@@ -43,7 +43,6 @@ from openhands.nvidia.controller import run_controller_with_controller
 from openhands.nvidia.os_world.controllers.setup import SetupController
 from openhands.nvidia.os_world.evaluate import Evaluator
 
-from openhands.utils.ast_process import simplify_accessibility_tree
 
 
 def get_config(
@@ -110,8 +109,6 @@ Instruction: {instance['instruction']}
     
     if include_a11y_tree:
         accessibility_tree = runtime.get_vm_accessibility_tree()
-        if accessibility_tree:
-            accessibility_tree = simplify_accessibility_tree(accessibility_tree)
 
     image_url = None
     if include_screenshot:
@@ -123,7 +120,7 @@ Instruction: {instance['instruction']}
 
 def create_runtime(config: OpenHandsConfig, sid: str | None = None) -> Runtime:
     vm_image_path = os.getenv('OSWORLD_VM_IMAGE_PATH', './OS_images/Ubuntu.qcow2')
-    assert Path(vm_image_path).exists(), f"ERROR: VM image not found at {vm_image_path}"
+    assert Path(vm_image_path).exists(), f"ERROR: VM image not found at {vm_image_path}. Export OSWORLD_VM_IMAGE_PATH."
     logger.info(f"Using VM image path: {vm_image_path}")
 
     session_id = sid or generate_sid(config)
@@ -246,12 +243,16 @@ async def run_agent(
             raise EvalException('Fatal error detected: ' + state.last_error)
 
     except Exception as e:
+        import traceback
+        print(traceback.format_exc())
         logger.error(f"Error running agent: {e}")
 
     # get messages from agent history
     try:
         run_results = process_messages_from_agent_state(agent, state, job_details) # type: ignore
     except Exception as e:
+        import traceback
+        print(traceback.format_exc())
         logger.error(f"Error while running, failed to retrieve agent messages: {e}")
         raise Exception(f"Failed to retrieve agent messages: {str(e)}")
 
@@ -265,7 +266,7 @@ async def run_agent(
 async def evaluate_agent(run_results: dict, instance: dict, runtime: Runtime):
     try:
         evaluator = Evaluator(instance, runtime.setup_controller)
-        score = await evaluator.evaluate()
+        score = await evaluator.evaluate(run_results['messages'])
         if score > 0.99:
             return {'resolved': True, 'reward': score}
         return {'resolved': False, 'reward': score}
@@ -307,6 +308,7 @@ def process_messages_from_agent_state(
 
     tools = agent.tools
     return {
+        'problem_id': job_details.instance.get('id', None),
         'messages': messages,
         'tools': tools,
         'end_properly': not state.get_last_agent_format_error(),

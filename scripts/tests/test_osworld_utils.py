@@ -48,7 +48,7 @@ async def run(instance):
     run_results = await run_agent(job_details)   
 
     import pdb; pdb.set_trace()
-    eval_results = await evaluate_agent({}, instance, runtime)
+    eval_results = await evaluate_agent(run_results, instance, runtime)
     return eval_results
 
 
@@ -123,6 +123,16 @@ if __name__ == '__main__':
         "fixed_ip": False,
         "possibility_of_env_change": "low"
     }
+
+    import json
+    data_file = '/root/OSWorld/osworld_test_nogdrive.json'
+    all_data = []
+    with open(data_file, 'r') as f:
+        for line in f:
+            data = json.loads(line)
+            all_data.append(data)
+    instance = all_data[3] # 3 is a good example of pruning too much?
+    print(instance)
 
     # Initialize the agents
     results = asyncio.run(run(instance))
