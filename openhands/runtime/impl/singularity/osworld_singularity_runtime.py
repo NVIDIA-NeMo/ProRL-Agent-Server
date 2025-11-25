@@ -858,7 +858,7 @@ class OSWorldSingularityRuntime(SingularityRuntime):
             if method == 'execute_action':
                 return self._handle_execute_action(params)
             elif method == 'execute_agentic_action':
-                return self._handle_execute_agentic_action(params, action.tool_call_metadata)
+                return self._handle_execute_agentic_action(params, action.tool_call_metadata, action.pause_time)
             elif method == 'get_screenshot':
                 return self._handle_get_screenshot()
             elif method == 'get_accessibility_tree':
@@ -919,7 +919,7 @@ class OSWorldSingularityRuntime(SingularityRuntime):
                 exit_code=1,
             )
 
-    def _handle_execute_agentic_action(self, params: dict, tool_call_metadata: ToolCallMetadata | None) -> 'Observation':
+    def _handle_execute_agentic_action(self, params: dict, tool_call_metadata: ToolCallMetadata | None, pause_time: float = 0.0) -> 'Observation':
         """Handle execute_action - PyAutoGUI actions like CLICK, TYPING, etc."""
         from openhands.events.observation.osworld import OSWorldOutputObservation  
         from openhands.events.observation import ErrorObservation   
@@ -946,15 +946,17 @@ class OSWorldSingularityRuntime(SingularityRuntime):
         result = self.execute_vm_action(action_data)
         
         if result.get('status') == 'success':
+            if pause_time > 0.5:
+                time.sleep(pause_time)
             if include_screenshot:
                 screenshot_bytes = self.get_vm_screenshot()
-                screenshot_bytes = base64.b64encode(screenshot_bytes).decode('utf-8')
+                if screenshot_bytes:
+                    screenshot_bytes = base64.b64encode(screenshot_bytes).decode('utf-8')
             else:
                 screenshot_bytes = None
 
             if include_a11y_tree:
                 accessibility_tree = self.get_vm_accessibility_tree()
-                #accessibility_tree = linearize_accessibility_tree(accessibility_tree)
             else:
                 accessibility_tree = None
 

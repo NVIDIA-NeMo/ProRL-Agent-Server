@@ -2,6 +2,7 @@
 import time
 import os
 import pandas as pd
+import base64
 import numpy as np
 import asyncio
 from evaluation.utils.shared import (  # type: ignore
@@ -89,8 +90,8 @@ def get_config(
         ensure_thinking_end_properly=agent_config['ensure_thinking_end_properly'], # set to true only if using text based server for training.
         action_timeout=30.0, # 30 seconds per action
         strict_loop_detector=agent_config['strict_loop_detector'], # set to true only if training
-        enable_vision=False,
-        enable_a11y_tree=True,
+        enable_vision=agent_config['enable_vision'],
+        enable_a11y_tree=agent_config['enable_a11y_tree'],
     )
     config.set_agent_config(agent_config)
     return config
@@ -114,6 +115,7 @@ Instruction: {instance['instruction']}
     if include_screenshot:
         image = runtime.get_vm_screenshot()
         if image:
+            image = base64.b64encode(image).decode('utf-8')
             image_url = [f'data:image/png;base64,{image}']
 
     return MessageAction(content=instruction, image_urls=image_url, accessibility_tree=accessibility_tree)
@@ -218,6 +220,9 @@ async def run_agent(
     message_action = get_instruction(instance, metadata, runtime)
     try:
         agent = create_agent(config)
+        # Set pause time for agent to wait for the screenshot to be taken
+        # You can play around with this value to find appropriate value for setup.
+        agent.pause_time = 4.0
         job_details.agent = agent
         controller, initial_state = create_controller(
             agent=agent,

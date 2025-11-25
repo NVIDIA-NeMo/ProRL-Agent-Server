@@ -17,6 +17,8 @@ _DEFAULT_AGENT_CONFIG = {
     'max_iterations': 2,
     'ensure_thinking_end_properly': False,
     'strict_loop_detector': False,
+    'enable_vision': False,
+    'enable_a11y_tree': False,
 }
 
 

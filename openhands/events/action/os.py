@@ -40,6 +40,7 @@ class OSWorldInteractiveAction(Action):
     action: str = ActionType.OSWORLD_INTERACTIVE
     runnable: ClassVar[bool] = True
     security_risk: ActionSecurityRisk | None = None
+    pause_time: float = 0.0
 
     def __post_init__(self):
         if self.params is None:

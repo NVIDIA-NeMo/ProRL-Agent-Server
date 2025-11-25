@@ -18,14 +18,14 @@ from openhands.nvidia.timer import PausableTimer
 async def run(instance):
     max_iterations = 35
     sampling_params = {
-        'model': 'deepseek/deepseek-chat',
-        'api_key': os.getenv('DEEPSEEK_API_KEY', ''),
+        'model': 'gpt-5-mini-2025-08-07',
+        'api_key': os.getenv('OPENAI_API_KEY', ''),
         'modify_params': False,
         'log_completions': True,
         'native_tool_calling': True,
-        'temperature': 0.6,
+        'temperature': 1,
     }
-    llm_config = LLMConfig(base_url='https://api.deepseek.com/chat/completions', **sampling_params)
+    llm_config = LLMConfig(base_url='https://api.openai.com/v1', **sampling_params)
 
 
     job_details = JobDetails(
@@ -34,6 +34,8 @@ async def run(instance):
         llm_config=llm_config,
     )
     job_details.agent_config['max_iterations'] = max_iterations
+    job_details.agent_config['enable_vision'] = True
+    job_details.agent_config['enable_a11y_tree'] = False
     job_details.timer = PausableTimer(timeout=500)
     job_details.timer.start()
 

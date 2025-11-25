@@ -42,7 +42,7 @@ def test_server(
         'log_completions': False,
         'native_tool_calling': True,
         'temperature': 0.6,
-        'max_iterations': 35,
+        'max_iterations': 3,
     }
 
     print('Starting server')
@@ -77,7 +77,7 @@ if __name__ == '__main__':
     start = time.time()
     # set timeout approriate to terminate
     results = test_server(
-        total_jobs=1, max_parallel_jobs=1, allow_skip_eval=False, timeout=6000
+        total_jobs=4, max_parallel_jobs=4, allow_skip_eval=False, timeout=6000
     )
     # Don't print full messages
     print(f'Time taken: {time.time() - start}')

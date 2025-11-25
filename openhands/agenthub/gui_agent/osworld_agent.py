@@ -47,6 +47,10 @@ def convert_action_to_message(action: OSWorldInteractiveAction) -> Message:
     output_ids = getattr(llm_response.choices[0], 'output_ids', None)
     logprobs = getattr(llm_response.choices[0], 'logprobs', None)
 
+    text_content = assistant_msg.content
+    if text_content is None:
+        text_content = ''
+
     return Message(
         role=getattr(assistant_msg, 'role', 'assistant'),
         content=[TextContent(text=assistant_msg.content)],
@@ -63,11 +67,19 @@ def convert_message_action_to_message(
     ) -> Message:
     text_content = action.content
     if include_a11y_tree:
-        accessibility_tree = linearize_accessibility_tree(action.accessibility_tree)
-        text_content += f"\n\nAccessibility Tree:\n{accessibility_tree}"
+        accessibility_tree = action.accessibility_tree
+        if accessibility_tree is None or len(accessibility_tree) < 1:
+            logger.error('Accessibility tree is None or empty, skipping')
+        else:
+            accessibility_tree = linearize_accessibility_tree(accessibility_tree)
+            text_content += f"\n\nAccessibility Tree:\n{accessibility_tree}"
     content = [TextContent(text=text_content)]
     if include_screenshot:
-        content.append(ImageContent(image_urls=action.image_urls))
+        image_urls = action.image_urls
+        if image_urls is None or len(image_urls) < 1:
+            logger.error('Image urls is None or empty, skipping')
+        else:
+            content.append(ImageContent(image_urls=image_urls))
     return Message(
         role='user',
         content=content,
@@ -82,11 +94,19 @@ def convert_observation_to_message(
     if isinstance(observation, OSWorldOutputObservation):
         prompt_text = OSWORLD_OBSERVATION_FEEDBACK_PROMPT.format(instruction=instruction)
         if include_a11y_tree:
-            accessibility_tree = linearize_accessibility_tree(observation.accessibility_tree)
-            prompt_text += f"\n\nAccessibility Tree:\n{accessibility_tree}"
+            accessibility_tree = observation.accessibility_tree
+            if accessibility_tree and len(accessibility_tree) >= 1:
+                logger.error('Accessibility tree is None or empty, skipping')
+            else:
+                accessibility_tree = linearize_accessibility_tree(accessibility_tree)
+                prompt_text += f"\n\nAccessibility Tree:\n{accessibility_tree}"
         content = [TextContent(text=prompt_text)]
         if include_screenshot:
-            content.append(ImageContent(image_urls=observation.image_urls))
+            image_url = observation.image_urls
+            if image_url is None or len(image_url) < 1:
+                logger.error('Image urls is None or empty, skipping')
+            else:
+                content.append(ImageContent(image_urls=image_url))
         return Message(
             role='tool', # or user?
             content=content,
@@ -106,11 +126,13 @@ def convert_message_action_to_message_full_state(
     action: MessageAction,
     include_a11y_tree: bool = True,
     ) -> Message:
-    test_content = action.content
+    text_content = action.content
     if include_a11y_tree:
-        accessibility_tree = linearize_accessibility_tree(action.accessibility_tree)
-        test_content += f"\n\nAccessibility Tree:\n{accessibility_tree}"
-    content = [TextContent(text=action.content)]
+        accessibility_tree = action.accessibility_tree
+        if accessibility_tree and len(accessibility_tree) > 0:
+            accessibility_tree = linearize_accessibility_tree(action.accessibility_tree)
+            text_content += f"\n\nAccessibility Tree:\n{accessibility_tree}"
+    content = [TextContent(text=text_content)]
     content.append(ImageContent(image_urls=action.image_urls))
     content.append(TextContent(text=action.accessibility_tree))
     return Message(
@@ -126,8 +148,10 @@ def convert_observation_to_message_full_state(
     if isinstance(observation, OSWorldOutputObservation):
         prompt_text = OSWORLD_OBSERVATION_FEEDBACK_PROMPT.format(instruction=instruction)
         if include_a11y_tree:
-            accessibility_tree = linearize_accessibility_tree(observation.accessibility_tree)
-            prompt_text += f"\n\nAccessibility Tree:\n{accessibility_tree}"
+            accessibility_tree = observation.accessibility_tree
+            if accessibility_tree and len(accessibility_tree) > 0:
+                accessibility_tree = linearize_accessibility_tree(accessibility_tree)
+                prompt_text += f"\n\nAccessibility Tree:\n{accessibility_tree}"
         content = [TextContent(text=prompt_text)]
         
         # We always add screenshot and accessibility tree to the message
@@ -168,6 +192,7 @@ class OSWorldAgent(Agent):
         """
         super().__init__(llm, config)
 
+        self.pause_time = 0.0
         self.system_prompt = os.path.join(os.path.dirname(__file__), 'prompts', 'system_prompt_osworld.j2')
         with open(self.system_prompt, 'r') as file:
             self.system_prompt = file.read()
@@ -296,10 +321,14 @@ class OSWorldAgent(Agent):
         }
         params['tools'] = self.tools
         params['extra_body'] = {'metadata': state.to_llm_metadata(agent_name=self.name)}
+        import pdb; pdb.set_trace()
         response = self.llm.completion(**params)
         import pdb; pdb.set_trace()
         logger.debug(f'Response from LLM: {response}')
         action = codeact_function_calling.response_to_actions(response, timeout=self.config.action_timeout)
+        if self.pause_time > 0.5:
+            logger.info(f'Setting pause time to {self.pause_time} seconds for agentic action')
+            action.pause_time = self.pause_time
         logger.debug(f'Actions after response_to_actions: {action}')
         return action
 

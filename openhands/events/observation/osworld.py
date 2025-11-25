@@ -10,8 +10,8 @@ class OSWorldOutputObservation(Observation):
     observation: str = ObservationType.OSWORLD
     command: str = field(default='')
     content: str = field(default='')
-    screenshot: str = field(repr=False, default='')  # don't show in repr, in base64 format
-    accessibility_tree: str = field(repr=False, default='')
+    screenshot: str | None = None
+    accessibility_tree: str | None = None
     tool_call_id: str | None = None
     name: str = ''
 
@@ -21,7 +21,10 @@ class OSWorldOutputObservation(Observation):
 
     @property
     def image_urls(self) -> list[str]:
-        return [f'data:image/png;base64,{self.screenshot}']
+        if self.screenshot:
+            return [f'data:image/png;base64,{self.screenshot}']
+        else:
+            return []
 
     def __str__(self) -> str:
         ret = (
