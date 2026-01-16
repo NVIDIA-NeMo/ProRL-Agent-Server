@@ -1,0 +1,25 @@
+[project]
+name = "openhands-workspace"
+version = "1.7.4"
+description = "OpenHands Workspace - Docker and container-based workspace implementations"
+
+requires-python = ">=3.12"
+dependencies = [
+    "openhands-sdk",
+    "openhands-agent-server",
+    "pydantic>=2.11.7",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-dir]
+"" = "."
+
+[tool.setuptools.packages.find]
+include = ["openhands.workspace*"]
+namespaces = true
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]

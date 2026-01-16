@@ -1,300 +1,97 @@
-SHELL=/usr/bin/env bash
-# Makefile for OpenHands project
+SHELL := /usr/bin/env bash
+.SHELLFLAGS := -eu -o pipefail -c
 
-# Variables
-BACKEND_HOST ?= "127.0.0.1"
-BACKEND_PORT = 3000
-BACKEND_HOST_PORT = "$(BACKEND_HOST):$(BACKEND_PORT)"
-FRONTEND_HOST ?= "127.0.0.1"
-FRONTEND_PORT = 3001
-DEFAULT_WORKSPACE_DIR = "./workspace"
-DEFAULT_MODEL = "gpt-4o"
-CONFIG_FILE = config.toml
-PRE_COMMIT_CONFIG_PATH = "./dev_config/python/.pre-commit-config.yaml"
-PYTHON_VERSION = 3.12
+# Colors for output
+ECHO := printf '%b\n'
+GREEN := \033[32m
+YELLOW := \033[33m
+RED := \033[31m
+CYAN := \033[36m
+RESET := \033[0m
 
-# ANSI color codes
-GREEN=$(shell tput -Txterm setaf 2)
-YELLOW=$(shell tput -Txterm setaf 3)
-RED=$(shell tput -Txterm setaf 1)
-BLUE=$(shell tput -Txterm setaf 6)
-RESET=$(shell tput -Txterm sgr0)
+# Required uv version
+REQUIRED_UV_VERSION := 0.8.13
+PKGS ?= openhands-sdk openhands-tools openhands-workspace openhands-agent-server
 
-# Build
-build:
-	@echo "$(GREEN)Building project...$(RESET)"
-	@$(MAKE) -s check-dependencies
-	@$(MAKE) -s install-python-dependencies
-	@$(MAKE) -s install-pre-commit-hooks
-	@echo "$(GREEN)Build completed successfully.$(RESET)"
+.PHONY: build format lint clean help check-uv-version
 
-check-dependencies:
-	@echo "$(YELLOW)Checking dependencies...$(RESET)"
-	@$(MAKE) -s check-system
-	@$(MAKE) -s check-python
-ifeq ($(INSTALL_DOCKER),)
-	@$(MAKE) -s check-docker
-endif
-	@$(MAKE) -s check-poetry
-	@$(MAKE) -s check-tmux
-	@echo "$(GREEN)Dependencies checked successfully.$(RESET)"
+# Default target
+.DEFAULT_GOAL := help
 
-check-system:
-	@echo "$(YELLOW)Checking system...$(RESET)"
-	@if [ "$(shell uname)" = "Darwin" ]; then \
-		echo "$(BLUE)macOS detected.$(RESET)"; \
-	elif [ "$(shell uname)" = "Linux" ]; then \
-		if [ -f "/etc/manjaro-release" ]; then \
-			echo "$(BLUE)Manjaro Linux detected.$(RESET)"; \
-		else \
-			echo "$(BLUE)Linux detected.$(RESET)"; \
-		fi; \
-	elif [ "$$(uname -r | grep -i microsoft)" ]; then \
-		echo "$(BLUE)Windows Subsystem for Linux detected.$(RESET)"; \
-	else \
-		echo "$(RED)Unsupported system detected. Please use macOS, Linux, or Windows Subsystem for Linux (WSL).$(RESET)"; \
+
+check-uv-version:
+	@$(ECHO) "$(YELLOW)Checking uv version...$(RESET)"
+	@UV_VERSION=$$(uv --version | cut -d' ' -f2); \
+	REQUIRED_VERSION=$(REQUIRED_UV_VERSION); \
+	if [ "$$(printf '%s\n' "$$REQUIRED_VERSION" "$$UV_VERSION" | sort -V | head -n1)" != "$$REQUIRED_VERSION" ]; then \
+		$(ECHO) "$(RED)Error: uv version $$UV_VERSION is less than required $$REQUIRED_VERSION$(RESET)"; \
+		$(ECHO) "$(YELLOW)Please update uv with: uv self update$(RESET)"; \
 		exit 1; \
-	fi
+	fi; \
+	$(ECHO) "$(GREEN)uv version $$UV_VERSION meets requirements$(RESET)"
 
-check-python:
-	@echo "$(YELLOW)Checking Python installation...$(RESET)"
-	@if command -v python$(PYTHON_VERSION) > /dev/null; then \
-		echo "$(BLUE)$(shell python$(PYTHON_VERSION) --version) is already installed.$(RESET)"; \
-	else \
-		echo "$(RED)Python $(PYTHON_VERSION) is not installed. Please install Python $(PYTHON_VERSION) to continue.$(RESET)"; \
-		exit 1; \
-	fi
+build: check-uv-version
+	@$(ECHO) "$(CYAN)Setting up OpenHands V1 development environment...$(RESET)"
+	@$(ECHO) "$(YELLOW)Installing dependencies with uv sync --dev...$(RESET)"
+	@uv sync --dev
+	@$(ECHO) "$(GREEN)Dependencies installed successfully.$(RESET)"
+	@$(ECHO) "$(YELLOW)Setting up pre-commit hooks...$(RESET)"
+	@uv run pre-commit install
+	@$(ECHO) "$(GREEN)Pre-commit hooks installed successfully.$(RESET)"
+	@$(ECHO) "$(GREEN)Build complete! Development environment is ready.$(RESET)"
 
-check-npm:
-	@echo "$(YELLOW)Checking npm installation...$(RESET)"
-	@if command -v npm > /dev/null; then \
-		echo "$(BLUE)npm $(shell npm --version) is already installed.$(RESET)"; \
-	else \
-		echo "$(RED)npm is not installed. Please install Node.js to continue.$(RESET)"; \
-		exit 1; \
-	fi
-
-check-nodejs:
-	@echo "$(YELLOW)Checking Node.js installation...$(RESET)"
-	@if command -v node > /dev/null; then \
-		NODE_VERSION=$(shell node --version | sed -E 's/v//g'); \
-		IFS='.' read -r -a NODE_VERSION_ARRAY <<< "$$NODE_VERSION"; \
-		if [ "$${NODE_VERSION_ARRAY[0]}" -ge 22 ]; then \
-			echo "$(BLUE)Node.js $$NODE_VERSION is already installed.$(RESET)"; \
-		else \
-			echo "$(RED)Node.js 22.x or later is required. Please install Node.js 22.x or later to continue.$(RESET)"; \
-			exit 1; \
-		fi; \
-	else \
-		echo "$(RED)Node.js is not installed. Please install Node.js to continue.$(RESET)"; \
-		exit 1; \
-	fi
-
-check-docker:
-	@echo "$(YELLOW)Checking Docker installation...$(RESET)"
-	@if command -v docker > /dev/null; then \
-		echo "$(BLUE)$(shell docker --version) is already installed.$(RESET)"; \
-	else \
-		echo "$(RED)Docker is not installed. Please install Docker to continue.$(RESET)"; \
-		exit 1; \
-	fi
-
-check-tmux:
-	@echo "$(YELLOW)Checking tmux installation...$(RESET)"
-	@if command -v tmux > /dev/null; then \
-		echo "$(BLUE)$(shell tmux -V) is already installed.$(RESET)"; \
-	else \
-		echo "$(YELLOW)╔════════════════════════════════════════════════════════════════════════════╗$(RESET)"; \
-		echo "$(YELLOW)║ OPTIONAL: tmux is not installed.                                          ║$(RESET)"; \
-		echo "$(YELLOW)║ Some advanced terminal features may not work without tmux.                ║$(RESET)"; \
-		echo "$(YELLOW)║ You can install it if needed, but it's not required for development.      ║$(RESET)"; \
-		echo "$(YELLOW)╚════════════════════════════════════════════════════════════════════════════╝$(RESET)"; \
-	fi
-
-check-poetry:
-	@echo "$(YELLOW)Checking Poetry installation...$(RESET)"
-	@if command -v poetry > /dev/null; then \
-		POETRY_VERSION=$(shell poetry --version 2>&1 | sed -E 's/Poetry \(version ([0-9]+\.[0-9]+\.[0-9]+)\)/\1/'); \
-		IFS='.' read -r -a POETRY_VERSION_ARRAY <<< "$$POETRY_VERSION"; \
-		if [ $${POETRY_VERSION_ARRAY[0]} -gt 1 ] || ([ $${POETRY_VERSION_ARRAY[0]} -eq 1 ] && [ $${POETRY_VERSION_ARRAY[1]} -ge 8 ]); then \
-			echo "$(BLUE)$(shell poetry --version) is already installed.$(RESET)"; \
-		else \
-			echo "$(RED)Poetry 1.8 or later is required. You can install poetry by running the following command, then adding Poetry to your PATH:"; \
-			echo "$(RED) curl -sSL https://install.python-poetry.org | python$(PYTHON_VERSION) -$(RESET)"; \
-			echo "$(RED)More detail here: https://python-poetry.org/docs/#installing-with-the-official-installer$(RESET)"; \
-			exit 1; \
-		fi; \
-	else \
-		echo "$(RED)Poetry is not installed. You can install poetry by running the following command, then adding Poetry to your PATH:"; \
-		echo "$(RED) curl -sSL https://install.python-poetry.org | python$(PYTHON_VERSION) -$(RESET)"; \
-		echo "$(RED)More detail here: https://python-poetry.org/docs/#installing-with-the-official-installer$(RESET)"; \
-		exit 1; \
-	fi
-
-install-python-dependencies:
-	@echo "$(GREEN)Installing Python dependencies...$(RESET)"
-	@if [ -z "${TZ}" ]; then \
-		echo "Defaulting TZ (timezone) to UTC"; \
-		export TZ="UTC"; \
-	fi
-	poetry env use python$(PYTHON_VERSION)
-	@if [ "$(shell uname)" = "Darwin" ]; then \
-		echo "$(BLUE)Installing chroma-hnswlib...$(RESET)"; \
-		export HNSWLIB_NO_NATIVE=1; \
-		poetry run pip install chroma-hnswlib; \
-	fi
-	@if [ -n "${POETRY_GROUP}" ]; then \
-		echo "Installing only POETRY_GROUP=${POETRY_GROUP}"; \
-		poetry install --only $${POETRY_GROUP}; \
-	else \
-		poetry install; \
-	fi
-	@if [ "${INSTALL_PLAYWRIGHT}" != "false" ] && [ "${INSTALL_PLAYWRIGHT}" != "0" ]; then \
-		if [ -f "/etc/manjaro-release" ]; then \
-			echo "$(BLUE)Detected Manjaro Linux. Installing Playwright dependencies...$(RESET)"; \
-			poetry run pip install playwright; \
-			poetry run playwright install chromium; \
-		else \
-			if [ ! -f cache/playwright_chromium_is_installed.txt ]; then \
-				echo "Running playwright install --with-deps chromium..."; \
-				poetry run playwright install --with-deps chromium; \
-				mkdir -p cache; \
-				touch cache/playwright_chromium_is_installed.txt; \
-			else \
-				echo "Setup already done. Skipping playwright installation."; \
-			fi \
-		fi \
-	else \
-		echo "Skipping Playwright installation (INSTALL_PLAYWRIGHT=${INSTALL_PLAYWRIGHT})."; \
-	fi
-	@echo "$(GREEN)Python dependencies installed successfully.$(RESET)"
-
-install-pre-commit-hooks:
-	@echo "$(YELLOW)Installing pre-commit hooks...$(RESET)"
-	@git config --unset-all core.hooksPath || true
-	@poetry run pre-commit install --config $(PRE_COMMIT_CONFIG_PATH)
-	@echo "$(GREEN)Pre-commit hooks installed successfully.$(RESET)"
-
-lint-backend:
-	@echo "$(YELLOW)Running linters...$(RESET)"
-	@poetry run pre-commit run --files openhands/**/* evaluation/**/* tests/**/* --show-diff-on-failure --config $(PRE_COMMIT_CONFIG_PATH)
-
-lint-scripts:
-	@echo "$(YELLOW)Running linters for scripts...$(RESET)"
-	@poetry run pre-commit run --files scripts/**/* --show-diff-on-failure --config $(PRE_COMMIT_CONFIG_PATH)
+format:
+	@$(ECHO) "$(YELLOW)Formatting code with uv format...$(RESET)"
+	@uv run ruff format
+	@$(ECHO) "$(GREEN)Code formatted successfully.$(RESET)"
 
 lint:
-	@$(MAKE) -s lint-backend
+	@$(ECHO) "$(YELLOW)Linting code with ruff...$(RESET)"
+	@uv run ruff check --fix
+	@$(ECHO) "$(GREEN)Linting completed.$(RESET)"
 
-test:
-	@echo "$(YELLOW)No frontend tests. Skipping...$(RESET)"
+clean:
+	@$(ECHO) "$(YELLOW)Cleaning up cache files...$(RESET)"
+	@find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+	@find . -type f -name "*.pyc" -delete 2>/dev/null || true
+	@rm -rf .pytest_cache .ruff_cache .mypy_cache 2>/dev/null || true
+	@$(ECHO) "$(GREEN)Cache files cleaned.$(RESET)"
 
-# Start backend
-start-backend:
-	@echo "$(YELLOW)Starting backend...$(RESET)"
-	@poetry run uvicorn openhands.server.listen:app --host $(BACKEND_HOST) --port $(BACKEND_PORT) --reload --reload-exclude "./workspace"
 
-# Common setup for running the app (non-callable)
-_run_setup:
-	@if [ "$(OS)" = "Windows_NT" ]; then \
-		echo "$(RED) Windows is not supported, use WSL instead!$(RESET)"; \
+# Show help
+help:
+	@$(ECHO) "$(CYAN)OpenHands V1 Makefile$(RESET)"
+	@$(ECHO) "Available targets:"
+	@$(ECHO) "  $(GREEN)build$(RESET)        - Setup development environment (install deps + hooks)"
+	@$(ECHO) "  $(GREEN)format$(RESET)       - Format code with uv format"
+	@$(ECHO) "  $(GREEN)lint$(RESET)         - Lint code with ruff"
+	@$(ECHO) "  $(GREEN)clean$(RESET)        - Clean up cache files"
+	@$(ECHO) "  $(GREEN)help$(RESET)         - Show this help message"
+
+build-server: check-uv-version
+	@$(ECHO) "$(CYAN)Building agent-server executable...$(RESET)"
+	@uv run pyinstaller openhands-agent-server/openhands/agent_server/agent-server.spec
+	@$(ECHO) "$(GREEN)Build complete! Executable is in dist/agent-server/$(RESET)"
+
+test-server-schema: check-uv-version
+	set -euo pipefail;
+	# Generate OpenAPI JSON inline (no file left in repo)
+	uv run python -c 'import os,json; from openhands.agent_server.api import api; open("openapi.json","w").write(json.dumps(api.openapi(), indent=2))'
+	npx --yes @apidevtools/swagger-cli@^4 validate openapi.json
+	# Clean up temp schema
+	rm -f openapi.json
+	rm -rf .client
+
+
+.PHONY: set-package-version
+set-package-version: check-uv-version
+	@if [ -z "$(version)" ]; then \
+		$(ECHO) "$(RED)Error: missing version. Use: make set-package-version version=1.2.3$(RESET)"; \
 		exit 1; \
 	fi
-	@mkdir -p logs
-	@echo "$(YELLOW)Starting backend server...$(RESET)"
-	@poetry run uvicorn openhands.server.listen:app --host $(BACKEND_HOST) --port $(BACKEND_PORT) &
-	@echo "$(YELLOW)Waiting for the backend to start...$(RESET)"
-	@until nc -z localhost $(BACKEND_PORT); do sleep 0.1; done
-	@echo "$(GREEN)Backend started successfully.$(RESET)"
-
-# Run the app (standard mode)
-run:
-	@echo "$(YELLOW)Running the app (backend only)...$(RESET)"
-	@$(MAKE) -s _run_setup
-	@echo "$(GREEN)Application started successfully.$(RESET)"
-
-# Run the app (in docker)
-docker-run: WORKSPACE_BASE ?= $(PWD)/workspace
-docker-run:
-	@if [ -f /.dockerenv ]; then \
-		echo "Running inside a Docker container. Exiting..."; \
-		exit 0; \
-	else \
-		echo "$(YELLOW)Running the app in Docker $(OPTIONS)...$(RESET)"; \
-		export WORKSPACE_BASE=${WORKSPACE_BASE}; \
-		export SANDBOX_USER_ID=$(shell id -u); \
-		export DATE=$(shell date +%Y%m%d%H%M%S); \
-		docker compose up $(OPTIONS); \
-	fi
-
-
-# Setup config.toml
-setup-config:
-	@echo "$(YELLOW)Setting up config.toml...$(RESET)"
-	@$(MAKE) setup-config-prompts
-	@mv $(CONFIG_FILE).tmp $(CONFIG_FILE)
-	@echo "$(GREEN)Config.toml setup completed.$(RESET)"
-
-setup-config-prompts:
-	@echo "[core]" > $(CONFIG_FILE).tmp
-
-	@read -p "Enter your workspace directory (as absolute path) [default: $(DEFAULT_WORKSPACE_DIR)]: " workspace_dir; \
-	 workspace_dir=$${workspace_dir:-$(DEFAULT_WORKSPACE_DIR)}; \
-	 echo "workspace_base=\"$$workspace_dir\"" >> $(CONFIG_FILE).tmp
-
-	@echo "" >> $(CONFIG_FILE).tmp
-
-	@echo "[llm]" >> $(CONFIG_FILE).tmp
-	@read -p "Enter your LLM model name, used for running without UI. Set the model in the UI after you start the app. (see https://docs.litellm.ai/docs/providers for full list) [default: $(DEFAULT_MODEL)]: " llm_model; \
-	 llm_model=$${llm_model:-$(DEFAULT_MODEL)}; \
-	 echo "model=\"$$llm_model\"" >> $(CONFIG_FILE).tmp
-
-	@read -p "Enter your LLM api key: " llm_api_key; \
-	 echo "api_key=\"$$llm_api_key\"" >> $(CONFIG_FILE).tmp
-
-	@read -p "Enter your LLM base URL [mostly used for local LLMs, leave blank if not needed - example: http://localhost:5001/v1/]: " llm_base_url; \
-	 if [[ ! -z "$$llm_base_url" ]]; then echo "base_url=\"$$llm_base_url\"" >> $(CONFIG_FILE).tmp; fi
-
-setup-config-basic:
-	@printf '%s\n' \
-	'[core]' \
-	'workspace_base="./workspace"' \
-	> config.toml
-	@echo "$(GREEN)config.toml created.$(RESET)"
-
-openhands-cloud-run:
-	@$(MAKE) run BACKEND_HOST="0.0.0.0" BACKEND_PORT="12000" FRONTEND_HOST="0.0.0.0" FRONTEND_PORT="12001"
-
-# Develop in container
-docker-dev:
-	@if [ -f /.dockerenv ]; then \
-		echo "Running inside a Docker container. Exiting..."; \
-		exit 0; \
-	else \
-		echo "$(YELLOW)Build and run in Docker $(OPTIONS)...$(RESET)"; \
-		./containers/dev/dev.sh $(OPTIONS); \
-	fi
-
-# Clean up all caches
-clean:
-	@echo "$(YELLOW)Cleaning up caches...$(RESET)"
-	@rm -rf openhands/.cache
-	@echo "$(GREEN)Caches cleaned up successfully.$(RESET)"
-
-# Help
-help:
-	@echo "$(BLUE)Usage: make [target]$(RESET)"
-	@echo "Targets:"
-	@echo "  $(GREEN)build$(RESET)               - Build project, including environment setup and dependencies."
-	@echo "  $(GREEN)lint$(RESET)                - Run linters on the project."
-	@echo "  $(GREEN)setup-config$(RESET)        - Setup the configuration for OpenHands by providing LLM API key,"
-	@echo "                        LLM Model name, and workspace directory."
-	@echo "  $(GREEN)start-backend$(RESET)       - Start the backend server for the OpenHands project."
-	@echo "  $(GREEN)run$(RESET)                 - Run the OpenHands application (backend only)."
-	@echo "                        Backend Log file will be stored in the 'logs' directory."
-	@echo "  $(GREEN)docker-dev$(RESET)          - Build and run the OpenHands application in Docker."
-	@echo "  $(GREEN)docker-run$(RESET)          - Run the OpenHands application in Docker."
-	@echo "  $(GREEN)help$(RESET)                - Display this help message, providing information on available targets."
-
-# Phony targets
-.PHONY: build check-dependencies check-system check-python check-npm check-nodejs check-docker check-poetry install-python-dependencies install-pre-commit-hooks lint-backend lint test start-backend _run_setup run run-wsl setup-config setup-config-prompts setup-config-basic openhands-cloud-run docker-dev docker-run clean help
+	@$(ECHO) "$(CYAN)Setting version to $(version) for: $(PKGS)$(RESET)"
+	@for PKG in $(PKGS); do \
+		$(ECHO) "$(YELLOW)bumping $$PKG -> $(version)$(RESET)"; \
+		uv version --package $$PKG $(version); \
+	done
+	@$(ECHO) "$(GREEN)Version updated in all selected packages.$(RESET)"
