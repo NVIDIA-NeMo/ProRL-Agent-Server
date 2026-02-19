@@ -11,7 +11,7 @@ from modules.module_data_collector import DataCollector
 from openhands.core.logger import openhands_logger
 
 # Configure logging
-openhands_logger.setLevel(logging.WARNING)
+openhands_logger.setLevel(logging.DEBUG)
 logger = openhands_logger.getChild('parallel_collector')
 logger.setLevel(logging.INFO)
 

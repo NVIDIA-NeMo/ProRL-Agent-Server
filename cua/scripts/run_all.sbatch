@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=cua_all
+#SBATCH --job-name=cua_all_single_thread
 #SBATCH --account=nvr_lacr_llm
 #SBATCH --partition=interactive
 #SBATCH --nodes=2
@@ -8,7 +8,7 @@
 #SBATCH --mem=0
 #SBATCH --time=04:00:00
 #SBATCH --exclusive
-#SBATCH --output=logs/run_all-%j.out
+#SBATCH --output=logs_single/run_all-%j.out
 
 # ============================================================================
 # Consolidated 2-Node CUA Data Collection Script
@@ -37,8 +37,8 @@ ACTOR_MODEL="ByteDance-Seed/UI-TARS-1.5-7B"
 PLANNER_PORT=8000
 ACTOR_PORT=8000
 
-# Max parallel VMs (reduced from 24 to account for shared resources with vLLM)
-MAX_PARALLEL=${MAX_PARALLEL:-16}
+# Trying to run this w/ KVM?
+MAX_PARALLEL=${MAX_PARALLEL:-1}
 MAX_TRAJECTORIES=${MAX_TRAJECTORIES:-10000}
 
 # --- 1. Get Node List and Assign Roles ---
@@ -60,7 +60,7 @@ srun -w "$PLANNER_NODE" \
      --ntasks=1 \
      --container-image="$CONTAINER_IMAGE" \
      --container-mounts=/lustre:/lustre \
-     --output=logs/planner.out \
+     --output=logs_single/planner.out \
      bash -c "
       echo '[Planner] Launching Qwen3-VL-235B on $PLANNER_NODE'
       vllm serve $PLANNER_MODEL \
@@ -84,17 +84,24 @@ srun -w "$ACTOR_NODE" \
      --container-image="$CONTAINER_IMAGE" \
      --container-mounts=/lustre:/lustre,/dev/kvm:/dev/kvm \
      --container-writable \
-     --output=logs/actor_and_collect.out \
+     --output=logs_single/actor_and_collect.out \
      bash -c "
       set -e
 
+      # Suppress vLLM noise: only show warnings and above
+    #   export VLLM_LOGGING_LEVEL=WARNING
+
       echo '[Actor] Launching UI-TARS-1.5-7B on $ACTOR_NODE'
+      # Redirect vLLM output to separate log to keep collection logs_single clean
       vllm serve $ACTOR_MODEL \
         --api-key gen \
         --tensor-parallel-size 4 \
         --limit-mm-per-prompt.image 5 \
         --limit-mm-per-prompt.video 0 \
-        --max-model-len 65536 &
+        --max-model-len 65536 \
+        --disable-log-requests \
+        --disable-log-stats \
+        > $PROJECT_DIR/scripts/logs_single/vllm_actor.log 2>&1 &
       VLLM_PID=\$!
 
       # --- Health Check: Wait for both vLLM servers ---

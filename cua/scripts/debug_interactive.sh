@@ -3,13 +3,14 @@
 # --- 1. Submit the "Holder" Job ---
 echo "[Local] Submitting background job to reserve node..."
 
-# for CPU reservation
-IMAGE="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/images/cua_cpu.sqsh"
+# GPU reservation (consolidated: runs VMs on GPU node)
+# IMAGE="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/images/cua_vllm.sqsh"
+IMAGE="/lustre/fsw/portfolios/nvr/users/bcui/images/cua-vllm-0.13.0.sqsh"
 JOB_ID=$(sbatch --parsable \
     --job-name=kvm_interactive \
-    --account=nvr_lpr_agentic \
-    --partition=cpu_interactive \
-    --reservation=sla_res_osworld_agent_vlm_cpu_only \
+    --account=nvr_lacr_llm \
+    --partition=interactive \
+    --gpus-per-node=8 \
     --nodes=1 \
     --ntasks-per-node=1 \
     --time=04:00:00 \
@@ -18,14 +19,15 @@ JOB_ID=$(sbatch --parsable \
     --error=/dev/null \
     --wrap="srun --container-image=$IMAGE --container-mounts=/lustre:/lustre sleep infinity")
 
-# for GPU reservation - note: the container image for GPU node is not ready yet
-#IMAGE="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/images/cua_vllm.sqsh"
+# Old CPU-only reservation (kept for reference)
+#IMAGE="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/images/cua_cpu.sqsh"
 #JOB_ID=$(sbatch --parsable \
 #    --job-name=kvm_interactive \
-#    --account=llmservice_fm_vision \
-#    --partition=interactive \
-#    --gpus-per-node=8 \
-#    --reservation=sla_res_osworld_agent_vlm \
+#    --account=nvr_lpr_agentic \
+#    --partition=cpu_interactive \
+#    --reservation=sla_res_osworld_agent_vlm_cpu_only \
+#    --nodes=1 \
+#    --ntasks-per-node=1 \
 #    --time=04:00:00 \
 #    --exclusive \
 #    --output=/dev/null \
@@ -87,7 +89,10 @@ echo "[Local] Found Container PID: $CONTAINER_PID"
 
 # --- 5. Launch Interactive Session ---
 echo "=========================================================="
-echo "                KVM-enabled shell on $NODE                "
+echo "       KVM-enabled GPU shell on $NODE                     "
+echo "=========================================================="
+echo "  Container: $(basename $IMAGE)"
+echo "  /dev/kvm mounted for VM support"
 echo "=========================================================="
 
 # -t forces pseudo-terminal allocation so you get an interactive shell
