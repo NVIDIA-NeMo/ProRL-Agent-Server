@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trajectory: {{ traj_id }}</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #e0e0e0;
+        }
+        
+        .header {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 20px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            backdrop-filter: blur(10px);
+        }
+        
+        .header-content {
+            max-width: 1400px;
+            margin: 0 auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+        
+        .back-link {
+            color: #64b5f6;
+            text-decoration: none;
+            font-size: 0.9rem;
+        }
+        
+        .back-link:hover {
+            text-decoration: underline;
+        }
+        
+        .traj-title {
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 0.85rem;
+            color: #aaa;
+        }
+        
+        .result-badge {
+            display: inline-block;
+            padding: 6px 16px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+        
+        .result-pass {
+            background: linear-gradient(135deg, #00c853 0%, #00e676 100%);
+            color: #000;
+        }
+        
+        .result-fail {
+            background: linear-gradient(135deg, #ff1744 0%, #ff5252 100%);
+            color: #fff;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 30px 20px;
+        }
+        
+        .task-instruction {
+            background: rgba(33, 150, 243, 0.15);
+            border: 1px solid rgba(33, 150, 243, 0.3);
+            border-radius: 12px;
+            padding: 20px 24px;
+            margin-bottom: 30px;
+        }
+        
+        .task-label {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #64b5f6;
+            margin-bottom: 8px;
+        }
+        
+        .task-text {
+            font-size: 1.1rem;
+            line-height: 1.5;
+            color: #fff;
+        }
+        
+        .steps-container {
+            display: flex;
+            flex-direction: column;
+            gap: 40px;
+        }
+        
+        .step {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            overflow: hidden;
+        }
+        
+        .step-header {
+            padding: 16px 20px;
+            background: rgba(0, 0, 0, 0.2);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        
+        .step-number {
+            background: #2196f3;
+            color: #fff;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.85rem;
+            font-weight: 600;
+        }
+        
+        .step-img-name {
+            color: #888;
+            font-size: 0.85rem;
+        }
+        
+        .step-body {
+            padding: 20px;
+        }
+        
+        .screenshot-container {
+            display: flex;
+            justify-content: center;
+            margin-bottom: 20px;
+        }
+        
+        .screenshot-wrapper {
+            position: relative;
+            display: inline-block;
+            line-height: 0;
+        }
+        
+        .screenshot {
+            display: block;
+            max-width: 100%;
+            max-height: 70vh;
+            height: auto;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+        }
+        
+        .screenshot-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+        
+        .coordinate-marker {
+            position: absolute;
+            pointer-events: none;
+            /* Marker is positioned at exact coordinate */
+        }
+        
+        .marker-dot {
+            position: absolute;
+            width: 8px;
+            height: 8px;
+            background: #ffff00;
+            border-radius: 50%;
+            left: -4px;
+            top: -4px;
+            z-index: 10;
+            border: 1px solid #000;
+        }
+        
+        .marker-label {
+            position: absolute;
+            left: 0;
+            bottom: 20px;
+            transform: translateX(-50%);
+            background: rgba(255, 0, 0, 0.9);
+            color: white;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            white-space: nowrap;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+        }
+        
+        .marker-circle {
+            position: absolute;
+            width: 30px;
+            height: 30px;
+            left: -15px;
+            top: -15px;
+            border: 4px solid #ff0000;
+            border-radius: 50%;
+            background: rgba(255, 0, 0, 0.3);
+            box-shadow: 0 0 15px rgba(255, 0, 0, 0.6);
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.1); opacity: 0.8; }
+        }
+        
+        .action-info {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 8px;
+            padding: 16px 20px;
+        }
+        
+        .action-header {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #888;
+            margin-bottom: 12px;
+        }
+        
+        .tool-call {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 6px;
+            padding: 10px 14px;
+            margin-bottom: 8px;
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 0.85rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .tool-name {
+            color: #ffd54f;
+            font-weight: 600;
+        }
+        
+        .tool-args {
+            color: #81d4fa;
+        }
+        
+        .assistant-reasoning {
+            margin-top: 16px;
+            padding-top: 16px;
+            border-top: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .reasoning-header {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #888;
+            margin-bottom: 8px;
+        }
+        
+        .reasoning-text {
+            font-size: 0.9rem;
+            line-height: 1.6;
+            color: #bbb;
+            max-height: 200px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+        }
+        
+        .reasoning-text::-webkit-scrollbar {
+            width: 6px;
+        }
+        
+        .reasoning-text::-webkit-scrollbar-track {
+            background: rgba(0,0,0,0.2);
+            border-radius: 3px;
+        }
+        
+        .reasoning-text::-webkit-scrollbar-thumb {
+            background: rgba(255,255,255,0.2);
+            border-radius: 3px;
+        }
+        
+        .no-action {
+            color: #666;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-content">
+            <a href="/" class="back-link">← Back to Trajectories</a>
+            <span class="traj-title">{{ traj_id }}</span>
+            {% if result is none %}
+            <span class="result-badge" style="background: #666; color: #fff;">Unknown</span>
+            {% elif result %}
+            <span class="result-badge result-pass">PASS</span>
+            {% else %}
+            <span class="result-badge result-fail">FAIL</span>
+            {% endif %}
+        </div>
+    </div>
+    
+    <div class="container">
+        {% if task_instruction %}
+        <div class="task-instruction">
+            <div class="task-label">Task Instruction</div>
+            <div class="task-text">{{ task_instruction }}</div>
+        </div>
+        {% endif %}
+        
+        <div class="steps-container">
+            {% for step in steps %}
+            <div class="step">
+                <div class="step-header">
+                    <span class="step-number">Step {{ step.step_num }}</span>
+                    <span class="step-img-name">{{ step.img }}</span>
+                </div>
+                <div class="step-body">
+                    <div class="screenshot-container">
+                        <div class="screenshot-wrapper" data-tool-calls='{{ step.tool_calls | tojson | safe }}'>
+                            <img src="/results/{{ traj_id }}/{{ step.img }}" 
+                                 alt="Screenshot {{ step.img }}" 
+                                 class="screenshot">
+                            <div class="screenshot-overlay"></div>
+                        </div>
+                    </div>
+                    
+                    <div class="action-info">
+                        <div class="action-header">Next Action</div>
+                        {% if step.tool_calls %}
+                            {% for tc in step.tool_calls %}
+                            <div class="tool-call">
+                                <span class="tool-name">{{ tc.name }}</span>
+                                <span class="tool-args">{{ tc.arguments }}</span>
+                            </div>
+                            {% endfor %}
+                        {% else %}
+                            <div class="no-action">No action taken</div>
+                        {% endif %}
+                        
+                        {% if step.assistant_content %}
+                        <div class="assistant-reasoning">
+                            <div class="reasoning-header">Assistant Reasoning</div>
+                            <div class="reasoning-text">{{ step.assistant_content }}</div>
+                        </div>
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    
+    <script>
+        // Draw coordinate markers on screenshots
+        function drawMarkers() {
+            document.querySelectorAll('.screenshot-wrapper').forEach(wrapper => {
+                const img = wrapper.querySelector('.screenshot');
+                const overlay = wrapper.querySelector('.screenshot-overlay');
+                const toolCallsData = wrapper.dataset.toolCalls;
+                
+                if (!toolCallsData || !img.complete) return;
+                
+                const toolCalls = JSON.parse(toolCallsData);
+                
+                // Clear existing markers
+                overlay.innerHTML = '';
+                
+                toolCalls.forEach((tc, index) => {
+                    if (tc.coordinates && tc.coordinates.length > 0) {
+                        tc.coordinates.forEach(coord => {
+                            // Coordinates are normalized (0-1), convert to percentage
+                            const xPercent = coord.x * 100;
+                            const yPercent = coord.y * 100;
+                            
+                            const marker = document.createElement('div');
+                            marker.className = 'coordinate-marker';
+                            marker.style.left = xPercent + '%';
+                            marker.style.top = yPercent + '%';
+                            
+                            const dot = document.createElement('div');
+                            dot.className = 'marker-dot';
+                            
+                            const label = document.createElement('div');
+                            label.className = 'marker-label';
+                            label.textContent = tc.name;
+                            
+                            const circle = document.createElement('div');
+                            circle.className = 'marker-circle';
+                            
+                            marker.appendChild(dot);
+                            marker.appendChild(label);
+                            marker.appendChild(circle);
+                            overlay.appendChild(marker);
+                        });
+                    }
+                });
+            });
+        }
+        
+        // Draw markers when images load
+        document.querySelectorAll('.screenshot').forEach(img => {
+            if (img.complete) {
+                drawMarkers();
+            } else {
+                img.addEventListener('load', drawMarkers);
+            }
+        });
+        
+        // Redraw on window resize
+        window.addEventListener('resize', drawMarkers);
+    </script>
+</body>
+</html>

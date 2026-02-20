@@ -1,5 +1,6 @@
 import os
 from jinja2 import Template
+from collections import deque
 
 from openhands.agenthub.gui_agent.tools import OSWORLD_TOOLS
 
@@ -210,6 +211,8 @@ class OSWorldAgent(Agent):
             self.llm.model_info['supports_vision'] = True
         else:
             self.llm.model_info = {'supports_vision': True}
+        
+        self.pending_actions: deque['Action'] = deque()
 
         self.reset()
 
@@ -218,6 +221,7 @@ class OSWorldAgent(Agent):
         super().reset()
         self.cost_accumulator = 0
         self.error_accumulator = 0
+        self.pending_actions.clear()
 
     def _get_initial_user_message(self, history: list[Event]) -> MessageAction:
         """Get the initial user message from the conversation history.
@@ -272,6 +276,9 @@ class OSWorldAgent(Agent):
         include_a11y_tree = self.config.enable_a11y_tree
         total_screenshot_count = 0
 
+        llm_response_ids_action = set()
+        llm_response_ids_observation = set()
+
         # Build history prompts (alternating assistant/user messages) in reverse order
         for event in reversed(events):
             include_screenshot = self.config.enable_vision
@@ -279,16 +286,24 @@ class OSWorldAgent(Agent):
                 include_screenshot = False
 
             if isinstance(event, OSWorldInteractiveAction):
+                llm_response_id = event.tool_call_metadata.model_response.id
+                if llm_response_id in llm_response_ids_action:
+                    continue
+                llm_response_ids_action.add(llm_response_id)
                 messages.append(convert_action_to_message(event))
             elif isinstance(event, MessageAction):
                 messages.append(convert_message_action_to_message(
                     event, include_a11y_tree=include_a11y_tree, include_screenshot=include_screenshot))
                 total_screenshot_count += 1
             elif isinstance(event, OSWorldOutputObservation) or isinstance(event, ErrorObservation):
+                llm_response_id = event.tool_call_metadata.model_response.id
+                if llm_response_id in llm_response_ids_observation:
+                    continue
                 msg = convert_observation_to_message(
                     event, instruction, include_a11y_tree=include_a11y_tree, include_screenshot=include_screenshot)
                 messages.append(msg)
                 total_screenshot_count += 1
+                llm_response_ids_observation.add(llm_response_id)
 
         # System message
         messages.append(Message(role='system', content=[TextContent(text=self.system_prompt)]))
@@ -308,6 +323,9 @@ class OSWorldAgent(Agent):
         - MessageAction(content) - Message action to run (e.g. ask for clarification)
         - AgentFinishAction() - end the interaction
         """
+        # Continue with pending actions if any
+        if self.pending_actions:
+            return self.pending_actions.popleft()
 
         format_error = state.get_last_agent_format_error()
         if format_error and isinstance(format_error, str):
@@ -332,14 +350,20 @@ class OSWorldAgent(Agent):
         }
         params['tools'] = self.tools
         params['extra_body'] = {'metadata': state.to_llm_metadata(agent_name=self.name)}
+        for msg in params['messages']:
+            if msg.get('role') == 'tool':
+                msg['role'] = 'user'
         response = self.llm.completion(**params)
         logger.debug(f'Response from LLM: {response}')
-        action = codeact_function_calling.response_to_actions(response, timeout=self.config.action_timeout)
-        if self.pause_time > 0.5:
-            logger.info(f'Setting pause time to {self.pause_time} seconds for agentic action')
-            action.pause_time = self.pause_time
-        logger.debug(f'Actions after response_to_actions: {action}')
-        return action
+        actions = codeact_function_calling.response_to_actions(response, timeout=self.config.action_timeout)
+        logger.debug(f'Actions after response_to_actions: {actions}')
+        for action in actions:
+            if self.pause_time > 0.5:
+                logger.info(f'Setting pause time to {self.pause_time} seconds for agentic action')
+                action.pause_time = self.pause_time
+            self.pending_actions.append(action)
+        
+        return self.pending_actions.popleft()
 
     def _get_messages_from_agent_state(
         self, events: list[Event], initial_user_message: MessageAction,
@@ -355,6 +379,7 @@ class OSWorldAgent(Agent):
 
         Returns:
             list[dict]: A list of formatted messages ready for LLM consumption
+        """
         """
         messages: list[Message] = []
 
@@ -376,7 +401,42 @@ class OSWorldAgent(Agent):
                 msg = convert_observation_to_message_full_state(
                     event, instruction, include_a11y_tree=include_a11y_tree)
                 messages.append(msg)
+        """
+        messages: list[Message] = []
 
+        # Get instruction from initial user message
+        # User message is a MessageAction with content and image_urls, will be processed in events
+        instruction = get_instruction(initial_user_message)
+        include_a11y_tree = self.config.enable_a11y_tree
+
+        llm_response_ids_action = set()
+        llm_response_ids_observation = set()
+
+        # Build history prompts (alternating assistant/user messages) in reverse order
+        for event in reversed(events):
+            if isinstance(event, AgentFinishAction):
+                messages.append(convert_action_to_message(event))
+            elif isinstance(event, OSWorldInteractiveAction):
+                llm_response_id = event.tool_call_metadata.model_response.id
+                if llm_response_id in llm_response_ids_action:
+                    continue
+                llm_response_ids_action.add(llm_response_id)
+                messages.append(convert_action_to_message(event))
+            elif isinstance(event, MessageAction):
+                messages.append(convert_message_action_to_message_full_state(event, include_a11y_tree=include_a11y_tree))
+            elif isinstance(event, OSWorldOutputObservation) or isinstance(event, ErrorObservation):
+                llm_response_id = event.tool_call_metadata.model_response.id
+                if llm_response_id in llm_response_ids_observation:
+                    continue
+                msg = convert_observation_to_message_full_state(
+                    event, instruction, include_a11y_tree=include_a11y_tree)
+                messages.append(msg)
+                llm_response_ids_observation.add(llm_response_id)
+
+        # System message
+        messages.append(Message(role='system', content=[TextContent(text=self.system_prompt)]))
+
+        messages = messages[::-1]
         # set flags to know how to serialize the messages
         for message in messages:
             message.cache_enabled = False

@@ -67,7 +67,7 @@ def get_config(
 
     sandbox_config = SandboxConfig(
         base_container_image='ubuntu:24.04',
-        run_as_fakeroot=True,
+        run_as_fakeroot=False,
     )
 
     config = OpenHandsConfig(
@@ -116,11 +116,9 @@ def get_instruction(instance: pd.Series | dict, metadata: EvalMetadata, runtime:
 
     include_screenshot = True #runtime.config.agents['agent'].enable_vision
     include_a11y_tree = True #runtime.config.agents['agent'].enable_a11y_tree
-    instruction = f"""Work on the following task accourding to the UI screenshot.
+    instruction = f"""Work on the following task according to the UI screenshot.
 
 Instruction: {instance['instruction']}
-
-First describe the screenshot in detail, think step by step, then generate the next move.
 """
     
     if include_a11y_tree:
@@ -216,6 +214,7 @@ async def initialize_runtime(runtime: Runtime, instance: dict, metadata: EvalMet
         vm_ip="127.0.0.1",
         server_port=runtime._vm_server_port,
         chromium_port=runtime._chromium_port,
+        vlc_port=runtime._vlc_port,
         cache_dir="/tmp/osworld_example",
         client_password="password",
         runtime=runtime  # Pass your runtime object here

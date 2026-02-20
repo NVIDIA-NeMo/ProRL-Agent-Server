@@ -18,6 +18,28 @@ from pydrive.drive import GoogleDrive, GoogleDriveFileList, GoogleDriveFile
 
 from openhands.core.logger import openhands_logger as logger
 
+
+def _get_cdp_connection_info(env):
+    """Get CDP URL and headers from env, using http_client if available."""
+    if hasattr(env, 'client') and env.client:
+        return env.client.get_cdp_url(), env.client.get_cdp_headers()
+    else:
+        host = env.vm_ip
+        port = env.chromium_port
+        return f"http://{host}:{port}", None
+
+
+def _make_post_request(env, endpoint: str, **kwargs):
+    """Make a POST request using env.client if available, otherwise direct."""
+    if hasattr(env, 'client') and env.client:
+        return env.client.post(endpoint, **kwargs)
+    else:
+        host = env.vm_ip
+        port = env.server_port
+        url = f"http://{host}:{port}{endpoint}"
+        return requests.post(url, **kwargs)
+
+
 _accessibility_ns_map = {
     "st": "uri:deskat:state.at-spi.gnome.org",
     "attr": "uri:deskat:attributes.at-spi.gnome.org",
@@ -58,11 +80,7 @@ async def get_info_from_website(env, config: Dict[Any, Any]) -> Any:
     logger.debug(f"[INFO_FROM_WEBSITE] Full config: {config}")
     
     try:
-        host = env.vm_ip
-        port = env.chromium_port  # fixme: this port is hard-coded, need to be changed from config file
-        server_port = env.server_port
-        remote_debugging_url = f"http://{host}:{port}"
-        backend_url = f"http://{host}:{server_port}"
+        remote_debugging_url, cdp_headers = _get_cdp_connection_info(env)
         use_proxy = env.current_use_proxy
         
         logger.info(f"[INFO_FROM_WEBSITE] Connecting to Chrome at {remote_debugging_url}")
@@ -70,7 +88,7 @@ async def get_info_from_website(env, config: Dict[Any, Any]) -> Any:
         async with async_playwright() as p:
             # connect to remote Chrome instance
             try:
-                browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                browser = await p.chromium.connect_over_cdp(remote_debugging_url, headers=cdp_headers or {})
                 logger.info(f"[INFO_FROM_WEBSITE] Successfully connected to existing Chrome instance")
             except Exception as e:
                 logger.warning(f"[INFO_FROM_WEBSITE] Failed to connect to existing Chrome instance: {e}")
@@ -89,10 +107,9 @@ async def get_info_from_website(env, config: Dict[Any, Any]) -> Any:
                 logger.info(f"[INFO_FROM_WEBSITE] Starting browser with command: {' '.join(command)}")
                 payload = json.dumps({"command": command, "shell": False})
                 headers = {"Content-Type": "application/json"}
-                #requests.post("http://" + host + ":" + server_port + "/setup" + "/launch", headers=headers, data=payload)
-                requests.post(backend_url + "/setup" + "/launch", headers=headers, data=payload)
+                _make_post_request(env, "/setup/launch", headers=headers, data=payload)
                 await asyncio.sleep(5)
-                browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                browser = await p.chromium.connect_over_cdp(remote_debugging_url, headers=cdp_headers or {})
                 logger.info(f"[INFO_FROM_WEBSITE] Successfully connected to new Chrome instance")
 
             page = await browser.new_page()
@@ -536,12 +553,8 @@ def get_extensions_installed_from_shop(env, config: Dict[str, str]):
 # port info to allow remote debugging, see README.md for details
 
 async def get_page_info(env, config: Dict[str, str]):
-    host = env.vm_ip
-    port = env.chromium_port  # fixme: this port is hard-coded, need to be changed from config file
-    server_port = env.server_port
+    remote_debugging_url, cdp_headers = _get_cdp_connection_info(env)
     url = config["url"]
-
-    remote_debugging_url = f"http://{host}:{port}"
     
     # Configuration for retry and timeout
     max_retries = 2
@@ -554,12 +567,11 @@ async def get_page_info(env, config: Dict[str, str]):
             async with async_playwright() as p:
                 # connect to remote Chrome instance
                 try:
-                    browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                    browser = await p.chromium.connect_over_cdp(remote_debugging_url, headers=cdp_headers or {})
                     logger.info(f"[PAGE_INFO] Successfully connected to existing Chrome instance")
                 except Exception as e:
                     logger.warning(f"[PAGE_INFO] Failed to connect to existing Chrome instance: {e}")
                     # If the connection fails, start a new browser instance
-                    platform.machine()
                     if "arm" in platform.machine():
                         # start a new browser instance if the connection fails
                         payload = json.dumps({"command": [
@@ -573,9 +585,9 @@ async def get_page_info(env, config: Dict[str, str]):
                         ], "shell": False})
 
                     headers = {"Content-Type": "application/json"}
-                    requests.post("http://" + host + ":" + server_port + "/setup" + "/launch", headers=headers, data=payload)
+                    _make_post_request(env, "/setup/launch", headers=headers, data=payload)
                     await asyncio.sleep(5)
-                    browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                    browser = await p.chromium.connect_over_cdp(remote_debugging_url, headers=cdp_headers or {})
                     logger.info(f"[PAGE_INFO] Successfully connected to new Chrome instance")
 
                 page = await browser.new_page()
@@ -621,11 +633,7 @@ async def get_page_info(env, config: Dict[str, str]):
 
 
 async def get_open_tabs_info(env, config: Dict[str, str]):
-    host = env.vm_ip
-    port = env.chromium_port  # fixme: this port is hard-coded, need to be changed from config file
-    server_port = env.server_port
-
-    remote_debugging_url = f"http://{host}:{port}"
+    remote_debugging_url, cdp_headers = _get_cdp_connection_info(env)
     
     # Configuration for retry and timeout
     max_retries = 2
@@ -638,12 +646,11 @@ async def get_open_tabs_info(env, config: Dict[str, str]):
             async with async_playwright() as p:
                 # connect to remote Chrome instance
                 try:
-                    browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                    browser = await p.chromium.connect_over_cdp(remote_debugging_url, headers=cdp_headers or {})
                     logger.info(f"[OPEN_TABS_INFO] Successfully connected to existing Chrome instance")
                 except Exception as e:
                     logger.warning(f"[OPEN_TABS_INFO] Failed to connect to existing Chrome instance: {e}")
                     # If the connection fails, start a new browser instance
-                    platform.machine()
                     if "arm" in platform.machine():
                         # start a new browser instance if the connection fails
                         payload = json.dumps({"command": [
@@ -657,10 +664,10 @@ async def get_open_tabs_info(env, config: Dict[str, str]):
                         ], "shell": False})
 
                     headers = {"Content-Type": "application/json"}
-                    requests.post(f"http://{host}:{server_port}/setup/launch", headers=headers, data=payload)
+                    _make_post_request(env, "/setup/launch", headers=headers, data=payload)
                     await asyncio.sleep(5)
                     try:
-                        browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                        browser = await p.chromium.connect_over_cdp(remote_debugging_url, headers=cdp_headers or {})
                         logger.info(f"[OPEN_TABS_INFO] Successfully connected to new Chrome instance")
                     except Exception as e:
                         logger.error(f"[OPEN_TABS_INFO] Failed to connect to new Chrome instance: {e}")
@@ -796,10 +803,7 @@ async def get_active_tab_info(env, config: Dict[str, str]):
         
     logger.info(f"[ACTIVE_TAB_INFO] Active tab URL: {active_tab_url}")
     
-    host = env.vm_ip
-    port = env.chromium_port  # fixme: this port is hard-coded, need to be changed from config file
-
-    remote_debugging_url = f"http://{host}:{port}"
+    remote_debugging_url, cdp_headers = _get_cdp_connection_info(env)
     
     # Configuration for retry and timeout
     max_retries = 2
@@ -812,7 +816,7 @@ async def get_active_tab_info(env, config: Dict[str, str]):
             async with async_playwright() as p:
                 # connect to remote Chrome instance, since it is supposed to be the active one, we won't start a new one if failed
                 try:
-                    browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                    browser = await p.chromium.connect_over_cdp(remote_debugging_url, headers=cdp_headers or {})
                     logger.info(f"[ACTIVE_TAB_INFO] Successfully connected to Chrome instance")
                 except Exception as e:
                     logger.error(f"[ACTIVE_TAB_INFO] Failed to connect to Chrome instance: {e}")
@@ -879,11 +883,7 @@ async def get_pdf_from_url(env, config: Dict[str, str]) -> str:
     logger.info(f"[PDF_FROM_URL] Starting PDF download from URL: {_url}")
     logger.info(f"[PDF_FROM_URL] Target path: {_path}")
 
-    host = env.vm_ip
-    port = env.chromium_port  # fixme: this port is hard-coded, need to be changed from config file
-    server_port = env.server_port
-
-    remote_debugging_url = f"http://{host}:{port}"
+    remote_debugging_url, cdp_headers = _get_cdp_connection_info(env)
     
     # Configuration for retry and timeout
     max_retries = 3
@@ -895,14 +895,13 @@ async def get_pdf_from_url(env, config: Dict[str, str]) -> str:
             
             async with async_playwright() as p:
                 try:
-                    browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                    browser = await p.chromium.connect_over_cdp(remote_debugging_url, headers=cdp_headers or {})
                     logger.info(f"[PDF_FROM_URL] Successfully connected to existing Chrome instance")
                 except Exception as e:
                     logger.warning(f"[PDF_FROM_URL] Failed to connect to existing Chrome instance: {e}")
                     logger.info(f"[PDF_FROM_URL] Starting new Chrome instance...")
                     
                     # If the connection fails, start a new browser instance
-                    platform.machine()
                     if "arm" in platform.machine():
                         # start a new browser instance if the connection fails
                         payload = json.dumps({"command": [
@@ -916,9 +915,9 @@ async def get_pdf_from_url(env, config: Dict[str, str]) -> str:
                         ], "shell": False})
 
                     headers = {"Content-Type": "application/json"}
-                    requests.post("http://" + host + ":" + server_port + "/setup" + "/launch", headers=headers, data=payload)
+                    _make_post_request(env, "/setup/launch", headers=headers, data=payload)
                     await asyncio.sleep(5)
-                    browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                    browser = await p.chromium.connect_over_cdp(remote_debugging_url, headers=cdp_headers or {})
                     logger.info(f"[PDF_FROM_URL] Successfully connected to new Chrome instance")
 
                 page = await browser.new_page()
@@ -983,11 +982,7 @@ async def get_pdf_from_url(env, config: Dict[str, str]) -> str:
 
 # fixme: needs to be changed (maybe through post-processing) since it's not working
 async def get_chrome_saved_address(env, config: Dict[str, str]):
-    host = env.vm_ip
-    port = env.chromium_port  # fixme: this port is hard-coded, need to be changed from config file
-    server_port = env.server_port
-
-    remote_debugging_url = f"http://{host}:{port}"
+    remote_debugging_url, cdp_headers = _get_cdp_connection_info(env)
     
     # Configuration for retry and timeout
     max_retries = 2
@@ -1000,12 +995,11 @@ async def get_chrome_saved_address(env, config: Dict[str, str]):
             async with async_playwright() as p:
                 # connect to remote Chrome instance
                 try:
-                    browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                    browser = await p.chromium.connect_over_cdp(remote_debugging_url, headers=cdp_headers or {})
                     logger.info(f"[CHROME_SAVED_ADDRESS] Successfully connected to existing Chrome instance")
                 except Exception as e:
                     logger.warning(f"[CHROME_SAVED_ADDRESS] Failed to connect to existing Chrome instance: {e}")
                     # If the connection fails, start a new browser instance
-                    platform.machine()
                     if "arm" in platform.machine():
                         # start a new browser instance if the connection fails
                         payload = json.dumps({"command": [
@@ -1019,9 +1013,9 @@ async def get_chrome_saved_address(env, config: Dict[str, str]):
                         ], "shell": False})
 
                     headers = {"Content-Type": "application/json"}
-                    requests.post("http://" + host + ":" + server_port + "/setup" + "/launch", headers=headers, data=payload)
+                    _make_post_request(env, "/setup/launch", headers=headers, data=payload)
                     await asyncio.sleep(5)
-                    browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                    browser = await p.chromium.connect_over_cdp(remote_debugging_url, headers=cdp_headers or {})
                     logger.info(f"[CHROME_SAVED_ADDRESS] Successfully connected to new Chrome instance")
 
                 page = await browser.new_page()
@@ -1097,11 +1091,7 @@ def get_shortcuts_on_desktop(env, config: Dict[str, str]):
 async def get_number_of_search_results(env, config: Dict[str, str]):
     # todo: move into the config file
     url, result_selector = "https://google.com/search?q=query", '.search-result'
-    host = env.vm_ip
-    port = env.chromium_port  # fixme: this port is hard-coded, need to be changed from config file
-    server_port = env.server_port
-
-    remote_debugging_url = f"http://{host}:{port}"
+    remote_debugging_url, cdp_headers = _get_cdp_connection_info(env)
     
     # Configuration for retry and timeout
     max_retries = 2
@@ -1113,12 +1103,11 @@ async def get_number_of_search_results(env, config: Dict[str, str]):
             
             async with async_playwright() as p:
                 try:
-                    browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                    browser = await p.chromium.connect_over_cdp(remote_debugging_url, headers=cdp_headers or {})
                     logger.info(f"[SEARCH_RESULTS] Successfully connected to existing Chrome instance")
                 except Exception as e:
                     logger.warning(f"[SEARCH_RESULTS] Failed to connect to existing Chrome instance: {e}")
                     # If the connection fails, start a new browser instance
-                    platform.machine()
                     if "arm" in platform.machine():
                         # start a new browser instance if the connection fails
                         payload = json.dumps({"command": [
@@ -1132,9 +1121,9 @@ async def get_number_of_search_results(env, config: Dict[str, str]):
                         ], "shell": False})
 
                     headers = {"Content-Type": "application/json"}
-                    requests.post("http://" + host + ":" + server_port + "/setup" + "/launch", headers=headers, data=payload)
+                    _make_post_request(env, "/setup/launch", headers=headers, data=payload)
                     await asyncio.sleep(5)
-                    browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                    browser = await p.chromium.connect_over_cdp(remote_debugging_url, headers=cdp_headers or {})
                     logger.info(f"[SEARCH_RESULTS] Successfully connected to new Chrome instance")
                     
                 page = await browser.new_page()
@@ -1520,11 +1509,8 @@ async def get_active_tab_html_parse(env, config: Dict[str, Any]):
     if not isinstance(active_tab_url, str):
         logger.error(f"[DEBUG] active_tab_url is not a string, got {type(active_tab_url)}: {active_tab_url}")
         return None
-    host = env.vm_ip
-    port = env.chromium_port  # fixme: this port is hard-coded, need to be changed from config file
-    server_port = env.server_port
-
-    remote_debugging_url = f"http://{host}:{port}"
+    
+    remote_debugging_url, cdp_headers = _get_cdp_connection_info(env)
     
     # DEBUG: Add logging for configuration
     logger.info(f"[DEBUG] get_active_tab_html_parse called with config: {config}")
@@ -1532,10 +1518,9 @@ async def get_active_tab_html_parse(env, config: Dict[str, Any]):
     async with async_playwright() as p:
         # connect to remote Chrome instance
         try:
-            browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+            browser = await p.chromium.connect_over_cdp(remote_debugging_url, headers=cdp_headers or {})
         except Exception as e:
             # If the connection fails, start a new browser instance
-            platform.machine()
             if "arm" in platform.machine():
                 # start a new browser instance if the connection fails
                 payload = json.dumps({"command": [
@@ -1549,9 +1534,9 @@ async def get_active_tab_html_parse(env, config: Dict[str, Any]):
                 ], "shell": False})
 
             headers = {"Content-Type": "application/json"}
-            requests.post("http://" + host + ":" + str(server_port) + "/setup" + "/launch", headers=headers, data=payload)
+            _make_post_request(env, "/setup/launch", headers=headers, data=payload)
             await asyncio.sleep(5)
-            browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+            browser = await p.chromium.connect_over_cdp(remote_debugging_url, headers=cdp_headers or {})
         target_page = None
         for context in browser.contexts:
             for page in context.pages:
@@ -1984,13 +1969,8 @@ async def get_gotoRecreationPage_and_get_html_content(env, config: Dict[str, Any
     logger.info(f"[RECREATION_PAGE] Starting recreation.gov page processing")
     logger.debug(f"[RECREATION_PAGE] Config: {config}")
     
-    host = env.vm_ip
-    port = env.chromium_port  # fixme: this port is hard-coded, need to be changed from config file
-    server_port = env.server_port
+    remote_debugging_url, cdp_headers = _get_cdp_connection_info(env)
     use_proxy = env.current_use_proxy
-
-    remote_debugging_url = f"http://{host}:{port}"
-    backend_url = f"http://{host}:{server_port}"
     
     # Configuration for retry and timeout
     max_retries = 3
@@ -2013,7 +1993,7 @@ async def get_gotoRecreationPage_and_get_html_content(env, config: Dict[str, Any
             async with async_playwright() as p:
                 # Connect to remote Chrome instance
                 try:
-                    browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                    browser = await p.chromium.connect_over_cdp(remote_debugging_url, headers=cdp_headers or {})
                     logger.info(f"[RECREATION_PAGE] Successfully connected to existing Chrome instance")
                 except Exception as e:
                     logger.warning(f"[RECREATION_PAGE] Failed to connect to existing Chrome instance: {e}")
@@ -2038,9 +2018,9 @@ async def get_gotoRecreationPage_and_get_html_content(env, config: Dict[str, Any
                     logger.info(f"[RECREATION_PAGE] Starting browser with command: {' '.join(command)}")
                     payload = json.dumps({"command": command, "shell": False})
                     headers = {"Content-Type": "application/json"}
-                    requests.post(backend_url + "/setup/launch", headers=headers, data=payload)
+                    _make_post_request(env, "/setup/launch", headers=headers, data=payload)
                     await asyncio.sleep(8)  # Give more time for browser to start
-                    browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                    browser = await p.chromium.connect_over_cdp(remote_debugging_url, headers=cdp_headers or {})
                     logger.info(f"[RECREATION_PAGE] Successfully connected to new Chrome instance")
 
                 page = await browser.new_page()

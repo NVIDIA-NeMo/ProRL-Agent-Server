@@ -186,8 +186,8 @@ def parse_args():
     parser.add_argument(
         '--temperature',
         type=float,
-        default=0.0,
-        help='Sampling temperature (0.0 for deterministic)'
+        default=0.2,
+        help='Sampling temperature'
     )
     parser.add_argument(
         '--max-iterations',
@@ -218,7 +218,7 @@ def parse_args():
     parser.add_argument(
         '--max-image-history',
         type=int,
-        default=4,
+        default=3,
         help='Maximum number of images to keep in history'
     )
     

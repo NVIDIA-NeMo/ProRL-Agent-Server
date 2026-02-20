@@ -88,6 +88,11 @@ class OpenHandsServer:
                 'No reward server IP provided. Evaluations would only work for swebench problems.'
             )
 
+        # For sequential VM start-ups to mitigate boot storm
+        self._launch_lock = threading.Lock()
+        self._last_launch_time = 0
+        self._launch_delay_seconds = 15.0  # Wait 15s between starts
+
     def get_unique_id(self, instance, max_retries=10):
         base = f'{get_instance_id(instance)}_{instance["trajectory_id"]}'
         base_hash = hashlib.sha256(base.encode('utf-8')).hexdigest()[:16]
@@ -395,6 +400,25 @@ class OpenHandsServer:
 
         if job_details.timer is None:
             raise RuntimeError('Timer is not initialized')
+
+        # Rate Limit Logic: Prevent Boot Storm
+        wait_time = 0.0
+        with self._launch_lock:
+            now = time.time()
+            # The earliest this worker can start is either NOW,
+            # or 15s after the last scheduled launch.
+            target_start_time = max(now, self._last_launch_time + self._launch_delay_seconds)
+
+            wait_time = target_start_time - now
+
+            # Reserve this slot by updating the global timestamp immediately
+            self._last_launch_time = target_start_time
+
+        # Perform the wait asynchronously (outside the lock)
+        if wait_time > 0:
+            if wait_time > 1.0:
+                logger.info(f"Delayed boot-up: waiting {wait_time:.1f}s...")
+            await asyncio.sleep(wait_time)
 
         with phase_context(job_details.timer, 'init'):
             init_coro = func(job_details=job_details, sid=job_id)

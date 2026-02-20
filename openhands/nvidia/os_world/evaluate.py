@@ -25,12 +25,18 @@ class Evaluator:
         self.client_password = controller.client_password
         self.screen_width = controller.screen_width
         self.screen_height = controller.screen_height
+        
+        # Get http_client from controller for runtime-agnostic HTTP calls
+        self.client = getattr(controller, 'client', None)
 
         # Assume Linux platform for OS World VMs
         # TODO: get from runtime/controller, mismatch initial letter is lowercase 
         self.vm_platform = 'Linux'
+        
+        # Current proxy setting (for chrome getters)
+        self.current_use_proxy = False
 
-        self.controller = PythonController(self.vm_ip, self.server_port)
+        self.controller = PythonController(self.vm_ip, self.server_port, http_client=self.client)
         self._set_evaluator_info(task_config)
  
     def _set_evaluator_info(self, task_config: Dict[str, Any]):

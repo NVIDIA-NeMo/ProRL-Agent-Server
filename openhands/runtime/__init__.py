@@ -12,6 +12,7 @@ from openhands.runtime.impl.remote.remote_runtime import RemoteRuntime
 from openhands.runtime.impl.runloop.runloop_runtime import RunloopRuntime
 from openhands.runtime.impl.singularity.singularity_runtime import SingularityRuntime
 from openhands.runtime.impl.singularity.osworld_singularity_runtime import OSWorldSingularityRuntime
+from openhands.runtime.impl.nvcf import OSWorldNVCFRuntime
 from openhands.utils.import_utils import get_impl
 
 # mypy: disable-error-code="type-abstract"
@@ -27,6 +28,7 @@ _DEFAULT_RUNTIME_CLASSES: dict[str, type[Runtime]] = {
     'enroot': EnrootRuntime,
     'singularity': SingularityRuntime,
     'osworld': OSWorldSingularityRuntime,
+    'osworld_nvcf': OSWorldNVCFRuntime,
     'cli': CLIRuntime,
 }
 
@@ -60,5 +62,6 @@ __all__ = [
     'EnrootRuntime',
     'SingularityRuntime',
     'OSWorldSingularityRuntime',
+    'OSWorldNVCFRuntime',
     'get_runtime_cls',
 ]

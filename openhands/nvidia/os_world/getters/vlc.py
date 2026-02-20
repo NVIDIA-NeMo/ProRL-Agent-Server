@@ -11,14 +11,21 @@ def get_vlc_playing_info(env, config: Dict[str, str]):
     """
     Gets the current playing information from VLC's HTTP interface.
     """
-
-    host = env.vm_ip
-    port = env.vlc_port
     password = 'password'
-
     _path = os.path.join(env.cache_dir, config["dest"])
-    url = f'http://{host}:{port}/requests/status.xml'
-    response = requests.get(url, auth=('', password))
+    
+    # Use http_client if available for VLC URL
+    if hasattr(env, 'client') and env.client:
+        vlc_url = env.client.get_vlc_url()
+        url = f'{vlc_url}/requests/status.xml'
+        headers = env.client.get_cdp_headers() or {}
+        response = requests.get(url, auth=('', password), headers=headers)
+    else:
+        host = env.vm_ip
+        port = env.vlc_port
+        url = f'http://{host}:{port}/requests/status.xml'
+        response = requests.get(url, auth=('', password))
+    
     if response.status_code == 200:
         content = response.content
     else:

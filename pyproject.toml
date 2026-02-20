@@ -135,6 +135,9 @@ datasets = "*"
 [tool.poetry.scripts]
 openhands = "openhands.cli.main:main"
 
+[tool.poetry.group.osworld-nvcf.dependencies]
+ngcsdk = ">=3.64.0"
+
 [tool.poetry.group.testgeneval.dependencies]
 fuzzywuzzy = "^0.18.0"
 rouge = "^1.0.1"

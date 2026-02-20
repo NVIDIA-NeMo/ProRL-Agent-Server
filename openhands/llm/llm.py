@@ -204,6 +204,7 @@ class LLM(RetryMixin, DebugMixin):
         kwargs: dict[str, Any] = {
             'temperature': self.config.temperature,
             'max_completion_tokens': self.config.max_output_tokens,
+            'skip_special_tokens': False,
         }
         if self.config.top_k is not None:
             # openai doesn't expose top_k

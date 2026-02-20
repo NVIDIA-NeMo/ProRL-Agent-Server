@@ -21,13 +21,14 @@ from requests_toolbelt.multipart.encoder import MultipartEncoder
 from openhands.events.action.os import OSWorldInteractiveAction
 from openhands.core.logger import openhands_logger as logger
 from openhands.nvidia.os_world.metrics.utils import compare_urls
+from openhands.runtime.utils.osworld_http_client import OSWorldHttpClient
 
 FILE_PATH = os.path.dirname(os.path.abspath(__file__))
 
 MAX_RETRIES = 20
 
 class SetupController:
-    def __init__(self, vm_ip: str, server_port: int = 5000, chromium_port: int = 9222, vlc_port: int = 8080, cache_dir: str = "cache", client_password: str = "", screen_width: int = 1920, screen_height: int = 1080, runtime=None):
+    def __init__(self, vm_ip: str, server_port: int = 5000, chromium_port: int = 9222, vlc_port: int = 8080, cache_dir: str = "cache", client_password: str = "", screen_width: int = 1920, screen_height: int = 1080, runtime=None, http_client: OSWorldHttpClient = None):
         self.vm_ip: str = vm_ip
         self.server_port: int = server_port
         self.chromium_port: int = chromium_port
@@ -40,6 +41,20 @@ class SetupController:
         self.screen_height: int = screen_height
         self.runtime = runtime  # Runtime object for interacting with the environment
         self.additional_wait_time = 3
+        # Use http_client if provided, otherwise fall back to direct requests
+        self.client = http_client
+
+    def _get(self, endpoint: str, **kwargs) -> requests.Response:
+        """Make a GET request using client or direct requests."""
+        if self.client:
+            return self.client.get(endpoint, **kwargs)
+        return requests.get(self.http_server + endpoint, **kwargs)
+
+    def _post(self, endpoint: str, **kwargs) -> requests.Response:
+        """Make a POST request using client or direct requests."""
+        if self.client:
+            return self.client.post(endpoint, **kwargs)
+        return requests.post(self.http_server + endpoint, **kwargs)
 
     def reset_cache_dir(self, cache_dir: str):
         self.cache_dir = cache_dir
@@ -227,8 +242,8 @@ class SetupController:
                         logger.debug(form.content_type)
 
                         # Explicit connect/read timeout to avoid hanging forever
-                        response = requests.post(
-                            self.http_server + "/setup" + "/upload",
+                        response = self._post(
+                            "/setup/upload",
                             headers=headers,
                             data=form,
                             timeout=(10, 600)
@@ -270,7 +285,7 @@ class SetupController:
         # send request to server to change wallpaper
         # Note: This uses a custom /setup endpoint, not a standard OSWorld method
         try:
-            response = requests.post(self.http_server + "/setup" + "/change_wallpaper", headers=headers, data=payload)
+            response = self._post("/setup/change_wallpaper", headers=headers, data=payload)
             if response.status_code == 200:
                 logger.info("Command executed successfully: %s", response.text)
             else:
@@ -298,7 +313,7 @@ class SetupController:
         try:
             # The server-side call is now blocking and can take time.
             # We set a timeout that is slightly longer than the server's timeout (1800s).
-            response = requests.post(self.http_server + "/setup" + "/open_file", headers=headers, data=payload, timeout=1810)
+            response = self._post("/setup/open_file", headers=headers, data=payload, timeout=1810)
             response.raise_for_status()  # This will raise an exception for 4xx and 5xx status codes
             logger.info("Command executed successfully: %s", response.text)
             time.sleep(self.additional_wait_time)
@@ -436,13 +451,16 @@ class SetupController:
             logger.warning("Command should be a list of strings. Now it is a string. Will split it by space.")
             command = command.split()
 
+        if self.client:
+            command = self.client.update_launch_command(command)
+
         payload = json.dumps({"command": command, "shell": shell})
         headers = {"Content-Type": "application/json"}
 
         # Note: This uses a custom /setup endpoint, not a standard OSWorld method
         try:
-            logger.info("REQUEST ADDRESS: %s", self.http_server + "/setup" + "/launch")
-            response = requests.post(self.http_server + "/setup" + "/launch", headers=headers, data=payload)
+            logger.info("REQUEST ADDRESS: %s", self.http_server + "/setup/launch")
+            response = self._post("/setup/launch", headers=headers, data=payload)
             if response.status_code == 200:
                 logger.info("Command executed successfully: %s", response.text)
             else:
@@ -516,7 +534,7 @@ class SetupController:
         # Execute using runtime
         while not terminates:
             try:
-                response = requests.post(self.http_server + "/setup" + "/execute", headers=headers, data=payload)
+                response = self._post("/setup/execute", headers=headers, data=payload)
                 if response.status_code == 200:
                     results: Dict[str, str] = response.json()
                     if stdout:
@@ -588,8 +606,8 @@ class SetupController:
 
         # Note: This uses a custom /setup endpoint, not a standard OSWorld method
         try:
-            response = requests.post(self.http_server + "/setup" + "/execute_with_verification", 
-                                   headers=headers, data=payload, timeout=max_wait_time + 10)
+            response = self._post("/setup/execute_with_verification", 
+                                  headers=headers, data=payload, timeout=max_wait_time + 10)
             if response.status_code == 200:
                 result = response.json()
                 logger.info("Command executed and verified successfully: %s -> %s"
@@ -639,7 +657,7 @@ class SetupController:
         # send request to server to open file
         # Note: This uses a custom /setup endpoint, not a standard OSWorld method
         try:
-            response = requests.post(self.http_server + "/setup" + "/activate_window", headers=headers, data=payload)
+            response = self._post("/setup/activate_window", headers=headers, data=payload)
             if response.status_code == 200:
                 logger.info("Command executed successfully: %s", response.text)
             else:
@@ -663,7 +681,7 @@ class SetupController:
         # send request to server to open file
         # Note: This uses a custom /setup endpoint, not a standard OSWorld method
         try:
-            response = requests.post(self.http_server + "/setup" + "/close_window", headers=headers, data=payload)
+            response = self._post("/setup/close_window", headers=headers, data=payload)
             if response.status_code == 200:
                 logger.info("Command executed successfully: %s", response.text)
             else:
@@ -676,10 +694,16 @@ class SetupController:
         if not self.runtime:
             raise Exception("Runtime is required for SetupController. Please provide a runtime object.")
 
-        host = self.vm_ip
-        port = self.chromium_port  # fixme: this port is hard-coded, need to be changed from config file
+        # Get CDP URL and headers from client if available
+        if self.client:
+            remote_debugging_url = self.client.get_cdp_url()
+            cdp_headers = self.client.get_cdp_headers()
+        else:
+            host = self.vm_ip
+            port = self.chromium_port
+            remote_debugging_url = f"http://{host}:{port}"
+            cdp_headers = None
 
-        remote_debugging_url = f"http://{host}:{port}"
         logger.info("Connect to Chrome @: %s", remote_debugging_url)
         logger.debug("PLAYWRIGHT ENV: %s", repr(os.environ))
         for attempt in range(15):
@@ -689,7 +713,10 @@ class SetupController:
             browser = None
             async with async_playwright() as p:
                 try:
-                    browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                    browser = await p.chromium.connect_over_cdp(
+                        remote_debugging_url,
+                        headers=cdp_headers or {}
+                    )
                     # break
                 except Exception as e:
                     if attempt < 14:
@@ -730,15 +757,24 @@ class SetupController:
 
         time.sleep(5)  # Wait for Chrome to finish launching
 
-        host = self.vm_ip
-        port = self.chromium_port  # fixme: this port is hard-coded, need to be changed from config file
+        # Get CDP URL and headers from client if available
+        if self.client:
+            remote_debugging_url = self.client.get_cdp_url()
+            cdp_headers = self.client.get_cdp_headers()
+        else:
+            host = self.vm_ip
+            port = self.chromium_port
+            remote_debugging_url = f"http://{host}:{port}"
+            cdp_headers = None
 
-        remote_debugging_url = f"http://{host}:{port}"
         async with async_playwright() as p:
             browser = None
             for attempt in range(15):
                 try:
-                    browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                    browser = await p.chromium.connect_over_cdp(
+                        remote_debugging_url,
+                        headers=cdp_headers or {}
+                    )
                     break
                 except Exception as e:
                     if attempt < 14:
@@ -867,15 +903,24 @@ class SetupController:
         if not self.runtime:
             raise Exception("Runtime is required for SetupController. Please provide a runtime object.")
 
-        host = self.vm_ip
-        port = self.chromium_port
+        # Get CDP URL and headers from client if available
+        if self.client:
+            remote_debugging_url = self.client.get_cdp_url()
+            cdp_headers = self.client.get_cdp_headers()
+        else:
+            host = self.vm_ip
+            port = self.chromium_port
+            remote_debugging_url = f"http://{host}:{port}"
+            cdp_headers = None
 
-        remote_debugging_url = f"http://{host}:{port}"
         async with async_playwright() as p:
             browser = None
             for attempt in range(15):
                 try:
-                    browser = await p.chromium.connect_over_cdp(remote_debugging_url)
+                    browser = await p.chromium.connect_over_cdp(
+                        remote_debugging_url,
+                        headers=cdp_headers or {}
+                    )
                     break
                 except Exception as e:
                     if attempt < 14:
@@ -930,8 +975,8 @@ class SetupController:
 
         for _ in range(3):
             try:
-                response = requests.post(self.http_server + "/execute", headers={'Content-Type': 'application/json'},
-                                         data=payload, timeout=90)
+                response = self._post("/execute", headers={'Content-Type': 'application/json'},
+                                      data=payload, timeout=90)
                 if response.status_code == 200:
                     logger.info("Command executed successfully: %s", response.text)
                     return response.json()
@@ -1042,8 +1087,8 @@ class SetupController:
 
             # send request to server to upload file
             try:
-                logger.debug("REQUEST ADDRESS: %s", self.http_server + "/setup" + "/upload")
-                response = requests.post(self.http_server + "/setup" + "/upload", headers=headers, data=form)
+                logger.debug("REQUEST ADDRESS: %s", self.http_server + "/setup/upload")
+                response = self._post("/setup/upload", headers=headers, data=form)
                 if response.status_code == 200:
                     logger.info("Command executed successfully: %s", response.text)
                 else:

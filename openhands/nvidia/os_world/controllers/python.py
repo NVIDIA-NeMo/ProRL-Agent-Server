@@ -5,18 +5,34 @@ import time
 import traceback
 import requests
 from openhands.core.logger import openhands_logger as logger
+from openhands.runtime.utils.osworld_http_client import OSWorldHttpClient
 
 KEYBOARD_KEYS = ['\t', '\n', '\r', ' ', '!', '"', '#', '$', '%', '&', "'", '(', ')', '*', '+', ',', '-', '.', '/', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '~', 'accept', 'add', 'alt', 'altleft', 'altright', 'apps', 'backspace', 'browserback', 'browserfavorites', 'browserforward', 'browserhome', 'browserrefresh', 'browsersearch', 'browserstop', 'capslock', 'clear', 'convert', 'ctrl', 'ctrlleft', 'ctrlright', 'decimal', 'del', 'delete', 'divide', 'down', 'end', 'enter', 'esc', 'escape', 'execute', 'f1', 'f10', 'f11', 'f12', 'f13', 'f14', 'f15', 'f16', 'f17', 'f18', 'f19', 'f2', 'f20', 'f21', 'f22', 'f23', 'f24', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', 'final', 'fn', 'hanguel', 'hangul', 'hanja', 'help', 'home', 'insert', 'junja', 'kana', 'kanji', 'launchapp1', 'launchapp2', 'launchmail', 'launchmediaselect', 'left', 'modechange', 'multiply', 'nexttrack', 'nonconvert', 'num0', 'num1', 'num2', 'num3', 'num4', 'num5', 'num6', 'num7', 'num8', 'num9', 'numlock', 'pagedown', 'pageup', 'pause', 'pgdn', 'pgup', 'playpause', 'prevtrack', 'print', 'printscreen', 'prntscrn', 'prtsc', 'prtscr', 'return', 'right', 'scrolllock', 'select', 'separator', 'shift', 'shiftleft', 'shiftright', 'sleep', 'stop', 'subtract', 'tab', 'up', 'volumedown', 'volumemute', 'volumeup', 'win', 'winleft', 'winright', 'yen', 'command', 'option', 'optionleft', 'optionright']
 
 class PythonController:
     def __init__(self, vm_ip: str,
                  server_port: int,
-                 pkgs_prefix: str = "import pyautogui; import time; pyautogui.FAILSAFE = False; {command}"):
+                 pkgs_prefix: str = "import pyautogui; import time; pyautogui.FAILSAFE = False; {command}",
+                 http_client: OSWorldHttpClient = None):
         self.vm_ip = vm_ip
         self.http_server = f"http://{vm_ip}:{server_port}"
         self.pkgs_prefix = pkgs_prefix  # fixme: this is a hacky way to execute python commands. fix it and combine it with installation of packages
         self.retry_times = 3
         self.retry_interval = 5
+        # Use http_client if provided, otherwise fall back to direct requests
+        self.client = http_client
+
+    def _get(self, endpoint: str, **kwargs) -> requests.Response:
+        """Make a GET request using client or direct requests."""
+        if self.client:
+            return self.client.get(endpoint, **kwargs)
+        return requests.get(self.http_server + endpoint, **kwargs)
+
+    def _post(self, endpoint: str, **kwargs) -> requests.Response:
+        """Make a POST request using client or direct requests."""
+        if self.client:
+            return self.client.post(endpoint, **kwargs)
+        return requests.post(self.http_server + endpoint, **kwargs)
 
     @staticmethod
     def _is_valid_image_response(content_type: str, data: Optional[bytes]) -> bool:
@@ -43,7 +59,7 @@ class PythonController:
 
         for attempt_idx in range(self.retry_times):
             try:
-                response = requests.get(self.http_server + "/screenshot", timeout=10)
+                response = self._get("/screenshot", timeout=10)
                 if response.status_code == 200:
                     content_type = response.headers.get("Content-Type", "")
                     content = response.content
@@ -71,7 +87,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response: requests.Response = requests.get(self.http_server + "/accessibility")
+                response: requests.Response = self._get("/accessibility")
                 if response.status_code == 200:
                     logger.info("Got accessibility tree successfully")
                     return response.json()["AT"]
@@ -93,7 +109,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.get(self.http_server + "/terminal")
+                response = self._get("/terminal")
                 if response.status_code == 200:
                     logger.info("Got terminal output successfully")
                     return response.json()["output"]
@@ -115,7 +131,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/file", data={"file_path": file_path})
+                response = self._post("/file", data={"file_path": file_path})
                 if response.status_code == 200:
                     logger.info("File downloaded successfully")
                     return response.content
@@ -141,8 +157,8 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/execute", headers={'Content-Type': 'application/json'},
-                                         data=payload, timeout=90)
+                response = self._post("/execute", headers={'Content-Type': 'application/json'},
+                                      data=payload, timeout=90)
                 if response.status_code == 200:
                     logger.info("Command executed successfully: %s", response.text)
                     return response.json()
@@ -167,8 +183,8 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/run_python", headers={'Content-Type': 'application/json'},
-                                         data=payload, timeout=90)
+                response = self._post("/run_python", headers={'Content-Type': 'application/json'},
+                                      data=payload, timeout=90)
                 if response.status_code == 200:
                     return response.json()
                 else:
@@ -200,8 +216,8 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(
-                    self.http_server + "/run_bash_script", 
+                response = self._post(
+                    "/run_bash_script", 
                     headers={'Content-Type': 'application/json'},
                     data=payload, 
                     timeout=timeout + 100  # Add buffer to HTTP timeout
@@ -416,7 +432,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/start_recording")
+                response = self._post("/start_recording")
                 if response.status_code == 200:
                     logger.info("Recording started successfully")
                     return
@@ -437,7 +453,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/end_recording")
+                response = self._post("/end_recording")
                 if response.status_code == 200:
                     logger.info("Recording stopped successfully")
                     with open(dest, 'wb') as f:
@@ -469,7 +485,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/screen_size")
+                response = self._post("/screen_size")
                 if response.status_code == 200:
                     logger.info("Got screen size successfully")
                     return response.json()
@@ -491,7 +507,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/window_size", data={"app_class_name": app_class_name})
+                response = self._post("/window_size", data={"app_class_name": app_class_name})
                 if response.status_code == 200:
                     logger.info("Got window size successfully")
                     return response.json()
@@ -513,7 +529,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/wallpaper")
+                response = self._post("/wallpaper")
                 if response.status_code == 200:
                     logger.info("Got wallpaper successfully")
                     return response.content
@@ -535,7 +551,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/desktop_path")
+                response = self._post("/desktop_path")
                 if response.status_code == 200:
                     logger.info("Got desktop path successfully")
                     return response.json()["desktop_path"]
@@ -558,7 +574,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/list_directory", headers={'Content-Type': 'application/json'}, data=payload)
+                response = self._post("/list_directory", headers={'Content-Type': 'application/json'}, data=payload)
                 if response.status_code == 200:
                     logger.info("Got directory tree successfully")
                     return response.json()["directory_tree"]

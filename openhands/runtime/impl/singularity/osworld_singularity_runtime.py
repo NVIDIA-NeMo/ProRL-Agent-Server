@@ -32,6 +32,7 @@ from openhands.runtime.impl.singularity.singularity_runtime import (
 from openhands.runtime.plugins import PluginRequirement
 from openhands.runtime.utils import find_available_tcp_port
 from openhands.runtime.utils.command import DEFAULT_MAIN_MODULE
+from openhands.runtime.utils.osworld_http_client import DirectHttpClient
 
 from openhands.events.tool import ToolCallMetadata
 
@@ -586,6 +587,19 @@ class OSWorldSingularityRuntime(SingularityRuntime):
         """
         return f'http://localhost:{self._vlc_port}'
 
+    
+    @property
+    def http_client(self):
+        """Get the HTTP client for runtime-agnostic communication.
+        
+        Returns a DirectHttpClient that makes direct HTTP requests to the VM.
+        """
+        return DirectHttpClient(
+            base_url=self.osworld_vm_url,
+            chromium_port=self._chromium_port,
+            vlc_port=self._vlc_port
+        )
+    
     def get_vm_screenshot(self) -> bytes | None:
         """Get screenshot from the VM.
 
