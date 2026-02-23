@@ -102,32 +102,38 @@ class NVCFHttpClient:
     NVCF_CHROME_BASE = "https://grpc.nvcf.nvidia.com/chrome"
     NVCF_VLC_BASE = "https://grpc.nvcf.nvidia.com/vlc"
     
-    def __init__(self, api_key: str, function_id: str):
+    def __init__(self, api_key: str, function_id: str, session_headers: Optional[Dict[str, str]] = None):
         """Initialize the NVCF HTTP client.
-        
+
         Args:
             api_key: NGC API key for authentication
             function_id: NVCF function ID
+            session_headers: Optional NVCF session routing headers (e.g. NVCF-SESSION-ID)
         """
         self.headers = {
             "Authorization": f"Bearer {api_key}",
             "Function-ID": function_id,
         }
+        if session_headers:
+            self.headers.update(session_headers)
+        self._session = requests.Session()
+        self._session.headers.update(self.headers)
         self._cached_cdp_url: Optional[str] = None
-    
+        logger.info(f"NVCFHttpClient created with headers: { {k: v[:20]+'...' if len(str(v))>20 else v for k,v in self.headers.items()} }")
+
     def get(self, endpoint: str, **kwargs) -> requests.Response:
         """Make an authenticated GET request to NVCF."""
         url = self.NVCF_API_BASE + endpoint
         # Merge auth headers with any provided headers
         headers = {**self.headers, **kwargs.pop('headers', {})}
-        return requests.get(url, headers=headers, **kwargs)
-    
+        return self._session.get(url, headers=headers, **kwargs)
+
     def post(self, endpoint: str, **kwargs) -> requests.Response:
         """Make an authenticated POST request to NVCF."""
         url = self.NVCF_API_BASE + endpoint
         # Merge auth headers with any provided headers
         headers = {**self.headers, **kwargs.pop('headers', {})}
-        return requests.post(url, headers=headers, **kwargs)
+        return self._session.post(url, headers=headers, **kwargs)
     
     def get_cdp_url(self) -> str:
         """Get the Chrome DevTools Protocol URL with WebSocket rewriting.
@@ -172,21 +178,39 @@ class NVCFHttpClient:
         """Get the VLC web interface URL through NVCF."""
         return self.NVCF_VLC_BASE
 
-    def update_launch_command(self, command: str) -> str:
-        """Update the launch command to use the HTTP client. NVCF will have different command for launching apps"""
+    def update_launch_command(self, command) -> list:
+        """Update the launch command for NVCF VMs.
 
-        if command[0] == "google-chrome":
-                      
-            command = [ "google-chrome-wrapper",
-                "--remote-debugging-port=9223",
-                "--remote-debugging-address=127.0.0.1",
-                "--remote-allow-origins=*",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-infobars",
-                "--disable-session-crashed-bubble",
-                "--disable-features=TranslateUI",
-                "--start-maximized"
-            ]
+        Replaces google-chrome with google-chrome-wrapper and adds
+        required NVCF flags, while preserving the original
+        --remote-debugging-port from the setup config.
+        """
+        if not command:
+            return command
+
+        cmd_name = command[0] if isinstance(command, list) else command
+        if cmd_name != "google-chrome":
+            return command
+
+        # Extract the original debugging port from the command args
+        original_args = command[1:] if isinstance(command, list) else []
+        debug_port = "9222"  # default
+        for arg in original_args:
+            if arg.startswith("--remote-debugging-port="):
+                debug_port = arg.split("=", 1)[1]
+                break
+
+        command = [
+            "google-chrome-wrapper",
+            f"--remote-debugging-port={debug_port}",
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-allow-origins=*",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-infobars",
+            "--disable-session-crashed-bubble",
+            "--disable-features=TranslateUI",
+            "--start-maximized",
+        ]
 
         return command

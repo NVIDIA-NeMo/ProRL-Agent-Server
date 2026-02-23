@@ -2,6 +2,7 @@
 
 import os
 import time
+import threading
 from typing import TYPE_CHECKING, Any, Optional
 
 import httpx
@@ -91,7 +92,7 @@ class OSWorldNVCFRuntime(NVCFRuntime):
             headers=headers,
             timeout=60.0,
         )
-        # Verify endpoint
+        # Verify endpoint and capture NVCF session headers
         r = self._nvcf_client.get("/screenshot", timeout=15.0)
         if r.status_code != 200:
             self._nvcf_client.close()
@@ -99,11 +100,38 @@ class OSWorldNVCFRuntime(NVCFRuntime):
             raise AgentRuntimeDisconnectedError(
                 f"NVCF function returned HTTP {r.status_code}"
             )
+        # NVCF stateful functions return session routing headers — persist them
+        self._nvcf_session_headers = {}
+        self.log("info", f"NVCF init response headers: {dict(r.headers)}")
+        for hdr in ("NVCF-REQID", "NVCF-SESSION-ID", "nvcf-reqid", "nvcf-session-id"):
+            val = r.headers.get(hdr)
+            if val:
+                self._nvcf_client.headers[hdr] = val
+                self._nvcf_session_headers[hdr] = val
+                self.log("info", f"Captured NVCF session header: {hdr}={val}")
+        self.log("info", f"NVCF session headers captured: {self._nvcf_session_headers}")
         self.log("info", f"OSWorld NVCF client ready: {self._nvcf_function_id}")
-        
+
+        # Start NVCF session keepalive to prevent idle timeout (~30-60s)
+        self._keepalive_stop = threading.Event()
+        self._keepalive_thread = threading.Thread(
+            target=self._nvcf_keepalive_loop, daemon=True
+        )
+        self._keepalive_thread.start()
+
         # Start local proxies for Chrome DevTools and VLC
         self._start_local_proxies()
     
+    def _nvcf_keepalive_loop(self) -> None:
+        """Ping the NVCF function every 20s to prevent session idle timeout."""
+        while not self._keepalive_stop.wait(20.0):
+            try:
+                r = self.http_client.get("/platform", timeout=10.0)
+                if r.status_code != 200:
+                    self.log("warning", f"Keepalive got HTTP {r.status_code}")
+            except Exception as e:
+                self.log("warning", f"Keepalive failed: {e}")
+
     def _start_local_proxies(self) -> None:
         """Start local proxies for Chrome DevTools and VLC web interface."""
         if self._enable_chrome_proxy:
@@ -155,14 +183,22 @@ class OSWorldNVCFRuntime(NVCFRuntime):
     def check_if_alive(self) -> None:
         if not self._nvcf_client:
             raise AgentRuntimeDisconnectedError("OSWorld NVCF runtime is not connected.")
-        r = self._nvcf_client.get("/screenshot", timeout=5.0)
+        r = self._nvcf_get("/screenshot", timeout=5.0)
         if r.status_code != 200:
             raise AgentRuntimeDisconnectedError("NVCF function is not responding")
 
     def close(self, rm_all_containers: bool | None = None) -> None:
+        # Stop keepalive thread
+        if hasattr(self, '_keepalive_stop'):
+            self._keepalive_stop.set()
+
         # Stop local proxies first
         self._stop_local_proxies()
-        
+
+        # Clear shared http_client
+        if hasattr(self, '_http_client'):
+            self._http_client = None
+
         if self._nvcf_client:
             try:
                 self._nvcf_client.close()
@@ -220,26 +256,48 @@ class OSWorldNVCFRuntime(NVCFRuntime):
     @property
     def http_client(self):
         """Get the HTTP client for runtime-agnostic communication.
-        
-        Returns an NVCFHttpClient that handles NVCF authentication and URL rewriting.
+
+        Returns a shared NVCFHttpClient that handles NVCF authentication and URL rewriting.
+        Reuses the same instance so NVCF session state is preserved across all callers.
         """
-        return NVCFHttpClient(
-            api_key=self._nvcf_api_key,
-            function_id=self._nvcf_function_id
-        )
+        if not hasattr(self, '_http_client') or self._http_client is None:
+            self._http_client = NVCFHttpClient(
+                api_key=self._nvcf_api_key,
+                function_id=self._nvcf_function_id,
+                session_headers=getattr(self, '_nvcf_session_headers', None),
+            )
+        return self._http_client
 
     # --- OSWorld API (NVCF HTTP) ---
+    def _nvcf_get(self, endpoint: str, **kwargs):
+        """GET via shared http_client (requests-based) to maintain NVCF session."""
+        return self.http_client.get(endpoint, **kwargs)
+
+    def _nvcf_post(self, endpoint: str, **kwargs):
+        """POST via shared http_client (requests-based) to maintain NVCF session."""
+        return self.http_client.post(endpoint, **kwargs)
+
     def get_vm_screenshot(self) -> bytes | None:
-        try:
-            r = self._nvcf_client.get("/screenshot", timeout=30.0)
-            return r.content if r.status_code == 200 else None
-        except Exception as e:
-            self.log("error", f"Failed to get VM screenshot: {e}")
-            return None
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                r = self._nvcf_get("/screenshot", timeout=30.0)
+                if r.status_code == 200:
+                    return r.content
+                body = r.text[:200] if r.text else ""
+                self.log("warning",
+                    f"Screenshot attempt {attempt + 1}/{max_retries} failed: "
+                    f"HTTP {r.status_code} fn={self._nvcf_function_id} body={body}")
+            except Exception as e:
+                self.log("warning", f"Screenshot attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(5.0)
+        self.log("error", f"Failed to get VM screenshot after {max_retries} retries (fn={self._nvcf_function_id})")
+        return None
 
     def get_vm_accessibility_tree(self) -> str | None:
         try:
-            r = self._nvcf_client.get("/accessibility", timeout=30.0)
+            r = self._nvcf_get("/accessibility", timeout=30.0)
             if r.status_code != 200:
                 return None
             try:
@@ -251,17 +309,26 @@ class OSWorldNVCFRuntime(NVCFRuntime):
             return None
 
     def _execute_pyautogui_command(self, pyautogui_command: str) -> dict:
-        try:
-            command = (
-                "import pyautogui; import time; pyautogui.FAILSAFE = False; "
-                + pyautogui_command
-            )
-            payload = {"command": ["python", "-c", command], "shell": False}
-            r = self._nvcf_client.post("/execute", json=payload, timeout=30.0)
-            return r.json()
-        except Exception as e:
-            self.log("error", f"Failed to execute PyAutoGUI command: {e}")
-            return {"status": "error", "message": str(e)}
+        command = (
+            "import pyautogui; import time; pyautogui.FAILSAFE = False; "
+            + pyautogui_command
+        )
+        payload = {"command": ["python", "-c", command], "shell": False}
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                r = self._nvcf_post("/execute", json=payload, timeout=30.0)
+                if r.status_code == 200:
+                    return r.json()
+                body = r.text[:200] if r.text else ""
+                self.log("warning",
+                    f"Execute attempt {attempt + 1}/{max_retries} failed: "
+                    f"HTTP {r.status_code} fn={self._nvcf_function_id} body={body}")
+            except Exception as e:
+                self.log("warning", f"Execute attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(5.0)
+        return {"status": "error", "message": f"Failed after {max_retries} retries"}
 
     def _action_to_pyautogui_command(self, action_type: str, parameters: dict) -> str | None:
         import random
@@ -498,18 +565,23 @@ class OSWorldNVCFRuntime(NVCFRuntime):
 
     def _handle_get_terminal_output(self) -> "Observation":
         from openhands.events.observation import CmdOutputObservation, ErrorObservation
-        try:
-            r = self._nvcf_client.get("/terminal", timeout=10.0)
-            if r.status_code == 200:
-                output = r.json().get("output") or ""
-                return CmdOutputObservation(
-                    content=output,
-                    command="get_terminal_output",
-                    exit_code=0,
-                )
-            return ErrorObservation(f"Failed to get terminal output: {r.status_code}")
-        except Exception as e:
-            return ErrorObservation(f"Failed to get terminal output: {e}")
+        for attempt in range(5):
+            try:
+                r = self._nvcf_get("/terminal", timeout=30.0)
+                if r.status_code == 200:
+                    output = r.json().get("output") or ""
+                    return CmdOutputObservation(
+                        content=output,
+                        command="get_terminal_output",
+                        exit_code=0,
+                    )
+                body = r.text[:200] if r.text else ""
+                self.log("warning", f"Terminal output attempt {attempt + 1}/5: HTTP {r.status_code} body={body}")
+            except Exception as e:
+                self.log("warning", f"Terminal output attempt {attempt + 1}/5: {e}")
+            if attempt < 4:
+                time.sleep(5.0)
+        return ErrorObservation("Failed to get terminal output after 5 retries")
 
     def _handle_get_file(self, params: dict) -> "Observation":
         from openhands.events.observation import CmdOutputObservation, ErrorObservation
@@ -518,7 +590,7 @@ class OSWorldNVCFRuntime(NVCFRuntime):
         if not file_path:
             return ErrorObservation("file_path parameter required")
         try:
-            r = self._nvcf_client.post(
+            r = self._nvcf_post(
                 "/file",
                 data={"file_path": file_path},
                 timeout=30.0,
@@ -543,17 +615,27 @@ class OSWorldNVCFRuntime(NVCFRuntime):
         Returns:
             Response dictionary from OSWorld server (status, output, error, returncode or message).
         """
-        try:
-            wrapped = (
-                "import pyautogui; import time; pyautogui.FAILSAFE = False; "
-                f"{pyautogui_command}"
-            )
-            payload = {"command": ["python", "-c", wrapped], "shell": False}
-            r = self._nvcf_client.post("/execute", json=payload, timeout=30.0)
-            return r.json()
-        except Exception as e:
-            self.log("error", f"Failed to execute PyAutoGUI command: {e}")
-            return {"status": "error", "message": str(e)}
+        wrapped = (
+            "import pyautogui; import time; pyautogui.FAILSAFE = False; "
+            f"{pyautogui_command}"
+        )
+        payload = {"command": ["python", "-c", wrapped], "shell": False}
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                r = self._nvcf_post("/execute", json=payload, timeout=30.0)
+                if r.status_code == 200:
+                    return r.json()
+                body = r.text[:200] if r.text else ""
+                self.log("warning",
+                    f"Execute attempt {attempt + 1}/{max_retries} failed: "
+                    f"HTTP {r.status_code} fn={self._nvcf_function_id} body={body}")
+            except Exception as e:
+                self.log("warning", f"Execute attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(5.0)
+        self.log("error", f"Failed to execute PyAutoGUI command after {max_retries} retries: {pyautogui_command[:100]}")
+        return {"status": "error", "message": f"Failed after {max_retries} retries"}
 
     def _handle_execute_python_command(self, params: dict) -> "Observation":
         """Handle execute_python_command - raw Python command execution (PyAutoGUI-style, same as singularity)."""
@@ -589,7 +671,7 @@ class OSWorldNVCFRuntime(NVCFRuntime):
         if not script:
             return CmdOutputObservation(content="script parameter required", command="run_python_script", exit_code=1)
         try:
-            r = self._nvcf_client.post("/run_python", json={"code": script}, timeout=90.0)
+            r = self._nvcf_post("/run_python", json={"code": script}, timeout=90.0)
             if r.status_code == 200:
                 res = r.json()
                 out, err = res.get("output", ""), res.get("error", "")
@@ -612,42 +694,56 @@ class OSWorldNVCFRuntime(NVCFRuntime):
         timeout = params.get("timeout", 30)
         working_dir = params.get("working_dir")
 
-        try:
-            payload = {"script": script, "timeout": timeout}
-            if working_dir is not None:
-                payload["working_dir"] = working_dir
-            r = self._nvcf_client.post(
-                "/run_bash_script",
-                json=payload,
-                timeout=timeout + 10.0,
-            )
-            if r.status_code == 200:
-                result = r.json()
-                output = result.get("output", "")
-                error = result.get("error", "")
-                content = output
-                if error:
-                    content = f"{content}\n{error}" if content else error
-                return CmdOutputObservation(
-                    content=content,
-                    command="run_bash_script",
-                    exit_code=result.get("returncode", 0),
-                )
+        payload = {"script": script, "timeout": timeout}
+        if working_dir is not None:
+            payload["working_dir"] = working_dir
+
+        for attempt in range(5):
             try:
-                error_detail = r.json()
-                error_msg = error_detail.get("output", error_detail.get("message", "Unknown error"))
-            except Exception:
-                error_msg = r.text or "Unknown error"
-            return ErrorObservation(f"Failed to run bash script (HTTP {r.status_code}): {error_msg}")
-        except Exception as e:
-            return ErrorObservation(f"Failed to run bash script: {e}")
+                r = self._nvcf_post(
+                    "/run_bash_script",
+                    json=payload,
+                    timeout=timeout + 10.0,
+                )
+                if r.status_code == 200:
+                    result = r.json()
+                    output = result.get("output", "")
+                    error = result.get("error", "")
+                    content = output
+                    if error:
+                        content = f"{content}\n{error}" if content else error
+                    return CmdOutputObservation(
+                        content=content,
+                        command="run_bash_script",
+                        exit_code=result.get("returncode", 0),
+                    )
+                if r.status_code in (404, 502, 503, 504):
+                    body = r.text[:200] if r.text else ""
+                    self.log("warning",
+                        f"run_bash_script attempt {attempt + 1}/5: HTTP {r.status_code} body={body}")
+                    if attempt < 4:
+                        time.sleep(5.0)
+                        continue
+                try:
+                    error_detail = r.json()
+                    error_msg = error_detail.get("output", error_detail.get("message", "Unknown error"))
+                except Exception:
+                    error_msg = r.text or "Unknown error"
+                return ErrorObservation(f"Failed to run bash script (HTTP {r.status_code}): {error_msg}")
+            except Exception as e:
+                self.log("warning", f"run_bash_script attempt {attempt + 1}/5: {e}")
+                if attempt < 4:
+                    time.sleep(5.0)
+                    continue
+                return ErrorObservation(f"Failed to run bash script: {e}")
+        return ErrorObservation("Failed to run bash script after 5 retries")
 
     def _handle_start_recording(self) -> "Observation":
         """Handle start_recording. Uses POST /api/start_recording."""
         from openhands.events.observation import CmdOutputObservation, ErrorObservation
 
         try:
-            r = self._nvcf_client.post("/start_recording", timeout=10.0)
+            r = self._nvcf_post("/start_recording", timeout=10.0)
             if r.status_code == 200:
                 return CmdOutputObservation(
                     content="Recording started",
@@ -664,7 +760,7 @@ class OSWorldNVCFRuntime(NVCFRuntime):
         import base64
 
         try:
-            r = self._nvcf_client.post("/end_recording", timeout=60.0)
+            r = self._nvcf_post("/end_recording", timeout=60.0)
             if r.status_code == 200:
                 video_content = r.content
                 content_b64 = base64.b64encode(video_content).decode("utf-8")
@@ -682,7 +778,7 @@ class OSWorldNVCFRuntime(NVCFRuntime):
         from openhands.events.observation import CmdOutputObservation
 
         try:
-            r = self._nvcf_client.get("/platform", timeout=10.0)
+            r = self._nvcf_get("/platform", timeout=30.0)
             if r.status_code == 200:
                 platform_str = (r.text or "").strip()
                 return CmdOutputObservation(
@@ -709,7 +805,7 @@ class OSWorldNVCFRuntime(NVCFRuntime):
             if hasattr(self, "screen_size") and self.screen_size:
                 width, height = self.screen_size
             else:
-                r = self._nvcf_client.post("/screen_size", timeout=10.0)
+                r = self._nvcf_post("/screen_size", timeout=30.0)
                 if r.status_code != 200:
                     return ErrorObservation(f"Failed to get screen size: {r.status_code}")
                 size = r.json()
@@ -730,7 +826,7 @@ class OSWorldNVCFRuntime(NVCFRuntime):
         app = params.get("app_class_name", "") or "window"
         try:
             payload = {"command": ["wmctrl", "-l", "-G"], "shell": False}
-            r = self._nvcf_client.post("/execute", json=payload, timeout=10.0)
+            r = self._nvcf_post("/execute", json=payload, timeout=30.0)
             if r.status_code == 200:
                 res = r.json()
                 out = (res.get("output") or "").strip()
@@ -758,7 +854,7 @@ class OSWorldNVCFRuntime(NVCFRuntime):
         import base64
 
         try:
-            r = self._nvcf_client.post("/wallpaper", timeout=30.0)
+            r = self._nvcf_post("/wallpaper", timeout=30.0)
             if r.status_code == 200:
                 wallpaper_bytes = r.content
                 content_b64 = base64.b64encode(wallpaper_bytes).decode("utf-8")
@@ -776,7 +872,7 @@ class OSWorldNVCFRuntime(NVCFRuntime):
         from openhands.events.observation import CmdOutputObservation, ErrorObservation
 
         try:
-            r = self._nvcf_client.post("/desktop_path", timeout=10.0)
+            r = self._nvcf_post("/desktop_path", timeout=30.0)
             if r.status_code == 200:
                 desktop_path = r.json().get("desktop_path", "")
                 return CmdOutputObservation(
@@ -797,7 +893,7 @@ class OSWorldNVCFRuntime(NVCFRuntime):
         if not path:
             return ErrorObservation("path parameter required")
         try:
-            r = self._nvcf_client.post(
+            r = self._nvcf_post(
                 "/list_directory",
                 json={"path": path},
                 timeout=30.0,

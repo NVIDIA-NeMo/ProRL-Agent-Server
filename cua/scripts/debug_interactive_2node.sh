@@ -15,7 +15,8 @@ PROJECT_ROOT="/lustre/fsw/portfolios/nvr/users/bcui/ProRL-Agent-Server"
 PROJECT_DIR="$PROJECT_ROOT/cua"
 
 PLANNER_MODEL="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/models/Qwen3-VL-235B-A22B-Thinking"
-ACTOR_MODEL="ByteDance-Seed/UI-TARS-1.5-7B"
+# ACTOR_MODEL="ByteDance-Seed/UI-TARS-1.5-7B"
+ACTOR_MODEL="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/bcui/huggingface_models/UI-TARS-1.5-7B"
 
 PLANNER_PORT=8000
 ACTOR_PORT=8000
@@ -26,7 +27,7 @@ echo "[Local] Submitting 2-node GPU job..."
 JOB_ID=$(sbatch --parsable \
     --job-name=debug_2node \
     --account=llmservice_fm_vision \
-    --partition=batch_block1 \
+    --partition=interactive \
     --reservation=sla_res_osworld_agent_vlm \
     --gpus-per-node=8 \
     --nodes=2 \
@@ -123,6 +124,7 @@ ssh -q -o StrictHostKeyChecking=no "$ACTOR_NODE" \
     "enroot exec $ACTOR_PID bash -c '
       mkdir -p $PROJECT_DIR/scripts/logs
       nohup vllm serve $ACTOR_MODEL \
+        --served-model-name ByteDance-Seed/UI-TARS-1.5-7B \
         --api-key gen \
         --tensor-parallel-size 4 \
         --limit-mm-per-prompt.image 5 \

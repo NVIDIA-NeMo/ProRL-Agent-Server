@@ -42,6 +42,11 @@ class DataCollector:
         self.vm_image_path = args.vm_image_path
         self.os_type = 'linux' if 'Ubuntu' in self.vm_image_path else 'windows'
 
+        # Runtime type: "singularity" (local KVM) or "nvcf" (NVIDIA Cloud Functions)
+        self.runtime_type = getattr(args, 'runtime', 'singularity')
+        self.nvcf_api_key = getattr(args, 'nvcf_api_key', None)
+        self.nvcf_org = getattr(args, 'nvcf_org', None)
+
         self.max_steps_per_trajectory = args.max_steps_per_trajectory
         self.max_steps_per_goal = args.max_steps_per_goal
 
@@ -117,10 +122,15 @@ class DataCollector:
 
         logger.debug(f"✓ [save_trajectory] Saved to {str(trajectory_save_dir / 'trajectory.json')}")
 
-    async def init_runtime_for_job(self, trajectory_idx: int) -> Tuple:
+    async def init_runtime_for_job(self, trajectory_idx: int,
+                                   nvcf_function_id: str = None,
+                                   nvcf_version_id: str = None) -> Tuple:
         """
         Stage 1: Initialize the VM and OSWorld setup.
         Returns: (runtime, trajectory, trajectory_save_dir, trajectory_id, osworld_setup)
+
+        For NVCF runtime, nvcf_function_id and nvcf_version_id should be provided
+        (acquired from the NVCFPool).
         """
         # Create unique IDs
         job_id = f"job_{trajectory_idx:04d}"
@@ -142,7 +152,12 @@ class DataCollector:
 
         # Initialize Runtime (Async)
         runtime = await EnvController.initialize_runtime(
-            job_id, self.vm_image_path, self.os_type, osworld_setup
+            job_id, self.vm_image_path, self.os_type, osworld_setup,
+            runtime_type=self.runtime_type,
+            nvcf_function_id=nvcf_function_id,
+            nvcf_version_id=nvcf_version_id,
+            nvcf_api_key=self.nvcf_api_key,
+            nvcf_org=self.nvcf_org,
         )
 
         # Get screen size

@@ -35,7 +35,7 @@ dotenv.load_dotenv()
 
 FILE_PATH = os.path.dirname(os.path.abspath(__file__))
 
-MAX_RETRIES = 20
+MAX_RETRIES = 5
 
 from openhands.nvidia.os_world import metrics, getters
 
@@ -102,7 +102,7 @@ def compare_urls(url1, url2, full=True):
     return norm_url1 == norm_url2
 
 class SetupController:
-    def __init__(self, vm_ip: str, server_port: int = 5000, chromium_port: int = 9222, vlc_port: int = 8080, cache_dir: str = "cache", client_password: str = "", screen_width: int = 1920, screen_height: int = 1080, runtime=None):
+    def __init__(self, vm_ip: str, server_port: int = 5000, chromium_port: int = 9222, vlc_port: int = 8080, cache_dir: str = "cache", client_password: str = "", screen_width: int = 1920, screen_height: int = 1080, runtime=None, http_client=None):
         self.vm_ip: str = vm_ip
         self.server_port: int = server_port
         self.chromium_port: int = chromium_port
@@ -114,7 +114,39 @@ class SetupController:
         self.screen_width: int = screen_width
         self.screen_height: int = screen_height
         self.runtime = runtime  # Runtime object for interacting with the environment
+        self.http_client = http_client  # Optional HTTP client (e.g. NVCFHttpClient) for routing VM requests
         self.additional_wait_time = 3
+
+    def _vm_post(self, endpoint: str, **kwargs) -> requests.Response:
+        """POST to the VM server, routing through http_client if available."""
+        if self.http_client:
+            return self.http_client.post(endpoint, **kwargs)
+        url = self.http_server + endpoint
+        return requests.post(url, **kwargs)
+
+    def _vm_get(self, endpoint: str, **kwargs) -> requests.Response:
+        """GET from the VM server, routing through http_client if available."""
+        if self.http_client:
+            return self.http_client.get(endpoint, **kwargs)
+        url = self.http_server + endpoint
+        return requests.get(url, **kwargs)
+
+    def _get_cdp_url(self) -> str:
+        """Get the Chrome DevTools Protocol URL.
+
+        Always uses the local address since:
+        - Singularity: vm_ip=127.0.0.1, chromium_port=actual Chrome port
+        - NVCF: vm_ip=127.0.0.1, chromium_port=local proxy port (proxy adds auth headers)
+        Playwright's connect_over_cdp() can't send custom auth headers on WebSocket,
+        so we must go through the local proxy for NVCF rather than direct to the NVCF WSS URL.
+        """
+        return f"http://{self.vm_ip}:{self.chromium_port}"
+
+    def _get_cdp_headers(self) -> Optional[Dict[str, str]]:
+        """Get CDP headers (for NVCF auth), or None for direct connections."""
+        if self.http_client and hasattr(self.http_client, 'get_cdp_headers'):
+            return self.http_client.get_cdp_headers()
+        return None
 
     def reset_cache_dir(self, cache_dir: str):
         self.cache_dir = cache_dir
@@ -323,8 +355,8 @@ class SetupController:
                         logger.debug(form.content_type)
 
                         # Explicit connect/read timeout to avoid hanging forever
-                        response = requests.post(
-                            self.http_server + "/setup" + "/upload",
+                        response = self._vm_post(
+                            "/setup/upload",
                             headers=headers,
                             data=form,
                             timeout=(10, 600)
@@ -366,7 +398,7 @@ class SetupController:
         # send request to server to change wallpaper
         # Note: This uses a custom /setup endpoint, not a standard OSWorld method
         try:
-            response = requests.post(self.http_server + "/setup" + "/change_wallpaper", headers=headers, data=payload)
+            response = self._vm_post("/setup/change_wallpaper", headers=headers, data=payload)
             if response.status_code == 200:
                 logger.info("Command executed successfully: %s", response.text)
             else:
@@ -394,7 +426,7 @@ class SetupController:
         try:
             # The server-side call is now blocking and can take time.
             # We set a timeout that is slightly longer than the server's timeout (1800s).
-            response = requests.post(self.http_server + "/setup" + "/open_file", headers=headers, data=payload, timeout=1810)
+            response = self._vm_post("/setup/open_file", headers=headers, data=payload, timeout=1810)
             response.raise_for_status()  # This will raise an exception for 4xx and 5xx status codes
             logger.info("Command executed successfully: %s", response.text)
             time.sleep(self.additional_wait_time)
@@ -532,13 +564,18 @@ class SetupController:
             logger.warning("Command should be a list of strings. Now it is a string. Will split it by space.")
             command = command.split()
 
+        # For NVCF, rewrite launch commands (e.g. Chrome flags differ on cloud VMs)
+        if self.http_client and hasattr(self.http_client, 'update_launch_command'):
+            command = self.http_client.update_launch_command(command)
+
         payload = json.dumps({"command": command, "shell": shell})
         headers = {"Content-Type": "application/json"}
 
         # Note: This uses a custom /setup endpoint, not a standard OSWorld method
         try:
-            logger.info("REQUEST ADDRESS: %s", self.http_server + "/setup" + "/launch")
-            response = requests.post(self.http_server + "/setup" + "/launch", headers=headers, data=payload)
+            target = "NVCF" if self.http_client else (self.http_server + "/setup/launch")
+            logger.info("REQUEST ADDRESS: %s", target)
+            response = self._vm_post("/setup/launch", headers=headers, data=payload, timeout=300)
             if response.status_code == 200:
                 logger.info("Command executed successfully: %s", response.text)
             else:
@@ -611,7 +648,7 @@ class SetupController:
         # Execute using runtime
         while not terminates:
             try:
-                response = requests.post(self.http_server + "/setup" + "/execute", headers=headers, data=payload)
+                response = self._vm_post("/setup/execute", headers=headers, data=payload, timeout=300)
                 if response.status_code == 200:
                     results: Dict[str, str] = response.json()
                     if stdout:
@@ -683,7 +720,7 @@ class SetupController:
 
         # Note: This uses a custom /setup endpoint, not a standard OSWorld method
         try:
-            response = requests.post(self.http_server + "/setup" + "/execute_with_verification",
+            response = self._vm_post("/setup/execute_with_verification",
                                    headers=headers, data=payload, timeout=max_wait_time + 10)
             if response.status_code == 200:
                 result = response.json()
@@ -734,7 +771,7 @@ class SetupController:
         # send request to server to open file
         # Note: This uses a custom /setup endpoint, not a standard OSWorld method
         try:
-            response = requests.post(self.http_server + "/setup" + "/activate_window", headers=headers, data=payload)
+            response = self._vm_post("/setup/activate_window", headers=headers, data=payload)
             if response.status_code == 200:
                 logger.info("Command executed successfully: %s", response.text)
             else:
@@ -758,7 +795,7 @@ class SetupController:
         # send request to server to open file
         # Note: This uses a custom /setup endpoint, not a standard OSWorld method
         try:
-            response = requests.post(self.http_server + "/setup" + "/close_window", headers=headers, data=payload)
+            response = self._vm_post("/setup/close_window", headers=headers, data=payload)
             if response.status_code == 200:
                 logger.info("Command executed successfully: %s", response.text)
             else:
@@ -771,13 +808,36 @@ class SetupController:
         if not self.runtime:
             raise Exception("Runtime is required for SetupController. Please provide a runtime object.")
 
-        host = self.vm_ip
-        port = self.chromium_port  # fixme: this port is hard-coded, need to be changed from config file
+        # Pre-validate: check if Chrome DevTools is reachable via NVCF before Playwright retries
+        if self.http_client and hasattr(self.http_client, 'get_cdp_headers'):
+            r = None
+            for pre_attempt in range(3):
+                try:
+                    cdp_headers = self.http_client.get_cdp_headers()
+                    r = requests.get(
+                        "https://grpc.nvcf.nvidia.com/chrome/json/version",
+                        headers=cdp_headers,
+                        timeout=10.0,
+                    )
+                    if r.status_code == 200:
+                        logger.info("Chrome pre-check passed (HTTP 200)")
+                        break
+                    logger.warning(f"Chrome pre-check attempt {pre_attempt+1}/3: HTTP {r.status_code}")
+                except Exception as e:
+                    logger.warning(f"Chrome pre-check attempt {pre_attempt+1}/3: {e}")
+                if pre_attempt < 2:
+                    time.sleep(5)
+                else:
+                    raise Exception(
+                        f"Chrome DevTools unreachable after 3 pre-check attempts "
+                        f"(last status: {getattr(r, 'status_code', 'N/A')}). "
+                        f"Chrome or socat likely crashed inside the VM."
+                    )
 
-        remote_debugging_url = f"http://{host}:{port}"
+        remote_debugging_url = self._get_cdp_url()
         logger.info("Connect to Chrome @: %s", remote_debugging_url)
         logger.debug("PLAYWRIGHT ENV: %s", repr(os.environ))
-        for attempt in range(15):
+        for attempt in range(5):
             if attempt > 0:
                 time.sleep(5)
 
@@ -787,12 +847,11 @@ class SetupController:
                     browser = await p.chromium.connect_over_cdp(remote_debugging_url)
                     # break
                 except Exception as e:
-                    if attempt < 14:
+                    if attempt < 4:
                         logger.error(f"Attempt {attempt + 1}: Failed to connect, retrying. Error: {e}")
-                        # time.sleep(10)
                         continue
                     else:
-                        logger.error(f"Failed to connect after multiple attempts: {e}")
+                        logger.error(f"Failed to connect after 5 attempts: {e}")
                         raise e
 
                 if not browser:
@@ -825,22 +884,19 @@ class SetupController:
 
         time.sleep(5)  # Wait for Chrome to finish launching
 
-        host = self.vm_ip
-        port = self.chromium_port  # fixme: this port is hard-coded, need to be changed from config file
-
-        remote_debugging_url = f"http://{host}:{port}"
+        remote_debugging_url = self._get_cdp_url()
         async with async_playwright() as p:
             browser = None
-            for attempt in range(15):
+            for attempt in range(5):
                 try:
                     browser = await p.chromium.connect_over_cdp(remote_debugging_url)
                     break
                 except Exception as e:
-                    if attempt < 14:
+                    if attempt < 4:
                         logger.error(f"Attempt {attempt + 1}: Failed to connect, retrying. Error: {e}")
                         time.sleep(5)
                     else:
-                        logger.error(f"Failed to connect after multiple attempts: {e}")
+                        logger.error(f"Failed to connect after 5 attempts: {e}")
                         raise e
 
             if not browser:
@@ -962,22 +1018,19 @@ class SetupController:
         if not self.runtime:
             raise Exception("Runtime is required for SetupController. Please provide a runtime object.")
 
-        host = self.vm_ip
-        port = self.chromium_port
-
-        remote_debugging_url = f"http://{host}:{port}"
+        remote_debugging_url = self._get_cdp_url()
         async with async_playwright() as p:
             browser = None
-            for attempt in range(15):
+            for attempt in range(5):
                 try:
                     browser = await p.chromium.connect_over_cdp(remote_debugging_url)
                     break
                 except Exception as e:
-                    if attempt < 14:
+                    if attempt < 4:
                         logger.error(f"Attempt {attempt + 1}: Failed to connect, retrying. Error: {e}")
                         time.sleep(5)
                     else:
-                        logger.error(f"Failed to connect after multiple attempts: {e}")
+                        logger.error(f"Failed to connect after 5 attempts: {e}")
                         raise e
             if not browser:
                 return
@@ -1025,7 +1078,7 @@ class SetupController:
 
         for _ in range(3):
             try:
-                response = requests.post(self.http_server + "/execute", headers={'Content-Type': 'application/json'},
+                response = self._vm_post("/execute", headers={'Content-Type': 'application/json'},
                                          data=payload, timeout=90)
                 if response.status_code == 200:
                     logger.info("Command executed successfully: %s", response.text)
@@ -1139,7 +1192,7 @@ class SetupController:
             # send request to server to upload file
             try:
                 logger.debug("REQUEST ADDRESS: %s", self.http_server + "/setup" + "/upload")
-                response = requests.post(self.http_server + "/setup" + "/upload", headers=headers, data=form)
+                response = self._vm_post("/setup/upload", headers=headers, data=form)
                 if response.status_code == 200:
                     logger.info("Command executed successfully: %s", response.text)
                 else:
