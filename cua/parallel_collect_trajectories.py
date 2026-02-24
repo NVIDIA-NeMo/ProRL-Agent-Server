@@ -179,6 +179,13 @@ class ParallelTrajectoryGenerator:
                 job_details.completed = False  # Failed
                 job_details.event.set()  # Signal main thread we are done (failed)
 
+                # Close runtime if it was stored (stops keepalive thread, proxies, etc.)
+                if job_details.runtime:
+                    try:
+                        job_details.runtime.close()
+                    except Exception:
+                        pass
+
                 # Release NVCF function back to pool on failure (health-check first)
                 if self.nvcf_pool and job_details.nvcf_function_id:
                     self.nvcf_pool.release_or_replace(job_details.nvcf_function_id, job_details.nvcf_version_id)

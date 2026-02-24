@@ -150,6 +150,11 @@ class DataCollector:
             else:
                 osworld_setup_ready = True
 
+        logger.info(f"[job {trajectory_idx:04d}] Sampled OSWorld config: id={osworld_setup.get('id', 'unknown')}, "
+                     f"snapshot={osworld_setup.get('snapshot', 'unknown')}, "
+                     f"apps={osworld_setup.get('related_apps', [])}, "
+                     f"instruction={osworld_setup.get('instruction', '')[:80]}")
+
         # Initialize Runtime (Async)
         runtime = await EnvController.initialize_runtime(
             job_id, self.vm_image_path, self.os_type, osworld_setup,

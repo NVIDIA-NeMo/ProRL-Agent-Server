@@ -119,9 +119,52 @@ class OSWorldNVCFRuntime(NVCFRuntime):
         )
         self._keepalive_thread.start()
 
+        # Soft-reset VM state from previous job (kill leftover apps, clear temp files)
+        # self._reset_vm()
+        self.log("info", "Skipping VM soft-reset")
+
         # Start local proxies for Chrome DevTools and VLC
         self._start_local_proxies()
     
+    def _reset_vm(self) -> None:
+        """Soft-reset VM state between jobs: kill leftover apps, clear temp files."""
+        script = """
+# Kill all user Chrome processes
+pkill -f chrome || true
+pkill -f chromium || true
+
+# Kill common leftover apps from OSWorld tasks
+pkill -f thunderbird || true
+pkill -f libreoffice || true
+pkill -f vlc || true
+pkill -f gimp || true
+pkill -f nautilus || true
+pkill -f gedit || true
+pkill -f code || true
+
+# Clean temp files
+rm -rf /tmp/tmp* 2>/dev/null || true
+rm -rf /home/user/Downloads/* 2>/dev/null || true
+
+# Clear Chrome session/cache state
+rm -rf /home/user/.config/google-chrome/Default/Sessions/* 2>/dev/null || true
+rm -rf /home/user/.config/google-chrome/Default/Current* 2>/dev/null || true
+rm -rf /home/user/.cache/google-chrome/* 2>/dev/null || true
+
+# Remove files uploaded to Desktop by previous jobs
+find /home/user/Desktop -maxdepth 1 -newer /etc/hostname -delete 2>/dev/null || true
+
+sleep 1
+"""
+        try:
+            r = self._nvcf_post("/run_bash_script", json={"script": script, "timeout": 30})
+            if r.status_code == 200:
+                self.log("info", "VM soft-reset completed successfully")
+            else:
+                self.log("warning", f"VM soft-reset returned HTTP {r.status_code}")
+        except Exception as e:
+            self.log("warning", f"VM soft-reset failed: {e}")
+
     def _nvcf_keepalive_loop(self) -> None:
         """Ping the NVCF function every 20s to prevent session idle timeout."""
         while not self._keepalive_stop.wait(20.0):

@@ -84,7 +84,19 @@ class EnvController:
                     runtime=runtime,
                     http_client=http_client,
                 )
-                await setup_controller.setup(osworld_setup['config'])
+                try:
+                    await setup_controller.setup(osworld_setup['config'])
+                except Exception as e:
+                    # Close runtime to stop keepalive thread and release resources
+                    try:
+                        runtime.close()
+                    except Exception:
+                        pass
+                    raise Exception(
+                        f"Setup failed for config id={osworld_setup.get('id', 'unknown')} "
+                        f"snapshot={osworld_setup.get('snapshot', 'unknown')} "
+                        f"apps={osworld_setup.get('related_apps', [])}: {e}"
+                    ) from e
                 logger.debug(f"[initialize_runtime] OSWorld setup completed")
 
         else:
@@ -116,7 +128,19 @@ class EnvController:
                     client_password="password",
                     runtime=runtime
                 )
-                await setup_controller.setup(osworld_setup['config'])
+                try:
+                    await setup_controller.setup(osworld_setup['config'])
+                except Exception as e:
+                    # Close runtime to stop keepalive thread and release resources
+                    try:
+                        runtime.close()
+                    except Exception:
+                        pass
+                    raise Exception(
+                        f"Setup failed for config id={osworld_setup.get('id', 'unknown')} "
+                        f"snapshot={osworld_setup.get('snapshot', 'unknown')} "
+                        f"apps={osworld_setup.get('related_apps', [])}: {e}"
+                    ) from e
                 logger.debug(f"[initialize_runtime] OSWorld setup completed")
             else:
                 logger.debug(f"[initialize_runtime] No OSWorld setup provided")
