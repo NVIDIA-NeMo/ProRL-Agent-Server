@@ -372,7 +372,7 @@ async def main():
             nvcf_org=org,
         )
         logger.info(f"Deploying {args.max_parallel} NVCF functions (this may take several minutes)...")
-        nvcf_pool.deploy_all()
+        nvcf_pool.deploy_all(args.max_parallel)
         logger.info("NVCF pool ready.")
 
     try:
