@@ -148,6 +148,38 @@ class SetupController:
             return self.http_client.get_cdp_headers()
         return None
 
+    def _restart_vm_services(self, services: str = "chrome"):
+        """Restart crashed services inside the VM via bash script.
+
+        Args:
+            services: Which services to restart. "chrome" restarts Chrome + socat.
+        """
+        if services == "chrome":
+            script = """
+# Restart Chrome and socat (CDP proxy)
+pkill -9 -f socat || true
+pkill -9 -f 'chrome' || true
+sleep 2
+
+# Re-launch socat to proxy Chrome DevTools (port 9222 -> NVCF /chrome path)
+nohup socat TCP-LISTEN:9222,fork,reuseaddr TCP:127.0.0.1:9223 &>/dev/null &
+
+# Re-launch Chrome
+nohup google-chrome-wrapper --remote-debugging-port=9223 --remote-debugging-address=127.0.0.1 --remote-allow-origins=* --no-first-run --no-default-browser-check --disable-infobars --disable-session-crashed-bubble --disable-features=TranslateUI --start-maximized &>/dev/null &
+sleep 3
+"""
+        else:
+            return
+
+        try:
+            r = self._vm_post("/run_bash_script", json={"script": script, "timeout": 30}, timeout=60)
+            if r.status_code == 200:
+                logger.info(f"VM service restart ({services}) completed successfully")
+            else:
+                logger.warning(f"VM service restart ({services}) returned HTTP {r.status_code}")
+        except Exception as e:
+            logger.warning(f"VM service restart ({services}) failed: {e}")
+
     def reset_cache_dir(self, cache_dir: str):
         self.cache_dir = cache_dir
 
@@ -423,16 +455,28 @@ class SetupController:
 
         # send request to server to open file
         # Note: This uses a custom /setup endpoint, not a standard OSWorld method
-        try:
-            # The server-side call is now blocking and can take time.
-            # We set a timeout that is slightly longer than the server's timeout (1800s).
-            response = self._vm_post("/setup/open_file", headers=headers, data=payload, timeout=1810)
-            response.raise_for_status()  # This will raise an exception for 4xx and 5xx status codes
-            logger.info("Command executed successfully: %s", response.text)
-            time.sleep(self.additional_wait_time)
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to open file '{path}'. An error occurred while trying to send the request or the server responded with an error: {e}")
-            raise Exception(f"Failed to open file '{path}'. An error occurred while trying to send the request or the server responded with an error: {e}") from e
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                # The server-side call is now blocking and can take time.
+                # We set a timeout that is slightly longer than the server's timeout (1800s).
+                response = self._vm_post("/setup/open_file", headers=headers, data=payload, timeout=1810)
+                response.raise_for_status()  # This will raise an exception for 4xx and 5xx status codes
+                logger.info("Command executed successfully: %s", response.text)
+                time.sleep(self.additional_wait_time)
+                return  # Success
+            except requests.exceptions.RequestException as e:
+                status = getattr(getattr(e, 'response', None), 'status_code', None)
+                if status in (502, 503, 504) and attempt < max_retries - 1:
+                    wait_time = 20 * (attempt + 1)
+                    logger.warning(
+                        f"open_file attempt {attempt + 1}/{max_retries} failed for '{path}' "
+                        f"(HTTP {status}). Retrying in {wait_time}s..."
+                    )
+                    time.sleep(wait_time)
+                    continue
+                logger.error(f"Failed to open file '{path}'. An error occurred while trying to send the request or the server responded with an error: {e}")
+                raise Exception(f"Failed to open file '{path}'. An error occurred while trying to send the request or the server responded with an error: {e}") from e
 
     def _ensure_launch_command_finish(self, command):
         if isinstance(command, list):
@@ -810,8 +854,9 @@ class SetupController:
 
         # Pre-validate: check if Chrome DevTools is reachable via NVCF before Playwright retries
         if self.http_client and hasattr(self.http_client, 'get_cdp_headers'):
+            max_pre_checks = 8
             r = None
-            for pre_attempt in range(3):
+            for pre_attempt in range(max_pre_checks):
                 try:
                     cdp_headers = self.http_client.get_cdp_headers()
                     r = requests.get(
@@ -822,14 +867,22 @@ class SetupController:
                     if r.status_code == 200:
                         logger.info("Chrome pre-check passed (HTTP 200)")
                         break
-                    logger.warning(f"Chrome pre-check attempt {pre_attempt+1}/3: HTTP {r.status_code}")
+                    logger.warning(f"Chrome pre-check attempt {pre_attempt+1}/{max_pre_checks}: HTTP {r.status_code}")
                 except Exception as e:
-                    logger.warning(f"Chrome pre-check attempt {pre_attempt+1}/3: {e}")
-                if pre_attempt < 2:
-                    time.sleep(5)
+                    logger.warning(f"Chrome pre-check attempt {pre_attempt+1}/{max_pre_checks}: {e}")
+
+                # After 3 consecutive failures, try restarting Chrome/socat inside the VM
+                if pre_attempt == 2:
+                    logger.warning("Chrome pre-check failed 3 times, attempting VM-side Chrome restart...")
+                    self._restart_vm_services("chrome")
+
+                if pre_attempt < max_pre_checks - 1:
+                    wait_time = 10 * (pre_attempt + 1)
+                    logger.info(f"Waiting {wait_time}s before next Chrome pre-check...")
+                    time.sleep(wait_time)
                 else:
                     raise Exception(
-                        f"Chrome DevTools unreachable after 3 pre-check attempts "
+                        f"Chrome DevTools unreachable after {max_pre_checks} pre-check attempts "
                         f"(last status: {getattr(r, 'status_code', 'N/A')}). "
                         f"Chrome or socat likely crashed inside the VM."
                     )

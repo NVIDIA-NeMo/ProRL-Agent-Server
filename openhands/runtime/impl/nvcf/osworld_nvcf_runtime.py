@@ -95,10 +95,11 @@ class OSWorldNVCFRuntime(NVCFRuntime):
         # Verify endpoint and capture NVCF session headers
         r = self._nvcf_client.get("/screenshot", timeout=15.0)
         if r.status_code != 200:
+            body = r.text[:500]
             self._nvcf_client.close()
             self._nvcf_client = None
             raise AgentRuntimeDisconnectedError(
-                f"NVCF function returned HTTP {r.status_code}"
+                f"NVCF function returned HTTP {r.status_code}: {body}"
             )
         # NVCF stateful functions return session routing headers — persist them
         self._nvcf_session_headers = {}
@@ -120,41 +121,42 @@ class OSWorldNVCFRuntime(NVCFRuntime):
         self._keepalive_thread.start()
 
         # Soft-reset VM state from previous job (kill leftover apps, clear temp files)
-        # self._reset_vm()
-        self.log("info", "Skipping VM soft-reset")
+        self._reset_vm()
+        # self.log("info", "Skipping VM soft-reset")
 
         # Start local proxies for Chrome DevTools and VLC
         self._start_local_proxies()
     
     def _reset_vm(self) -> None:
-        """Soft-reset VM state between jobs: kill leftover apps, clear temp files."""
+        """Soft-reset VM state between jobs: kill leftover apps, clear temp files.
+        
+        Important: Do NOT kill chrome, chromium, or socat -- these are part of the
+        VM base state and are expected by setup steps (_chrome_open_tabs_setup uses
+        socat to proxy Chrome DevTools). Setup will re-launch them if needed.
+        """
         script = """
-# Kill all user Chrome processes
-pkill -f chrome || true
-pkill -f chromium || true
-
 # Kill common leftover apps from OSWorld tasks
+# NOTE: Do NOT kill chrome/chromium/socat - they are part of the VM base state
 pkill -f thunderbird || true
 pkill -f libreoffice || true
 pkill -f vlc || true
 pkill -f gimp || true
 pkill -f nautilus || true
 pkill -f gedit || true
-pkill -f code || true
+pkill -f "code " || true
+pkill -f evince || true
+pkill -f eog || true
 
-# Clean temp files
-rm -rf /tmp/tmp* 2>/dev/null || true
+# Clean temp files (screenshot temp files + general tmp)
+rm -f /tmp/tmp*.png 2>/dev/null || true
+rm -f /tmp/tmp*.jpg 2>/dev/null || true
+rm -rf /tmp/tmp[A-Za-z0-9_]* 2>/dev/null || true
 rm -rf /home/user/Downloads/* 2>/dev/null || true
 
-# Clear Chrome session/cache state
-rm -rf /home/user/.config/google-chrome/Default/Sessions/* 2>/dev/null || true
-rm -rf /home/user/.config/google-chrome/Default/Current* 2>/dev/null || true
-rm -rf /home/user/.cache/google-chrome/* 2>/dev/null || true
-
 # Remove files uploaded to Desktop by previous jobs
-find /home/user/Desktop -maxdepth 1 -newer /etc/hostname -delete 2>/dev/null || true
+find /home/user/Desktop -maxdepth 1 -newer /etc/hostname -not -name "*.desktop" -delete 2>/dev/null || true
 
-sleep 1
+sleep 0.5
 """
         try:
             r = self._nvcf_post("/run_bash_script", json={"script": script, "timeout": 30})
@@ -334,7 +336,8 @@ sleep 1
             except Exception as e:
                 self.log("warning", f"Screenshot attempt {attempt + 1}/{max_retries} failed: {e}")
             if attempt < max_retries - 1:
-                time.sleep(5.0)
+                backoff = min(5 * (2 ** attempt), 30)  # 5s, 10s, 20s, 30s
+                time.sleep(backoff)
         self.log("error", f"Failed to get VM screenshot after {max_retries} retries (fn={self._nvcf_function_id})")
         return None
 
@@ -370,7 +373,8 @@ sleep 1
             except Exception as e:
                 self.log("warning", f"Execute attempt {attempt + 1}/{max_retries} failed: {e}")
             if attempt < max_retries - 1:
-                time.sleep(5.0)
+                backoff = min(5 * (2 ** attempt), 30)  # 5s, 10s, 20s, 30s
+                time.sleep(backoff)
         return {"status": "error", "message": f"Failed after {max_retries} retries"}
 
     def _action_to_pyautogui_command(self, action_type: str, parameters: dict) -> str | None:

@@ -310,16 +310,30 @@ class SetupController:
 
         # send request to server to open file
         # Note: This uses a custom /setup endpoint, not a standard OSWorld method
-        try:
-            # The server-side call is now blocking and can take time.
-            # We set a timeout that is slightly longer than the server's timeout (1800s).
-            response = self._post("/setup/open_file", headers=headers, data=payload, timeout=1810)
-            response.raise_for_status()  # This will raise an exception for 4xx and 5xx status codes
-            logger.info("Command executed successfully: %s", response.text)
-            time.sleep(self.additional_wait_time)
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to open file '{path}'. An error occurred while trying to send the request or the server responded with an error: {e}")
-            raise Exception(f"Failed to open file '{path}'. An error occurred while trying to send the request or the server responded with an error: {e}") from e
+        max_retries = 3
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                # The server-side call is now blocking and can take time.
+                # We set a timeout that is slightly longer than the server's timeout (1800s).
+                response = self._post("/setup/open_file", headers=headers, data=payload, timeout=1810)
+                response.raise_for_status()  # This will raise an exception for 4xx and 5xx status codes
+                logger.info("Command executed successfully: %s", response.text)
+                time.sleep(self.additional_wait_time)
+                return  # Success
+            except requests.exceptions.RequestException as e:
+                last_error = e
+                status = getattr(getattr(e, 'response', None), 'status_code', None)
+                if status in (502, 503, 504) and attempt < max_retries - 1:
+                    wait_time = 10 * (attempt + 1)
+                    logger.warning(
+                        f"open_file attempt {attempt + 1}/{max_retries} failed for '{path}' "
+                        f"(HTTP {status}). Retrying in {wait_time}s..."
+                    )
+                    time.sleep(wait_time)
+                    continue
+                logger.error(f"Failed to open file '{path}'. An error occurred while trying to send the request or the server responded with an error: {e}")
+                raise Exception(f"Failed to open file '{path}'. An error occurred while trying to send the request or the server responded with an error: {e}") from e
 
     def _ensure_launch_command_finish(self, command):
         if isinstance(command, list):

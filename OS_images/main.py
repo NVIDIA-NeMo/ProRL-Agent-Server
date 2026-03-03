@@ -346,16 +346,33 @@ def capture_screen_with_cursor():
         pyautogui.moveTo(current_x, current_y)
         # =====================================
 
-        cursor_obj = Xcursor()
-        imgarray = cursor_obj.getCursorImageArrayFast()
-        cursor_img = Image.fromarray(imgarray)
+        max_screenshot_attempts = 3
+        for _screenshot_attempt in range(max_screenshot_attempts):
+            try:
+                cursor_obj = Xcursor()
+                imgarray = cursor_obj.getCursorImageArrayFast()
+                cursor_img = Image.fromarray(imgarray)
 
-        # Taking screenshot after the wake-up
-        screenshot = pyautogui.screenshot()
+                # Taking screenshot after the wake-up
+                screenshot = pyautogui.screenshot()
 
-        cursor_x, cursor_y = pyautogui.position()
-        screenshot.paste(cursor_img, (cursor_x, cursor_y), cursor_img)
-        screenshot.save(file_path)
+                cursor_x, cursor_y = pyautogui.position()
+                screenshot.paste(cursor_img, (cursor_x, cursor_y), cursor_img)
+                screenshot.save(file_path)
+                break  # Success
+            except Exception as e:
+                logger.warning(f"Screenshot attempt {_screenshot_attempt + 1}/{max_screenshot_attempts} failed: {e}")
+                # Clean up stale temp files that may cause PIL errors
+                import glob
+                for tmp_png in glob.glob("/tmp/tmp*.png"):
+                    try:
+                        os.remove(tmp_png)
+                    except OSError:
+                        pass
+                if _screenshot_attempt == max_screenshot_attempts - 1:
+                    logger.error(f"All {max_screenshot_attempts} screenshot attempts failed, returning error")
+                    return jsonify({"status": "error", "message": f"Screenshot failed: {e}"}), 503
+                time.sleep(0.5)
     elif user_platform == "Darwin":  # (Mac OS)
         # Use the screencapture utility to capture the screen with the cursor
         subprocess.run(["screencapture", "-C", file_path])
@@ -3773,4 +3790,4 @@ def run_bash_script():
             pass
 
 if __name__ == '__main__':
-    app.run(debug=True, host="0.0.0.0")
+    app.run(debug=False, host="0.0.0.0")

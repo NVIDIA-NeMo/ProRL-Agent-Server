@@ -340,8 +340,11 @@ def parse_args():
     # Parallel specific args
     parser.add_argument("--max_parallel", type=int, default=24, help="Max concurrent VMs")
     parser.add_argument(
-        "--max_trajectories", type=int, default=10000, help="Total trajectories to generate"
-    )
+        "--max_trajectories", type=int, default=10000, help="Total trajectories to generate")
+    parser.add_argument(
+        "--num_vms_per_instance", type=int, default=1,
+        help="Number of VM instances per NVCF function (subdivides one machine into multiple VMs)")
+    
 
     return parser.parse_args()
 
@@ -368,6 +371,7 @@ async def main():
 
         nvcf_pool = NVCFPool(
             pool_size=args.max_parallel,
+            num_vms_per_instance=args.num_vms_per_instance,
             nvcf_api_key=api_key,
             nvcf_org=org,
         )

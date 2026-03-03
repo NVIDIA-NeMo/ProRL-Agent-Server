@@ -1,11 +1,15 @@
 """Configuration dataclasses for OSWorld NVCF deployment."""
 
 import os
+import logging
+logger = logging.getLogger(__name__)
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-NGC_ORG = os.environ.get("NGC_ORG", "nvidian")
-DEFAULT_CONTAINER_IMAGE = f"nvcr.io/{NGC_ORG}/nemo:osworld-linux-2"
+# NGC_ORG = os.environ.get("NGC_ORG", "nvidian")
+# DEFAULT_CONTAINER_IMAGE = f"nvcr.io/{NGC_ORG}/nemo:osworld-linux-2"
+
+DEFAULT_CONTAINER_IMAGE = "nvcr.io/i01fc6pe8nwm/nemo:osworld-linux-2-debug"
 
 
 @dataclass
@@ -39,6 +43,7 @@ class OSWorldFunctionConfig:
         """Set default container image if not provided."""
         if self.container_image is None:
             self.container_image = DEFAULT_CONTAINER_IMAGE
+        logger.info(f"Using container image: {self.container_image}")
 
 
 @dataclass
