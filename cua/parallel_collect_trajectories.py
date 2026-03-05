@@ -35,20 +35,17 @@ class TrajectoryJobDetails:
         self.error: Optional[str] = None
 
         # Runtime objects (populated during execution)
-        self.runtime: Any = None
+        self.env: Any = None  # OSWorld DesktopEnv instance
         self.trajectory_data: Optional[Dict] = None
         self.save_dir: Any = None
         self.osworld_setup: Any = None
-        self.nvcf_function_id: Optional[str] = None
-        self.nvcf_version_id: Optional[str] = None
 
 
 class ParallelTrajectoryGenerator:
-    def __init__(self, args, data_collector: DataCollector, nvcf_pool=None):
+    def __init__(self, args, data_collector: DataCollector):
         self.data_collector = data_collector
         self.max_parallel = args.max_parallel
         self.max_trajectories = args.max_trajectories
-        self.nvcf_pool = nvcf_pool  # Optional NVCFPool for NVCF runtime
         self.runtime_type = getattr(args, 'runtime', 'singularity')
 
         # Queues
@@ -117,23 +114,16 @@ class ParallelTrajectoryGenerator:
             job_details = self.jobs[job_idx]
 
             # Wait for available runtime slot
-            # logger.debug(f"[init-{worker_id}] Waiting for slot for job {job_idx}")
             await asyncio.to_thread(self._runtime_semaphore.acquire)
 
             # Rate Limit Logic: Prevent Boot Storm
             wait_time = 0.0
             with self._launch_lock:
                 now = time.time()
-                # The earliest this worker can start is either NOW,
-                # or 15s after the last scheduled launch.
                 target_start_time = max(now, self._last_launch_time + self._launch_delay_seconds)
-
                 wait_time = target_start_time - now
-
-                # Reserve this slot by updating the global timestamp immediately
                 self._last_launch_time = target_start_time
 
-            # Perform the wait asynchronously (outside the lock)
             if wait_time > 0:
                 if wait_time > 1.0:
                     logger.info(f"[init-{worker_id}] Delayed boot-up: waiting {wait_time:.1f}s...")
@@ -145,27 +135,15 @@ class ParallelTrajectoryGenerator:
             logger.info(f"[init-{worker_id}] Slot acquired. Active: {self._active_runtime_count}")
 
             try:
-                # For NVCF, acquire a function from the warm pool
-                nvcf_fn_id, nvcf_ver_id = None, None
-                if self.nvcf_pool:
-                    nvcf_fn_id, nvcf_ver_id = await asyncio.to_thread(self.nvcf_pool.acquire)
-                    job_details.nvcf_function_id = nvcf_fn_id
-                    job_details.nvcf_version_id = nvcf_ver_id
-                    logger.info(f"[init-{worker_id}] Acquired NVCF function {nvcf_fn_id} for job {job_idx}")
-
                 # --- call init_runtime_for_job --- #
-                # This creates the runtime and runs setup
-                runtime, traj_data, save_dir, traj_id, setup = \
-                    await self.data_collector.init_runtime_for_job(
-                        job_idx,
-                        nvcf_function_id=nvcf_fn_id,
-                        nvcf_version_id=nvcf_ver_id,
-                    )
+                # This creates the DesktopEnv, deploys NVCF (if needed), and runs setup
+                env, traj_data, save_dir, traj_id, setup = \
+                    await self.data_collector.init_runtime_for_job(job_idx)
 
                 # Store details in the pre-allocated object
-                job_details.job_id = traj_id  # Using traj_id as primary ID
+                job_details.job_id = traj_id
                 job_details.trajectory_id = traj_id
-                job_details.runtime = runtime
+                job_details.env = env
                 job_details.trajectory_data = traj_data
                 job_details.save_dir = save_dir
                 job_details.osworld_setup = setup
@@ -176,19 +154,15 @@ class ParallelTrajectoryGenerator:
             except Exception as e:
                 logger.error(f"[init-{worker_id}] Failed setup for job {job_idx}: {e}")
                 job_details.error = str(e)
-                job_details.completed = False  # Failed
-                job_details.event.set()  # Signal main thread we are done (failed)
+                job_details.completed = False
+                job_details.event.set()
 
-                # Close runtime if it was stored (stops keepalive thread, proxies, etc.)
-                if job_details.runtime:
+                # Close DesktopEnv if it was created
+                if job_details.env:
                     try:
-                        job_details.runtime.close()
+                        job_details.env.close()
                     except Exception:
                         pass
-
-                # Release NVCF function back to pool on failure (health-check first)
-                if self.nvcf_pool and job_details.nvcf_function_id:
-                    self.nvcf_pool.release_or_replace(job_details.nvcf_function_id, job_details.nvcf_version_id)
 
                 # Release semaphore immediately on failure
                 self._runtime_semaphore.release()
@@ -212,7 +186,7 @@ class ParallelTrajectoryGenerator:
                 # --- call collect_trajectory ---
                 # This runs the Planner/Actor loop
                 await self.data_collector.collect_trajectory(
-                    job_details.runtime,
+                    job_details.env,
                     job_details.trajectory_data,
                     job_details.save_dir,
                     job_details.osworld_setup
@@ -224,17 +198,9 @@ class ParallelTrajectoryGenerator:
                 logger.error(f"[collect-{worker_id}] Error in {traj_id}: {e}")
                 job_details.error = str(e)
             finally:
-                # Cleanup Runtime (close HTTP client, but don't undeploy NVCF function)
-                if job_details.runtime:
-                    threading.Thread(target=job_details.runtime.close, daemon=True).start()
-
-                # Release NVCF function back to pool for reuse
-                # If the job errored, health-check first to avoid returning a broken function
-                if self.nvcf_pool and job_details.nvcf_function_id:
-                    if job_details.error:
-                        self.nvcf_pool.release_or_replace(job_details.nvcf_function_id, job_details.nvcf_version_id)
-                    else:
-                        self.nvcf_pool.release(job_details.nvcf_function_id, job_details.nvcf_version_id)
+                # Cleanup DesktopEnv (closes NVCF proxy, undeploys function)
+                if job_details.env:
+                    threading.Thread(target=job_details.env.close, daemon=True).start()
 
                 # Release semaphore (allows new Init worker to proceed)
                 self._runtime_semaphore.release()
@@ -306,13 +272,7 @@ def parse_args():
 
     # Runtime selection
     parser.add_argument("--runtime", type=str, choices=["singularity", "nvcf"], default="singularity",
-                        help="Runtime backend: 'singularity' (local KVM) or 'nvcf' (NVIDIA Cloud Functions)")
-
-    # NVCF-specific args
-    parser.add_argument("--nvcf_api_key", type=str, default=None,
-                        help="NGC API key (or set NGC_API_KEY env var)")
-    parser.add_argument("--nvcf_org", type=str, default=None,
-                        help="NGC org name (or set NGC_ORG env var)")
+                        help="Runtime backend: 'singularity' (local KVM) or 'nvcf' (NVCF via OSWorld DesktopEnv)")
 
     # Environment & Setup
     parser.add_argument("--vm_image_path", type=str,
@@ -341,10 +301,6 @@ def parse_args():
     parser.add_argument("--max_parallel", type=int, default=24, help="Max concurrent VMs")
     parser.add_argument(
         "--max_trajectories", type=int, default=10000, help="Total trajectories to generate")
-    parser.add_argument(
-        "--num_vms_per_instance", type=int, default=1,
-        help="Number of VM instances per NVCF function (subdivides one machine into multiple VMs)")
-    
 
     return parser.parse_args()
 
@@ -356,38 +312,12 @@ async def main():
     data_collector = DataCollector(args)
     logger.info("DataCollector initialized (datasets loaded)")
 
-    # 2. Set up NVCF pool if using NVCF runtime
-    nvcf_pool = None
-    if args.runtime == "nvcf":
-        import os
-        from modules.nvcf_pool import NVCFPool
-
-        api_key = args.nvcf_api_key or os.environ.get("NGC_API_KEY")
-        org = args.nvcf_org or os.environ.get("NGC_ORG")
-        if not api_key:
-            raise ValueError("NGC_API_KEY required for NVCF runtime. Set via --nvcf_api_key or NGC_API_KEY env var.")
-        if not org:
-            raise ValueError("NGC_ORG required for NVCF runtime. Set via --nvcf_org or NGC_ORG env var.")
-
-        nvcf_pool = NVCFPool(
-            pool_size=args.max_parallel,
-            num_vms_per_instance=args.num_vms_per_instance,
-            nvcf_api_key=api_key,
-            nvcf_org=org,
-        )
-        logger.info(f"Deploying {args.max_parallel} NVCF functions (this may take several minutes)...")
-        nvcf_pool.deploy_all(args.max_parallel)
-        logger.info("NVCF pool ready.")
-
-    try:
-        # 3. Start Parallel Generator
-        generator = ParallelTrajectoryGenerator(args, data_collector, nvcf_pool=nvcf_pool)
-        await generator.run()
-    finally:
-        # 4. Cleanup NVCF pool
-        if nvcf_pool:
-            logger.info("Undeploying NVCF functions...")
-            nvcf_pool.undeploy_all()
+    # 2. Start Parallel Generator
+    # Each worker's DesktopEnv manages its own NVCF function lifecycle
+    # (deploy, local proxy, health monitoring, undeploy on close)
+    # No centralized NVCFPool needed - OSWorld's NVCFProvider handles everything.
+    generator = ParallelTrajectoryGenerator(args, data_collector)
+    await generator.run()
 
 
 if __name__ == "__main__":
