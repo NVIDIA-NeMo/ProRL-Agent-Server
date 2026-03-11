@@ -16,7 +16,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 
-import ipdb
 
 from modules_kimi.kimi_actor import KimiActor
 from modules_kimi.env_controller import EnvController
@@ -43,6 +42,9 @@ class DataCollector:
 
         self.vm_image_path = args.vm_image_path
         self.os_type = 'linux' if 'Ubuntu' in self.vm_image_path else 'windows'
+
+        # Runtime type: 'singularity' (local KVM) or 'nvcf' (NVCF via OSWorld DesktopEnv)
+        self.runtime_type = getattr(args, 'runtime', 'singularity')
 
         self.max_steps_per_trajectory = args.max_steps_per_trajectory
 
@@ -85,7 +87,7 @@ class DataCollector:
 
         logger.debug(f"Saved trajectory to {trajectory_save_dir / 'trajectory.json'}")
 
-    async def init_runtime_for_job(self, trajectory_idx: int) -> Tuple:
+    async def init_runtime_for_job(self, trajectory_idx: int, nvcf_function_id: str = None, nvcf_version_id: str = None) -> Tuple:
         """
         Stage 1: Initialize the VM and OSWorld setup.
         Returns: (runtime, trajectory, trajectory_save_dir, trajectory_id, osworld_setup)
@@ -109,13 +111,27 @@ class DataCollector:
             # else:
             #     osworld_setup_ready = True
 
+        # Pre-download setup files before NVCF deploy to avoid wasting GPU resources
+        if self.runtime_type == 'nvcf':
+            logger.info(f'[job {trajectory_idx:04d}] Pre-downloading setup files before NVCF deploy...')
+            download_ok = EnvController.pre_download_setup_files(osworld_setup)
+            if not download_ok:
+                raise RuntimeError(
+                    f'[job {trajectory_idx:04d}] Setup file pre-download failed. '
+                    f'Skipping NVCF deploy to avoid wasting resources.'
+                )
+            logger.info(f'[job {trajectory_idx:04d}] Pre-download complete.')
+
         # Initialize runtime
-        runtime = await EnvController.initialize_runtime(
-            job_id, self.vm_image_path, self.os_type, osworld_setup
+        env_or_runtime = await EnvController.initialize_runtime(
+            job_id, self.vm_image_path, self.os_type, osworld_setup,
+            runtime_type=self.runtime_type,
+            nvcf_function_id=nvcf_function_id,
+            nvcf_version_id=nvcf_version_id,
         )
 
         # Get screen size
-        width, height = EnvController.get_screen_size(runtime)
+        width, height = EnvController.get_screen_size(env_or_runtime)
 
         trajectory = {
             "trajectory_id": trajectory_id,
@@ -129,7 +145,7 @@ class DataCollector:
             "steps": [],
         }
 
-        return runtime, trajectory, trajectory_save_dir, trajectory_id, osworld_setup
+        return env_or_runtime, trajectory, trajectory_save_dir, trajectory_id, osworld_setup
 
     async def collect_trajectory(
         self, runtime, trajectory: Dict, trajectory_save_dir: Path, osworld_setup: Dict

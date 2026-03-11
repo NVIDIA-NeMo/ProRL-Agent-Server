@@ -59,6 +59,7 @@ class ParallelTrajectoryGenerator:
         self.data_collector = data_collector
         self.max_parallel = args.max_parallel
         self.max_trajectories = args.max_trajectories
+        self.runtime_type = getattr(args, 'runtime', 'singularity')
 
         # Queues
         self.init_queue: queue.Queue = queue.Queue()
@@ -80,7 +81,7 @@ class ParallelTrajectoryGenerator:
         # For sequential VM start-ups to mitigate boot storm
         self._launch_lock = threading.Lock()
         self._last_launch_time = 0
-        self._launch_delay_seconds = 15.0  # Wait 15s between starts
+        self._launch_delay_seconds = 0.0 if self.runtime_type == "nvcf" else 15.0
 
     def start_workers(self):
         self._server_running = True
@@ -163,6 +164,12 @@ class ParallelTrajectoryGenerator:
                 job_details.error = str(e)
                 job_details.completed = False
                 job_details.event.set()
+
+                if job_details.runtime:
+                    try:
+                        job_details.runtime.close()
+                    except Exception:
+                        pass
 
                 self._runtime_semaphore.release()
                 with self._active_runtime_lock:
@@ -260,6 +267,10 @@ def parse_args():
                         help="Hostname of the Kimi vLLM server head node")
     parser.add_argument("--kimi_model_name", type=str,
                         default="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/models/Kimi-K2.5")
+
+    # Runtime selection
+    parser.add_argument("--runtime", type=str, choices=["singularity", "nvcf"], default="singularity",
+                        help="Runtime backend: 'singularity' (local KVM) or 'nvcf' (NVCF via OSWorld DesktopEnv)")
 
     # Environment & Setup
     parser.add_argument("--vm_image_path", type=str,

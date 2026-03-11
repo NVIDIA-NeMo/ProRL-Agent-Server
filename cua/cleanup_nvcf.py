@@ -22,7 +22,7 @@ sys.path.insert(0, "/lustre/fsw/portfolios/nvr/users/bcui/ProRL-Agent-Server")
 
 from openhands.nvidia.os_world.nvcf import OSWorldDeployer
 
-POOL_NAME_PREFIX = "nvcf-pool-"
+POOL_NAME_PREFIX = "data-collection-"
 
 
 def main():
