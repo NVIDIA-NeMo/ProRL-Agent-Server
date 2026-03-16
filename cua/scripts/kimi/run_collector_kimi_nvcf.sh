@@ -30,7 +30,8 @@ LOG_DIR="${LOG_DIR:-./logs}"
 PROJECT_ROOT="/lustre/fsw/portfolios/nvr/users/bcui/ProRL-Agent-Server"
 PROJECT_DIR="$PROJECT_ROOT/cua"
 # COLLECTOR_IMAGE="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/images/cua_cpu.sqsh"
-COLLECTOR_IMAGE="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/bcui/images/cua_cpu.sqsh"
+# COLLECTOR_IMAGE="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/bcui/images/cua_cpu.sqsh"
+COLLECTOR_IMAGE="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/images/cua-vllm-0.16.0.sqsh"
 
 MAX_PARALLEL=${MAX_PARALLEL:-10}
 MAX_TRAJECTORIES=${MAX_TRAJECTORIES:-10000}
@@ -68,8 +69,8 @@ COLLECTOR_JOB_ID=$(sbatch --parsable \
     --mem=0 \
     --time=01:30:00 \
     --exclusive \
-    --output="/dev/null" \
-    --error="/dev/null" \
+    --output="$LOG_DIR/slurm-holder-${COLLECTOR_IDX}.out" \
+    --error="$LOG_DIR/slurm-holder-${COLLECTOR_IDX}.out" \
     --wrap="srun --container-image=$COLLECTOR_IMAGE --container-mounts=/lustre:/lustre sleep infinity")
 
 if [ -z "$COLLECTOR_JOB_ID" ]; then
@@ -149,10 +150,8 @@ ssh -t -q -o StrictHostKeyChecking=no "$COLLECTOR_NODE" \
         fi
 
         # Run data collection with NVCF backend
-        # Install missing Python dependencies (--break-system-packages for PEP 668 containers)
-        python -m pip install --break-system-packages openai Pillow jsonlines pandas requests 2>&1 || \
-        pip3 install --break-system-packages openai Pillow jsonlines pandas requests 2>&1 || \
-        echo "[WARNING] Failed to install Python dependencies"
+        # Activate Python venv with required dependencies
+
         echo \"[Collector $COLLECTOR_IDX] Starting parallel data collection (NVCF backend)...\"
         cd $PROJECT_DIR
         python parallel_collect_kimi.py \

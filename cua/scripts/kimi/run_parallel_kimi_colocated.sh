@@ -27,7 +27,8 @@ export LOG_DIR="${LOG_DIR:-./logs}"
 # Configurable parameters
 MAX_PARALLEL="${MAX_PARALLEL:-16}"
 MAX_TRAJECTORIES="${MAX_TRAJECTORIES:-10000}"
-TRAJECTORY_SAVE_DIR=/lustre/fs1/portfolios/nvr/projects/nvr_lpr_agentic/users/mingjiel/workspace/data/jaehun/cua/trajectories/kimi
+# TRAJECTORY_SAVE_DIR=/lustre/fs1/portfolios/nvr/projects/nvr_lpr_agentic/users/mingjiel/workspace/data/jaehun/cua/trajectories/kimi
+TRAJECTORY_SAVE_DIR=/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/bcui/ProRL-Agent-Server/cua/trajectories/kimi-debug/
 
 # Create logs directory
 mkdir -p "$LOG_DIR"
@@ -36,7 +37,8 @@ KIMI_JOB_ID=""
 COLLECTOR_PIDS=()
 KIMI_PORT=8000
 
-PROJECT_ROOT="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/cua/prorl-agent-server"
+# PROJECT_ROOT="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/cua/prorl-agent-server"
+PROJECT_ROOT="/lustre/fsw/portfolios/nvr/users/bcui/ProRL-Agent-Server"
 PROJECT_DIR="$PROJECT_ROOT/cua"
 
 echo "============================================"

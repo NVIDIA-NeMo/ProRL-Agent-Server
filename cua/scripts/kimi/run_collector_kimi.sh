@@ -24,7 +24,8 @@ COLLECTOR_IDX="${1:-0}"
 LOG_DIR="${LOG_DIR:-./logs}"
 
 # Configs
-PROJECT_ROOT="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/cua/prorl-agent-server"
+# PROJECT_ROOT="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/cua/prorl-agent-server"
+PROJECT_ROOT="/lustre/fsw/portfolios/nvr/users/bcui/ProRL-Agent-Server"
 PROJECT_DIR="$PROJECT_ROOT/cua"
 COLLECTOR_IMAGE="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/images/cua_cpu.sqsh"
 
