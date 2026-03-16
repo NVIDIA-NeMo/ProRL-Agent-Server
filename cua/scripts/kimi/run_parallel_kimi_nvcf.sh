@@ -57,50 +57,6 @@ echo "NGC_ORG:           $NGC_ORG"
 echo "NVCF_PREFIX:       $NVCF_FUNCTION_NAME_PREFIX"
 echo ""
 
-
-# --- Helper: run NVCF cleanup ---
-nvcf_cleanup() {
-    echo "[nvcf] Cleaning up NVCF functions with prefix '$NVCF_FUNCTION_NAME_PREFIX'..."
-    NVCF_FUNCTION_NAME_PREFIX="$NVCF_FUNCTION_NAME_PREFIX" \
-    NGC_API_KEY="$NGC_API_KEY" \
-    NGC_ORG="$NGC_ORG" \
-        python "$PROJECT_DIR/cleanup_nvcf.py" --cleanup 2>&1 || \
-        echo "[nvcf] WARNING: NVCF cleanup failed (non-fatal)"
-}
-
-# --- Cleanup: cancel Kimi server + NVCF functions on exit ---
-cleanup() {
-    echo ""
-    echo "[nvcf] Cleaning up..."
-
-    # 1. Kill collector SSH sessions
-    if [ ${#COLLECTOR_PIDS[@]} -gt 0 ]; then
-        echo "[nvcf] Killing ${#COLLECTOR_PIDS[@]} collector(s)..."
-        for pid in "${COLLECTOR_PIDS[@]}"; do
-            if kill -0 "$pid" 2>/dev/null; then
-                kill "$pid" 2>/dev/null
-            fi
-        done
-    fi
-
-    # 2. Cancel Kimi vLLM server
-    if [ -n "$KIMI_JOB_ID" ]; then
-        echo "[nvcf] Cancelling Kimi vLLM job $KIMI_JOB_ID"
-        scancel "$KIMI_JOB_ID" 2>/dev/null
-    fi
-
-    # 3. Remove head node file
-    rm -f "$LOG_DIR/head_node_${KIMI_JOB_ID}"
-
-    # 4. Clean up any remaining NVCF functions
-    nvcf_cleanup
-}
-trap cleanup EXIT
-
-
-# --- 0. Clean up stale NVCF functions from previous runs ---
-nvcf_cleanup
-
 # --- 1. Submit Kimi vLLM server ---
 echo "[nvcf] Submitting Kimi vLLM sbatch job..."
 KIMI_JOB_ID=$(sbatch \

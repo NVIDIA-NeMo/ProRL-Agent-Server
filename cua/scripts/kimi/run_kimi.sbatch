@@ -17,7 +17,8 @@ TOTAL_TP=$(( SLURM_JOB_NUM_NODES * 8 ))
 TOTAL_PP=1
 #TOTAL_TP=8
 #TOTAL_PP=$SLURM_JOB_NUM_NODES
-CONTAINER_IMAGE="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/images/cua-vllm-0.16.0.sqsh"
+# CONTAINER_IMAGE="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/images/cua-vllm-0.16.0.sqsh"
+CONTAINER_IMAGE="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/bcui/images/cua-vllm-0.16.0.sqsh"
 CONTAINER_MOUNTS="/lustre:/lustre,/tmp:/tmp"
 
 
