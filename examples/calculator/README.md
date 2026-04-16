@@ -102,3 +102,69 @@ Each rollout then prepares a fresh workspace by:
 - creating `/polar/session/workspace`
 - uploading `calculator.py` and `test_calculator.py`
 - initializing a git repo used by the evaluator
+
+## Cluster Deployment (SLURM)
+
+For running on a SLURM cluster with Apptainer containers and vLLM inference.
+See [examples/slurm/README.md](../slurm/README.md) for full documentation.
+
+### 1. Configure
+
+```bash
+cp examples/slurm/cluster.yaml.example my-cluster.yaml
+# Edit my-cluster.yaml with your cluster details
+```
+
+### 2. One-Time Setup
+
+```bash
+polar cluster setup -c my-cluster.yaml
+```
+
+### 3. Build SIF Image
+
+```bash
+# Single harness:
+polar cluster build-sif -c my-cluster.yaml --example calculator --harness opencode
+
+# Multiple harnesses:
+polar cluster build-sif -c my-cluster.yaml --example calculator --harness opencode,codex,swe_agent
+```
+
+### 4. Start Services
+
+```bash
+polar cluster serve -c my-cluster.yaml
+```
+
+Once services are ready, the command prints the job ID and a sample `submit-task` command.
+
+### 5. Submit Tasks
+
+```bash
+# Use the job ID from step 4
+polar cluster submit-task -c my-cluster.yaml \
+    --job-id JOB_ID --example calculator --harness opencode
+
+# Multiple harnesses against the same running service
+polar cluster submit-task -c my-cluster.yaml \
+    --job-id JOB_ID --example calculator --harness codex
+```
+
+### 6. Stop Services
+
+```bash
+scancel JOB_ID
+```
+
+### 7. Collect Results
+
+```bash
+polar cluster sync -c my-cluster.yaml
+```
+
+**One-shot alternative** — start services, run tasks, and exit in one command:
+
+```bash
+polar cluster launch -c my-cluster.yaml --example calculator --harness opencode
+```

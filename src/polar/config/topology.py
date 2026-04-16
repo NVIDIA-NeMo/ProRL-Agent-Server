@@ -161,7 +161,10 @@ class TopologyConfig:
                 if public_url_raw is not None
                 else _default_public_url(host, port)
             )
-            sglang = _require_mapping(node.get("sglang"), f"gateway.nodes[{index}].sglang")
+            sglang = _require_mapping(
+                node.get("vllm") or node.get("sglang"),
+                f"gateway.nodes[{index}].vllm",
+            )
             default_runtime_raw = node.get("default_runtime")
             default_runtime = None
             if default_runtime_raw is not None:

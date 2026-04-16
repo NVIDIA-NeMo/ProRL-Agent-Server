@@ -15,3 +15,20 @@ checkpoints/
 rollout_results/
 reference_projects/
 docs/
+
+# SLURM job outputs
+*.out
+*.err
+
+# Cluster results
+results/
+
+# Private cluster configs and logs
+worklogs/
+
+# Cluster artifacts (generated locally)
+cluster.yaml
+opencode.def
+test_results.log
+tmp_defs/
+sif_images/

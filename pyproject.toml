@@ -40,3 +40,6 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["polar*"]
+
+[tool.setuptools.package-data]
+"polar.cluster" = ["templates/*.sbatch", "templates/*.sh"]

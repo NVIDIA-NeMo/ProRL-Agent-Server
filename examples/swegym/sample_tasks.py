@@ -152,3 +152,10 @@ def fetch_sample_instances(
     cache_file.parent.mkdir(parents=True, exist_ok=True)
     cache_file.write_text(json.dumps(ordered, indent=2, ensure_ascii=True, sort_keys=True))
     return ordered
+
+
+if __name__ == "__main__":
+    instances = fetch_sample_instances()
+    print(f"Cached {len(instances)} instances to {DEFAULT_CACHE_PATH}")
+    for inst in instances:
+        print(f"  {inst['instance_id']}")

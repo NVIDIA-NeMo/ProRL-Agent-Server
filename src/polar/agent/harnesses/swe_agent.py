@@ -86,6 +86,7 @@ class SweAgentHarness(BaseHarness):
                 command=(
                     f"cat > {self._problem_statement_path} << 'POLARINST'\n{safe_instruction}\nPOLARINST\n"
                     f"{preamble}"
+                    'set -o pipefail && '
                     'export OPENAI_API_KEY="$OPENAI_API_KEY" OPENAI_BASE_URL="$OPENAI_BASE_URL" && '
                     f"sweagent run "
                     f"--agent.model.name={shlex.quote(model)} "

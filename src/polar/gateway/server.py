@@ -500,12 +500,82 @@ async def proxy_request(request: Request, path: str):
         request.method, full_path, api_type.value, original_model, session_id,
     )
 
+    # Debug: log request body keys and previous_response_id for diagnostics
+    body_keys = sorted(body.keys()) if isinstance(body, dict) else "not-a-dict"
+    prev_resp_id = body.get("previous_response_id") if isinstance(body, dict) else None
+    input_type = type(body.get("input", "")).__name__ if isinstance(body, dict) else "?"
+    input_len = len(body.get("input", "")) if isinstance(body, dict) and isinstance(body.get("input"), (str, list)) else 0
+    logger.info(
+        "  body_keys=%s prev_response_id=%s input_type=%s input_len=%s stream=%s",
+        body_keys, prev_resp_id, input_type, input_len, body.get("stream"),
+    )
+
     if api_type == APIType.GOOGLE and "streamGenerateContent" in full_path:
         body["_streaming"] = True
 
-    transformed_body = body.copy()
-    transformed_body["_polar_model_served"] = state.node.model_served
-    openai_request = transformer.transform_request(transformed_body)
+    # Resolve previous_response_id for multi-turn Responses API conversations
+    if (
+        api_type == APIType.OPENAI_RESPONSES
+        and isinstance(body, dict)
+        and body.get("previous_response_id")
+    ):
+        prev_id = body["previous_response_id"]
+        logger.info("  Resolving previous_response_id=%s from session %s", prev_id, session_id)
+        session_data = state.storage.load_completion_session(session_id)
+        if session_data and session_data.completions:
+            # Rebuild conversation history from stored completions
+            history_items: list[dict[str, Any]] = []
+            for rec in session_data.completions:
+                req_msgs = rec.request.get("messages", [])
+                resp_choices = rec.response.get("choices", [])
+                # Add the request messages (skip system — instructions handles that)
+                for msg in req_msgs:
+                    role = msg.get("role", "")
+                    if role == "system":
+                        continue
+                    if role == "user":
+                        history_items.append({"type": "message", "role": "user", "content": msg.get("content", "")})
+                    elif role == "tool":
+                        history_items.append({
+                            "type": "function_call_output",
+                            "call_id": msg.get("tool_call_id", ""),
+                            "output": msg.get("content", ""),
+                        })
+                # Add the assistant response
+                if resp_choices:
+                    resp_msg = resp_choices[0].get("message", {})
+                    content = resp_msg.get("content", "")
+                    tool_calls = resp_msg.get("tool_calls", [])
+                    if content:
+                        history_items.append({
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": content}],
+                        })
+                    for tc in tool_calls:
+                        func = tc.get("function", {})
+                        history_items.append({
+                            "type": "function_call",
+                            "call_id": tc.get("id", ""),
+                            "name": func.get("name", ""),
+                            "arguments": func.get("arguments", "{}"),
+                        })
+
+            # Merge: history_items + current input items
+            current_input = body.get("input", [])
+            if isinstance(current_input, str):
+                current_input = [{"type": "message", "role": "user", "content": current_input}]
+            elif not isinstance(current_input, list):
+                current_input = []
+            body["input"] = history_items + current_input
+            logger.info(
+                "  Resolved history: %d records, %d history items + %d current items",
+                len(session_data.completions), len(history_items), len(current_input),
+            )
+        else:
+            logger.warning("  No session data found for previous_response_id=%s", prev_id)
+
+    openai_request = transformer.transform_request(body)
     openai_request["model"] = state.node.model_served
     is_streaming = openai_request.get("stream", False)
 

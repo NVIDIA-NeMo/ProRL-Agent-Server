@@ -16,7 +16,7 @@ class CodexHarness(BaseHarness):
 
     def __init__(self, agent_spec: AgentSpec) -> None:
         super().__init__(agent_spec)
-        self._codex_home = "$HOME/.codex"
+        self._codex_home = "/root/.codex"
 
     async def setup(self, runtime: BaseRuntime) -> None:
         await runtime.exec(f"mkdir -p {self._codex_home}")
@@ -82,6 +82,7 @@ class CodexHarness(BaseHarness):
         return [
             ExecInput(
                 command=(
+                    f"set -o pipefail && "
                     f"codex exec {flags_str} -- {escaped} "
                     f"2>&1 | tee {RUNTIME_AGENT_LOG_DIR}/codex.txt"
                 ),

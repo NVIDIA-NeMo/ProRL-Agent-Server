@@ -1,0 +1,71 @@
+# Polar cluster configuration.
+#
+# Copy this file and fill in your cluster details:
+#   cp examples/slurm/cluster.yaml.example my-cluster.yaml
+#   # Edit my-cluster.yaml
+#   polar cluster launch -c my-cluster.yaml
+#
+# The same config works for local, SLURM, and (future) Kubernetes backends.
+# Set 'backend' to select the deployment target.
+
+# ── Backend ─────────────────────────────────────────────────────────────────
+backend: slurm  # "local" | "slurm" | "k8s"
+
+# ── SLURM connection (required when backend=slurm) ─────────────────────────
+slurm:
+  login_node: "<your-login-node>"          # SSH host for job submission
+  account: "<your-slurm-account>"          # SLURM account/project string
+  partition: "<your-partition>"            # SLURM partition name
+
+# ── Paths on the cluster filesystem ─────────────────────────────────────────
+paths:
+  # Base workspace directory (required).  All other paths derive from this.
+  workspace: "/path/to/your/workspace"
+
+  # Override any derived path if your layout differs:
+  # polar_root: "${workspace}/polar"
+  # code: "${polar_root}/ProRL-Agent-Server"
+  # sif_dir: "${polar_root}/sif_images"
+  # results: "${polar_root}/results"
+  # venv: "${polar_root}/.venv"
+
+  # Optional: custom binary paths (leave commented if system-installed)
+  # apptainer_bin_dir: "/path/to/apptainer/usr/bin"
+  # cuda_home: "/path/to/cuda-12.x"
+
+# ── Model configuration ──────────────────────────────────────────────────────
+model:
+  name: "Qwen/Qwen3.5-27B"              # HuggingFace model ID
+  tensor_parallel_size: 8                # TP size for vLLM
+  max_model_len: 16384
+  gpu_memory_utilization: 0.90
+  max_num_seqs: 64
+  tool_call_parser: "qwen3_xml"          # qwen3_xml, hermes, etc.
+
+# ── Task defaults ────────────────────────────────────────────────────────────
+task:
+  example: "calculator"                  # calculator or swegym
+  harness: "opencode"                    # opencode, codex, swe_agent, etc.
+  num_rollouts: 4
+  timeout_seconds: 900
+
+# ── Resource allocation ──────────────────────────────────────────────────────
+resources:
+  nodes: 1
+  gpus_per_node: 8
+  cpus_per_task: 64
+  mem: "512G"
+  time: "04:00:00"                       # HH:MM:SS job time limit
+
+# ── Service ports ────────────────────────────────────────────────────────────
+ports:
+  vllm: 18000
+  rollout: 18080
+  gateway_base: 18100
+
+# ── Gateway tuning ───────────────────────────────────────────────────────────
+gateway:
+  max_init_workers: 8
+  max_run_workers: 4
+  max_postrun_workers: 4
+  ready_buffer_target: 4

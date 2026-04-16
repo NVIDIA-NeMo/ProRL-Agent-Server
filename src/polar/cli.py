@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import subprocess
 import sys
 from typing import Any
 from urllib.parse import urlparse
@@ -93,6 +94,108 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the raw response JSON.",
     )
 
+    # ── cluster subcommands ─────────────────────────────────────────────────
+    cluster_parser = subparsers.add_parser(
+        "cluster",
+        help="Cluster deployment operations (launch, setup, sync, build-sif, status, train).",
+    )
+    cluster_sub = cluster_parser.add_subparsers(
+        dest="cluster_command",
+        required=True,
+    )
+
+    # polar cluster launch
+    launch_p = cluster_sub.add_parser("launch", help="Sync code and submit a cluster job.")
+    launch_p.add_argument("-c", "--config", required=True, help="Path to cluster.yaml")
+    launch_p.add_argument("--example", default=None, help="Override task.example")
+    launch_p.add_argument("--harness", default=None, help="Override task.harness")
+    launch_p.add_argument("--model", default=None, help="Override model.name")
+    launch_p.add_argument("--nodes", type=int, default=None, help="Override resources.nodes")
+    launch_p.add_argument("--gpus", type=int, default=None, help="Override resources.gpus_per_node")
+    launch_p.add_argument("--time", default=None, help="Override resources.time (HH:MM:SS)")
+    launch_p.add_argument("--num-rollouts", type=int, default=None)
+    launch_p.add_argument("--timeout-seconds", type=float, default=None)
+    launch_p.add_argument(
+        "--instance-id", action="append", default=None,
+        help="SWE-Gym instance ID (repeatable; defaults to sample 10)",
+    )
+    launch_p.add_argument("--no-sync", action="store_true", help="Skip rsync to cluster")
+    launch_p.add_argument("--dry-run", action="store_true", help="Print sbatch command only")
+
+    # polar cluster setup
+    setup_p = cluster_sub.add_parser("setup", help="One-time cluster environment setup.")
+    setup_p.add_argument("-c", "--config", required=True, help="Path to cluster.yaml")
+
+    # polar cluster status
+    cstatus_p = cluster_sub.add_parser("status", help="Check SLURM job status.")
+    cstatus_p.add_argument("-c", "--config", required=True, help="Path to cluster.yaml")
+    cstatus_p.add_argument("--job-id", default=None, help="Specific job ID to query")
+
+    # polar cluster sync
+    sync_p = cluster_sub.add_parser("sync", help="Sync code/results from cluster.")
+    sync_p.add_argument("-c", "--config", required=True, help="Path to cluster.yaml")
+    sync_p.add_argument("--job-id", default=None, help="Sync specific job results")
+    sync_p.add_argument("--code-only", action="store_true")
+    sync_p.add_argument("--results-only", action="store_true")
+    sync_p.add_argument("--dry-run", action="store_true")
+
+    # polar cluster build-sif
+    sif_p = cluster_sub.add_parser("build-sif", help="Build Apptainer SIF images.")
+    sif_p.add_argument("-c", "--config", required=True, help="Path to cluster.yaml")
+    sif_p.add_argument("--example", required=True, help="Example name (calculator, swegym, swebench_verified, train)")
+    sif_p.add_argument("--harness", default=None, help="Comma-separated harness names (required except for --example train)")
+    sif_p.add_argument("--force", action="store_true", help="Rebuild even if SIF exists")
+    sif_p.add_argument(
+        "--instance-id", action="append", default=None,
+        help="SWE-Gym instance ID (repeatable; defaults to sample 10)",
+    )
+
+    # polar cluster serve
+    serve_p = cluster_sub.add_parser("serve", help="Start services (vLLM + rollout + gateway).")
+    serve_p.add_argument("-c", "--config", required=True, help="Path to cluster.yaml")
+    serve_p.add_argument("--model", default=None, help="Override model.name")
+    serve_p.add_argument("--nodes", type=int, default=None, help="Override resources.nodes")
+    serve_p.add_argument("--gpus", type=int, default=None, help="Override resources.gpus_per_node")
+    serve_p.add_argument("--time", default=None, help="Override resources.time (HH:MM:SS)")
+    serve_p.add_argument("--no-sync", action="store_true", help="Skip rsync to cluster")
+    serve_p.add_argument("--no-wait", action="store_true", help="Don't wait for services to be ready")
+    serve_p.add_argument("--wait-timeout", type=int, default=600, help="Seconds to wait for readiness (default: 600)")
+    serve_p.add_argument("--dry-run", action="store_true", help="Print sbatch command only")
+
+    # polar cluster submit-task
+    submit_task_p = cluster_sub.add_parser("submit-task", help="Submit tasks to a running serve job.")
+    submit_task_p.add_argument("-c", "--config", required=True, help="Path to cluster.yaml")
+    submit_task_p.add_argument("--job-id", required=True, help="SLURM job ID of the serve job")
+    submit_task_p.add_argument("--example", default=None, help="Override task.example")
+    submit_task_p.add_argument("--harness", default=None, help="Override task.harness")
+    submit_task_p.add_argument("--num-rollouts", type=int, default=None)
+    submit_task_p.add_argument("--timeout-seconds", type=float, default=None)
+    submit_task_p.add_argument(
+        "--instance-id", action="append", default=None,
+        help="SWE-Gym instance ID (repeatable; defaults to sample 10)",
+    )
+
+    # polar cluster train
+    train_p = cluster_sub.add_parser("train", help="Submit a distributed RL training job.")
+    train_p.add_argument("-c", "--config", required=True, help="Path to cluster.yaml")
+    train_p.add_argument("--polar-config", default=None, help="Path to polar_config.yaml (bridge config)")
+    train_p.add_argument("--prompt-data", default=None, help="Path to JSONL training data")
+    train_p.add_argument("--hf-checkpoint", default=None, help="HuggingFace model checkpoint")
+    train_p.add_argument("--num-rollouts", type=int, default=None, help="Number of training steps")
+    train_p.add_argument("--rollout-batch-size", type=int, default=None)
+    train_p.add_argument("--n-samples-per-prompt", type=int, default=None)
+    train_p.add_argument("--global-batch-size", type=int, default=None)
+    train_p.add_argument("--actor-gpus", type=int, default=None)
+    train_p.add_argument("--rollout-gpus", type=int, default=None)
+    train_p.add_argument("--tp-size", type=int, default=None)
+    train_p.add_argument("--nodes", type=int, default=None, help="Override resources.nodes")
+    train_p.add_argument("--gpus", type=int, default=None, help="Override resources.gpus_per_node")
+    train_p.add_argument("--time", default=None, help="Override resources.time (HH:MM:SS)")
+    train_p.add_argument("--no-sync", action="store_true", help="Skip rsync to cluster")
+    train_p.add_argument("--no-wait", action="store_true", help="Don't wait for training to complete")
+    train_p.add_argument("--wait-timeout", type=int, default=3600, help="Seconds to wait (default: 3600)")
+    train_p.add_argument("--dry-run", action="store_true", help="Print sbatch command only")
+
     return parser
 
 
@@ -111,6 +214,8 @@ def main(argv: list[str] | None = None) -> int:
             return _handle_submit(args)
         if args.command == "status":
             return _handle_status(args)
+        if args.command == "cluster":
+            return _handle_cluster(args)
     except httpx.HTTPStatusError as exc:
         body = exc.response.text.strip()
         if body:
@@ -127,12 +232,159 @@ def main(argv: list[str] | None = None) -> int:
     except httpx.HTTPError as exc:
         print(f"error: could not reach the rollout service: {exc}", file=sys.stderr)
         return 1
-    except (FileNotFoundError, ValueError) as exc:
+    except NotImplementedError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except (FileNotFoundError, ValueError, TimeoutError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except subprocess.CalledProcessError as exc:
+        print(f"error: command failed with exit code {exc.returncode}", file=sys.stderr)
+        if exc.stderr:
+            print(exc.stderr.strip(), file=sys.stderr)
         return 1
 
     parser.error(f"Unknown command: {args.command}")
     return 2
+
+
+def _handle_cluster(args: argparse.Namespace) -> int:
+    # Lazy imports — avoid loading cluster modules for non-cluster commands.
+    from polar.cluster.config import ClusterConfig
+    from polar.cluster.backend import get_backend
+
+    config = ClusterConfig.load(args.config)
+    overrides = _build_cluster_overrides(args)
+    if overrides:
+        config = config.apply_overrides(overrides)
+
+    repo_root = Path.cwd()
+    backend = get_backend(config)
+
+    cmd = args.cluster_command
+    if cmd == "launch":
+        backend.launch(repo_root, dry_run=args.dry_run, no_sync=args.no_sync)
+        return 0
+    if cmd == "setup":
+        backend.setup(repo_root)
+        return 0
+    if cmd == "status":
+        result = backend.status(job_id=args.job_id)
+        jobs = result.get("jobs", [])
+        if not jobs:
+            print("No jobs found.")
+        else:
+            print(f"{'JOB_ID':<12} {'NAME':<30} {'STATE':<12} {'TIME':<10} {'NODES'}")
+            for j in jobs:
+                print(f"{j.get('job_id',''):<12} {j.get('name',''):<30} {j.get('state',''):<12} {j.get('time',''):<10} {j.get('nodes','')}")
+        return 0
+    if cmd == "sync":
+        backend.sync(
+            repo_root,
+            job_id=args.job_id,
+            code_only=args.code_only,
+            results_only=args.results_only,
+            dry_run=args.dry_run,
+        )
+        return 0
+    if cmd == "build-sif":
+        if args.example != "train" and not args.harness:
+            print("error: --harness is required for non-train examples", file=sys.stderr)
+            return 1
+        harnesses = [h.strip() for h in args.harness.split(",")] if args.harness else []
+        results = backend.build_sif(
+            repo_root, args.example, harnesses,
+            force=args.force,
+            instance_ids=getattr(args, "instance_id", None),
+        )
+        for key, sif_path in results.items():
+            print(f"  {key}: {sif_path}")
+        return 0
+    if cmd == "serve":
+        result = backend.serve(
+            repo_root,
+            dry_run=args.dry_run,
+            no_sync=args.no_sync,
+            wait=not args.no_wait,
+            wait_timeout=args.wait_timeout,
+        )
+        if result:
+            print(f"\n[cluster] Services ready.")
+            print(f"[cluster] Job ID: {result['job_id']}")
+            print(f"[cluster] Topology: {result['topology']}")
+            print(f"\n[cluster] Submit tasks with:")
+            print(f"  python -m polar.cli cluster submit-task -c {args.config} \\")
+            print(f"      --job-id {result['job_id']} --example calculator --harness opencode")
+        return 0
+    if cmd == "submit-task":
+        return backend.submit_task(
+            repo_root,
+            job_id=args.job_id,
+            example=getattr(args, "example", None),
+            harness=getattr(args, "harness", None),
+        )
+    if cmd == "train":
+        result = backend.train(
+            repo_root,
+            dry_run=args.dry_run,
+            no_sync=args.no_sync,
+            wait=not args.no_wait,
+            wait_timeout=args.wait_timeout,
+        )
+        if result:
+            print(f"\n[cluster] Training job info:")
+            for k, v in result.items():
+                print(f"  {k}: {v}")
+        return 0
+
+    print(f"Unknown cluster command: {cmd}", file=sys.stderr)
+    return 2
+
+
+def _build_cluster_overrides(args: argparse.Namespace) -> dict:
+    """Extract CLI flag overrides into a nested dict for ``ClusterConfig.apply_overrides``."""
+    overrides: dict = {}
+    if getattr(args, "example", None):
+        overrides.setdefault("task", {})["example"] = args.example
+    if getattr(args, "harness", None) and args.cluster_command == "launch":
+        overrides.setdefault("task", {})["harness"] = args.harness
+    if getattr(args, "model", None):
+        overrides.setdefault("model", {})["name"] = args.model
+    if getattr(args, "nodes", None) is not None:
+        overrides.setdefault("resources", {})["nodes"] = args.nodes
+    if getattr(args, "gpus", None) is not None:
+        overrides.setdefault("resources", {})["gpus_per_node"] = args.gpus
+    if getattr(args, "time", None):
+        overrides.setdefault("resources", {})["time"] = args.time
+    if getattr(args, "num_rollouts", None) is not None:
+        if getattr(args, "cluster_command", None) == "train":
+            overrides.setdefault("train", {})["num_rollouts"] = args.num_rollouts
+        else:
+            overrides.setdefault("task", {})["num_rollouts"] = args.num_rollouts
+    if getattr(args, "timeout_seconds", None) is not None:
+        overrides.setdefault("task", {})["timeout_seconds"] = args.timeout_seconds
+    if getattr(args, "instance_id", None):
+        overrides.setdefault("task", {})["instance_ids"] = args.instance_id
+    # Train-specific overrides
+    if getattr(args, "polar_config", None):
+        overrides.setdefault("train", {})["polar_config"] = args.polar_config
+    if getattr(args, "prompt_data", None):
+        overrides.setdefault("train", {})["prompt_data"] = args.prompt_data
+    if getattr(args, "hf_checkpoint", None):
+        overrides.setdefault("train", {})["hf_checkpoint"] = args.hf_checkpoint
+    if getattr(args, "rollout_batch_size", None) is not None:
+        overrides.setdefault("train", {})["rollout_batch_size"] = args.rollout_batch_size
+    if getattr(args, "n_samples_per_prompt", None) is not None:
+        overrides.setdefault("train", {})["n_samples_per_prompt"] = args.n_samples_per_prompt
+    if getattr(args, "global_batch_size", None) is not None:
+        overrides.setdefault("train", {})["global_batch_size"] = args.global_batch_size
+    if getattr(args, "actor_gpus", None) is not None:
+        overrides.setdefault("train", {})["actor_gpus"] = args.actor_gpus
+    if getattr(args, "rollout_gpus", None) is not None:
+        overrides.setdefault("train", {})["rollout_gpus"] = args.rollout_gpus
+    if getattr(args, "tp_size", None) is not None:
+        overrides.setdefault("train", {})["tp_size"] = args.tp_size
+    return overrides
 
 
 def _handle_submit(args: argparse.Namespace) -> int:

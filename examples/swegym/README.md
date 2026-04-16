@@ -86,3 +86,63 @@ examples/swegym/<harness>/batches/<timestamp>/
 - The sample is text-only SWE-Gym data.
 - The submit helper extracts patches from `/polar/session/workspace`, then replays them onto `/testbed` for grading.
 - `swe_agent` uses a dedicated `polar-sweagent` environment inside the derived image.
+- `openhands_sdk` only builds on benchmark images whose native Python is already compatible.
+
+## Cluster Deployment (SLURM)
+
+For running on a SLURM cluster with Apptainer containers and vLLM inference.
+See [examples/slurm/README.md](../slurm/README.md) for full documentation.
+
+### 1. Configure
+
+```bash
+cp examples/slurm/cluster.yaml.example my-cluster.yaml
+# Edit my-cluster.yaml with your cluster details
+```
+
+### 2. Build SIF Images
+
+```bash
+polar cluster build-sif -c my-cluster.yaml --example swegym --harness swe_agent
+```
+
+### 3. Start Services
+
+```bash
+polar cluster serve -c my-cluster.yaml
+```
+
+Once services are ready, the command prints the job ID.
+
+### 4. Submit Tasks
+
+```bash
+# All 10 sample instances (use job ID from step 3)
+polar cluster submit-task -c my-cluster.yaml \
+    --job-id JOB_ID --example swegym --harness swe_agent \
+    --timeout-seconds 2400
+
+# Or a single instance
+polar cluster submit-task -c my-cluster.yaml \
+    --job-id JOB_ID --example swegym --harness swe_agent \
+    --timeout-seconds 2400 --instance-id getmoto__moto-7365
+```
+
+### 5. Stop Services
+
+```bash
+scancel JOB_ID
+```
+
+### 6. Collect Results
+
+```bash
+polar cluster sync -c my-cluster.yaml
+```
+
+**One-shot alternative** — start services, run tasks, and exit in one command:
+
+```bash
+polar cluster launch -c my-cluster.yaml --example swegym --harness swe_agent \
+    --timeout-seconds 2400
+```

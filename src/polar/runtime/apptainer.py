@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
+import logging
 import shlex
 import shutil
 from pathlib import Path
@@ -23,8 +25,15 @@ class ApptainerRuntime(BaseRuntime):
         # Use a hash suffix to guarantee uniqueness even when session IDs
         # share a long prefix (e.g. "sk-polar-...-eval" vs "sk-polar-...").
         short_hash = hashlib.sha256(session_id.encode()).hexdigest()[:8]
-        safe_name = session_id.replace("/", "-")[:30]
-        self._instance_name = f"polar-{safe_name}-{short_hash}"
+        safe_name = session_id.replace("/", "-")
+        if len(safe_name) > 40:
+            # Keep a recognisable prefix plus a hash suffix to guarantee
+            # uniqueness even when session IDs share a long common prefix
+            # (e.g. "sk-polar-<uuid>" vs "sk-polar-<uuid>-eval").
+            prefix = safe_name[:24]
+            suffix = hashlib.sha256(safe_name.encode()).hexdigest()[:12]
+            safe_name = f"{prefix}-{suffix}"
+        self._instance_name = f"polar-{safe_name}"
         self._binary = self._resolve_binary()
 
     @property
@@ -42,12 +51,15 @@ class ApptainerRuntime(BaseRuntime):
     async def start(self) -> None:
         if self._destroyed:
             raise RuntimeError("apptainer runtime was already destroyed")
-        # Use a host-backed overlay directory instead of --writable-tmpfs
-        # (default tmpfs overlay is only 64 MB, too small for most workloads).
-        self._overlay_dir = self.session_dir / "overlay"
-        self._overlay_dir.mkdir(parents=True, exist_ok=True)
-        args = [self._binary, "instance", "start",
-                "--overlay", str(self._overlay_dir)]
+        args = [self._binary, "instance", "start"]
+        # --writable-tmpfs gives a small (64 MB) writable layer on top of the
+        # read-only SIF for caches/configs.  Actual workload data goes through
+        # the bind mount (session_dir → /polar/session).
+        # --no-home avoids mounting the host home directory which would leak
+        # host-specific paths into the container.
+        args.extend(["--writable-tmpfs", "--no-home"])
+        if self.spec.kwargs.get("fakeroot"):
+            args.append("--fakeroot")
         if self.spec.gpus > 0:
             args.append("--nv")
         network_name: str | None
@@ -59,10 +71,26 @@ class ApptainerRuntime(BaseRuntime):
             args.extend(["--net", "--network", network_name])
         args.extend(["--bind", f"{self.session_dir}:{self.runtime_session_dir}"])
         args.extend([self.spec.image, self._instance_name])
-        rc, _, _ = await self._run_local_command(*args)
+        # Do NOT use capture=True here. `apptainer instance start` forks a
+        # daemon that inherits pipe fds; asyncio.communicate() then blocks
+        # forever waiting for the daemon to close them.  We redirect stderr
+        # to a temp file so we can still report errors on failure.
+        stderr_path = self.session_dir / "apptainer_start.err"
+        stderr_fh = stderr_path.open("w")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=stderr_fh,
+            )
+            rc = await proc.wait()
+        finally:
+            stderr_fh.close()
         if rc != 0:
+            detail = stderr_path.read_text().strip()
             raise RuntimeError(
                 f"{self._binary} instance start failed with exit code {rc}"
+                + (f": {detail}" if detail else "")
             )
 
     _STOP_TIMEOUT = 30.0
@@ -94,9 +122,14 @@ class ApptainerRuntime(BaseRuntime):
         if effective_workdir:
             wrapped_command = f"cd {shlex.quote(effective_workdir)} && {command}"
         args = [self._binary, "exec", f"instance://{self._instance_name}"]
+        # Ensure HOME is set inside the container (--no-home leaves it
+        # pointing at the non-existent host home) and clear host-specific
+        # cache dirs that would fail inside a read-only overlay.
+        effective_env: dict[str, str] = {"HOME": "/root"}
         if env:
-            args.append("env")
-            args.extend(f"{key}={value}" for key, value in env.items())
+            effective_env.update(env)
+        args.append("env")
+        args.extend(f"{key}={value}" for key, value in effective_env.items())
         args.extend(["bash", "-lc", wrapped_command])
         rc, stdout, stderr = await self._run_local_command(
             *args, timeout=timeout_sec, capture=True

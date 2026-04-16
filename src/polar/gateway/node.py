@@ -313,6 +313,8 @@ class GatewayNodeManager:
         log_dir = managed.session_dir / "logs" / "agent"
         log_dir.mkdir(parents=True, exist_ok=True)
 
+        last_stdout: str | None = None
+        last_stderr: str | None = None
         for i, step in enumerate(steps):
             if managed.cancel_requested:
                 return AgentRunResult(
@@ -325,28 +327,43 @@ class GatewayNodeManager:
                 env=merged_env,
                 timeout_sec=self._remaining_budget(managed),
             )
+            last_stdout = result.stdout
+            last_stderr = result.stderr
             self._write_exec_log(
                 log_dir, f"step.{i:02d}", result.stdout, result.stderr
+            )
+            logger.info(
+                "Step %d for session %s: rc=%s stdout_tail=%s",
+                i,
+                managed.request.session_id,
+                result.return_code,
+                (result.stdout or "")[-500:],
             )
             if result.return_code == -1:
                 return AgentRunResult(
                     status="timeout",
                     return_code=-1,
                     error=f"step {i} timed out",
-                    metadata=self._step_metadata(log_dir, i, managed),
+                    metadata=self._step_metadata(
+                        log_dir, i, managed, last_stdout, last_stderr
+                    ),
                 )
             if result.return_code != 0:
                 return AgentRunResult(
                     status="failed",
                     return_code=result.return_code,
                     error=f"step {i} exited with code {result.return_code}",
-                    metadata=self._step_metadata(log_dir, i, managed),
+                    metadata=self._step_metadata(
+                        log_dir, i, managed, last_stdout, last_stderr
+                    ),
                 )
 
         return AgentRunResult(
             status="completed",
             return_code=0,
-            metadata=self._step_metadata(log_dir, len(steps) - 1, managed),
+            metadata=self._step_metadata(
+                log_dir, len(steps) - 1, managed, last_stdout, last_stderr
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -751,12 +768,24 @@ class GatewayNodeManager:
             (log_dir / f"{prefix}.stderr.log").write_text(stderr)
 
     @staticmethod
-    def _step_metadata(log_dir: Path, step_index: int, managed: ManagedSession) -> dict:
-        return {
+    def _step_metadata(
+        log_dir: Path,
+        step_index: int,
+        managed: ManagedSession,
+        last_stdout: str | None = None,
+        last_stderr: str | None = None,
+    ) -> dict:
+        meta: dict = {
             "log_dir": str(log_dir),
             "last_step": step_index,
             "cwd": str(managed.session_dir),
         }
+        # Include truncated output tails so they survive session dir cleanup
+        if last_stdout:
+            meta["stdout_tail"] = last_stdout[-4000:]
+        if last_stderr:
+            meta["stderr_tail"] = last_stderr[-4000:]
+        return meta
 
     def _error_result(
         self,

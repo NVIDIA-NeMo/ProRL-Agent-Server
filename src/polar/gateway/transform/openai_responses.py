@@ -263,6 +263,16 @@ class OpenAIResponsesTransformer(BaseTransformer):
         elif isinstance(input_data, list):
             messages.extend(self._convert_input_items_to_messages(input_data))
 
+        # vLLM / Qwen chat templates require exactly ONE system message at
+        # position 0.  Responses API clients (e.g. codex CLI) may produce
+        # multiple system messages (from "instructions" + "developer" items).
+        # Merge them into a single system message.
+        system_parts = [m["content"] for m in messages if m.get("role") == "system" and m.get("content")]
+        other_msgs = [m for m in messages if m.get("role") != "system"]
+        if system_parts:
+            messages = [{"role": "system", "content": "\n\n".join(system_parts)}] + other_msgs
+        else:
+            messages = other_msgs
         result: dict[str, Any] = {"messages": messages}
 
         if "max_tokens" in body:
@@ -322,9 +332,11 @@ class OpenAIResponsesTransformer(BaseTransformer):
             else:
                 output_items.append({
                     "type": "function_call",
+                    "id": f"fc_{uuid.uuid4().hex[:24]}",
                     "call_id": tc.get("id", ""),
                     "name": name,
                     "arguments": func.get("arguments", "{}"),
+                    "status": "completed",
                 })
 
         usage = response.get("usage", {})
@@ -378,6 +390,10 @@ class OpenAIResponsesTransformer(BaseTransformer):
                     pending_tool_outputs = []
 
                 role = item.get("role", "user")
+                # Responses API uses "developer" for system-level instructions;
+                # map to "system" for Chat Completions compatibility.
+                if role == "developer":
+                    role = "system"
                 content = self._extract_text_from_content(item.get("content", ""))
                 messages.append({"role": role, "content": content})
 
@@ -446,6 +462,8 @@ class OpenAIResponsesTransformer(BaseTransformer):
 
         if item_type == "message":
             role = item.get("role", "user")
+            if role == "developer":
+                role = "system"
             content_items = item.get("content", [])
             text_parts = []
             for c in content_items if isinstance(content_items, list) else []:
@@ -466,6 +484,8 @@ class OpenAIResponsesTransformer(BaseTransformer):
         # Fallback: plain {role, content} dict
         if not item_type and "role" in item and "content" in item:
             role = item["role"]
+            if role == "developer":
+                role = "system"
             content = item["content"]
             if isinstance(content, str):
                 return {"role": role, "content": content}
