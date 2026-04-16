@@ -313,7 +313,7 @@ def _handle_cluster(args: argparse.Namespace) -> int:
             print(f"[cluster] Job ID: {result['job_id']}")
             print(f"[cluster] Topology: {result['topology']}")
             print(f"\n[cluster] Submit tasks with:")
-            print(f"  python -m polar.cli cluster submit-task -c {args.config} \\")
+            print(f"  polar cluster submit-task -c {args.config} \\")
             print(f"      --job-id {result['job_id']} --example calculator --harness opencode")
         return 0
     if cmd == "submit-task":

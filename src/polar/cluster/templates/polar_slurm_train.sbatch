@@ -136,7 +136,7 @@ source "${TEMPLATE_DIR}/wait_for_service.sh"
 
 # ── Step 1: Start Polar services (CPU, on host using POLAR_VENV) ──────────────
 echo "[polar_train] Starting Polar rollout server on ${TRAINER_NODE}:${ROLLOUT_PORT}..."
-python -m polar.cli serve_rollout -c "${TOPOLOGY_PATH}" \
+polar serve_rollout -c "${TOPOLOGY_PATH}" \
     > "${JOB_DIR}/logs/rollout.log" 2>&1 &
 PIDS+=($!)
 
@@ -150,7 +150,7 @@ for ((i=0; i<NUM_NODES; i++)); do
 
     echo "[polar_train] Starting gateway ${NODE_ID} on ${GW_HOST}:${GW_PORT}..."
     if [ "${i}" -eq 0 ]; then
-        python -m polar.cli serve_gateway \
+        polar serve_gateway \
             -c "${TOPOLOGY_PATH}" \
             --node-id "${NODE_ID}" \
             > "${JOB_DIR}/logs/gateway_${NODE_ID}.log" 2>&1 &
@@ -201,7 +201,7 @@ if [ ! -d "${TORCH_DIST_DIR}/release" ]; then
     mkdir -p "${TORCH_DIST_DIR}"
     ${APPTAINER_EXEC} bash -c "
         export CUDA_DEVICE_MAX_CONNECTIONS=1
-        export PYTHONPATH='/opt/Megatron-LM:/opt/polar/src:\${PYTHONPATH:-}'
+        export PYTHONPATH='/opt/polar/src:\${PYTHONPATH:-}'
         torchrun --nproc_per_node 1 \
             /opt/slime/tools/convert_hf_to_torch_dist.py \
             ${MODEL_ARGS} \
@@ -231,7 +231,7 @@ echo "[polar_train]   Actor GPUs: ${ACTOR_GPUS} (TP=${TP_SIZE}), Rollout GPUs: $
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/opt/Megatron-LM:/opt/polar/src\",
+    \"PYTHONPATH\": \"/opt/polar/src\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\"
   }
 }"
@@ -239,10 +239,10 @@ RUNTIME_ENV_JSON="{
 ${APPTAINER_EXEC} bash -c "
     set -euo pipefail
 
-    # Verify critical SGLang dependencies are importable
+    # Verify critical training dependencies are importable
     echo '[polar_train] Verifying runtime dependencies...'
-    python3 -c 'import openai; import pybase64; import partial_json_parser; import sglang; print(\"All SGLang deps OK\")' || {
-        echo '[polar_train] ERROR: Missing SGLang dependencies in SIF. Rebuild with: polar cluster build-sif --example train --force' >&2
+    python3 -c 'import sglang; import slime; import megatron; import mbridge; print(\"All training deps OK\")' || {
+        echo '[polar_train] ERROR: Missing training dependencies in SIF. Rebuild with: polar cluster build-sif --example train --force' >&2
         exit 1
     }
 
@@ -272,7 +272,7 @@ ${APPTAINER_EXEC} bash -c "
     done
 
     # Submit training job (uses localhost since we're in the same namespace)
-    export PYTHONPATH='/opt/Megatron-LM:/opt/polar/src:\${PYTHONPATH:-}'
+    export PYTHONPATH='/opt/polar/src:\${PYTHONPATH:-}'
     export CUDA_DEVICE_MAX_CONNECTIONS=1
 
     ray job submit \

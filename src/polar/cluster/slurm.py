@@ -993,64 +993,28 @@ def _generate_swebench_def(
 def _generate_train_def(code_path: str) -> str:
     """Generate an Apptainer .def for the Slime+Megatron GRPO training SIF.
 
-    Based on NGC PyTorch with Slime, Megatron-LM, and Polar patches installed.
+    Uses slimerl/slime Docker image which ships sglang v0.5.9, Megatron-LM,
+    flash-attn, transformer_engine, apex, mbridge, and all training deps
+    pre-built.  We only add Polar and apply Polar's Slime patch on top.
     """
     return (
         "Bootstrap: docker\n"
-        "From: nvcr.io/nvidia/pytorch:24.12-py3\n"
+        "From: slimerl/slime:nightly-dev-20260329a\n"
         "\n"
         "%files\n"
         f"    {code_path} /opt/polar\n"
         "\n"
         "%post\n"
-        "    # Freeze NGC's PyTorch version and constrain transformers.\n"
-        "    # transformers >=4.51 adds Qwen3 support; >=4.53 imports\n"
-        "    # torch._dynamo.TransformGetItemToIndex which doesn't exist in\n"
-        "    # NGC's torch 2.6.0a0.  So we pin to [4.51, 4.53).\n"
-        "    TORCH_VER=$(pip show torch 2>/dev/null | grep '^Version' | awk '{print $2}')\n"
-        '    echo "torch==${TORCH_VER}" > /tmp/torch_constraint.txt\n'
-        '    echo "transformers>=4.51.0,<4.53.0" >> /tmp/torch_constraint.txt\n'
-        "\n"
-        "    # Install Slime (training framework) — constrain torch to NGC version\n"
-        "    git clone https://github.com/THUDM/slime.git /opt/slime\n"
-        "    cd /opt/slime && pip install -e . -c /tmp/torch_constraint.txt\n"
-        "\n"
-        "    # Install mbridge (model bridge for HF↔Megatron weight conversion)\n"
-        "    pip install mbridge -c /tmp/torch_constraint.txt\n"
-        "\n"
-        "    # Install Megatron-LM at the commit Slime officially ships with.\n"
-        "    # Commit 3714d81d is what Slime's Docker image uses; newer commits\n"
-        "    # pass a 'config' kwarg to model_provider which Slime doesn't accept.\n"
-        "    # --no-deps: megatron-core requires torch>=2.6.0 but NGC's\n"
-        "    # 2.6.0a0 pre-release doesn't satisfy that constraint.\n"
-        "    git clone https://github.com/NVIDIA/Megatron-LM.git /opt/Megatron-LM\n"
-        "    cd /opt/Megatron-LM && git checkout 3714d81d\n"
-        "    pip install -e . --no-deps\n"
-        "\n"
-        "    # Install SGLang without its dependency tree.  sglang requires\n"
-        "    # torch>=2.9 but NGC ships 2.6.0a0 — pip can't resolve that,\n"
-        "    # so --no-deps is mandatory.  Then install the critical runtime\n"
-        "    # deps separately (they don't drag in torch).\n"
-        "    pip install sglang sglang-router --no-deps\n"
-        "    pip install openai pybase64 partial_json_parser interegular outlines\n"
-        "\n"
-        "    # Install Polar\n"
+        "    # Install Polar on top of the Slime image\n"
         "    pip install -e /opt/polar\n"
         "\n"
-        "    # Apply SGLang patch (adds token IDs to logprobs for serving).\n"
-        "    # Non-fatal: the training workflow uses SGLang through Slime's\n"
-        "    # internal APIs, not the OpenAI chat endpoint the patch modifies.\n"
-        "    bash /opt/polar/scripts/patch/patch_sglang.sh || echo 'WARNING: SGLang patch skipped (version mismatch)'\n"
-        "\n"
-        "    # Apply Slime patch (adds external advantage estimator)\n"
+        "    # Apply Slime patch (adds external advantage estimator for Polar)\n"
         "    bash /opt/polar/scripts/patch/patch_slime.sh\n"
         "\n"
         "%environment\n"
-        '    export PYTHONPATH="/opt/Megatron-LM:/opt/polar/src:${PYTHONPATH:-}"\n'
+        '    export PYTHONPATH="/opt/polar/src:${PYTHONPATH:-}"\n'
         "    export CUDA_DEVICE_MAX_CONNECTIONS=1\n"
-        "    # Prevent user-site packages (~/.local) from shadowing container packages\n"
         "    export PYTHONNOUSERSITE=1\n"
-        "    # CUDA forward-compat: allow newer toolkit to work with older drivers\n"
         '    export LD_LIBRARY_PATH="/usr/local/cuda/compat:${LD_LIBRARY_PATH:-}"\n'
         "\n"
         "%labels\n"

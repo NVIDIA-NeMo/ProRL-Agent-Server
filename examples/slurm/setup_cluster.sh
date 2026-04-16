@@ -69,7 +69,7 @@ fi
 # ── 4. Verify polar CLI ───────────────────────────────────────────────────────
 echo ""
 echo "[setup] Verifying polar CLI..."
-python -m polar.cli --help > /dev/null 2>&1 && echo "  polar CLI: OK" || echo "  ERROR: polar CLI not working"
+polar --help > /dev/null 2>&1 && echo "  polar CLI: OK" || echo "  ERROR: polar CLI not working"
 
 # ── 5. Summary ─────────────────────────────────────────────────────────────────
 echo ""

@@ -153,7 +153,7 @@ wait_for_service "http://${NODE_0}:${VLLM_PORT}/health" "vLLM" 240 5 || exit 1
 # ── Launch Rollout Service ─────────────────────────────────────────────────────
 echo "[polar_slurm] Starting rollout service on ${NODE_0}:${ROLLOUT_PORT}..."
 
-python -m polar.cli serve_rollout -c "${TOPOLOGY_PATH}" \
+polar serve_rollout -c "${TOPOLOGY_PATH}" \
     > "${JOB_DIR}/logs/rollout.log" 2>&1 &
 PIDS+=($!)
 echo "[polar_slurm] Rollout PID: ${PIDS[-1]}"
@@ -170,7 +170,7 @@ for ((i=0; i<NUM_NODES; i++)); do
 
     if [ "${i}" -eq 0 ]; then
         # Gateway on node 0 runs locally (same as rollout + vLLM)
-        python -m polar.cli serve_gateway \
+        polar serve_gateway \
             -c "${TOPOLOGY_PATH}" \
             --node-id "${NODE_ID}" \
             > "${JOB_DIR}/logs/gateway_${NODE_ID}.log" 2>&1 &
@@ -200,8 +200,8 @@ done
 
 # ── Check overall status ───────────────────────────────────────────────────────
 echo "[polar_slurm] All services running. Checking status..."
-python -m polar.cli status -c "${TOPOLOGY_PATH}" --json > "${JOB_DIR}/logs/status.json" 2>&1 || true
-python -m polar.cli status -c "${TOPOLOGY_PATH}" || true
+polar status -c "${TOPOLOGY_PATH}" --json > "${JOB_DIR}/logs/status.json" 2>&1 || true
+polar status -c "${TOPOLOGY_PATH}" || true
 
 # ── Submit Tasks ───────────────────────────────────────────────────────────────
 echo ""
@@ -212,7 +212,7 @@ echo "[polar_slurm] ════════════════════
 if [ -n "${TASK_FILE:-}" ]; then
     # Direct task file submission
     echo "[polar_slurm] Submitting task file: ${TASK_FILE}"
-    python -m polar.cli submit "${TASK_FILE}" \
+    polar submit "${TASK_FILE}" \
         -c "${TOPOLOGY_PATH}" \
         --json | tee "${JOB_DIR}/response.json"
 else
@@ -246,7 +246,7 @@ echo "[polar_slurm] Rollout results: ${SAVE_DIR}"
 echo "[polar_slurm] ════════════════════════════════════════════════════════"
 
 # Final status check
-python -m polar.cli status -c "${TOPOLOGY_PATH}" || true
+polar status -c "${TOPOLOGY_PATH}" || true
 
 echo "[polar_slurm] Job complete."
 exit ${SUBMIT_EXIT}

@@ -87,3 +87,87 @@ uv run python examples/swebench_verified/submit_swebench_tasks.py \
   --max-concurrent 4 \
   --max-tasks 10
 ```
+
+Supported harness names: `claude_code`, `codex`, `opencode`, `openhands_sdk`
+
+## Cluster Deployment (SLURM)
+
+For running on a SLURM cluster with Apptainer containers and vLLM inference.
+See [examples/slurm/README.md](../slurm/README.md) for full documentation.
+
+### 1. Configure
+
+```bash
+cp examples/slurm/cluster.yaml.example my-cluster.yaml
+# Edit my-cluster.yaml with your cluster details
+```
+
+### 2. Populate Dataset Cache
+
+The task runner needs the full SWE-bench Verified dataset cached locally.
+Run once (requires `datasets` library):
+
+```bash
+python -c "from examples.swebench_verified.dataset import load_swebench_verified; load_swebench_verified()"
+```
+
+### 3. Build SIF Images
+
+Each SWE-bench Verified instance needs a per-instance SIF:
+
+```bash
+# Build SIF for a specific instance + harness
+polar cluster build-sif -c my-cluster.yaml \
+    --example swebench_verified --harness opencode \
+    --instance-id django__django-15098
+
+# Build multiple instances
+polar cluster build-sif -c my-cluster.yaml \
+    --example swebench_verified --harness opencode \
+    --instance-id django__django-15098 \
+    --instance-id sympy__sympy-18835
+```
+
+### 4. Start Services
+
+```bash
+polar cluster serve -c my-cluster.yaml
+```
+
+Once services are ready, the command prints the job ID.
+
+### 5. Submit Tasks
+
+```bash
+# Submit a single instance (use job ID from step 4)
+polar cluster submit-task -c my-cluster.yaml \
+    --job-id JOB_ID --example swebench_verified --harness opencode \
+    --timeout-seconds 3600 --instance-id django__django-15098
+
+# Submit multiple instances
+polar cluster submit-task -c my-cluster.yaml \
+    --job-id JOB_ID --example swebench_verified --harness opencode \
+    --timeout-seconds 3600 \
+    --instance-id django__django-15098 \
+    --instance-id sympy__sympy-18835
+```
+
+### 6. Stop Services
+
+```bash
+scancel JOB_ID
+```
+
+### 7. Collect Results
+
+```bash
+polar cluster sync -c my-cluster.yaml
+```
+
+**One-shot alternative** — start services, run tasks, and exit in one command:
+
+```bash
+polar cluster launch -c my-cluster.yaml \
+    --example swebench_verified --harness opencode \
+    --timeout-seconds 3600 --instance-id django__django-15098
+```

@@ -124,7 +124,7 @@ wait_for_service "http://${NODE_0}:${VLLM_PORT}/health" "vLLM" 240 5 || exit 1
 # ── Launch Rollout Service ─────────────────────────────────────────────────────
 echo "[polar_serve] Starting rollout service on ${NODE_0}:${ROLLOUT_PORT}..."
 
-python -m polar.cli serve_rollout -c "${TOPOLOGY_PATH}" \
+polar serve_rollout -c "${TOPOLOGY_PATH}" \
     > "${JOB_DIR}/logs/rollout.log" 2>&1 &
 PIDS+=($!)
 echo "[polar_serve] Rollout PID: ${PIDS[-1]}"
@@ -140,7 +140,7 @@ for ((i=0; i<NUM_NODES; i++)); do
     echo "[polar_serve] Starting gateway ${NODE_ID} on ${GW_HOST}:${GW_PORT}..."
 
     if [ "${i}" -eq 0 ]; then
-        python -m polar.cli serve_gateway \
+        polar serve_gateway \
             -c "${TOPOLOGY_PATH}" \
             --node-id "${NODE_ID}" \
             > "${JOB_DIR}/logs/gateway_${NODE_ID}.log" 2>&1 &
@@ -169,8 +169,8 @@ done
 
 # ── All services ready ───────────────────────────────────────────────────────
 echo "[polar_serve] All services running. Checking status..."
-python -m polar.cli status -c "${TOPOLOGY_PATH}" --json > "${JOB_DIR}/logs/status.json" 2>&1 || true
-python -m polar.cli status -c "${TOPOLOGY_PATH}" || true
+polar status -c "${TOPOLOGY_PATH}" --json > "${JOB_DIR}/logs/status.json" 2>&1 || true
+polar status -c "${TOPOLOGY_PATH}" || true
 
 # Write sentinel file so 'polar cluster serve' knows services are ready
 cat > "${JOB_DIR}/.services_ready" <<EOF
