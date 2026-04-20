@@ -72,6 +72,93 @@ _state: GatewayState | None = None
 _configured_topology_path: str | None = None
 _configured_node_id: str | None = None
 
+# Cached max_model_len from the backend model (populated lazily).
+_max_model_len: int | None = None
+_DEFAULT_MAX_OUTPUT_TOKENS = 4096  # Sensible default if model info unavailable
+
+
+async def _fetch_max_model_len(base_url: str) -> int | None:
+    """Query backend for max_model_len via /v1/models."""
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(base_url=base_url, timeout=10.0) as client:
+            resp = await client.get("/v1/models")
+            if resp.is_success:
+                data = resp.json().get("data", [])
+                if data:
+                    return data[0].get("max_model_len")
+    except Exception:
+        pass
+    return None
+
+
+def _clamp_max_tokens(request: dict[str, Any]) -> None:
+    """Reduce max_tokens / max_completion_tokens so it leaves room for input.
+
+    Reserves at least 25% of the context window (min 2048 tokens) for the
+    input prompt.  This avoids the common failure where
+    ``max_tokens == max_model_len`` leaves zero tokens for the prompt.
+
+    Handles both ``max_tokens`` (legacy) and ``max_completion_tokens``
+    (modern OpenAI API used by litellm/openhands).
+    """
+    global _max_model_len
+    if _max_model_len:
+        input_reserve = max(_max_model_len // 4, 2048)
+        limit = _max_model_len - input_reserve
+    else:
+        limit = _DEFAULT_MAX_OUTPUT_TOKENS
+    for key in ("max_tokens", "max_completion_tokens"):
+        val = request.get(key)
+        if val is not None and isinstance(val, int) and val > limit:
+            logger.info(
+                "Clamped %s from %d to %d (model limit %s, input reserve %d)",
+                key, val, limit, _max_model_len or "default",
+                input_reserve if _max_model_len else 0,
+            )
+            request[key] = limit
+
+
+def _try_reduce_max_tokens_from_error(
+    error_msg: str,
+    request: dict[str, Any],
+) -> bool:
+    """On a vLLM token-limit 400 error, shrink output-token fields by ~30%.
+
+    Handles both ``max_tokens`` and ``max_completion_tokens``.
+    Returns ``True`` if any field was lowered (caller should retry).
+
+    We deliberately avoid parsing the reported input-token count from the
+    error because vLLM reports a *derived* value (``context_len + 1 -
+    max_tokens``) rather than the true tokenised length, which makes
+    error-guided reduction unreliable.  A fixed 30% reduction converges
+    quickly in practice.
+    """
+    if "maximum context length" not in error_msg:
+        return False
+
+    changed = False
+    for key in ("max_tokens", "max_completion_tokens"):
+        old = request.get(key)
+        if isinstance(old, int) and old > 128:
+            new = max(128, old * 7 // 10)  # ~30% reduction
+            logger.info("Auto-reducing %s from %d to %d", key, old, new)
+            request[key] = new
+            changed = True
+
+    # If no output-token field exists, add one at ¼ of context.
+    if not changed and _max_model_len:
+        for key in ("max_tokens", "max_completion_tokens"):
+            if key not in request:
+                new = _max_model_len // 4
+                logger.info("Adding %s=%d to constrain output", key, new)
+                request[key] = new
+                changed = True
+                break
+
+    return changed
+
 
 def configure_server(topology_path: str = "topology.yaml", *, node_id: str | None = None) -> None:
     global _configured_topology_path, _configured_node_id, _state
@@ -142,10 +229,20 @@ def get_state() -> GatewayState:
 
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
+    global _max_model_len
     state = get_state()
     await state.node_manager.start()
     if state.control_client is not None:
         await state.control_client.start()
+    # Cache backend model's max_model_len for request clamping.
+    _max_model_len = await _fetch_max_model_len(state.node.sglang_base_url)
+    if _max_model_len:
+        logger.info("Backend max_model_len: %d", _max_model_len)
+    else:
+        logger.warning(
+            "Could not fetch max_model_len from backend; using default cap %d",
+            _DEFAULT_MAX_OUTPUT_TOKENS,
+        )
     try:
         yield
     finally:
@@ -577,6 +674,10 @@ async def proxy_request(request: Request, path: str):
 
     openai_request = transformer.transform_request(body)
     openai_request["model"] = state.node.model_served
+
+    # Clamp max_tokens so it never exceeds the backend model's capacity.
+    _clamp_max_tokens(openai_request)
+
     is_streaming = openai_request.get("stream", False)
 
     if is_streaming:
@@ -611,11 +712,28 @@ async def _handle_non_streaming(
     session_info: Any | None,
 ) -> JSONResponse:
     state = get_state()
-    try:
-        response = await state.sglang.completion(openai_request)
-    except UpstreamError as exc:
-        logger.warning("Non-streaming upstream error for session %s: %s", session_id, exc)
-        return _upstream_error_response(api_type, exc)
+    response = None
+    last_exc: Exception | None = None
+    for _attempt in range(4):
+        try:
+            response = await state.sglang.completion(openai_request)
+            break
+        except UpstreamHTTPError as exc:
+            last_exc = exc
+            if (
+                exc.status_code == 400
+                and _try_reduce_max_tokens_from_error(str(exc), openai_request)
+            ):
+                logger.info("Retrying (%d) with reduced max_tokens", _attempt + 1)
+                continue
+            logger.warning("Non-streaming upstream error for session %s: %s", session_id, exc)
+            return _upstream_error_response(api_type, exc)
+        except UpstreamError as exc:
+            logger.warning("Non-streaming upstream error for session %s: %s", session_id, exc)
+            return _upstream_error_response(api_type, exc)
+    if response is None:
+        logger.warning("All retries exhausted for session %s: %s", session_id, last_exc)
+        return _upstream_error_response(api_type, last_exc or UpstreamError("max_tokens retries exhausted"))
 
     state.storage.save_message(
         session_id,
@@ -643,11 +761,30 @@ async def _handle_streaming(
     session_info: Any | None,
 ) -> StreamingResponse | JSONResponse:
     state = get_state()
-    try:
-        raw_stream = await state.sglang.open_completion_stream(openai_request)
-    except UpstreamError as exc:
-        logger.warning("Streaming setup error for session %s: %s", session_id, exc)
-        return _upstream_error_response(api_type, exc)
+    # Try opening the stream; on a token-limit 400 error, auto-reduce
+    # max_tokens and retry (up to 3 retries, so 4 total attempts).
+    raw_stream = None
+    last_exc: Exception | None = None
+    for _attempt in range(4):
+        try:
+            raw_stream = await state.sglang.open_completion_stream(openai_request)
+            break
+        except UpstreamHTTPError as exc:
+            last_exc = exc
+            if (
+                exc.status_code == 400
+                and _try_reduce_max_tokens_from_error(str(exc), openai_request)
+            ):
+                logger.info("Retrying (%d) with reduced max_tokens", _attempt + 1)
+                continue
+            logger.warning("Streaming setup error for session %s: %s", session_id, exc)
+            return _upstream_error_response(api_type, exc)
+        except UpstreamError as exc:
+            logger.warning("Streaming setup error for session %s: %s", session_id, exc)
+            return _upstream_error_response(api_type, exc)
+    if raw_stream is None:
+        logger.warning("All retries exhausted for session %s: %s", session_id, last_exc)
+        return _upstream_error_response(api_type, last_exc or UpstreamError("max_tokens retries exhausted"))
 
     accumulator = StreamAccumulator()
     stream_state = transformer.create_stream_state(original_request)

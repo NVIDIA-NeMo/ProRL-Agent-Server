@@ -79,7 +79,8 @@ class OpenHandsSdkHarness(BaseHarness):
             ExecInput(
                 command=(
                     'export LLM_API_KEY="$OPENAI_API_KEY" LLM_BASE_URL="$OPENAI_BASE_URL" && '
-                    'PYTHON_BIN="$HOME/.venv/bin/python"; '
+                    'PYTHON_BIN="/opt/miniconda3/envs/polar-openhands/bin/python"; '
+                    '[ -x "$PYTHON_BIN" ] || PYTHON_BIN="$HOME/.venv/bin/python"; '
                     '[ -x "$PYTHON_BIN" ] || PYTHON_BIN="/opt/openhands-sdk-venv/bin/python"; '
                     '[ -x "$PYTHON_BIN" ] || PYTHON_BIN="$(command -v python3 || command -v python)"; '
                     '"$PYTHON_BIN" '
@@ -93,12 +94,19 @@ class OpenHandsSdkHarness(BaseHarness):
 
 _RUNNER_SCRIPT = r'''#!/usr/bin/env python3
 """OpenHands SDK runner for Polar."""
-from __future__ import annotations
+import sys
+if sys.version_info < (3, 10):
+    print(
+        f"Error: OpenHands SDK requires Python >= 3.10, "
+        f"got {'.'.join(map(str, sys.version_info[:3]))}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 import json
 import os
-import sys
 from pathlib import Path
+from typing import Optional
 
 
 def _load_skills(skill_paths_raw: str) -> list[object]:
@@ -136,7 +144,7 @@ def _load_skills(skill_paths_raw: str) -> list[object]:
     return skills
 
 
-def _load_mcp_config() -> dict[str, object] | None:
+def _load_mcp_config() -> Optional[dict[str, object]]:
     raw = os.environ.get("MCP_SERVERS_JSON")
     if not raw:
         return None

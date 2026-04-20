@@ -34,6 +34,8 @@ HARNESS_NPM_PACKAGE: dict[str, str] = {
     "codex": "@openai/codex@latest",
     "opencode": "opencode-ai@latest",
     "claude_code": "@anthropic-ai/claude-code@latest",
+    "gemini_cli": "@google/gemini-cli@latest",
+    "qwen_code": "@qwen-code/qwen-code@latest",
 }
 
 _PREPARE_BASE = (
@@ -48,8 +50,18 @@ _PREPARE_BASE = (
 
 
 def prepare_command_for_harness(harness: str) -> str:
-    pkg = HARNESS_NPM_PACKAGE[harness]
-    return f"npm install -g {pkg} && {_PREPARE_BASE}"
+    if harness in HARNESS_NPM_PACKAGE:
+        pkg = HARNESS_NPM_PACKAGE[harness]
+        return f"npm install -g {pkg} && {_PREPARE_BASE}"
+    if harness == "swe_agent":
+        return (
+            "source /opt/miniconda3/etc/profile.d/conda.sh && "
+            "conda activate polar-sweagent && "
+            f"{_PREPARE_BASE}"
+        )
+    if harness == "openhands_sdk":
+        return _PREPARE_BASE
+    raise ValueError(f"Unknown harness: {harness}")
 
 
 def runtime_env_for_harness(harness: str) -> dict[str, str]:
@@ -146,6 +158,31 @@ def select_instances(args: argparse.Namespace) -> list[dict[str, Any]]:
     return instances
 
 
+def agent_settings_for_harness(harness: str) -> dict[str, Any]:
+    if harness == "swe_agent":
+        return {
+            "repo_path": "/polar/session/workspace",
+            "shell_preamble": (
+                "source /opt/miniconda3/etc/profile.d/conda.sh && "
+                "conda activate polar-sweagent && "
+                "export PATH=/opt/miniconda3/envs/testbed/bin:$PATH"
+            ),
+        }
+    return {}
+
+
+def agent_env_for_harness(harness: str) -> dict[str, str]:
+    if harness in ("openhands_sdk", "openhands"):
+        return {"WORKSPACE_BASE": "/polar/session/workspace"}
+    return {}
+
+
+def runtime_kwargs_for_harness(harness: str) -> dict[str, Any]:
+    if harness == "swe_agent":
+        return {"fakeroot": True}
+    return {}
+
+
 def build_task_request(
     args: argparse.Namespace,
     *,
@@ -154,6 +191,7 @@ def build_task_request(
 ) -> dict[str, Any]:
     instance_id = str(instance["instance_id"])
     image = runtime_image_for_instance(instance_id)
+    kwargs = runtime_kwargs_for_harness(args.harness)
     return {
         "task_id": f"swebench-{args.harness}-{sanitize_instance_id(instance_id)}-{batch_id}",
         "instruction": str(instance["problem_statement"]).strip(),
@@ -166,11 +204,12 @@ def build_task_request(
             "env": runtime_env_for_harness(args.harness),
             "network": "host",
             "workdir": "/polar/session/workspace",
+            **({"kwargs": kwargs} if kwargs else {}),
         },
         "agent": {
             "harness": args.harness,
-            "settings": {},
-            "env": {},
+            "settings": agent_settings_for_harness(args.harness),
+            "env": agent_env_for_harness(args.harness),
         },
         "builder": {"strategy": "prefix_merging"},
         "evaluator": {

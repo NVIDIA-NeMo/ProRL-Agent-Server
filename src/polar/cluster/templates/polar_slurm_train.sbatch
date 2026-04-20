@@ -201,9 +201,9 @@ if [ ! -d "${TORCH_DIST_DIR}/release" ]; then
     mkdir -p "${TORCH_DIST_DIR}"
     ${APPTAINER_EXEC} bash -c "
         export CUDA_DEVICE_MAX_CONNECTIONS=1
-        export PYTHONPATH='/opt/polar/src:\${PYTHONPATH:-}'
+        export PYTHONPATH='/opt/polar/src:/root/Megatron-LM:\${PYTHONPATH:-}'
         torchrun --nproc_per_node 1 \
-            /opt/slime/tools/convert_hf_to_torch_dist.py \
+            /root/slime/tools/convert_hf_to_torch_dist.py \
             ${MODEL_ARGS} \
             --hf-checkpoint '${HF_CHECKPOINT}' \
             --save '${TORCH_DIST_DIR}' \
@@ -231,7 +231,7 @@ echo "[polar_train]   Actor GPUs: ${ACTOR_GPUS} (TP=${TP_SIZE}), Rollout GPUs: $
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/opt/polar/src\",
+    \"PYTHONPATH\": \"/opt/polar/src:/root/Megatron-LM\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\"
   }
 }"
@@ -272,13 +272,13 @@ ${APPTAINER_EXEC} bash -c "
     done
 
     # Submit training job (uses localhost since we're in the same namespace)
-    export PYTHONPATH='/opt/polar/src:\${PYTHONPATH:-}'
+    export PYTHONPATH='/opt/polar/src:/root/Megatron-LM:\${PYTHONPATH:-}'
     export CUDA_DEVICE_MAX_CONNECTIONS=1
 
     ray job submit \
         --address='http://127.0.0.1:${RAY_DASHBOARD_PORT}' \
         --runtime-env-json='${RUNTIME_ENV_JSON}' \
-        -- python3 /opt/slime/train_async.py \
+        -- python3 /root/slime/train_async.py \
         --actor-num-nodes 1 \
         --actor-num-gpus-per-node '${ACTOR_GPUS}' \
         --rollout-num-gpus '${ROLLOUT_GPUS}' \
@@ -318,7 +318,7 @@ ${APPTAINER_EXEC} bash -c "
         --recompute-num-layers 1 \
         --use-dynamic-batch-size \
         --max-tokens-per-gpu 8192 \
-        --advantage-estimator external \
+        --advantage-estimator '${ADVANTAGE_ESTIMATOR:-grpo}' \
         --use-rollout-logprobs \
         --use-kl-loss \
         --kl-loss-coef 0.001 \
@@ -341,8 +341,8 @@ ${APPTAINER_EXEC} bash -c "
         ${WANDB_PROJECT:+--use-wandb --wandb-project '${WANDB_PROJECT}'} \
         ${WANDB_EXP_NAME:+--wandb-exp-name '${WANDB_EXP_NAME}'} \
         ${WANDB_GROUP:+--wandb-group '${WANDB_GROUP}'} \
-        --sglang-router-ip 0.0.0.0 \
         --sglang-router-port '${SGLANG_ROUTER_PORT}' \
+        --sglang-disable-cuda-graph \
         ${EXTRA_TRAIN_ARGS:-}
 " 2>&1 | tee "${JOB_DIR}/logs/training.log"
 

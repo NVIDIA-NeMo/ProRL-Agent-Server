@@ -337,7 +337,7 @@ class SlurmBackend(ClusterBackend):
             f"--example {example} --harness {harness} "
             f"--topology {topology_path} "
             f"--sif-dir {cfg.paths.sif_dir} "
-            f"--output-dir {job_dir}/tasks "
+            f"--output-dir {job_dir}/tasks/{harness} "
             f"--num-rollouts {cfg.task.num_rollouts} "
             f"--timeout-seconds {cfg.task.timeout_seconds}"
             f"{instance_id_args}"
@@ -950,6 +950,39 @@ _SWEBENCH_HARNESS_DEFS: dict[str, list[str]] = {
         _SWEBENCH_NODE_INSTALL,
         "npm install -g @anthropic-ai/claude-code@latest",
     ],
+    "gemini_cli": [
+        _SWEBENCH_NODE_INSTALL,
+        "npm install -g @google/gemini-cli@latest",
+    ],
+    "qwen_code": [
+        _SWEBENCH_NODE_INSTALL,
+        "npm install -g @qwen-code/qwen-code@latest",
+    ],
+    "swe_agent": [
+        "apt-get update && apt-get install -y --no-install-recommends "
+        "bash ca-certificates curl git build-essential && rm -rf /var/lib/apt/lists/*",
+        "/opt/miniconda3/bin/conda create -y -n polar-sweagent python=3.11 pip",
+        "/opt/miniconda3/envs/polar-sweagent/bin/python -m pip install --no-cache-dir "
+        "'git+https://github.com/SWE-agent/SWE-agent.git'",
+        "/opt/miniconda3/envs/polar-sweagent/bin/python -m pip install --no-cache-dir "
+        "tree-sitter==0.21.3 tree-sitter-languages",
+        "SITE=$(/opt/miniconda3/envs/polar-sweagent/bin/python -c "
+        "\"import site; print(site.getsitepackages()[0])\") && "
+        "git clone --depth 1 https://github.com/SWE-agent/SWE-agent.git /tmp/swe-agent-src && "
+        "cp -r /tmp/swe-agent-src/config $SITE/config && "
+        "cp -r /tmp/swe-agent-src/tools $SITE/tools && "
+        "mkdir -p $SITE/trajectories && "
+        "/opt/miniconda3/bin/conda clean -afy && "
+        "rm -rf /tmp/swe-agent-src",
+    ],
+    "openhands_sdk": [
+        "apt-get update && apt-get install -y --no-install-recommends "
+        "bash ca-certificates curl git && rm -rf /var/lib/apt/lists/*",
+        "/opt/miniconda3/bin/conda create -y -n polar-openhands python=3.12 pip",
+        "/opt/miniconda3/envs/polar-openhands/bin/python -m pip install --no-cache-dir "
+        "openhands-sdk openhands-tools",
+        "/opt/miniconda3/bin/conda clean -afy",
+    ],
 }
 
 
@@ -971,6 +1004,15 @@ def _generate_swebench_def(
         return None
     base_image = _swebench_base_image(instance_id)
     post = "\n    ".join(spec)
+
+    # Build PATH: always include testbed; add harness-specific conda envs
+    path_parts = ["/opt/miniconda3/envs/testbed/bin"]
+    if harness == "swe_agent":
+        path_parts.insert(0, "/opt/miniconda3/envs/polar-sweagent/bin")
+    elif harness == "openhands_sdk":
+        path_parts.insert(0, "/opt/miniconda3/envs/polar-openhands/bin")
+    path_env = ":".join(path_parts)
+
     return (
         f"Bootstrap: docker\n"
         f"From: {base_image}\n"
@@ -981,7 +1023,7 @@ def _generate_swebench_def(
         f"\n"
         f"%environment\n"
         f"    export DEBIAN_FRONTEND=noninteractive\n"
-        f"    export PATH=/opt/miniconda3/envs/testbed/bin:$PATH\n"
+        f"    export PATH={path_env}:$PATH\n"
         f"\n"
         f"%labels\n"
         f"    io.polar.example swebench_verified\n"
@@ -1012,7 +1054,7 @@ def _generate_train_def(code_path: str) -> str:
         "    bash /opt/polar/scripts/patch/patch_slime.sh\n"
         "\n"
         "%environment\n"
-        '    export PYTHONPATH="/opt/polar/src:${PYTHONPATH:-}"\n'
+        '    export PYTHONPATH="/opt/polar/src:/root/Megatron-LM:${PYTHONPATH:-}"\n'
         "    export CUDA_DEVICE_MAX_CONNECTIONS=1\n"
         "    export PYTHONNOUSERSITE=1\n"
         '    export LD_LIBRARY_PATH="/usr/local/cuda/compat:${LD_LIBRARY_PATH:-}"\n'

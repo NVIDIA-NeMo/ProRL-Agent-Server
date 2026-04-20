@@ -310,6 +310,24 @@ def build_swebench_task(
     if harness == "claude_code":
         exclude_patterns.extend([".claude/**", "**/.claude/**"])
 
+    agent_settings: dict[str, Any] = {}
+    agent_env: dict[str, str] = {}
+    if harness == "swe_agent":
+        agent_settings = {
+            "repo_path": "/polar/session/workspace",
+            "shell_preamble": (
+                "source /opt/miniconda3/etc/profile.d/conda.sh && "
+                "conda activate polar-sweagent && "
+                "export PATH=/opt/miniconda3/envs/testbed/bin:$PATH"
+            ),
+        }
+    elif harness in ("openhands_sdk", "openhands"):
+        agent_env = {"WORKSPACE_BASE": "/polar/session/workspace"}
+
+    runtime_kwargs: dict[str, Any] = {}
+    if harness == "swe_agent":
+        runtime_kwargs["fakeroot"] = True
+
     return {
         "task_id": f"swebench-{harness}-{_sanitize_instance_id(instance_id)}-{batch_id}",
         "instruction": str(instance.get("problem_statement", "")).strip(),
@@ -322,12 +340,13 @@ def build_swebench_task(
             "env": runtime_env,
             "network": "host",
             "workdir": "/polar/session/workspace",
+            **({"kwargs": runtime_kwargs} if runtime_kwargs else {}),
         },
         "agent": {
             "harness": harness,
             "model_name": agent_model,
-            "settings": {},
-            "env": {},
+            "settings": agent_settings,
+            "env": agent_env,
         },
         "builder": {"strategy": "prefix_merging"},
         "evaluator": {
