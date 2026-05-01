@@ -161,7 +161,7 @@ class DesktopEnv(gym.Env):
         # Track whether environment has been used (step/setup) to optimize snapshot revert
         # docker, aws, gcp, azure are always unused as the emulator starts from a clean state
         # vmware, virtualbox are always used as the emulator starts from a dirty state
-        if self.provider_name in {"docker", "nvcf_dummy", "nvcf", "aws", "gcp", "azure", "aliyun", "volcengine", "singularity"}:
+        if self.provider_name in {"docker", "nvcf_dummy", "nvcf", "nvcf_singularity", "aws", "gcp", "azure", "aliyun", "volcengine", "singularity"}:
             self.is_environment_used = False
         elif self.provider_name in {"vmware", "virtualbox"}:
             self.is_environment_used = True
@@ -347,7 +347,8 @@ class DesktopEnv(gym.Env):
 
         # Link existing downloaded files to avoid re-downloading them
         setup_cache_dir = os.getenv('OSWORLD_SETUP_CACHE_DIR', None)
-        setup_cache_dir = os.path.join(setup_cache_dir, self.task_id)
+        if setup_cache_dir is not None:
+            setup_cache_dir = os.path.join(setup_cache_dir, self.task_id)
         if setup_cache_dir is not None and os.path.isdir(setup_cache_dir):
             logger.info(f"Setup cache directory: {setup_cache_dir}. Files will not need to be downloaded again.")
             # create symlink of all files in setup cache directory to eval cache directory

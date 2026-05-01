@@ -26,7 +26,7 @@ class EnvController:
     """
     Static wrapper class that interfaces with either:
     - OSWorldSingularityRuntime (runtime_type='singularity')
-    - OSWorld DesktopEnv (runtime_type='nvcf')
+    - OSWorld DesktopEnv (runtime_type='nvcf' or 'nvcf_singularity')
     """
 
     @staticmethod
@@ -120,6 +120,7 @@ class EnvController:
         Initialize runtime.
 
         runtime_type='singularity': uses OSWorldSingularityRuntime (local KVM).
+        runtime_type='nvcf_singularity': uses OSWorld DesktopEnv with NVCFSingularityProvider (local .sif).
         runtime_type='nvcf': uses OSWorld DesktopEnv with NVCFProvider.
         """
         logger.debug(f"[initialize_runtime] Creating {runtime_type} runtime for {job_id}")
@@ -153,6 +154,32 @@ class EnvController:
                 )
 
                 logger.debug(f"[initialize_runtime] DesktopEnv created, resetting with OSWorld setup...")
+                env.reset(task_config=osworld_setup)
+                logger.debug(f"[initialize_runtime] DesktopEnv reset complete for {job_id}")
+                return env
+            except Exception:
+                if env is not None:
+                    try:
+                        env.close()
+                    except Exception:
+                        pass
+                raise
+
+        elif runtime_type == "nvcf_singularity":
+            from desktop_env.desktop_env import DesktopEnv
+
+            env = None
+            try:
+                env = DesktopEnv(
+                    provider_name="nvcf_singularity",
+                    path_to_vm="",
+                    action_space="pyautogui",
+                    headless=True,
+                    os_type="Ubuntu" if os_type == "linux" else os_type,
+                    require_a11y_tree=False,
+                )
+
+                logger.debug(f"[initialize_runtime] DesktopEnv (nvcf_singularity) created, resetting with OSWorld setup...")
                 env.reset(task_config=osworld_setup)
                 logger.debug(f"[initialize_runtime] DesktopEnv reset complete for {job_id}")
                 return env

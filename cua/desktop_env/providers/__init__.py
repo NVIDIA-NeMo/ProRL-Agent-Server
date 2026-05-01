@@ -51,5 +51,9 @@ def create_vm_manager_and_provider(provider_name: str, region: str, use_proxy: b
         from desktop_env.providers.singularity.manager import SingularityVMManager
         from desktop_env.providers.singularity.provider import SingularityProvider
         return SingularityVMManager(), SingularityProvider(region)
+    elif provider_name == "nvcf_singularity":
+        from desktop_env.providers.nvcf_singularity.manager import NVCFSingularityVMManager
+        from desktop_env.providers.nvcf_singularity.provider import NVCFSingularityProvider
+        return NVCFSingularityVMManager(), NVCFSingularityProvider(region)
     else:
         raise NotImplementedError(f"{provider_name} not implemented!")

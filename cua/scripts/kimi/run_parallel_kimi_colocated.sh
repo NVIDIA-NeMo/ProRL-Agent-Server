@@ -22,6 +22,7 @@
 #   bash run_parallel_kimi_colocated.sh
 #   MAX_PARALLEL=12 RUNTIME=nvcf GENERATION_MODE=zenodo bash run_parallel_kimi_colocated.sh
 #   MAX_PARALLEL=16 RUNTIME=singularity GENERATION_MODE=zenodo bash run_parallel_kimi_colocated.sh
+#   MAX_PARALLEL=16 RUNTIME=nvcf_singularity GENERATION_MODE=zenodo bash run_parallel_kimi_colocated.sh
 # Log files:
 #   logs/slurm-<jobid>-server.out
 #   logs/slurm-<jobid>-collector-1.out
@@ -69,7 +70,10 @@ KIMI_JOB_ID=""
 COLLECTOR_PIDS=()
 KIMI_PORT=8000
 
-PROJECT_ROOT="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/cua/prorl-agent-server-v2"
+
+# TODO: change to your proejct root dir
+# PROJECT_ROOT="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/cua/prorl-agent-server-v2"
+PROJECT_ROOT="/lustre/fsw/portfolios/nvr/users/bcui/ProRL-Agent-Server"
 PROJECT_DIR="$PROJECT_ROOT/cua"
 
 echo "============================================"
@@ -150,10 +154,9 @@ if [ "$RUNTIME" = "nvcf" ]; then
 else
     echo "[colocated] Submitting Kimi vLLM sbatch job (KVM runtime, reserved nodes)..."
     KIMI_JOB_ID=$(sbatch \
-        --account=llmservice_fm_vision \
-        --reservation=sla_res_osworld_agent_vlm \
-        --partition=batch_block1 \
-        --time=04:00:00 \
+        --account=nvr_lacr_llm \
+        --partition=batch_short \
+        --time=02:00:00 \
         --output="$LOG_DIR/slurm-%j-server.out" \
         --error="$LOG_DIR/slurm-%j-server.out" \
         --parsable \
@@ -260,6 +263,8 @@ for i in "${!NODES_ARRAY[@]}"; do
     if [ "$RUNTIME" = "nvcf" ]; then
         NVCF_EXPORTS="export NGC_API_KEY=$NGC_API_KEY; export NGC_ORG=$NGC_ORG; export NVCF_FUNCTION_NAME_PREFIX=$NVCF_FUNCTION_NAME_PREFIX; export OSWORLD_SETUP_CACHE_DIR=/tmp/osworld_cache;"
         RUNTIME_ARG="--runtime nvcf"
+    elif [ "$RUNTIME" = "nvcf_singularity" ]; then
+        RUNTIME_ARG="--runtime nvcf_singularity"
     fi
 
     ssh -t -q -o StrictHostKeyChecking=no "$node" \
@@ -272,6 +277,7 @@ for i in "${!NODES_ARRAY[@]}"; do
             cd $PROJECT_DIR
             python parallel_collect_kimi.py \
                 --model_node $MODEL_NODE \
+                --project_dir $PROJECT_DIR \
                 --generation_mode $GENERATION_MODE \
                 $RUNTIME_ARG \
                 --max_parallel $MAX_PARALLEL \

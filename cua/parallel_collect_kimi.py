@@ -269,8 +269,8 @@ def parse_args():
                         default="/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/models/Kimi-K2.5")
 
     # Runtime selection
-    parser.add_argument("--runtime", type=str, choices=["singularity", "nvcf"], default="singularity",
-                        help="Runtime backend: 'singularity' (local KVM) or 'nvcf' (NVCF via OSWorld DesktopEnv)")
+    parser.add_argument("--runtime", type=str, choices=["singularity", "nvcf", "nvcf_singularity"], default="singularity",
+                        help="Runtime backend: 'singularity' (local KVM), 'nvcf' (NVCF cloud), or 'nvcf_singularity' (local .sif)")
 
     # Generation mode
     parser.add_argument("--generation_mode", type=str, default="vanilla",
@@ -290,12 +290,14 @@ def parse_args():
     parser.add_argument("--max_parallel", type=int, default=24, help="Max concurrent VMs")
     parser.add_argument("--max_trajectories", type=int, default=10000,
                         help="Total trajectories to generate")
+    parser.add_argument("--project_dir", type=str, required=True,
+                        help="Project directory (e.g. /path/to/ProRL-Agent-Server/cua)")
     parser.add_argument("--timeout", type=int, default=14400,
                         help="Global timeout in seconds (default: 14400 = 4 hours)")
 
     args = parser.parse_args()
 
-    PROJECT_DIR = "/lustre/fs1/portfolios/nvr/projects/nvr_lacr_llm/users/jaehunj/cua/prorl-agent-server-v2/cua"
+    PROJECT_DIR = args.project_dir
 
     if args.generation_mode == "vanilla":
         args.persona_dataset_path = "/lustre/fsw/portfolios/nvr/users/yidong/data/nemotron_data/data/"
