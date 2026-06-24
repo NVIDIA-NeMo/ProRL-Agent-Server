@@ -8,6 +8,7 @@ once; live progress and per-session detail are visible in the dashboard
 
     uv run python examples/calculator/run.py                 # docker (default)
     uv run python examples/calculator/run.py --backend apptainer
+    uv run python examples/calculator/run.py --harness codex # Codex-only smoke test
 """
 
 from __future__ import annotations
@@ -32,6 +33,8 @@ NUM_SAMPLES = 4
 # with the agent run and evaluation.
 TIMEOUT_SECONDS = 1200.0
 POLL_INTERVAL_SECONDS = 10.0
+CODEX_VERSION = "0.125.0"
+CODEX_REASONING_EFFORT = "xhigh"
 
 HARNESSES = (
     "claude_code",
@@ -73,7 +76,7 @@ After editing, run `python3 test_calculator.py` to test.
 # Pinned versions keep the quickstart stable. Bump intentionally.
 HARNESS_INSTALL: dict[str, str] = {
     "claude_code": "npm install -g @anthropic-ai/claude-code@2.1.111",
-    "codex": "npm install -g @openai/codex@0.121.0",
+    "codex": f"npm install -g @openai/codex@{CODEX_VERSION}",
     "gemini_cli": "npm install -g @google/gemini-cli@0.38.1",
     "opencode": "npm install -g opencode-ai@1.4.6",
     "pi": "npm install -g @mariozechner/pi-coding-agent@0.67.68",
@@ -93,7 +96,7 @@ HARNESS_INSTALL: dict[str, str] = {
 # Model name the harness CLI sends; the gateway rewrites it to the served model.
 HARNESS_MODEL: dict[str, str] = {
     "claude_code": "claude-opus-4-5",
-    "codex": "gpt-5.4",
+    "codex": "openai/gpt-5.5",
     "gemini_cli": "gemini-2.5-flash-lite",
     "opencode": "openai/gpt-5.4",
     "pi": "openai/gpt-5.4",
@@ -135,6 +138,13 @@ def runtime_image_for_backend(backend: str) -> str:
 
 
 def build_task_payload(harness: str, batch_id: str, backend: str) -> dict[str, Any]:
+    agent: dict[str, Any] = {"harness": harness, "model_name": HARNESS_MODEL[harness]}
+    if harness == "codex":
+        agent["settings"] = {
+            "version": CODEX_VERSION,
+            "reasoning_effort": CODEX_REASONING_EFFORT,
+        }
+
     return {
         "task_id": f"calculator-{harness}-{batch_id}",
         "instruction": INSTRUCTION,
@@ -152,7 +162,7 @@ def build_task_payload(harness: str, batch_id: str, backend: str) -> dict[str, A
             "network": "host",
             "workdir": "/polar/session/workspace",
         },
-        "agent": {"harness": harness, "model_name": HARNESS_MODEL[harness]},
+        "agent": agent,
         "builder": {"strategy": "prefix_merging"},
         "evaluator": {
             "strategy": "test_on_output",
@@ -193,18 +203,29 @@ def print_comparison(finished: dict[str, dict[str, Any]], elapsed: float) -> Non
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=["docker", "apptainer"], default="docker")
-    backend = parser.parse_args().backend
+    parser.add_argument(
+        "--harness",
+        action="append",
+        choices=HARNESSES,
+        help="Run only this harness. Repeat to select more than one.",
+    )
+    args = parser.parse_args()
+    backend = args.backend
+    selected_harnesses = tuple(args.harness or HARNESSES)
 
     from polar.config import TopologyConfig
 
     rollout_url = TopologyConfig.load(DEFAULT_TOPOLOGY).rollout.public_url
     batch_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
-    print(f"Submitting {len(HARNESSES)} harnesses to {rollout_url} (backend={backend})")
+    print(
+        f"Submitting {len(selected_harnesses)} harnesses to {rollout_url} "
+        f"(backend={backend})"
+    )
     timeout = httpx.Timeout(None, connect=30.0)
     with httpx.Client(base_url=rollout_url, timeout=timeout) as client:
         task_ids: dict[str, str] = {}
-        for harness in HARNESSES:
+        for harness in selected_harnesses:
             payload = build_task_payload(harness, batch_id, backend)
             resp = client.post("/rollout/task/submit", json=payload)
             resp.raise_for_status()
@@ -214,7 +235,7 @@ def main() -> int:
         print(f"\nPolling every {POLL_INTERVAL_SECONDS:.0f}s (watch live in the dashboard) ...")
         t0 = time.monotonic()
         finished: dict[str, dict[str, Any]] = {}
-        while len(finished) < len(HARNESSES):
+        while len(finished) < len(selected_harnesses):
             time.sleep(POLL_INTERVAL_SECONDS)
             for harness, tid in task_ids.items():
                 if harness in finished:

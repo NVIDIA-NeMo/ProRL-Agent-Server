@@ -40,7 +40,7 @@ examples may pin their own, but these are the known-good ones.
 | Preset | API type | Streaming | Verified version |
 |---|---|---|---|
 | `claude_code` | `anthropic` | `true` | `@anthropic-ai/claude-code@2.1.111` |
-| `codex` | `openai_responses` | `true` | `@openai/codex@0.121.0` |
+| `codex` | `openai_responses` | `true` | `@openai/codex@0.125.0` |
 | `gemini_cli` | `google` | `true` | `@google/gemini-cli@0.38.1` |
 | `opencode` | `openai_chat` | `true` | `opencode-ai@1.4.6` |
 | `openclaw` | `openai_chat` | `true` | `openclaw@2026.5.27` |
@@ -58,7 +58,8 @@ Each preset routes to the proxy a little differently because each agent reads a
 different env var / config key — e.g. `gemini_cli` maps `GOOGLE_API_*` onto the
 CLI's `GEMINI_API_KEY`/`GOOGLE_GEMINI_BASE_URL`; `openclaw` and `hermes` write the
 gateway URL into their config files because they don't read `OPENAI_BASE_URL`;
-`codex` declares a custom `responses`-wire provider. The per-file comments
+`codex` writes the gateway URL into the Codex config so the default OpenAI
+provider sends Responses API traffic through Polar. The per-file comments
 explain each piece — that glue is the *only* reason a preset is more than five
 lines.
 
