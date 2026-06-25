@@ -17,6 +17,7 @@ from polar.agent.presets.claude_code import ClaudeCodeHarness
 from polar.agent.presets.codex import CodexHarness
 from polar.agent.presets.gemini_cli import GeminiCliHarness
 from polar.agent.presets.hermes import HermesHarness
+from polar.agent.presets.mini_swe_agent import MiniSweAgentHarness
 from polar.agent.presets.openclaw import OpenClawHarness
 from polar.agent.presets.opencode import OpenCodeHarness
 from polar.agent.presets.openhands_sdk import OpenHandsSdkHarness
@@ -29,6 +30,7 @@ __all__ = [
     "CodexHarness",
     "GeminiCliHarness",
     "HermesHarness",
+    "MiniSweAgentHarness",
     "OpenClawHarness",
     "OpenCodeHarness",
     "OpenHandsSdkHarness",

@@ -34,12 +34,12 @@ EXAMPLE_DIR = Path(__file__).resolve().parent
 DEFAULT_TOPOLOGY = EXAMPLE_DIR / "topology.vllm.yaml"
 POLL_INTERVAL_SECONDS = 15.0
 
-# Per-harness INIT install command. The Node CLIs install globally. hermes is a
-# PyPI package that needs Python >=3.11, but TMax task images ship whatever Python
-# they were built with (this set includes 3.10), so installing against the image's
-# system Python fails. We install it with uv against a managed 3.12 interpreter;
-# `uv tool install` drops the `hermes` entry point in $HOME/.local/bin, which the
-# hermes preset's PATH already includes.
+# Per-harness INIT install command. The Node CLIs install globally. hermes and
+# mini-swe-agent are PyPI packages that need Python >=3.11, but TMax task images
+# ship whatever Python they were built with (this set includes 3.10), so installing
+# against the image's system Python fails. We install them with uv against a managed
+# 3.12 interpreter; `uv tool install` drops the entry point in $HOME/.local/bin,
+# which both presets' PATH already includes.
 # codex must match presets/codex.py DEFAULT_CODEX_VERSION (the preset hard-fails
 # on a version mismatch). Bump versions intentionally.
 HARNESS_INSTALL: dict[str, str] = {
@@ -52,6 +52,11 @@ HARNESS_INSTALL: dict[str, str] = {
         "curl -LsSf https://astral.sh/uv/install.sh | sh "
         '&& export PATH="$HOME/.local/bin:$PATH" '
         "&& uv tool install --python 3.12 hermes-agent==0.15.1"
+    ),
+    "mini_swe_agent": (
+        "curl -LsSf https://astral.sh/uv/install.sh | sh "
+        '&& export PATH="$HOME/.local/bin:$PATH" '
+        "&& uv tool install --python 3.12 mini-swe-agent==2.4.2"
     ),
 }
 

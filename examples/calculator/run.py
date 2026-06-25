@@ -46,6 +46,7 @@ HARNESSES = (
     "openhands_sdk",
     "openclaw",
     "hermes",
+    "mini_swe_agent",
 )
 
 INSTRUCTION = """\
@@ -71,8 +72,10 @@ After editing, run `python3 test_calculator.py` to test.
 """
 
 # Per-harness INIT install command. npm CLIs install globally into
-# ~/.local/bin; the two Python agents install via pip (hermes from PyPI,
-# openhands-sdk into ~/.venv where its harness looks for the interpreter).
+# ~/.local/bin; the Python agents install via pip (hermes and mini-swe-agent from
+# PyPI into ~/.local, openhands-sdk into ~/.venv where its harness looks for the
+# interpreter). The 3.12 runtime image satisfies their Python >=3.11 floor, so a
+# plain pip install works here (the tmax example needs uv for its 3.10 images).
 # Pinned versions keep the quickstart stable. Bump intentionally.
 HARNESS_INSTALL: dict[str, str] = {
     "claude_code": "npm install -g @anthropic-ai/claude-code@2.1.111",
@@ -83,6 +86,7 @@ HARNESS_INSTALL: dict[str, str] = {
     "qwen_code": "npm install -g @qwen-code/qwen-code@0.14.5",
     "openclaw": "npm install -g openclaw@2026.5.27",
     "hermes": "python3 -m pip install --user --quiet hermes-agent==0.15.1",
+    "mini_swe_agent": "python3 -m pip install --user --quiet mini-swe-agent==2.4.2",
     # Pin sdk + tools to the same version. Unpinned, pip resolves a mismatched
     # pair (sdk 1.17 + tools 1.24) whose imports break; the latest 1.24 needs
     # Python 3.13 (lmnr dep conflict on 3.12), so pin to 1.17.0 for this image.
@@ -104,6 +108,7 @@ HARNESS_MODEL: dict[str, str] = {
     "openhands_sdk": "openai/gpt-5.4",
     "openclaw": "openai/gpt-5.4",
     "hermes": "openai/gpt-5.4",
+    "mini_swe_agent": "openai/gpt-5.4",
 }
 
 # INIT stage: install the harness CLI, then set up a clean git workspace.
@@ -127,8 +132,16 @@ _EVAL_EXCLUDES: dict[str, list[str]] = {
     "openclaw": [".openclaw/**", "**/.openclaw/**"],
     "hermes": [".hermes/**", "**/.hermes/**"],
     "openhands_sdk": [".openhands/**", "**/.openhands/**"],
+    "mini_swe_agent": [".mini-swe-agent/**", "**/.mini-swe-agent/**", ".config/mini-swe-agent/**"],
 }
-_COMMON_EXCLUDES = ["node_modules/**", "**/node_modules/**", ".cache/**", "**/.cache/**", ".venv/**", "**/.venv/**"]
+_COMMON_EXCLUDES = [
+    "node_modules/**",
+    "**/node_modules/**",
+    ".cache/**",
+    "**/.cache/**",
+    ".venv/**",
+    "**/.venv/**",
+]
 
 
 def runtime_image_for_backend(backend: str) -> str:
@@ -155,9 +168,20 @@ def build_task_payload(harness: str, batch_id: str, backend: str) -> dict[str, A
             "image": runtime_image_for_backend(backend),
             "prepare": [
                 {"type": "exec", "command": f"{HARNESS_INSTALL[harness]} && {_WORKSPACE_PREPARE}"},
-                {"type": "upload_file", "source": str(TEST_FILE), "target": "/polar/session/workspace/test_calculator.py"},
-                {"type": "upload_file", "source": str(STARTER_FILE), "target": "/polar/session/workspace/calculator.py"},
-                {"type": "exec", "command": "cd /polar/session/workspace && git add -A && git commit -qm 'initial'"},
+                {
+                    "type": "upload_file",
+                    "source": str(TEST_FILE),
+                    "target": "/polar/session/workspace/test_calculator.py",
+                },
+                {
+                    "type": "upload_file",
+                    "source": str(STARTER_FILE),
+                    "target": "/polar/session/workspace/calculator.py",
+                },
+                {
+                    "type": "exec",
+                    "command": "cd /polar/session/workspace && git add -A && git commit -qm 'initial'",
+                },
             ],
             "network": "host",
             "workdir": "/polar/session/workspace",
@@ -218,10 +242,7 @@ def main() -> int:
     rollout_url = TopologyConfig.load(DEFAULT_TOPOLOGY).rollout.public_url
     batch_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
-    print(
-        f"Submitting {len(selected_harnesses)} harnesses to {rollout_url} "
-        f"(backend={backend})"
-    )
+    print(f"Submitting {len(selected_harnesses)} harnesses to {rollout_url} (backend={backend})")
     timeout = httpx.Timeout(None, connect=30.0)
     with httpx.Client(base_url=rollout_url, timeout=timeout) as client:
         task_ids: dict[str, str] = {}

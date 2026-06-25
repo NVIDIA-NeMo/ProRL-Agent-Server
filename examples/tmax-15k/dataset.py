@@ -24,8 +24,17 @@ HUB_DATASET = "tmax/TMax-15K-Harbor@latest"
 IMAGE_PREFIX = "polar-tmax15k"
 
 # Coding-agent harnesses install at task time via the INIT prepare step (the
-# Node CLIs globally, hermes from PyPI). See HARNESS_INSTALL in submit_tmax_tasks.py.
-SUPPORTED_HARNESSES = ("codex", "claude_code", "opencode", "qwen_code", "pi", "hermes")
+# Node CLIs globally, hermes and mini-swe-agent from PyPI). See HARNESS_INSTALL
+# in submit_tmax_tasks.py.
+SUPPORTED_HARNESSES = (
+    "codex",
+    "claude_code",
+    "opencode",
+    "qwen_code",
+    "pi",
+    "hermes",
+    "mini_swe_agent",
+)
 
 
 @dataclass(frozen=True)

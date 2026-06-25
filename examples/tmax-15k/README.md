@@ -64,7 +64,7 @@ uv run polar serve_gateway -c examples/tmax-15k/topology.vllm.yaml --node-id loc
 ### 5. Submit tasks
 
 The gateway rewrites the harness's `--model-name` to the served `Qwen/Qwen3.6-27B`.
-Supported harnesses: `codex`, `claude_code`, `opencode`, `qwen_code`, `pi`, `hermes`.
+Supported harnesses: `codex`, `claude_code`, `opencode`, `qwen_code`, `pi`, `hermes`, `mini_swe_agent`.
 
 ```bash
 # pass@4 over the first 10 tasks
