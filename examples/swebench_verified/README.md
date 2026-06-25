@@ -7,8 +7,10 @@ container at the repo's `base_commit`, then grades the patch with the official
 
 ## Prerequisites
 
-Install **Polar** + the SWE-bench extra and one inference backend — **vLLM** or **SGLang** —
-as described in the [top-level README](../../README.md#installation):
+Install **Polar** and one inference backend — **vLLM** or **SGLang** — as
+described in the [top-level README](../../README.md#installation). This example
+also needs Polar's optional **SWE-bench** extra (the official grading harness
+the evaluator runs):
 
 ```bash
 uv pip install -e ".[swebench]"

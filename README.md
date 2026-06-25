@@ -56,12 +56,6 @@ Polar is trainer agnostic. So choice of **Trainer** and **Training Backend** are
 Currently, we provide a demo-purpose [Slime](https://github.com/THUDM/slime) integration in [Slime bridge installation guide](src/slime_bridge/README.md#slime-installation).
 
 
-#### (Optional) For SWE-bench official evaluation harness:
-
-```bash
-uv pip install -e ".[swebench]"
-```
-
 #### (Optional) To enable **polar dashboard** UI, build the frontend once.
 
 ```bash

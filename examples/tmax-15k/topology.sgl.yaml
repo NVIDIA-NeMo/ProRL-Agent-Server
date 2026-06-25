@@ -1,0 +1,31 @@
+rollout:
+  host: 127.0.0.1
+  port: 8080
+  public_url: http://127.0.0.1:8080
+  save_dir: ./rollout_results
+
+gateway:
+  heartbeat_interval_seconds: 30
+  nodes:
+    - id: localhost-node-01
+      host: 127.0.0.1
+      port: 8100
+      public_url: http://127.0.0.1:8100
+      max_init_workers: 8
+      max_run_workers: 8
+      max_postrun_workers: 8
+      model_served: Qwen/Qwen3.6-27B
+      inference:
+        engine: sglang
+        base_url: http://127.0.0.1:8000
+    - id: localhost-node-02
+      host: 127.0.0.1
+      port: 8101
+      public_url: http://127.0.0.1:8101
+      max_init_workers: 8
+      max_run_workers: 8
+      max_postrun_workers: 8
+      model_served: Qwen/Qwen3.6-27B
+      inference:
+        engine: sglang
+        base_url: http://127.0.0.1:8001

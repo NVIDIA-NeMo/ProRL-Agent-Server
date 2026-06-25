@@ -84,6 +84,7 @@ class HermesHarness(BaseHarness):
                 }
             },
             "toolsets": ["hermes-cli"],
+            "model": {"context_length": int(self.settings.get("context_length", 262_144))},
             "agent": {"max_turns": int(self.settings.get("max_turns", 90))},
             # Disable the self-improvement loop so runs stay stateless and don't
             # write memory/profile files into the agent home.
