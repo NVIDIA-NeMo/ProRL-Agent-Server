@@ -71,10 +71,35 @@ Supported harnesses: `codex`, `claude_code`, `opencode`, `qwen_code`, `pi`, `her
 uv run python examples/tmax-15k/submit_tmax_tasks.py --dataset-dir ~/tmax15k --harness hermes --max-tasks 10 --num-samples 4
 ```
 
-Use Apptainer instead of Docker with `--runtime-backend apptainer`.
+Use Apptainer instead of Docker with `--runtime-backend apptainer` (this still
+reads images from a local docker daemon). For nodes **without Docker**, see
+[Docker-free runs](#docker-free-runs-apptainer-on-slurm) below.
 
 ### 6. (Optional) Watch in the dashboard
 
 ```bash
 uv run polar dashboard -c examples/tmax-15k/topology.vllm.yaml   # http://127.0.0.1:8090
 ```
+
+## Docker-free runs (Apptainer on Slurm)
+
+Slurm nodes without Docker can't `docker build` or pull `docker-daemon:` images.
+Build once on a docker-capable box, snapshot each runtime image to a `.sif`, copy
+them over, and launch the `.sif` directly — Polar's `ApptainerRuntime` needs only
+`apptainer` (set `POLAR_APPTAINER_BIN` if your cluster calls it `singularity`):
+
+```bash
+# on a box WITH docker — build images, then snapshot them to .sif
+uv run python examples/tmax-15k/build_images.py --dataset-dir ~/tmax15k --max-tasks 10
+uv run python examples/tmax-15k/prepare_apptainer_images.py \
+  --dataset-dir ~/tmax15k --image-dir ~/tmax15k-sif --max-tasks 10
+
+# copy ~/tmax15k-sif/ to the cluster, then on Slurm (no docker needed):
+uv run python examples/tmax-15k/submit_tmax_tasks.py --dataset-dir ~/tmax15k \
+  --harness hermes --max-tasks 10 \
+  --runtime-backend apptainer --apptainer-image-dir ~/tmax15k-sif
+```
+
+The dataset dir must also be on the cluster: `submit` reads each task's
+`instruction.md`, and the `harbor` evaluator uploads its `tests/` into the
+container — only the *images* become `.sif`.

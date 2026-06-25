@@ -27,6 +27,7 @@ from dataset import (
     load_tasks,
     runtime_image_for,
     sanitize,
+    sif_filename_for,
 )
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
@@ -88,14 +89,37 @@ def parse_args() -> argparse.Namespace:
         help="Model name the harness sends; the gateway rewrites it to the served model.",
     )
     parser.add_argument("--runtime-backend", choices=["docker", "apptainer"], default="docker")
+    parser.add_argument(
+        "--apptainer-image-dir",
+        default=None,
+        help="Dir of prebuilt .sif files for a docker-free Slurm flow. With "
+        "--runtime-backend apptainer, launch <dir>/<task>.sif directly instead of "
+        "reading from a local docker daemon. Build them with prepare_apptainer_images.py.",
+    )
     parser.add_argument("--topology", default=str(DEFAULT_TOPOLOGY))
     return parser.parse_args()
 
 
-def runtime_image_for_backend(image: str, backend: str) -> str:
-    if backend == "apptainer" and not image.startswith(("docker-daemon:", "docker://", "oras://")):
+def resolve_runtime_image(args: argparse.Namespace, task: TmaxTask) -> str:
+    """The image reference Polar's runtime launches for *task*.
+
+    ``.sif`` path (docker-free apptainer) > ``docker-daemon:`` (apptainer reading
+    the local docker daemon) > the plain docker tag.
+    """
+    if args.runtime_backend == "apptainer" and args.apptainer_image_dir:
+        return str(Path(args.apptainer_image_dir).expanduser() / sif_filename_for(task.name))
+    image = runtime_image_for(task.name)
+    if args.runtime_backend == "apptainer" and not image.startswith(("docker-daemon:", "docker://", "oras://")):
         return f"docker-daemon:{image}"
     return image
+
+
+def image_available(args: argparse.Namespace, task: TmaxTask) -> bool:
+    """Whether the launchable image exists — a ``.sif`` for docker-free apptainer,
+    otherwise a local docker image (so this works on nodes without docker)."""
+    if args.runtime_backend == "apptainer" and args.apptainer_image_dir:
+        return (Path(args.apptainer_image_dir).expanduser() / sif_filename_for(task.name)).is_file()
+    return docker_image_exists(runtime_image_for(task.name))
 
 
 def docker_image_exists(image_ref: str) -> bool:
@@ -114,7 +138,7 @@ def session_timeout(args: argparse.Namespace, task: TmaxTask) -> float:
 
 
 def build_task_request(args: argparse.Namespace, task: TmaxTask, batch_id: str) -> dict[str, Any]:
-    image = runtime_image_for_backend(runtime_image_for(task.name), args.runtime_backend)
+    image = resolve_runtime_image(args, task)
     return {
         "task_id": f"tmax15k-{args.harness}-{sanitize(task.name)}-{batch_id}",
         "instruction": task.instruction,
@@ -178,9 +202,14 @@ def main() -> int:
 
     ready, missing = [], []
     for task in tasks:
-        (ready if docker_image_exists(runtime_image_for(task.name)) else missing).append(task)
+        (ready if image_available(args, task) else missing).append(task)
     if not ready:
-        raise SystemExit("No runtime images found. Build them with: python build_images.py --dataset-dir ...")
+        how = (
+            "prepare_apptainer_images.py and copy the .sif dir to this node"
+            if args.runtime_backend == "apptainer" and args.apptainer_image_dir
+            else "build_images.py --dataset-dir ..."
+        )
+        raise SystemExit(f"No runtime images found. Build them with: python {how}")
     if missing:
         names = ", ".join(t.name for t in missing)
         print(f"Skipping {len(missing)} task(s) with missing images (build them first): {names}")

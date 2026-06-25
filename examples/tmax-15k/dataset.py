@@ -62,6 +62,12 @@ def runtime_image_for(name: str) -> str:
     return f"{IMAGE_PREFIX}-runtime:{sanitize(name)}"
 
 
+def sif_filename_for(name: str) -> str:
+    """Filename for the Apptainer ``.sif`` snapshot of a task's runtime image
+    (docker-free Slurm flow). Matches the tag in :func:`runtime_image_for`."""
+    return f"{sanitize(name)}.sif"
+
+
 def _coerce(value: object, caster: type, default: object) -> object:
     try:
         return caster(value)  # type: ignore[call-arg]
