@@ -1,19 +1,19 @@
 rollout:
-  host: 127.0.0.1
-  port: 8080
-  public_url: http://127.0.0.1:8080
+  host: "${POLAR_ROLLOUT_HOST}"
+  port: ${POLAR_ROLLOUT_PORT}
+  public_url: "${POLAR_ROLLOUT_URL}"
   save_dir: ./rollout_results
 
 gateway:
   heartbeat_interval_seconds: 30
   nodes:
     - id: localhost-node-01
-      host: 127.0.0.1
-      port: 8100
-      public_url: http://127.0.0.1:8100
-      max_init_workers: 16
-      max_run_workers: 16
-      max_postrun_workers: 16
+      host: "${POLAR_GATEWAY_HOST}"
+      port: ${POLAR_GATEWAY_PORT}
+      public_url: "${POLAR_GATEWAY_URL}"
+      max_init_workers: ${POLAR_MAX_INIT_WORKERS}
+      max_run_workers: ${POLAR_MAX_RUN_WORKERS}
+      max_postrun_workers: ${POLAR_MAX_POSTRUN_WORKERS}
       model_served: Qwen/Qwen3.5-4B
       inference:
         engine: sglang

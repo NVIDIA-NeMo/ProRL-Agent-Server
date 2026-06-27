@@ -1,13 +1,13 @@
 # Polar bridge configuration for Slime's --custom-config-path.
 # These become attributes on the `args` namespace passed to the rollout function.
 
-polar_rollout_url: "http://127.0.0.1:8080"
-polar_gateway_url: "http://127.0.0.1:8100"
+polar_rollout_url: "${POLAR_ROLLOUT_URL}"
+polar_gateway_url: "${POLAR_GATEWAY_URL}"
 polar_reward_key: "score"
-polar_max_async_level: 2
-polar_request_timeout: 2400
-polar_callback_host: "127.0.0.1"
-polar_min_complete_accept_fraction: 0.6
+polar_max_async_level: ${POLAR_MAX_ASYNC_LEVEL}
+polar_request_timeout: ${POLAR_REQUEST_TIMEOUT}
+polar_callback_host: "${POLAR_CALLBACK_HOST}"
+polar_min_complete_accept_fraction: ${POLAR_MIN_COMPLETE_ACCEPT_FRACTION}
 # Filled by run.sh via envsubst — absolute host paths to assets prepared by
 # prepare_apptainer_images.py. The container mounts and image lookups below
 # reference these through {args.polar_agent_cli_dir} / {args.polar_apptainer_image_dir}.
@@ -17,7 +17,7 @@ polar_apptainer_image_dir: ${APPTAINER_IMAGE_DIR}
 # Task template rendered per sample group.  Placeholders are filled
 # from the context: {instruction}, {num_samples}, {sample.*}, {args.*}.
 polar_task_template:
-  timeout_seconds: 2400
+  timeout_seconds: ${POLAR_TASK_TIMEOUT_SECONDS}
   runtime:
     backend: "apptainer"
     # Use project-local SIF files prepared from the official SWE-Gym registry
@@ -55,6 +55,10 @@ polar_task_template:
   agent:
     harness: "codex"
     model_name: "gpt-5.4"
+    settings:
+      # prepare_agent_cli.sh installs current npm releases into AGENT_CLI_DIR.
+      # For this SWE-Gym path, require the CLI binary but do not hard-pin its version.
+      version: ""
   builder:
     strategy: "prefix_merging"
   evaluator:
@@ -62,7 +66,13 @@ polar_task_template:
     refresh_runtime: true
     config:
       repo_dir: "/testbed"
-      patch_command: "cd /polar/session/workspace && git add -A && git diff --cached --binary"
+      patch_command: >-
+        bash -lc 'cd /polar/session/workspace &&
+        submodules=$(git config --file .gitmodules --get-regexp path 2>/dev/null | cut -d" " -f2- || true) &&
+        set -- git add -A -- . &&
+        for path in $submodules; do set -- "$@" ":(exclude)$path"; done &&
+        "$@" &&
+        git diff --cached --binary --ignore-submodules=all'
       instance: "{sample.metadata.instance}"
       # Strip per-harness config/session dirs and common stray artifacts that
       # would otherwise get swept into `git add -A` and bloat the patch.
