@@ -1,8 +1,8 @@
 """Convert Polar rollout results into Slime samples.
 
 Every trace in ``Trajectory.traces`` becomes one Slime ``Sample``.  All
-samples produced from the same session share ``Sample.group_id`` so Slime
-0.3.0's loss reducer counts the trajectory once even when it fans out into
+samples produced from the same session share ``Sample.rollout_id`` so Slime's
+loss reducer counts the trajectory once even when it fans out into
 multiple trace samples.  Builders own trace curation and per-token loss masks
 — the adapter does not infer trainable positions from bridge details. Traces
 that lack training tokens are dropped and represented as fully masked samples
@@ -39,14 +39,16 @@ def session_result_to_samples(
     """Convert one Polar session result into Slime samples — one per trace.
 
     Every usable trace becomes an independent Sample sharing the same
-    ``group_id`` key. Slime's loss reducer then averages all trace
+    ``rollout_id`` key. Slime's loss reducer then averages all trace
     contributions as one trajectory, while the reward post-processor can still
     assign each trace its own advantage.
 
-    Traces with empty tokens or exceeding ``max_tokens`` are dropped
-    (logged). If *all* traces are dropped we emit a single zero-gradient
-    placeholder so Slime's flattener doesn't crash on an empty list and
-    the rest of the group can still train.
+    Traces with empty tokens are dropped (logged). If a trace exceeds
+    ``max_tokens`` only because its prompt/history is too long, the oldest
+    prompt tokens are clipped while the response, loss mask, and rollout
+    logprobs are preserved. If *all* traces are dropped we emit a single
+    zero-gradient placeholder so Slime's flattener doesn't crash on an empty
+    list and the rest of the group can still train.
     """
     Sample = _load_sample_type()
     traces = result.trajectory.traces
@@ -102,12 +104,14 @@ def _build_sample(
         )
         return None
 
-    total_len = len(prompt_ids) + len(response_ids)
-    if max_tokens is not None and total_len > max_tokens:
-        logger.warning(
-            "Dropping trace %d from session %s: total_len=%d > max_tokens=%d",
-            trace_index, result.session_id, total_len, max_tokens,
-        )
+    prompt_clip_metadata = _clip_prompt_to_fit(
+        prompt_ids=prompt_ids,
+        response_ids=response_ids,
+        max_tokens=max_tokens,
+        session_id=result.session_id,
+        trace_index=trace_index,
+    )
+    if prompt_clip_metadata is None:
         return None
 
     prompt_messages = deepcopy(trace.prompt_messages)
@@ -158,6 +162,8 @@ def _build_sample(
             "response_messages": deepcopy(response_messages),
         },
     }
+    if prompt_clip_metadata:
+        polar_metadata["token_clipping"] = prompt_clip_metadata
     polar_metadata.update(_scheduler_metadata(result, trace))
 
     return Sample(
@@ -167,7 +173,7 @@ def _build_sample(
         tokens=prompt_ids + response_ids,
         response=response_text,
         response_length=len(response_ids),
-        group_id=index,
+        rollout_id=index,
         reward={reward_key: reward_value},
         loss_mask=loss_mask,
         rollout_log_probs=response_log_probs,
@@ -175,6 +181,60 @@ def _build_sample(
         session_id=result.session_id,
         metadata={"polar": polar_metadata},
     )
+
+
+def _clip_prompt_to_fit(
+    *,
+    prompt_ids: list[int],
+    response_ids: list[int],
+    max_tokens: int | None,
+    session_id: str,
+    trace_index: int,
+) -> dict[str, int] | None:
+    """Left-trim prompt tokens so the sample fits Slime's dynamic batch cap."""
+    if max_tokens is None:
+        return {}
+
+    total_len = len(prompt_ids) + len(response_ids)
+    if total_len <= max_tokens:
+        return {}
+
+    prompt_budget = max_tokens - len(response_ids)
+    if prompt_budget < 0:
+        logger.warning(
+            "Dropping trace %d from session %s: response_len=%d > max_tokens=%d",
+            trace_index,
+            session_id,
+            len(response_ids),
+            max_tokens,
+        )
+        return None
+
+    original_prompt_len = len(prompt_ids)
+    if prompt_budget == 0:
+        prompt_ids.clear()
+    else:
+        del prompt_ids[: original_prompt_len - prompt_budget]
+
+    clipped_tokens = original_prompt_len - len(prompt_ids)
+    logger.warning(
+        "Clipping trace %d from session %s: total_len=%d > max_tokens=%d "
+        "(prompt %d -> %d, response=%d)",
+        trace_index,
+        session_id,
+        total_len,
+        max_tokens,
+        original_prompt_len,
+        len(prompt_ids),
+        len(response_ids),
+    )
+    return {
+        "original_prompt_tokens": original_prompt_len,
+        "clipped_prompt_tokens": clipped_tokens,
+        "kept_prompt_tokens": len(prompt_ids),
+        "response_tokens": len(response_ids),
+        "max_tokens": max_tokens,
+    }
 
 
 def _build_dummy_sample(
@@ -213,7 +273,7 @@ def _build_dummy_sample(
         tokens=[0, 0],
         response="",
         response_length=1,
-        group_id=index,
+        rollout_id=index,
         reward={reward_key: 0.0},
         loss_mask=[0],
         rollout_log_probs=[0.0],

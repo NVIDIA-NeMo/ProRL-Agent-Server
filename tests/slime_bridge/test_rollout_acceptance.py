@@ -115,3 +115,18 @@ def test_async_worker_only_admits_requested_groups() -> None:
 
     worker._mark_delivered(1)
     assert worker._can_admit_group({}, 0) is False
+
+
+def test_fully_async_worker_keeps_prefetch_window_warm() -> None:
+    args = _worker_args()
+    args.polar_fully_async = True
+    worker = AsyncPolarRolloutWorker(args, data_source=SimpleNamespace())
+
+    assert worker._can_admit_group({}, 0) is False
+
+    worker.request_groups(1)
+    worker._mark_delivered(1)
+    assert worker._can_admit_group({}, 0) is True
+
+    active = {object(): SimpleNamespace() for _ in range(8)}
+    assert worker._can_admit_group(active, 8) is False

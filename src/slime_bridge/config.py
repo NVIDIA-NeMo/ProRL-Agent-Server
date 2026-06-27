@@ -24,6 +24,7 @@ class PolarSlimeConfig:
     max_concurrency: int
     max_session_concurrency: int
     max_async_level: int
+    fully_async: bool
     max_off_policy_steps: int
     request_timeout: float | None
     callback_host: str
@@ -54,6 +55,15 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
     max_async_level = int(getattr(args, "polar_max_async_level", 2))
     if max_async_level <= 0:
         raise ValueError("polar_max_async_level must be greater than 0")
+
+    fully_async_value = getattr(args, "polar_fully_async", False)
+    if isinstance(fully_async_value, str):
+        normalized = fully_async_value.strip().lower()
+        if normalized not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
+            raise ValueError("polar_fully_async must be a boolean")
+        fully_async = normalized in {"1", "true", "yes", "on"}
+    else:
+        fully_async = bool(fully_async_value)
 
     rollout_batch_size = int(getattr(args, "rollout_batch_size", 1) or 1)
     if rollout_batch_size <= 0:
@@ -108,6 +118,7 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
         max_concurrency=max_concurrency,
         max_session_concurrency=max_session_concurrency,
         max_async_level=max_async_level,
+        fully_async=fully_async,
         max_off_policy_steps=max_off_policy_steps,
         request_timeout=request_timeout,
         callback_host=callback_host,

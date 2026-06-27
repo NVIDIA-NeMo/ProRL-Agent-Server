@@ -25,6 +25,7 @@ def _args(**overrides):
         "polar_instruction_template": "Instruction: {instruction}",
         "polar_reward_key": "score",
         "polar_max_async_level": 2,
+        "polar_fully_async": True,
         "rollout_batch_size": 3,
         "n_samples_per_prompt": 4,
         "update_weights_interval": 5,
@@ -49,6 +50,7 @@ def test_resolve_polar_slime_config_computes_concurrency_and_normalizes_url() ->
     assert config.rollout_server_url == "http://rollout:8080"
     assert config.max_concurrency == 6
     assert config.max_session_concurrency == 24
+    assert config.fully_async is True
     assert config.max_off_policy_steps == 7
     assert config.request_timeout == 60.0
     assert config.min_complete_accept_fraction == 0.0
@@ -57,6 +59,11 @@ def test_resolve_polar_slime_config_computes_concurrency_and_normalizes_url() ->
 def test_resolve_polar_slime_config_requires_agent_template() -> None:
     with pytest.raises(ValueError, match="agent spec"):
         resolve_polar_slime_config(_args(polar_task_template={}))
+
+
+def test_resolve_polar_slime_config_rejects_invalid_fully_async_value() -> None:
+    with pytest.raises(ValueError, match="polar_fully_async"):
+        resolve_polar_slime_config(_args(polar_fully_async="sometimes"))
 
 
 def test_resolve_polar_slime_config_accepts_complete_fraction_threshold() -> None:

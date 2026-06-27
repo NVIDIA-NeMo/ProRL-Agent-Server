@@ -15,10 +15,11 @@ Slime calls one entry point, `generate_rollout_polar_async`, wired in via
   listener with a polling safety net;
 - tracks rollout ids and policy versions, stamps Polar scheduler metadata
   (`group_id`, `policy_version`, `rollout_step`) onto every task, and keeps
-  async admission bounded to the current Slime rollout request;
+  async admission bounded to the current request or an explicitly enabled
+  fixed fully-async prefetch window;
 - converts each Polar `Trajectory` back into Slime `Sample`s (one per trace,
-  grouped with Slime 0.3.0 `group_id` so all traces from a trajectory count
-  once), dropping empty or oversized traces;
+  grouped with `rollout_id` so all traces from a trajectory count once), clipping
+  overlong prompt history and dropping unusable traces;
 - computes dynamic-trace leave-one-trajectory-out advantages and zeroes out
   failed/aborted trajectories.
 
@@ -39,8 +40,10 @@ Slime calls one entry point, `generate_rollout_polar_async`, wired in via
 ## What the bridge owns
 
 - Turn Slime samples + prompts into Polar task requests and submit async batches.
-- Track rollout ids / policy versions and bound async admission to the current
-  Slime rollout request.
+- Track rollout ids / policy versions and bound async admission.
+- When `polar_fully_async: true`, keep a fixed
+  `rollout_batch_size * polar_max_async_level` prefetch window warm across
+  rollout boundaries; completed samples retain policy-staleness metadata.
 - Filter unusable groups (zero trainable tokens, too few completed samples,
   logprob errors) with per-category metrics.
 - Convert Polar trajectories back into Slime samples; compute dynamic-trace

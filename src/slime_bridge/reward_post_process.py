@@ -8,7 +8,7 @@ baseline built from other trajectories in the same prompt group.
 
 Adapter contract:
     All Slime samples produced from the same Polar ``SessionResult`` share
-    ``Sample.group_id``. Slime 0.3.0 uses that field to average all trace
+    ``Sample.rollout_id``. Slime uses that field to average all trace
     contributions from one trajectory as one gradient unit.
 """
 
@@ -90,7 +90,10 @@ def post_process_rewards(
 
 def _trajectory_key(sample: Any, sample_position: int) -> tuple[Any, tuple[Any, Any]]:
     group_idx = _key_value(getattr(sample, "group_index", None), -1)
-    traj_idx = getattr(sample, "group_id", None)
+    traj_idx = getattr(sample, "rollout_id", None)
+    if traj_idx is None:
+        # Older Slime bridge samples used ``group_id`` for this contract.
+        traj_idx = getattr(sample, "group_id", None)
     if traj_idx is None:
         traj_idx = getattr(sample, "index", None)
     return group_idx, (group_idx, _key_value(traj_idx, sample_position))

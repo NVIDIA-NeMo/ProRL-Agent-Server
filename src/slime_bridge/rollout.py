@@ -384,6 +384,7 @@ class AsyncPolarRolloutWorker:
         self._batch_size = batch_size
         self._current_rollout_id = int(getattr(args, "start_rollout_id", 0) or 0)
         self._requested_groups = 0
+        self._fully_async_started = False
         self._fatal_error: BaseException | None = None
         self._state_lock = threading.RLock()
         self._metrics: dict[str, float] = {}
@@ -421,6 +422,8 @@ class AsyncPolarRolloutWorker:
             return
         with self._state_lock:
             self._requested_groups += int(count)
+            if self.config.fully_async:
+                self._fully_async_started = True
 
     def raise_if_failed(self) -> None:
         if self._fatal_error is not None:
@@ -744,7 +747,12 @@ class AsyncPolarRolloutWorker:
         active_session_cost: int,
     ) -> bool:
         requested_groups = self._shared_requested_groups()
-        if requested_groups <= 0:
+        if self.config.fully_async:
+            with self._state_lock:
+                admission_started = self._fully_async_started
+            if not admission_started:
+                return False
+        elif requested_groups <= 0:
             return False
         if len(active) >= self.config.max_concurrency:
             return False
@@ -756,9 +764,11 @@ class AsyncPolarRolloutWorker:
             + self._shared_completed_buffer_size()
             + self.deferred_queue.qsize()
         )
-        admission_window = min(
-            requested_groups,
-            self._batch_size * self.config.max_async_level,
+        max_window = self._batch_size * self.config.max_async_level
+        admission_window = (
+            max_window
+            if self.config.fully_async
+            else min(requested_groups, max_window)
         )
         return owned_groups < admission_window
 
@@ -1199,6 +1209,7 @@ def generate_rollout_polar_async(args: Any, rollout_id: int, data_source: Any, e
     rewards = [_extract_sample_reward(s, async_worker.config.reward_key) for s in flat]
     metrics: dict[str, Any] = {}
     metrics.update(_polar_extra_metrics(flat, rewards, async_worker.config.reward_key))
+    metrics.update(async_worker.snapshot_metrics())
     return RolloutFnTrainOutput(samples=data, metrics=metrics)
 
 
