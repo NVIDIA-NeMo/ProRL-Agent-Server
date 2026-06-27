@@ -27,15 +27,23 @@ class CodexHarness(BaseHarness):
     async def setup(self, runtime: BaseRuntime) -> None:
         await runtime.exec(f"mkdir -p {self._codex_home}")
 
+        codex_env = "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
+        result = await runtime.exec(
+            codex_env
+            + "if ! command -v codex >/dev/null 2>&1; then "
+            + "echo 'codex CLI not found; install @openai/codex in runtime.prepare' >&2; "
+            + "exit 127; "
+            + "fi"
+        )
+        if result.return_code != 0:
+            output = result.stderr or result.stdout or "codex CLI check failed"
+            raise RuntimeError(output.strip())
+
         expected_version = self._expected_version()
         if expected_version:
             result = await runtime.exec(
-                "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
-                "if ! command -v codex >/dev/null 2>&1; then "
-                "echo 'codex CLI not found; install @openai/codex in runtime.prepare' >&2; "
-                "exit 127; "
-                "fi; "
-                "installed=$(codex --version | awk 'NF {print $NF; exit}'); "
+                codex_env
+                + "installed=$(codex --version | awk 'NF {print $NF; exit}'); "
                 f"if [ \"$installed\" != {shlex.quote(expected_version)} ]; then "
                 f"echo 'codex version mismatch: expected {expected_version}, got '\"$installed\" >&2; "
                 "exit 1; "
