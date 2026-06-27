@@ -69,6 +69,8 @@ cd web && npm install && npm run build
   evaluation on SWE-bench Verified tasks.
 - [SWE-Gym Slime GRPO](examples/swegym_slime_grpo/README.md): training
   path that connects Polar rollouts to Slime.
+- [TMax Slime GRPO](examples/tmax_slime_grpo/README.md): Harbor-reward training
+  with task-specific Apptainer SIFs on Slurm.
 
 <p align="center">
   <img src="assets/swegym_grpo_training_curves.png" alt="Polar rollout architecture" width="660" />
