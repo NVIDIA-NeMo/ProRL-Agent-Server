@@ -103,3 +103,65 @@ uv run python examples/tmax-15k/submit_tmax_tasks.py --dataset-dir ~/tmax15k \
 The dataset dir must also be on the cluster: `submit` reads each task's
 `instruction.md`, and the `harbor` evaluator uploads its `tests/` into the
 container — only the *images* become `.sif`.
+
+### Parallel SIF builds on Slurm
+
+For a larger TMax slice, submit CPU Slurm array jobs that deterministically shard
+the selected tasks. By default each shard translates the task's constrained
+`environment/Dockerfile` into an Apptainer definition and builds the `.sif`
+directly, so Slurm nodes do not need Docker. This runs inside
+`flappydora/ubuntu22.04-cuda13.3:latest` via Slurm's `--container-image` and
+uses Apptainer/Singularity inside that container. On this cluster fakeroot is
+not available through Pyxis, but the build container runs as root, so the direct
+Apptainer build path works without Docker:
+
+```bash
+TMAX_SIF_BUILD_SHARDS=1000 \
+TMAX_SIF_BUILD_ARRAY_PARALLEL=50 \
+TMAX_SIF_BUILD_JOBS_PER_TASK=1 \
+bash examples/tmax-15k/submit_build_sifs_slurm.sh
+```
+
+Useful knobs:
+
+```bash
+TMAX_DATA_ROOT=/lustre/fsw/portfolios/nvr/projects/nvr_lpr_llm/users/jiaruiy/spilot/data
+TMAX_DATASET_DIR=$TMAX_DATA_ROOT/tmax-15k
+APPTAINER_IMAGE_DIR=$TMAX_DATA_ROOT/tmax-15k-sif
+TMAX_SIF_PYTHON_BIN=/lustre/fsw/portfolios/nvr/projects/nvr_lpr_llm/users/jiaruiy/.python/polar/bin/python
+POLAR_APPTAINER_BIN=/usr/bin/apptainer  # auto-detects apptainer/singularity by default
+TMAX_SIF_BUILDER=direct-apptainer   # default; use docker-daemon only on docker-capable nodes
+TMAX_SIF_APPTAINER_FAKEROOT=0       # default; fakeroot is not available in Pyxis here
+TMAX_SIF_BASE_SIF=/path/ubuntu22.sif # optional; avoids Apptainer docker bootstrap pulls
+TMAX_SIF_BUILD_LAUNCHER=sbatch-container
+TMAX_SIF_BUILD_CONTAINER_IMAGE=flappydora/ubuntu22.04-cuda13.3:latest
+TMAX_SIF_BUILD_CONTAINER_MOUNTS=/lustre/fsw:/lustre/fsw
+TMAX_SIF_MAX_TASKS=100              # only the first 100 tasks before sharding
+TMAX_SIF_BUILD_SHARDS=1000          # default; keeps each cpu_short array task small
+TMAX_SIF_BUILD_ARRAY_PARALLEL=50    # default; concurrent cpu_short array tasks
+TMAX_SIF_BUILD_PARTITION=cpu_short  # default
+TMAX_SIF_BUILD_TIME=4:00:00         # default; cpu_short max on this cluster
+TMAX_SIF_BUILD_MEM=64G              # default: 32G
+TMAX_SIF_BUILD_FORCE=1              # rebuild existing .sif files
+TMAX_SIF_BUILD_FORCE_DOCKER=1       # also rebuild docker images
+TMAX_SIF_BUILD_DRY_RUN=1            # print the generated sbatch script
+```
+
+To run one shard manually:
+
+```bash
+TMAX_SIF_NUM_SHARDS=64 TMAX_SIF_SHARD_INDEX=0 \
+bash examples/tmax-15k/build_sif_shard.sh
+```
+
+## Train with Slime GRPO
+
+Once the task SIFs are available, use the dependency-compatible training entry
+under [`examples/tmax_slime_grpo`](../tmax_slime_grpo/README.md). It generates
+Slime JSONL rows from the local dataset, launches task SIFs through Polar, and
+uses the Harbor verifier reward for GRPO. A partial-image smoke run is:
+
+```bash
+TMAX_ONLY_READY=1 TMAX_MAX_TASKS=64 RUN_ID=tmax-smoke-64 \
+bash examples/tmax_slime_grpo/submit_slurm.sh
+```
