@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import base64
 import copy
+import hashlib
 import json
 import logging
 import math
+import os
 import queue
+import re
 import statistics
-import tempfile
 import threading
 import time
 from collections import deque
@@ -28,9 +31,15 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 
+from polar.http_logging import uvicorn_access_log_enabled
 from polar.rollout.models import TaskResult, TaskStatus
+from polar.runtime.command_timing import RUNTIME_EXEC_CATEGORIES
 from slime_bridge._messages import prompt_to_instruction_text
-from slime_bridge.adapter import RolloutLogprobError, session_result_to_samples
+from slime_bridge.adapter import (
+    RolloutLogprobError,
+    session_result_to_placeholder,
+    session_result_to_samples,
+)
 from slime_bridge.config import (
     PolarSlimeConfig,
     render_instruction,
@@ -42,7 +51,88 @@ logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL = 2.0  # seconds between task-status polls (eval / no-callback path)
 _CALLBACK_FALLBACK_POLL_SECONDS = 60.0  # defensive backstop for dropped callbacks
-_LONGEST_TRACE_ARTIFACT_INTERVAL = 5  # dump longest trace every N rollouts
+_TRAJECTORY_EXAMPLE_INTERVAL = 10
+_TRAJECTORY_EXAMPLE_COUNT = 2
+_EVAL_DATA_INTEGRITY_ENV = "POLAR_EVAL_DATA_INTEGRITY_B64"
+_EVAL_SAMPLING_SEED_METADATA_KEY = "eval_sampling_seed_base"
+_EVAL_DISPATCH_PRIORITY = 100
+
+_EVAL_STANDARD_MODEL_KWARGS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("temperature", "temperature", ("eval_temperature", "rollout_temperature")),
+    ("top_p", "top_p", ("eval_top_p", "rollout_top_p")),
+    (
+        "max_response_len",
+        "max_tokens",
+        ("eval_max_response_len", "rollout_max_response_len"),
+    ),
+    ("stop", "stop", ("rollout_stop",)),
+)
+_EVAL_SGLANG_EXTRA_BODY: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("top_k", "top_k", ("eval_top_k", "rollout_top_k")),
+    ("stop_token_ids", "stop_token_ids", ("rollout_stop_token_ids",)),
+    ("min_new_tokens", "min_tokens", ("eval_min_new_tokens",)),
+    ("repetition_penalty", "repetition_penalty", ()),
+    ("skip_special_tokens", "skip_special_tokens", ("rollout_skip_special_tokens",)),
+    ("no_stop_trim", "no_stop_trim", ()),
+)
+
+_eval_tokenizer_cache: dict[str, Any] = {}
+
+_SESSION_STAGE_TIMING_FIELDS: tuple[tuple[str, str], ...] = (
+    ("register_to_init_queue_ms", "register_to_init_queue_mean"),
+    ("rollout_dispatch_ms", "rollout_dispatch_mean"),
+    ("rollout_result_wait_ms", "rollout_result_wait_mean"),
+    ("rollout_pipeline_e2e_ms", "rollout_pipeline_e2e_mean"),
+    ("init_ms", "init_mean"),
+    ("ready_queue_ms", "ready_queue_mean"),
+    ("container_start_ms", "container_start_mean"),
+    ("eval_container_start_ms", "eval_container_start_mean"),
+    ("runtime_validation_ms", "runtime_validation_mean"),
+    ("eval_runtime_validation_ms", "eval_runtime_validation_mean"),
+    ("prepare_ms", "prepare_mean"),
+    ("eval_prepare_ms", "eval_prepare_mean"),
+    ("run_ms", "run_mean"),
+    ("postrun_queue_ms", "postrun_queue_mean"),
+    ("agent_setup_ms", "agent_setup_mean"),
+    ("agent_exec_ms", "agent_exec_mean"),
+    ("agent_postprocess_ms", "agent_postprocess_mean"),
+    ("postrun_ms", "postrun_mean"),
+    ("build_ms", "build_mean"),
+    ("eval_ms", "eval_mean"),
+    ("postrun_exec_ms", "postrun_exec_mean"),
+    ("runtime_stop_ms", "runtime_stop_mean"),
+    ("e2e_ms", "e2e_mean"),
+)
+
+_INFERENCE_TIMING_FIELDS: tuple[str, ...] = (
+    "e2e_ms",
+    "api_dispatch_ms",
+    "request_to_forward_ms",
+    "queue_ms",
+    "forward_ms",
+    "prefill_forward_ms",
+    "decode_forward_ms",
+    "decode_ms",
+    "inference_service_ms",
+    "num_running_reqs",
+    "num_waiting_reqs",
+    "num_retractions",
+    "prompt_tokens",
+    "completion_tokens",
+    "pd_prefill_bootstrap_queue_ms",
+    "pd_prefill_bootstrap_ms",
+    "pd_prefill_alloc_wait_ms",
+    "pd_prefill_forward_ms",
+    "pd_prefill_transfer_queue_ms",
+    "pd_transfer_speed_gb_s",
+    "pd_transfer_total_mb",
+    "pd_prefill_retry_count",
+    "pd_decode_prealloc_ms",
+    "pd_decode_bootstrap_ms",
+    "pd_decode_alloc_wait_ms",
+    "pd_decode_transfer_ms",
+    "pd_decode_forward_ms",
+)
 
 
 class PolarRolloutSchedulerError(RuntimeError):
@@ -53,30 +143,61 @@ class PolarLowCompleteAcceptFractionError(PolarRolloutSchedulerError):
     """Raised when a completed task has too few trainable completed sessions."""
 
 
+class PolarEvalDataIntegrityError(ValueError):
+    """Raised when an eval JSONL no longer matches its launcher manifest."""
+
+
 @dataclass(slots=True)
 class _DeferredGroup:
     group: list[Any]
+    reservation_id: int | None = None
 
 
 @dataclass(slots=True)
 class _PendingGroup:
     group_id: int
     group: list[Any]
+    reservation_id: int | None
     submitted_rollout_id: int
     policy_version: int
     session_cost: int
+    submitted_at: float = field(default_factory=time.monotonic)
 
 
 @dataclass(slots=True)
 class _CompletedGroup:
     group_id: int
     group: list[Any]
+    reservation_id: int | None
     samples: list[Any]
     task_id: str
     submitted_rollout_id: int
     policy_version: int
     session_count: int
+    submitted_at: float = 0.0
     completed_at: float = field(default_factory=time.monotonic)
+    service_time_seconds: float = 0.0
+    sample_conversion_seconds: float = 0.0
+    output_queue_wait_seconds: float = 0.0
+
+
+_WASTED_TIMING_FIELDS: tuple[str, ...] = (
+    "rollout_pipeline_e2e_ms",
+    "e2e_ms",
+    "runtime_validation_ms",
+    "ready_queue_ms",
+    "agent_exec_ms",
+    "eval_ms",
+    "runtime_exec_ms",
+    "mini_swe_command_ms",
+)
+_WASTED_INFERENCE_FIELDS: tuple[str, ...] = (
+    "e2e_ms",
+    "queue_ms",
+    "prefill_forward_ms",
+    "decode_ms",
+    "inference_service_ms",
+)
 
 # ---------------------------------------------------------------------------
 # Global worker singleton
@@ -103,6 +224,17 @@ def stop_global_worker() -> None:
             _global_async_worker = None
 
 
+def _current_ray_task_is_canceled() -> bool:
+    """Cooperatively observe ``ray.cancel`` from a regular actor method."""
+    try:
+        import ray
+
+        return bool(ray.get_runtime_context().is_canceled())
+    except (ImportError, RuntimeError):
+        # Unit tests and standalone callers do not run inside a Ray worker.
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -113,6 +245,8 @@ def _build_task_payload(
     group: list[Any],
     rollout_id: int,
     task_position: int,
+    eval_dataset_cfg: Any | None = None,
+    eval_dataset_name: str | None = None,
 ) -> dict[str, Any]:
     first_sample = group[0]
     prompt_text = prompt_to_instruction_text(getattr(first_sample, "prompt", ""))
@@ -125,7 +259,7 @@ def _build_task_payload(
         task_position=task_position,
         num_rollouts=len(group),
     )
-    return render_task_payload(
+    payload = render_task_payload(
         args=args,
         config=config,
         sample=first_sample,
@@ -133,7 +267,101 @@ def _build_task_payload(
         rollout_id=rollout_id,
         task_position=task_position,
         num_rollouts=len(group),
+        is_eval=eval_dataset_cfg is not None or eval_dataset_name is not None,
     )
+    if eval_dataset_cfg is not None or eval_dataset_name is not None:
+        _apply_eval_runtime_overrides(
+            payload,
+            args=args,
+            dataset_cfg=eval_dataset_cfg,
+            dataset_name=eval_dataset_name or "polar_eval",
+            task_position=task_position,
+        )
+    return payload
+
+
+def _apply_eval_runtime_overrides(
+    payload: dict[str, Any],
+    *,
+    args: Any,
+    dataset_cfg: Any | None,
+    dataset_name: str,
+    task_position: int,
+) -> None:
+    """Attach eval-only sampling controls to the agent and stable seed metadata."""
+
+    # Fixed eval must wait for every configured seed. Reusing training's
+    # straggler early-stop would compare whichever sessions happened to finish
+    # first at baseline versus final time.
+    payload["early_stop_min_usable_sessions"] = int(payload["num_samples"])
+    # A fully-async training call may enqueue hundreds of sessions at the same
+    # instant as the fixed pre-train baseline. Let eval overtake only sessions
+    # still waiting for gateway INIT; already-initializing/running sessions are
+    # untouched. This shortens the baseline tail without changing its model,
+    # sampling, execution timeout, evaluator, or initial-policy weight barrier.
+    payload["dispatch_priority"] = max(
+        int(payload.get("dispatch_priority", 0)),
+        _EVAL_DISPATCH_PRIORITY,
+    )
+
+    agent = payload.get("agent")
+    if not isinstance(agent, dict):
+        raise ValueError("polar eval task payload agent must be a mapping")
+    settings = agent.get("settings") or {}
+    if not isinstance(settings, dict):
+        raise ValueError("polar eval task payload agent.settings must be a mapping")
+
+    existing_model_kwargs = settings.get("model_kwargs") or {}
+    if not isinstance(existing_model_kwargs, dict):
+        raise ValueError("polar eval agent.settings.model_kwargs must be a mapping")
+    model_kwargs = copy.deepcopy(existing_model_kwargs)
+    for dataset_attr, request_key, arg_attrs in _EVAL_STANDARD_MODEL_KWARGS:
+        value = _eval_runtime_value(dataset_cfg, dataset_attr, args, arg_attrs)
+        if value is not None:
+            model_kwargs[request_key] = copy.deepcopy(value)
+
+    extra_body = model_kwargs.get("extra_body") or {}
+    if not isinstance(extra_body, dict):
+        raise ValueError("polar eval agent model_kwargs.extra_body must be a mapping")
+    extra_body = copy.deepcopy(extra_body)
+    for dataset_attr, request_key, arg_attrs in _EVAL_SGLANG_EXTRA_BODY:
+        value = _eval_runtime_value(dataset_cfg, dataset_attr, args, arg_attrs)
+        if value is not None:
+            extra_body[request_key] = copy.deepcopy(value)
+    if extra_body:
+        model_kwargs["extra_body"] = extra_body
+
+    settings = {**settings, "model_kwargs": model_kwargs}
+    agent["settings"] = settings
+
+    metadata = payload.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        raise ValueError("polar eval task metadata must be a mapping")
+    # Stable across baseline/final evaluations and independent of rollout id.
+    # RolloutManager adds the within-prompt sample index before dispatch.
+    seed_material = f"{dataset_name}\0{task_position}".encode()
+    seed_base = int.from_bytes(hashlib.sha256(seed_material).digest()[:4], "big")
+    payload["metadata"] = {
+        **metadata,
+        _EVAL_SAMPLING_SEED_METADATA_KEY: seed_base,
+    }
+
+
+def _eval_runtime_value(
+    dataset_cfg: Any | None,
+    dataset_attr: str,
+    args: Any,
+    arg_attrs: tuple[str, ...],
+) -> Any:
+    if dataset_cfg is not None:
+        value = getattr(dataset_cfg, dataset_attr, None)
+        if value is not None:
+            return value
+    for attr in arg_attrs:
+        value = getattr(args, attr, None)
+        if value is not None:
+            return value
+    return None
 
 
 def _attach_scheduler_metadata(
@@ -197,17 +425,38 @@ async def _submit_and_wait_for_task(
 
 
 def _resolve_max_tokens(args: Any) -> int | None:
-    """Per-sample token cap Slime's dynamic batcher can fit on one GPU.
+    """Safe per-sample cap for both the dynamic batcher and model sequence.
 
     Megatron asserts every sample length <= max_tokens_per_gpu * cp_size.
-    Deep agent trajectories can exceed this (24-turn sessions → 80k+ tokens)
-    and must be dropped before they reach the batcher.
+    The model's configured ``seq_length`` is an independent upper bound. Deep
+    agent trajectories can exceed either one, so the adapter receives the
+    smaller positive cap and keeps an exact causal prefix.
     """
     mtpg = getattr(args, "max_tokens_per_gpu", None)
-    if not mtpg:
-        return None
-    cp_size = int(getattr(args, "context_parallel_size", 1) or 1)
-    return int(mtpg) * cp_size
+    seq_length = getattr(args, "seq_length", None)
+    caps: list[int] = []
+    if mtpg:
+        cp_size = int(getattr(args, "context_parallel_size", 1) or 1)
+        caps.append(int(mtpg) * cp_size)
+    if seq_length:
+        caps.append(int(seq_length))
+    positive_caps = [cap for cap in caps if cap > 0]
+    hard_cap = min(positive_caps) if positive_caps else None
+
+    configured = getattr(args, "polar_max_trajectory_tokens", None)
+    if configured is None:
+        return hard_cap
+    configured = int(configured)
+    if configured <= 0:
+        raise ValueError("polar_max_trajectory_tokens must be positive")
+    if hard_cap is not None and configured > hard_cap:
+        raise ValueError(
+            "polar_max_trajectory_tokens exceeds trainer capacity: "
+            f"configured={configured}, capacity={hard_cap} "
+            f"(max_tokens_per_gpu={mtpg}, context_parallel_size="
+            f"{getattr(args, 'context_parallel_size', 1)}, seq_length={seq_length})"
+        )
+    return configured
 
 
 def _convert_task_result_to_samples(
@@ -230,15 +479,78 @@ def _convert_task_result_to_samples(
     for pos, session_result in enumerate(task_result.results):
         source = group[pos] if pos < len(group) else None
         traj_idx = int(getattr(source, "index", pos) if source is not None else pos)
-        group_samples.extend(
-            session_result_to_samples(
-                session_result,
-                group_index,
-                trajectory_index=traj_idx,
-                reward_key=config.reward_key,
-                max_tokens=max_tokens,
+        try:
+            group_samples.extend(
+                session_result_to_samples(
+                    session_result,
+                    group_index,
+                    trajectory_index=traj_idx,
+                    reward_key=config.reward_key,
+                    max_tokens=max_tokens,
+                )
             )
-        )
+        except Exception as exc:
+            # One corrupt/misaligned trajectory must not tear down a healthy
+            # asynchronous trainer. Keep group cardinality with a fully masked
+            # placeholder; the remaining sessions still contribute normally.
+            detail = f"{type(exc).__name__}: {' '.join(str(exc).splitlines())}"[:1000]
+            logger.exception(
+                "Training session %s could not be converted; replacing only "
+                "this session with a zero-gradient placeholder",
+                getattr(session_result, "session_id", f"{task_result.task_id}:{pos}"),
+            )
+            group_samples.append(
+                session_result_to_placeholder(
+                    session_result,
+                    group_index,
+                    trajectory_index=traj_idx,
+                    reward_key=config.reward_key,
+                    conversion_error=detail,
+                )
+            )
+    return group_samples
+
+
+def _convert_eval_task_result_to_samples(
+    config: PolarSlimeConfig,
+    task_result: TaskResult,
+    group: list[Any],
+    *,
+    dataset_name: str,
+    max_tokens: int | None = None,
+) -> list[Any]:
+    """Best-effort eval conversion with one-session failure isolation.
+
+    Training conversion remains fail-closed because malformed policy samples
+    must never reach the optimizer.  Evaluation has no gradient path, so a
+    malformed result is logged and later represented by one zero reward.
+    """
+
+    group_index = _group_index_for(group)
+    group_samples: list[Any] = []
+    for pos, session_result in enumerate(task_result.results[: len(group)]):
+        source = group[pos] if pos < len(group) else None
+        traj_idx = int(getattr(source, "index", pos) if source is not None else pos)
+        try:
+            group_samples.extend(
+                session_result_to_samples(
+                    session_result,
+                    group_index,
+                    trajectory_index=traj_idx,
+                    reward_key=config.reward_key,
+                    max_tokens=max_tokens,
+                )
+            )
+        except Exception as exc:
+            detail = " ".join(str(exc).splitlines())
+            logger.warning(
+                "Eval dataset %s session %s could not be converted; assigning "
+                "reward 0: %s: %.500s",
+                dataset_name,
+                getattr(session_result, "session_id", f"{task_result.task_id}:{pos}"),
+                type(exc).__name__,
+                detail,
+            )
     return group_samples
 
 
@@ -301,6 +613,41 @@ def _completed_trainable_session_count(
         ):
             count += 1
     return count
+
+
+def _completed_service_metrics(completed_groups: list[_CompletedGroup]) -> dict[str, float]:
+    """Summarize task latency and the production window for one accepted batch."""
+    timed_groups = [
+        completed
+        for completed in completed_groups
+        if (
+            completed.service_time_seconds > 0
+            and math.isfinite(completed.service_time_seconds)
+            and completed.completed_at > completed.submitted_at
+        )
+    ]
+    if not timed_groups:
+        return {}
+
+    service_window = max(group.completed_at for group in timed_groups) - min(
+        group.submitted_at for group in timed_groups
+    )
+    metrics = {
+        "timing/service_time_max": max(group.service_time_seconds for group in timed_groups),
+        "timing/pipeline_ms/sample_conversion_mean": 1000.0
+        * sum(group.sample_conversion_seconds for group in timed_groups)
+        / len(timed_groups),
+        "timing/pipeline_ms/sample_conversion_max": 1000.0
+        * max(group.sample_conversion_seconds for group in timed_groups),
+        "timing/pipeline_ms/output_queue_wait_mean": 1000.0
+        * sum(group.output_queue_wait_seconds for group in timed_groups)
+        / len(timed_groups),
+        "timing/pipeline_ms/output_queue_wait_max": 1000.0
+        * max(group.output_queue_wait_seconds for group in timed_groups),
+    }
+    if service_window > 0 and math.isfinite(service_window):
+        metrics["timing/service_window"] = service_window
+    return metrics
 
 
 def _sample_session_id(sample: Any) -> str | None:
@@ -384,10 +731,18 @@ class AsyncPolarRolloutWorker:
         self._batch_size = batch_size
         self._current_rollout_id = int(getattr(args, "start_rollout_id", 0) or 0)
         self._requested_groups = 0
-        self._fully_async_started = False
+        # Fully-async requests grant a finite number of fresh admissions.  The
+        # first request may fill the entire async window; each later request
+        # grants only enough credit to replace the batch it consumes.  Keeping
+        # this separate from outstanding demand closes the race where a request
+        # is satisfied immediately from the completed backlog before the worker
+        # thread gets a chance to refill any rollout work.
+        self._fully_async_request_count = 0
+        self._fully_async_admission_credit = 0
         self._fatal_error: BaseException | None = None
         self._state_lock = threading.RLock()
         self._metrics: dict[str, float] = {}
+        self._last_reported_counters: dict[str, float] = {}
         self._active_groups = 0
         self._active_sessions = 0
         self._completed_buffer_size = 0
@@ -400,7 +755,9 @@ class AsyncPolarRolloutWorker:
     # -- lifecycle -------------------------------------------------------------
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="polar-async-rollout")
+        self._thread = threading.Thread(
+            target=self._run_loop, daemon=True, name="polar-async-rollout"
+        )
         self._thread.start()
 
     def stop(self) -> None:
@@ -421,9 +778,16 @@ class AsyncPolarRolloutWorker:
         if count <= 0:
             return
         with self._state_lock:
-            self._requested_groups += int(count)
+            count = int(count)
+            self._requested_groups += count
             if self.config.fully_async:
-                self._fully_async_started = True
+                if self._fully_async_request_count == 0:
+                    self._fully_async_admission_credit += (
+                        self._batch_size * self.config.max_async_level
+                    )
+                else:
+                    self._fully_async_admission_credit += count
+                self._fully_async_request_count += 1
 
     def raise_if_failed(self) -> None:
         if self._fatal_error is not None:
@@ -437,12 +801,16 @@ class AsyncPolarRolloutWorker:
     ) -> list[_CompletedGroup]:
         self.raise_if_failed()
 
-        while True:
-            try:
-                self._completed_buffer.append(self.output_queue.get_nowait())
-            except queue.Empty:
-                break
         with self._state_lock:
+            # Move the handoff queue and publish its mirrored size atomically
+            # with respect to admission checks.  Otherwise qsize() can fall
+            # before `_completed_buffer_size` rises, briefly hiding owned work
+            # and allowing the single window to be exceeded.
+            while True:
+                try:
+                    self._completed_buffer.append(self.output_queue.get_nowait())
+                except queue.Empty:
+                    break
             self._completed_buffer_size = len(self._completed_buffer)
 
         accepted: list[_CompletedGroup] = []
@@ -464,6 +832,9 @@ class AsyncPolarRolloutWorker:
                     completed.task_id,
                     reason,
                 )
+                self._record_wasted_samples(completed.samples)
+                self._consume_reservation(completed.reservation_id, outcome="stale")
+                self._restore_fully_async_admission_credit(1)
                 continue
 
             _annotate_accepted_samples(
@@ -489,16 +860,75 @@ class AsyncPolarRolloutWorker:
                 + self.deferred_queue.qsize()
             )
 
+    def mark_dynamic_filter_drop(
+        self,
+        completed: _CompletedGroup,
+        *,
+        reason: str | None,
+    ) -> dict[str, float]:
+        """Permanently consume a completed group rejected by active sampling."""
+
+        self._inc_metric("polar/dropped_groups")
+        self._inc_metric("polar/dropped_dynamic_filter_groups")
+        self._inc_metric("polar/dropped_sessions", completed.session_count)
+        self._record_wasted_samples(completed.samples)
+        logger.info(
+            "Dynamic sampling filtered Polar group %s task=%s reason=%s",
+            completed.group_id,
+            completed.task_id,
+            reason or "unspecified",
+        )
+        return self._consume_reservation(
+            completed.reservation_id,
+            outcome="dynamic_filter",
+        )
+
     def snapshot_metrics(self) -> dict[str, float]:
         with self._state_lock:
-            out = dict(self._metrics)
+            raw_counters = dict(self._metrics)
+            out: dict[str, float] = {}
             out["polar/scheduler/active_groups"] = float(self._active_groups)
             out["polar/scheduler/active_sessions"] = float(self._active_sessions)
             out["polar/scheduler/completed_buffer"] = float(self._completed_buffer_size)
             out["polar/scheduler/output_queue"] = float(self.output_queue.qsize())
             out["polar/scheduler/deferred_queue"] = float(self.deferred_queue.qsize())
             out["polar/scheduler/requested_groups"] = float(self._requested_groups)
-            return out
+            if self.config.fully_async:
+                out["polar/scheduler/admission_credit"] = float(self._fully_async_admission_credit)
+        reservation_metrics = getattr(self.data_source, "reservation_metrics", None)
+        if callable(reservation_metrics):
+            for key, value in reservation_metrics().items():
+                value = float(value)
+                if key.endswith("_since_worker_start"):
+                    raw_counters[key] = value
+                else:
+                    out[key] = value
+
+        with self._state_lock:
+            for key, value in raw_counters.items():
+                if key.endswith("_since_worker_start"):
+                    lifetime_key = key
+                    delta_key = f"{key.removesuffix('_since_worker_start')}_delta"
+                else:
+                    lifetime_key = f"{key}_since_worker_start"
+                    delta_key = f"{key}_delta"
+                previous = self._last_reported_counters.get(key, 0.0)
+                out[lifetime_key] = value
+                out[delta_key] = max(0.0, value - previous)
+                self._last_reported_counters[key] = value
+        wasted_sessions = out.get("polar/wasted/session_count_delta", 0.0)
+        if wasted_sessions > 0.0:
+            for timing_field in _WASTED_TIMING_FIELDS:
+                total = out.get(f"timing/wasted/{timing_field}_sum_delta")
+                if total is not None:
+                    out[f"timing/wasted/{timing_field}_per_session_mean"] = total / wasted_sessions
+        wasted_inference = out.get("polar/wasted/inference_timing_count_delta", 0.0)
+        if wasted_inference > 0.0:
+            for timing_field in _WASTED_INFERENCE_FIELDS:
+                total = out.get(f"timing/wasted/inference_{timing_field}_sum_delta")
+                if total is not None:
+                    out[f"timing/wasted/inference_{timing_field}_mean"] = total / wasted_inference
+        return out
 
     # -- internal --------------------------------------------------------------
 
@@ -512,7 +942,11 @@ class AsyncPolarRolloutWorker:
         wakeup = asyncio.Event()
 
         callback_server, callback_task = await self._start_callback_listener()
-        timeout = None if self.config.request_timeout is None else httpx.Timeout(self.config.request_timeout)
+        timeout = (
+            None
+            if self.config.request_timeout is None
+            else httpx.Timeout(self.config.request_timeout)
+        )
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 while self._running:
@@ -548,7 +982,10 @@ class AsyncPolarRolloutWorker:
                             )
                             self._running = False
                             break
-                        if active_session_cost + session_cost > self.config.max_session_concurrency:
+                        if (
+                            active_session_cost + session_cost
+                            > self.config.max_session_concurrency
+                        ):
                             self.deferred_queue.put(next_group)
                             break
 
@@ -558,6 +995,7 @@ class AsyncPolarRolloutWorker:
                         pending = _PendingGroup(
                             group_id=gid,
                             group=next_group.group,
+                            reservation_id=next_group.reservation_id,
                             submitted_rollout_id=submitted_rollout_id,
                             policy_version=policy_version,
                             session_cost=session_cost,
@@ -578,9 +1016,17 @@ class AsyncPolarRolloutWorker:
                             pass
                         wakeup.clear()
 
-            if active:
-                logger.info("Waiting for %d in-flight Polar tasks", len(active))
-                await asyncio.gather(*active.keys(), return_exceptions=True)
+                if active:
+                    # These groups were only speculative prefetch. Once training is
+                    # disposing this worker they cannot enter a committed model
+                    # step, so waiting for full agent timeouts just delays the
+                    # graceful checkpoint exit and can consume the wall-time
+                    # reserve. Cancelling each waiter also sends a task-level
+                    # DELETE that tears down its gateway sessions.
+                    logger.info("Cancelling %d uncommitted in-flight Polar tasks", len(active))
+                    for task in active:
+                        task.cancel()
+                    await asyncio.gather(*active.keys(), return_exceptions=True)
         finally:
             callback_server.should_exit = True
             try:
@@ -611,8 +1057,12 @@ class AsyncPolarRolloutWorker:
             return {"ok": True}
 
         config = uvicorn.Config(
-            app=app, host=self.config.callback_host, port=0,
-            log_level="warning", lifespan="on",
+            app=app,
+            host=self.config.callback_host,
+            port=0,
+            log_level="warning",
+            lifespan="on",
+            access_log=uvicorn_access_log_enabled(),
         )
         server = uvicorn.Server(config)
         task = asyncio.create_task(server.serve(), name="polar-callback-listener")
@@ -623,9 +1073,7 @@ class AsyncPolarRolloutWorker:
         logger.info("Polar trainer callback listener bound to %s", self._callback_url)
         return server, task
 
-    async def _submit_and_collect(
-        self, client: httpx.AsyncClient, pending: _PendingGroup
-    ) -> None:
+    async def _submit_and_collect(self, client: httpx.AsyncClient, pending: _PendingGroup) -> None:
         last_error: BaseException | None = None
 
         if self._running:
@@ -639,18 +1087,28 @@ class AsyncPolarRolloutWorker:
         if last_error is None:
             return
 
+        # An external dispose may race with an HTTP waiter failing. A stopped
+        # worker must leave every uncommitted reservation at the checkpoint
+        # frontier instead of turning teardown into a permanent skip.
+        if not self._running:
+            return
+
         if _is_zero_trainable_error(last_error):
             category_metric = "polar/dropped_zero_trainable_groups"
             reason = "zero trainable tokens"
+            permanently_consumed = True
         elif isinstance(last_error, PolarLowCompleteAcceptFractionError):
             category_metric = "polar/dropped_low_complete_fraction_groups"
             reason = "low complete accept fraction"
+            permanently_consumed = True
         elif isinstance(last_error, RolloutLogprobError):
             category_metric = "polar/dropped_logprob_error_groups"
             reason = "rollout logprob error"
+            permanently_consumed = True
         else:
             category_metric = "polar/dropped_failed_groups"
             reason = "task failure"
+            permanently_consumed = False
 
         self._inc_metric("polar/dropped_groups")
         self._inc_metric(category_metric)
@@ -661,6 +1119,19 @@ class AsyncPolarRolloutWorker:
             reason,
             last_error,
         )
+        if permanently_consumed:
+            self._consume_reservation(pending.reservation_id, outcome="permanent_drop")
+            self._restore_fully_async_admission_credit(1)
+        else:
+            if pending.reservation_id is not None:
+                self._inc_metric("polar/replay_on_resume_groups")
+            logger.warning(
+                "Leaving reservation %s outstanding and stopping for checkpoint replay after %s",
+                pending.reservation_id,
+                reason,
+            )
+            self._set_fatal(last_error)
+            self._running = False
         return
 
     async def _submit_attempt(
@@ -669,8 +1140,11 @@ class AsyncPolarRolloutWorker:
         pending: _PendingGroup,
     ) -> _CompletedGroup:
         payload = _build_task_payload(
-            args=self.args, config=self.config, group=pending.group,
-            rollout_id=pending.group_id, task_position=0,
+            args=self.args,
+            config=self.config,
+            group=pending.group,
+            rollout_id=pending.group_id,
+            task_position=0,
         )
         payload["task_id"] = str(payload["task_id"])
         _attach_scheduler_metadata(
@@ -679,21 +1153,37 @@ class AsyncPolarRolloutWorker:
             policy_version=pending.policy_version,
             rollout_step=pending.submitted_rollout_id,
         )
+        pending.submitted_at = time.monotonic()
         task_result = await self._submit_with_callback(client, payload)
+        completed_at = time.monotonic()
+        service_time_seconds = max(0.0, completed_at - pending.submitted_at)
 
         rejection_reason = self._task_rejection_reason(task_result, pending.group)
         if rejection_reason is not None:
+            self._record_wasted_results(task_result.results)
             raise PolarRolloutSchedulerError(
                 f"Task {task_result.task_id} cannot be accepted: {rejection_reason}"
             )
 
-        group_samples = _convert_task_result_to_samples(
-            self.config, task_result, pending.group,
-            max_tokens=_resolve_max_tokens(self.args),
-        )
+        conversion_started = time.perf_counter()
+        try:
+            group_samples = _convert_task_result_to_samples(
+                self.config,
+                task_result,
+                pending.group,
+                max_tokens=_resolve_max_tokens(self.args),
+            )
+        except Exception:
+            self._record_wasted_results(task_result.results)
+            raise
+        sample_conversion_seconds = time.perf_counter() - conversion_started
         if not group_samples:
-            raise PolarRolloutSchedulerError(f"Task {task_result.task_id} converted to zero samples")
+            self._record_wasted_results(task_result.results)
+            raise PolarRolloutSchedulerError(
+                f"Task {task_result.task_id} converted to zero samples"
+            )
         if not _has_trainable_tokens(group_samples):
+            self._record_wasted_samples(group_samples)
             raise PolarRolloutSchedulerError(
                 f"Task {task_result.task_id} produced zero trainable tokens"
             )
@@ -701,6 +1191,7 @@ class AsyncPolarRolloutWorker:
             self.config, task_result, group_samples
         )
         if rejection_reason is not None:
+            self._record_wasted_samples(group_samples)
             raise PolarLowCompleteAcceptFractionError(
                 f"Task {task_result.task_id} cannot be accepted: {rejection_reason}"
             )
@@ -708,16 +1199,23 @@ class AsyncPolarRolloutWorker:
         return _CompletedGroup(
             group_id=pending.group_id,
             group=pending.group,
+            reservation_id=pending.reservation_id,
             samples=group_samples,
             task_id=task_result.task_id,
             submitted_rollout_id=pending.submitted_rollout_id,
             policy_version=pending.policy_version,
             session_count=len(task_result.results),
+            submitted_at=pending.submitted_at,
+            completed_at=completed_at,
+            service_time_seconds=service_time_seconds,
+            sample_conversion_seconds=sample_conversion_seconds,
         )
 
     async def _emit_completed(self, completed: _CompletedGroup) -> None:
+        wait_started = time.perf_counter()
         while self._running:
             try:
+                completed.output_queue_wait_seconds = time.perf_counter() - wait_started
                 self.output_queue.put_nowait(completed)
                 self._inc_metric("polar/completed_groups")
                 return
@@ -733,44 +1231,64 @@ class AsyncPolarRolloutWorker:
         except queue.Empty:
             pass
 
-        groups = self.data_source.get_samples(1)
-        if not groups:
-            return None
-        group = groups[0]
+        reservation_getter = getattr(self.data_source, "get_samples_with_reservation", None)
+        if callable(reservation_getter):
+            reservations = reservation_getter(1)
+            if not reservations:
+                return None
+            if len(reservations) != 1:
+                raise PolarRolloutSchedulerError(
+                    "Slime data source returned an invalid reservation batch"
+                )
+            reservation_id, group = reservations[0]
+        else:
+            groups = self.data_source.get_samples(1)
+            if not groups:
+                return None
+            reservation_id = None
+            group = groups[0]
         if not group:
             raise PolarRolloutSchedulerError("Slime data source returned an empty sample group")
-        return _DeferredGroup(group=group)
+        self._consume_fully_async_admission_credit()
+        return _DeferredGroup(group=group, reservation_id=reservation_id)
 
     def _can_admit_group(
         self,
         active: dict[asyncio.Task[None], _PendingGroup],
         active_session_cost: int,
     ) -> bool:
-        requested_groups = self._shared_requested_groups()
-        if self.config.fully_async:
-            with self._state_lock:
-                admission_started = self._fully_async_started
-            if not admission_started:
+        with self._state_lock:
+            if len(active) >= self.config.max_concurrency:
                 return False
-        elif requested_groups <= 0:
-            return False
-        if len(active) >= self.config.max_concurrency:
-            return False
-        if active_session_cost >= self.config.max_session_concurrency:
-            return False
-        owned_groups = (
-            len(active)
-            + self.output_queue.qsize()
-            + self._shared_completed_buffer_size()
-            + self.deferred_queue.qsize()
-        )
-        max_window = self._batch_size * self.config.max_async_level
-        admission_window = (
-            max_window
-            if self.config.fully_async
-            else min(requested_groups, max_window)
-        )
-        return owned_groups < admission_window
+            if active_session_cost >= self.config.max_session_concurrency:
+                return False
+
+            deferred_groups = self.deferred_queue.qsize()
+            # A deferred group was admitted earlier and already belongs to the
+            # window.  Promoting it to active work neither consumes fresh credit
+            # nor increases ownership, so let it finish even after delivery.
+            if deferred_groups > 0:
+                return True
+
+            max_window = self._batch_size * self.config.max_async_level
+            active_or_deferred = len(active) + deferred_groups
+            completed_backlog = self.output_queue.qsize() + self._completed_buffer_size
+            owned_groups = active_or_deferred + completed_backlog
+            if owned_groups >= max_window:
+                return False
+
+            if self.config.fully_async:
+                # A single ownership window covers every group reserved on
+                # behalf of the trainer, regardless of whether it is active or
+                # complete and awaiting delivery.  Finite per-request credit
+                # permits a backlog-satisfied request to refill its consumed
+                # batch, but cannot restart unlimited production afterward.
+                return self._fully_async_admission_credit > 0
+
+            requested_groups = self._requested_groups
+            if requested_groups <= 0:
+                return False
+            return owned_groups < min(requested_groups, max_window)
 
     def _task_rejection_reason(self, task_result: TaskResult, group: list[Any]) -> str | None:
         if task_result.status != "completed":
@@ -785,17 +1303,65 @@ class AsyncPolarRolloutWorker:
         with self._state_lock:
             return self._current_rollout_id, self._current_rollout_id
 
-    def _shared_requested_groups(self) -> int:
-        with self._state_lock:
-            return self._requested_groups
-
     def _mark_delivered(self, count: int) -> None:
         with self._state_lock:
             self._requested_groups = max(0, self._requested_groups - int(count))
 
-    def _shared_completed_buffer_size(self) -> int:
+    def _consume_fully_async_admission_credit(self) -> None:
+        if not self.config.fully_async:
+            return
         with self._state_lock:
-            return self._completed_buffer_size
+            if self._fully_async_admission_credit <= 0:
+                raise PolarRolloutSchedulerError(
+                    "Fully-async scheduler attempted a fresh admission without request credit"
+                )
+            self._fully_async_admission_credit -= 1
+
+    def _restore_fully_async_admission_credit(self, count: int) -> None:
+        """Replace rejected owned work only while a trainer still needs data."""
+
+        if not self.config.fully_async or count <= 0:
+            return
+        with self._state_lock:
+            if self._requested_groups > 0:
+                self._fully_async_admission_credit += int(count)
+
+    def _consume_reservation(
+        self,
+        reservation_id: int | None,
+        *,
+        outcome: str,
+    ) -> dict[str, float]:
+        if reservation_id is None:
+            return {}
+        marker = getattr(self.data_source, "mark_consumed", None)
+        if not callable(marker):
+            raise PolarRolloutSchedulerError(
+                "data source returned a reservation but does not expose mark_consumed"
+            )
+        metrics = marker(reservation_id, outcome=outcome)
+        return metrics if isinstance(metrics, dict) else {}
+
+    def _consume_reservations(
+        self,
+        reservation_ids: list[int | None],
+        *,
+        outcome: str,
+    ) -> dict[str, float]:
+        concrete_ids = [
+            reservation_id for reservation_id in reservation_ids if reservation_id is not None
+        ]
+        if not concrete_ids:
+            return {}
+        marker_many = getattr(self.data_source, "mark_consumed_many", None)
+        if callable(marker_many):
+            metrics = marker_many(concrete_ids, outcome=outcome)
+            return metrics if isinstance(metrics, dict) else {}
+
+        metrics: dict[str, float] = {}
+        for reservation_id in concrete_ids:
+            metrics = self._consume_reservation(reservation_id, outcome=outcome)
+        return metrics
 
     def _record_active_counts(
         self,
@@ -809,6 +1375,61 @@ class AsyncPolarRolloutWorker:
     def _inc_metric(self, key: str, amount: float = 1.0) -> None:
         with self._state_lock:
             self._metrics[key] = self._metrics.get(key, 0.0) + amount
+
+    def _record_wasted_results(self, results: list[Any]) -> None:
+        """Retain timing totals for completed work rejected before training."""
+
+        seen: set[str] = set()
+        for result in results:
+            session_id = str(getattr(result, "session_id", "") or "")
+            if not session_id or session_id in seen:
+                continue
+            seen.add(session_id)
+            timing = getattr(result, "timing", None)
+            values = timing.model_dump(mode="python") if timing is not None else {}
+            self._record_wasted_timing(values)
+            trajectory = getattr(result, "trajectory", None)
+            for trace in getattr(trajectory, "traces", []) or []:
+                self._record_wasted_inference(getattr(trace, "metadata", None))
+
+    def _record_wasted_samples(self, samples: list[Any]) -> None:
+        seen: set[str] = set()
+        seen_traces: set[tuple[str, int]] = set()
+        for sample in samples:
+            polar_meta = (getattr(sample, "metadata", {}) or {}).get("polar", {})
+            session_id = str(polar_meta.get("session_id") or "")
+            if not session_id:
+                continue
+            if session_id not in seen:
+                seen.add(session_id)
+                self._record_wasted_timing(polar_meta.get("timing") or {})
+            trace_key = (session_id, int(polar_meta.get("trace_index", 0) or 0))
+            if trace_key not in seen_traces:
+                seen_traces.add(trace_key)
+                self._record_wasted_inference(polar_meta.get("trace_metadata"))
+
+    def _record_wasted_timing(self, timing: Any) -> None:
+        if not isinstance(timing, dict):
+            return
+        self._inc_metric("polar/wasted/session_count")
+        for timing_field in _WASTED_TIMING_FIELDS:
+            value = _optional_nonnegative_finite_float(timing.get(timing_field))
+            if value is not None:
+                self._inc_metric(
+                    f"timing/wasted/{timing_field}_sum",
+                    value,
+                )
+
+    def _record_wasted_inference(self, trace_metadata: Any) -> None:
+        for timing in _iter_inference_timings(trace_metadata):
+            self._inc_metric("polar/wasted/inference_timing_count")
+            for timing_field in _WASTED_INFERENCE_FIELDS:
+                value = _optional_nonnegative_finite_float(timing.get(timing_field))
+                if value is not None:
+                    self._inc_metric(
+                        f"timing/wasted/inference_{timing_field}_sum",
+                        value,
+                    )
 
     def _set_fatal(self, exc: BaseException) -> None:
         with self._state_lock:
@@ -833,6 +1454,24 @@ class AsyncPolarRolloutWorker:
             )
             resp.raise_for_status()
             return await self._await_task_result(client, task_id, event)
+        except asyncio.CancelledError:
+            # Cancel the server-side task as well as this local waiter. The
+            # tombstone query closes the race where DELETE reaches the rollout
+            # server before the submit request is registered.
+            try:
+                response = await client.delete(
+                    f"{base_url}/rollout/task/{task_id}",
+                    params={"register_if_missing": "true"},
+                    timeout=10.0,
+                )
+                response.raise_for_status()
+            except Exception:
+                logger.warning(
+                    "Failed to cancel remote Polar task %s during worker shutdown",
+                    task_id,
+                    exc_info=True,
+                )
+            raise
         finally:
             self._task_events.pop(task_id, None)
             self._task_results.pop(task_id, None)
@@ -854,8 +1493,10 @@ class AsyncPolarRolloutWorker:
                 status = TaskStatus.model_validate(status_resp.json())
                 if status.status in ("completed", "failed"):
                     return TaskResult(
-                        task_id=task_id, status=status.status,
-                        results=status.results, result_paths=status.result_paths,
+                        task_id=task_id,
+                        status=status.status,
+                        results=status.results,
+                        result_paths=status.result_paths,
                     )
                 continue
             result = self._task_results.get(task_id)
@@ -866,8 +1507,10 @@ class AsyncPolarRolloutWorker:
             status_resp.raise_for_status()
             status = TaskStatus.model_validate(status_resp.json())
             return TaskResult(
-                task_id=task_id, status=status.status,
-                results=status.results, result_paths=status.result_paths,
+                task_id=task_id,
+                status=status.status,
+                results=status.results,
+                result_paths=status.result_paths,
             )
 
 
@@ -891,6 +1534,10 @@ async def _run_eval_rollout(
                 rollout_id=rollout_id,
                 dataset_cfg=dataset_cfg,
             )
+            if dataset_name in data:
+                raise ValueError(
+                    f"Duplicate eval dataset name {dataset_name!r}; metric namespaces must be unique"
+                )
             data[dataset_name] = dataset_data
             metrics.update(_prefix_eval_metrics(dataset_name, dataset_metrics))
 
@@ -908,11 +1555,12 @@ async def _run_eval_rollout(
         dataset_name=config.eval_dataset_name,
         rollout_id=rollout_id,
         sample_groups=sample_groups,
+        dataset_cfg=None,
     )
     RolloutFnEvalOutput = _load_rollout_eval_output_type()
     return RolloutFnEvalOutput(
         data={config.eval_dataset_name: dataset_data},
-        metrics=metrics,
+        metrics=_prefix_eval_metrics(config.eval_dataset_name, metrics),
     )
 
 
@@ -931,6 +1579,7 @@ async def _run_eval_dataset(
         dataset_name=dataset_name,
         rollout_id=rollout_id,
         sample_groups=sample_groups,
+        dataset_cfg=dataset_cfg,
     )
     return dataset_name, dataset_data, metrics
 
@@ -942,6 +1591,7 @@ async def _submit_eval_groups(
     dataset_name: str,
     rollout_id: int,
     sample_groups: list[list[Any]],
+    dataset_cfg: Any | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if not sample_groups:
         raise ValueError("Polar eval dataset produced no sample groups")
@@ -951,23 +1601,69 @@ async def _submit_eval_groups(
 
     async def _run_one(position: int, group: list[Any]) -> TaskResult:
         async with semaphore:
-            payload = _build_task_payload(
-                args=args, config=config, group=group,
-                rollout_id=rollout_id, task_position=position,
-            )
-            payload["task_id"] = _eval_task_id(
-                payload["task_id"],
+            payload: dict[str, Any] | None = None
+            fallback_task_id = _eval_task_id(
+                "payload-error",
                 dataset_name=dataset_name,
                 rollout_id=rollout_id,
                 position=position,
             )
-            _attach_scheduler_metadata(
-                payload,
-                group_id=position,
-                policy_version=rollout_id,
-                rollout_step=rollout_id,
-            )
-            return await _submit_and_wait_for_task(client, config.rollout_server_url, payload)
+            try:
+                payload = _build_task_payload(
+                    args=args,
+                    config=config,
+                    group=group,
+                    rollout_id=rollout_id,
+                    task_position=position,
+                    eval_dataset_cfg=dataset_cfg,
+                    eval_dataset_name=dataset_name,
+                )
+                payload["task_id"] = _eval_task_id(
+                    payload["task_id"],
+                    dataset_name=dataset_name,
+                    rollout_id=rollout_id,
+                    position=position,
+                )
+                _attach_scheduler_metadata(
+                    payload,
+                    group_id=position,
+                    policy_version=rollout_id,
+                    rollout_step=rollout_id,
+                )
+                return await _submit_and_wait_for_task(
+                    client,
+                    config.rollout_server_url,
+                    payload,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Evaluation is observational: one broken container, HTTP
+                # request, or malformed task response must not take down the
+                # trainer.  Preserve a task-shaped failure so the expected
+                # sessions are zero-filled below and remain visible in the
+                # dataset error counters.
+                detail = " ".join(str(exc).splitlines())
+                task_id = (
+                    str(payload.get("task_id", fallback_task_id))
+                    if isinstance(payload, dict)
+                    else fallback_task_id
+                )
+                logger.warning(
+                    "Eval dataset %s task/group %s failed before producing a result; "
+                    "assigning reward 0 to its %d session(s): %s: %.500s",
+                    dataset_name,
+                    task_id,
+                    len(group),
+                    type(exc).__name__,
+                    detail,
+                )
+                return TaskResult(
+                    task_id=task_id,
+                    status="failed",
+                    results=[],
+                    result_paths=[],
+                )
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         task_results = await asyncio.gather(
@@ -978,27 +1674,103 @@ async def _submit_eval_groups(
     max_tokens = _resolve_max_tokens(args)
     for group, task_result in zip(sample_groups, task_results, strict=True):
         output_groups.append(
-            _convert_task_result_to_samples(
-                config, task_result, group,
+            _convert_eval_task_result_to_samples(
+                config,
+                task_result,
+                group,
+                dataset_name=dataset_name,
                 max_tokens=max_tokens,
             )
         )
 
-    metrics = _build_metrics(
-        config,
-        task_results,
-        output_groups,
-        reward_filter="completed",
-    )
     flat_samples = [sample for group in output_groups for sample in group]
-    reward_samples = _completed_session_samples(flat_samples)
+    session_outcomes, completed_count, model_failure_count = _eval_session_outcomes(
+        flat_samples,
+        config.reward_key,
+        dataset_name=dataset_name,
+    )
+    trusted_rewards = [reward for reward, _sample in session_outcomes]
+    reward_samples = [sample for _reward, sample in session_outcomes]
+    expected_session_count = sum(len(group) for group in sample_groups)
+    valid_count = len(trusted_rewards)
+    error_count = max(0, expected_session_count - valid_count)
+    # Every fixed eval item receives one vote.  Infrastructure failures and
+    # malformed/missing results mean the model did not solve that item, so
+    # account them as zero instead of silently shrinking the denominator.
+    rewards = trusted_rewards + [0.0] * error_count
+    accounted_count = len(rewards)
+    _log_eval_zero_fill_diagnostics(
+        dataset_name=dataset_name,
+        sample_groups=sample_groups,
+        task_results=task_results,
+        flat_samples=flat_samples,
+        zero_filled_count=error_count,
+    )
+    try:
+        metrics = _build_metrics(
+            config,
+            task_results,
+            output_groups,
+            reward_filter="completed",
+        )
+        if not isinstance(metrics, dict):
+            raise TypeError("eval metric builder must return a mapping")
+    except Exception as exc:
+        # Timing/diagnostic telemetry is optional. A malformed sample must not
+        # stop the core per-item reward/count row from being emitted.
+        detail = " ".join(str(exc).splitlines())
+        logger.warning(
+            "Eval dataset %s optional metric aggregation failed; continuing "
+            "with reward/count metrics: %s: %.500s",
+            dataset_name,
+            type(exc).__name__,
+            detail,
+        )
+        metrics = {}
+    min_eval_samples = _eval_runtime_value(
+        dataset_cfg,
+        "min_eval_samples",
+        args,
+        ("min_eval_samples",),
+    )
+    metrics["polar/valid_count"] = float(valid_count)
+    metrics["polar/completed_count"] = float(completed_count)
+    metrics["polar/model_failure_count"] = float(model_failure_count)
+    metrics["polar/error_count"] = float(error_count)
+    metrics["polar/accounted_count"] = float(accounted_count)
+    if min_eval_samples is not None:
+        metrics["polar/min_valid_count"] = float(min_eval_samples)
+
+    # `_build_metrics` receives trace-level samples because those are still
+    # needed for timing and parser diagnostics. Replace only its primary reward
+    # summary with one outcome per fixed-seed session so sessions that happen to
+    # reconstruct into multiple traces cannot receive extra weight.
+    # Trace-level reward diagnostics can be both differently weighted and
+    # contaminated by a malformed raw reward (for example NaN or bool). Eval's
+    # authoritative view is the finite, one-vote-per-session vector above.
+    for metric_name in tuple(metrics):
+        if metric_name.startswith("polar/reward"):
+            metrics.pop(metric_name)
+    if rewards:
+        metrics["polar/reward_mean"] = sum(rewards) / len(rewards)
+    if len(rewards) > 1:
+        metrics["polar/reward_std"] = statistics.pstdev(rewards)
+    elif rewards:
+        metrics["polar/reward_std"] = 0.0
+    metrics["polar/reward_accounted_sessions"] = float(accounted_count)
 
     return {
-        "rewards": [_extract_sample_reward(s, config.reward_key) for s in reward_samples],
-        "all_rewards": [_extract_sample_reward(s, config.reward_key) for s in flat_samples],
-        "truncated": [_is_truncated(s) for s in reward_samples],
+        "rewards": rewards,
+        "all_rewards": list(rewards),
+        "truncated": [_is_truncated(s) for s in reward_samples] + [False] * error_count,
         "all_truncated": [_is_truncated(s) for s in flat_samples],
         "samples": flat_samples,
+        "valid_count": valid_count,
+        "accounted_count": accounted_count,
+        "completed_count": completed_count,
+        "model_failure_count": model_failure_count,
+        "error_count": error_count,
+        "min_eval_samples": min_eval_samples,
     }, metrics
 
 
@@ -1009,36 +1781,333 @@ def _eval_task_id(base_task_id: Any, *, dataset_name: str, rollout_id: int, posi
     ``position`` as group index, so eval 11 / item 11 would collide with train
     group 11. A suffix keeps task polling and persisted result dirs separate.
     """
-    safe_dataset = "".join(
-        ch if ch.isalnum() or ch in "._-" else "_" for ch in dataset_name
-    )
+    safe_dataset = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in dataset_name)
     return f"{base_task_id}-eval-{safe_dataset}-{rollout_id}-{position}"
 
 
 def _completed_session_samples(samples: list[Any]) -> list[Any]:
     return [
-        sample for sample in samples
+        sample
+        for sample in samples
         if _sample_session_status(sample) == "COMPLETED"
-        and not bool(
-            (getattr(sample, "metadata", {}) or {})
-            .get("polar", {})
-            .get("placeholder")
-        )
+        and not bool((getattr(sample, "metadata", {}) or {}).get("polar", {}).get("placeholder"))
     ]
 
 
+def _eval_session_outcomes(
+    samples: list[Any],
+    reward_key: str,
+    *,
+    dataset_name: str,
+) -> tuple[list[tuple[float, Any]], int, int]:
+    """Return one trusted eval outcome per unique completed session.
+
+    An ERROR/FAILED session never contributes an evaluator reward, even when
+    its verifier happened to finish successfully.  The caller gives every such
+    fixed eval item a fallback zero, so it remains an unsolved vote in the
+    denominator while ``valid_count`` continues to mean completed executions.
+    ``model_failure_count`` separately records errors with a trustworthy
+    verifier result for diagnosis.
+    """
+
+    samples_by_session: dict[str, list[Any]] = {}
+    for sample_index, sample in enumerate(samples):
+        metadata = getattr(sample, "metadata", {}) or {}
+        if not isinstance(metadata, dict):
+            logger.warning(
+                "Eval dataset %s sample %d has malformed metadata; assigning reward 0",
+                dataset_name,
+                sample_index,
+            )
+            continue
+        polar_meta = metadata.get("polar", {})
+        if not isinstance(polar_meta, dict):
+            logger.warning(
+                "Eval dataset %s sample %d has malformed polar metadata; assigning reward 0",
+                dataset_name,
+                sample_index,
+            )
+            continue
+        session_id = polar_meta.get("session_id")
+        if session_id is None:
+            logger.warning(
+                "Eval dataset %s sample %d has no session_id; assigning reward 0",
+                dataset_name,
+                sample_index,
+            )
+            continue
+        samples_by_session.setdefault(str(session_id), []).append(sample)
+
+    outcomes: list[tuple[float, Any]] = []
+    completed_count = 0
+    model_failure_count = 0
+    for session_samples in samples_by_session.values():
+        non_placeholder = [
+            sample
+            for sample in session_samples
+            if not bool(
+                (getattr(sample, "metadata", {}) or {}).get("polar", {}).get("placeholder")
+            )
+        ]
+        if not non_placeholder:
+            continue
+
+        completed = [
+            sample
+            for sample in non_placeholder
+            if str(_sample_session_status(sample) or "").upper() == "COMPLETED"
+        ]
+        if completed:
+            completed_rewards = [
+                _extract_eval_sample_reward(
+                    sample,
+                    reward_key,
+                    dataset_name=dataset_name,
+                )
+                for sample in completed
+            ]
+            # Any malformed trace makes this session an untrusted zero rather
+            # than silently selecting another trace and hiding the failure.
+            if all(reward is not None for reward in completed_rewards):
+                finite_rewards = [float(reward) for reward in completed_rewards]
+                outcomes.append((sum(finite_rewards) / len(finite_rewards), completed[0]))
+                completed_count += 1
+            continue
+
+        trusted_failure = next(
+            (
+                sample
+                for sample in non_placeholder
+                if str(_sample_session_status(sample) or "").upper() in {"ERROR", "FAILED"}
+                and _has_trusted_eval_failure(sample)
+            ),
+            None,
+        )
+        if trusted_failure is not None:
+            # Do not append an outcome here.  The fixed-denominator zero-fill
+            # represents this failed item below and also makes it visible in
+            # error_count/logs.  This avoids classifying an ERROR execution as
+            # a valid evaluation merely because its verifier observed a solved
+            # final container state.
+            model_failure_count += 1
+
+    return outcomes, completed_count, model_failure_count
+
+
+def _extract_eval_sample_reward(
+    sample: Any,
+    reward_key: str,
+    *,
+    dataset_name: str,
+) -> float | None:
+    """Strict finite eval reward extraction with per-session diagnostics."""
+
+    reward = getattr(sample, "reward", None)
+    if isinstance(reward, dict):
+        if reward_key in reward:
+            raw_value = reward[reward_key]
+        elif "score" in reward:
+            raw_value = reward["score"]
+        else:
+            raw_value = None
+    else:
+        raw_value = reward
+
+    try:
+        if isinstance(raw_value, bool) or raw_value is None:
+            raise TypeError("reward is missing or boolean")
+        value = float(raw_value)
+        if not math.isfinite(value):
+            raise ValueError("reward is not finite")
+    except (TypeError, ValueError, OverflowError) as exc:
+        polar_meta = _sample_polar_metadata(sample)
+        session_id = polar_meta.get("session_id") or getattr(sample, "session_id", None)
+        logger.warning(
+            "Eval dataset %s session %s has malformed reward; assigning reward 0: %s",
+            dataset_name,
+            session_id or "UNKNOWN",
+            exc,
+        )
+        return None
+    return value
+
+
+def _log_eval_zero_fill_diagnostics(
+    *,
+    dataset_name: str,
+    sample_groups: list[list[Any]],
+    task_results: list[TaskResult],
+    flat_samples: list[Any],
+    zero_filled_count: int,
+) -> None:
+    """Log actionable details for eval items represented by fallback zeros."""
+
+    if zero_filled_count <= 0:
+        return
+
+    for group, task_result in zip(sample_groups, task_results, strict=True):
+        expected = len(group)
+        returned = len(task_result.results)
+        if task_result.status != "completed" or returned != expected:
+            logger.warning(
+                "Eval dataset %s task %s status=%s returned %d/%d session "
+                "result(s); missing outcomes are assigned reward 0",
+                dataset_name,
+                task_result.task_id,
+                task_result.status,
+                returned,
+                expected,
+            )
+
+    logged_sessions: set[str] = set()
+    for sample in flat_samples:
+        polar_meta = _sample_polar_metadata(sample)
+        if not polar_meta:
+            continue
+        session_id = str(polar_meta.get("session_id") or "")
+        if not session_id or session_id in logged_sessions:
+            continue
+        status = str(_sample_session_status(sample) or "").upper()
+        placeholder = bool(polar_meta.get("placeholder"))
+        if not placeholder and status == "COMPLETED":
+            continue
+        logged_sessions.add(session_id)
+        result_error = polar_meta.get("result_error")
+        trajectory_error = polar_meta.get("trajectory_error")
+        detail = result_error or trajectory_error or "no trusted evaluator outcome"
+        logger.warning(
+            "Eval dataset %s session %s status=%s produced no trusted outcome; "
+            "assigning reward 0: %.500s",
+            dataset_name,
+            session_id,
+            status or "UNKNOWN",
+            " ".join(str(detail).splitlines()),
+        )
+
+    logger.warning(
+        "Eval dataset %s zero-filled %d failed/missing sample(s); evaluation "
+        "continues and the failures remain in error_count",
+        dataset_name,
+        zero_filled_count,
+    )
+
+
+def _has_trusted_eval_failure(sample: Any) -> bool:
+    polar_meta = _sample_polar_metadata(sample)
+    trajectory_metadata = polar_meta.get("trajectory_metadata")
+    if not isinstance(trajectory_metadata, dict):
+        return False
+    evaluation = trajectory_metadata.get("evaluation")
+    if not isinstance(evaluation, dict):
+        return False
+    exit_code = evaluation.get("verifier_exit_code")
+    return (
+        evaluation.get("verifier_reward_accepted") is True
+        and not isinstance(exit_code, bool)
+        and exit_code == 0
+    )
+
+
 def _sample_session_status(sample: Any) -> str | None:
-    polar_meta = (getattr(sample, "metadata", {}) or {}).get("polar", {})
+    polar_meta = _sample_polar_metadata(sample)
     status = polar_meta.get("session_status")
     return getattr(status, "value", status)
+
+
+def _sample_polar_metadata(sample: Any) -> dict[str, Any]:
+    metadata = getattr(sample, "metadata", {}) or {}
+    if not isinstance(metadata, dict):
+        return {}
+    polar_meta = metadata.get("polar", {})
+    return polar_meta if isinstance(polar_meta, dict) else {}
+
+
+def _eval_data_integrity_records() -> dict[str, dict[str, str]]:
+    """Decode the optional launcher-pinned eval manifest.
+
+    The manifest itself is copied into the Ray runtime environment rather than
+    re-read from a mutable file. This makes its expected digests stable for the
+    lifetime of the rollout manager while still leaving an on-disk manifest for
+    experiment auditing.
+    """
+
+    encoded = os.environ.get(_EVAL_DATA_INTEGRITY_ENV, "").strip()
+    if not encoded:
+        return {}
+    try:
+        payload = base64.b64decode(encoded, validate=True)
+        manifest = json.loads(payload)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise PolarEvalDataIntegrityError(
+            f"Invalid {_EVAL_DATA_INTEGRITY_ENV} manifest: {exc}"
+        ) from exc
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
+        raise PolarEvalDataIntegrityError(
+            f"{_EVAL_DATA_INTEGRITY_ENV} must contain a schema_version=1 object"
+        )
+    if manifest.get("algorithm") != "sha256":
+        raise PolarEvalDataIntegrityError("Eval data integrity manifest must use sha256")
+    datasets = manifest.get("datasets")
+    if not isinstance(datasets, list) or not datasets:
+        raise PolarEvalDataIntegrityError("Eval data integrity manifest has no datasets")
+
+    records: dict[str, dict[str, str]] = {}
+    for index, entry in enumerate(datasets):
+        if not isinstance(entry, dict):
+            raise PolarEvalDataIntegrityError(
+                f"Eval data integrity dataset {index} is not an object"
+            )
+        name = entry.get("name")
+        path = entry.get("path")
+        digest = entry.get("sha256")
+        if not isinstance(name, str) or not name:
+            raise PolarEvalDataIntegrityError(f"Eval data integrity dataset {index} has no name")
+        if not isinstance(path, str) or not path:
+            raise PolarEvalDataIntegrityError(f"Eval data integrity dataset {name!r} has no path")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdefABCDEF" for character in digest)
+        ):
+            raise PolarEvalDataIntegrityError(
+                f"Eval data integrity dataset {name!r} has an invalid sha256"
+            )
+        canonical = str(Path(path).expanduser().resolve(strict=False))
+        normalized = {"name": name, "sha256": digest.lower()}
+        previous = records.get(canonical)
+        if previous is not None and previous != normalized:
+            raise PolarEvalDataIntegrityError(
+                f"Conflicting eval data integrity entries for {canonical}"
+            )
+        records[canonical] = normalized
+    return records
+
+
+def _expected_eval_data_sha256(dataset_cfg: Any) -> str | None:
+    records = _eval_data_integrity_records()
+    if not records:
+        return None
+    path = str(getattr(dataset_cfg, "path"))
+    canonical = str(Path(path).expanduser().resolve(strict=False))
+    record = records.get(canonical)
+    if record is None:
+        protected = ", ".join(sorted(records))
+        raise PolarEvalDataIntegrityError(
+            f"Eval dataset {canonical} is absent from the immutable integrity manifest; "
+            f"protected paths: {protected}"
+        )
+    return record["sha256"]
 
 
 def _load_eval_sample_groups(args: Any, dataset_cfg: Any) -> list[list[Any]]:
     Sample = _load_sample_type()
     path = str(getattr(dataset_cfg, "path"))
+    expected_sha256 = _expected_eval_data_sha256(dataset_cfg)
     input_key = getattr(dataset_cfg, "input_key", None) or getattr(args, "input_key", "prompt")
     label_key = getattr(dataset_cfg, "label_key", None) or getattr(args, "label_key", None)
-    metadata_key = getattr(dataset_cfg, "metadata_key", None) or getattr(args, "metadata_key", "metadata")
+    metadata_key = getattr(dataset_cfg, "metadata_key", None) or getattr(
+        args, "metadata_key", "metadata"
+    )
     tool_key = getattr(dataset_cfg, "tool_key", None) or getattr(args, "tool_key", None)
     group_size = int(
         getattr(dataset_cfg, "n_samples_per_eval_prompt", None)
@@ -1047,12 +2116,29 @@ def _load_eval_sample_groups(args: Any, dataset_cfg: Any) -> list[list[Any]]:
     )
     if group_size <= 0:
         raise ValueError("n_samples_per_eval_prompt must be positive")
+    max_prompt_len = getattr(dataset_cfg, "max_prompt_len", None)
+    if max_prompt_len is None:
+        max_prompt_len = getattr(args, "eval_max_prompt_len", None)
+    if max_prompt_len is not None and int(max_prompt_len) <= 0:
+        raise ValueError("eval_max_prompt_len must be positive when provided")
 
     groups: list[list[Any]] = []
     sample_index = 0
-    for prompt_index, row in enumerate(_read_jsonl_rows(path)):
+    for prompt_index, row in enumerate(_read_jsonl_rows(path, expected_sha256=expected_sha256)):
         if input_key not in row:
             raise KeyError(f"Eval row {prompt_index} in {path} missing input key {input_key!r}")
+        prompt = row[input_key]
+        if max_prompt_len is not None:
+            prompt_tokens = _eval_prompt_token_length(args, prompt)
+            if prompt_tokens > int(max_prompt_len):
+                logger.warning(
+                    "Skipping eval row %d in %s: prompt has %d tokens (limit=%d)",
+                    prompt_index,
+                    path,
+                    prompt_tokens,
+                    int(max_prompt_len),
+                )
+                continue
 
         metadata = _inject_eval_metadata(dataset_cfg, row.get(metadata_key))
         if tool_key and tool_key in row:
@@ -1064,13 +2150,15 @@ def _load_eval_sample_groups(args: Any, dataset_cfg: Any) -> list[list[Any]]:
         group: list[Any] = []
         for _ in range(group_size):
             sample = Sample(
-                prompt=copy.deepcopy(row[input_key]),
+                prompt=copy.deepcopy(prompt),
                 label=row.get(label_key) if label_key else None,
                 metadata=copy.deepcopy(metadata),
                 group_index=prompt_index,
                 index=sample_index,
             )
-            sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
+            sample.generate_function_path = getattr(
+                dataset_cfg, "custom_generate_function_path", None
+            )
             group.append(sample)
             sample_index += 1
         groups.append(group)
@@ -1078,17 +2166,53 @@ def _load_eval_sample_groups(args: Any, dataset_cfg: Any) -> list[list[Any]]:
     return groups
 
 
-def _read_jsonl_rows(path: str) -> list[dict[str, Any]]:
+def _eval_prompt_token_length(args: Any, prompt: Any) -> int:
+    checkpoint = str(getattr(args, "hf_checkpoint", "") or "").strip()
+    if not checkpoint:
+        raise ValueError("hf_checkpoint is required to enforce eval_max_prompt_len")
+    tokenizer = _eval_tokenizer_cache.get(checkpoint)
+    if tokenizer is None:
+        from slime.utils.processing_utils import load_tokenizer
+
+        tokenizer = load_tokenizer(checkpoint, trust_remote_code=True)
+        _eval_tokenizer_cache[checkpoint] = tokenizer
+    encoded = tokenizer(
+        prompt_to_instruction_text(prompt),
+        add_special_tokens=False,
+    )
+    input_ids = encoded["input_ids"]
+    return len(input_ids)
+
+
+def _read_jsonl_rows(
+    path: str,
+    *,
+    expected_sha256: str | None = None,
+) -> list[dict[str, Any]]:
+    try:
+        payload = Path(path).read_bytes()
+    except OSError as exc:
+        raise PolarEvalDataIntegrityError(f"Cannot read eval dataset {path}: {exc}") from exc
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    if expected_sha256 is not None and actual_sha256 != expected_sha256:
+        raise PolarEvalDataIntegrityError(
+            f"Eval dataset changed after launcher validation: {path}; "
+            f"expected sha256={expected_sha256}, actual sha256={actual_sha256}"
+        )
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"Eval dataset {path} is not UTF-8: {exc}") from exc
+
     rows: list[dict[str, Any]] = []
-    with open(path, encoding="utf-8") as f:
-        for line_number, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            if not isinstance(row, dict):
-                raise ValueError(f"Eval row {line_number} in {path} is not a JSON object")
-            rows.append(row)
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError(f"Eval row {line_number} in {path} is not a JSON object")
+        rows.append(row)
     return rows
 
 
@@ -1106,10 +2230,12 @@ def _inject_eval_metadata(dataset_cfg: Any, sample_metadata: Any) -> dict[str, A
 def _prefix_eval_metrics(dataset_name: str, metrics: dict[str, Any]) -> dict[str, Any]:
     prefixed: dict[str, Any] = {}
     for key, value in metrics.items():
-        if key.startswith("polar/"):
-            prefixed[f"polar/eval/{dataset_name}/{key.removeprefix('polar/')}"] = value
+        if key.startswith("timing/"):
+            prefixed[f"timing/eval/{dataset_name}/{key.removeprefix('timing/')}"] = value
+        elif key.startswith("polar/"):
+            prefixed[f"eval/{dataset_name}/{key.removeprefix('polar/')}"] = value
         else:
-            prefixed[f"polar/eval/{dataset_name}/{key}"] = value
+            prefixed[f"eval/{dataset_name}/{key}"] = value
     return prefixed
 
 
@@ -1156,7 +2282,35 @@ def _build_metrics(
 # ---------------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------------
-def generate_rollout_polar_async(args: Any, rollout_id: int, data_source: Any, evaluation: bool = False) -> Any:
+def _load_training_dynamic_filter(args: Any) -> Any | None:
+    path = getattr(args, "dynamic_sampling_filter_path", None)
+    if not path:
+        return None
+
+    from slime.utils.misc import load_function
+
+    return load_function(path)
+
+
+def _call_training_dynamic_filter(dynamic_filter: Any, args: Any, samples: list[Any]) -> Any:
+    from slime.rollout.filter_hub.base_types import DynamicFilterOutput, call_dynamic_filter
+
+    # Failed, parser-invalid, placeholder, and otherwise fully masked samples
+    # are diagnostic-only.  Feeding their fail-closed reward=0 into a dynamic
+    # nonzero-std filter can manufacture an apparent mixed-reward group from
+    # valid rewards [1, 1, ...] plus an infrastructure/agent error.  That group
+    # has no real preference signal once reward post-processing correctly
+    # removes the failed trajectory.  Filter on exactly the trajectories that
+    # can contribute gradients instead.
+    trainable_samples = [sample for sample in samples if _sample_has_trainable_tokens(sample)]
+    if not trainable_samples:
+        return DynamicFilterOutput(keep=False, reason="no_trainable_samples")
+    return call_dynamic_filter(dynamic_filter, args, trainable_samples)
+
+
+def generate_rollout_polar_async(
+    args: Any, rollout_id: int, data_source: Any, evaluation: bool = False
+) -> Any:
     """Slime-compatible async rollout entrypoint.
 
     Training runs are served by a persistent background worker that pulls
@@ -1167,24 +2321,64 @@ def generate_rollout_polar_async(args: Any, rollout_id: int, data_source: Any, e
     if evaluation:
         return asyncio.run(_run_eval_rollout(args, rollout_id, data_source))
 
+    dynamic_filter = _load_training_dynamic_filter(args)
     async_worker = get_global_async_worker(args, data_source)
     async_worker.set_rollout_context(rollout_id)
     target = getattr(args, "rollout_batch_size", 1)
     async_worker.request_groups(int(target))
 
     data: list[list[Any]] = []
+    accepted_completions: list[_CompletedGroup] = []
+    dynamic_filter_metrics: dict[str, float] = {}
+    dynamic_filter_reservation_metrics: dict[str, float] = {}
     start = time.monotonic()
     last_progress = start
 
     while len(data) < target:
+        if _current_ray_task_is_canceled():
+            from ray.exceptions import TaskCancelledError
+
+            logger.info("Stopping Polar rollout worker after Ray task cancellation")
+            stop_global_worker()
+            raise TaskCancelledError(error_message="Polar rollout generation was cancelled")
         made_progress = False
         completed_groups = async_worker.drain_completed(
             max_groups=target - len(data),
             rollout_id=rollout_id,
         )
+        replacement_groups = 0
         for completed in completed_groups:
+            if dynamic_filter is not None:
+                filter_output = _call_training_dynamic_filter(
+                    dynamic_filter,
+                    args,
+                    completed.samples,
+                )
+                if not filter_output.keep:
+                    reason = filter_output.reason
+                    if reason:
+                        metric = f"rollout/dynamic_filter/drop_{reason}"
+                        dynamic_filter_metrics[metric] = (
+                            dynamic_filter_metrics.get(metric, 0.0) + 1.0
+                        )
+                    dynamic_filter_reservation_metrics.update(
+                        async_worker.mark_dynamic_filter_drop(
+                            completed,
+                            reason=reason,
+                        )
+                    )
+                    replacement_groups += 1
+                    made_progress = True
+                    continue
             data.append(completed.samples)
+            accepted_completions.append(completed)
             made_progress = True
+        if replacement_groups:
+            # drain_completed has already satisfied scheduler demand for every
+            # returned group. Restore exactly the filtered demand so fully-async
+            # admission creates fresh prompt reservations without growing the
+            # bounded ownership window.
+            async_worker.request_groups(replacement_groups)
 
         now = time.monotonic()
         if made_progress:
@@ -1192,7 +2386,9 @@ def generate_rollout_polar_async(args: Any, rollout_id: int, data_source: Any, e
         elif now - last_progress > 60:
             logger.warning(
                 "No progress for 60s. Queue=%d, accepted=%d/%d",
-                async_worker.queue_size(), len(data), target,
+                async_worker.queue_size(),
+                len(data),
+                target,
             )
             last_progress = now
 
@@ -1200,109 +2396,585 @@ def generate_rollout_polar_async(args: Any, rollout_id: int, data_source: Any, e
             time.sleep(0.05)
 
     elapsed = time.monotonic() - start
-    logger.info("Async rollout collected %d groups in %.1fs (queue=%d)", len(data), elapsed, async_worker.queue_size())
-
-    _maybe_dump_longest_trace_artifact(rollout_id, data)
+    logger.info(
+        "Async rollout collected %d groups in %.1fs (queue=%d)",
+        len(data),
+        elapsed,
+        async_worker.queue_size(),
+    )
 
     RolloutFnTrainOutput = _load_rollout_train_output_type()
     flat = [s for g in data for s in g]
     rewards = [_extract_sample_reward(s, async_worker.config.reward_key) for s in flat]
-    metrics: dict[str, Any] = {}
+    metrics: dict[str, Any] = dict(dynamic_filter_metrics)
+    metrics.update(dynamic_filter_reservation_metrics)
     metrics.update(_polar_extra_metrics(flat, rewards, async_worker.config.reward_key))
-    metrics.update(async_worker.snapshot_metrics())
-    return RolloutFnTrainOutput(samples=data, metrics=metrics)
+    metrics.update(_completed_service_metrics(accepted_completions))
+    metrics["timing/pipeline_ms/rollout_collect"] = elapsed * 1000.0
+    output = RolloutFnTrainOutput(samples=data, metrics=metrics)
+    # Commit accepted reservations only after a complete batch has been built.
+    # A cancellation after a partial drain must leave every partial group
+    # outstanding so the checkpoint frontier replays it on resume. Ray has no
+    # atomic "return-and-ack" handshake for actor cancellation; train_async's
+    # checkpoint-before-prefetch ordering is the durable at-least-once guard
+    # for the tiny race between this final check and the acknowledgement.
+    if _current_ray_task_is_canceled():
+        from ray.exceptions import TaskCancelledError
 
-
-def _maybe_dump_longest_trace_artifact(
-    rollout_id: int, data: list[list[Any]], *, interval: int = _LONGEST_TRACE_ARTIFACT_INTERVAL
-) -> None:
-    """Dump the longest session in this rollout's batch as a wandb artifact.
-
-    Groups samples by ``session_id``, picks the session with the largest
-    aggregated assistant tokens, and writes its full message chain (per
-    trace) to a JSON artifact. Silently no-ops if wandb isn't initialized.
-    """
-    if interval <= 0 or rollout_id % interval != 0:
-        return
-    try:
-        import wandb
-    except ImportError:
-        return
-    if getattr(wandb, "run", None) is None:
-        return
-
-    by_session: dict[str, list[Any]] = {}
-    for group in data:
-        for sample in group:
-            sid = getattr(sample, "session_id", None) or "unknown"
-            by_session.setdefault(sid, []).append(sample)
-    if not by_session:
-        return
-
-    def _session_tokens(samples: list[Any]) -> int:
-        return sum(int(getattr(s, "response_length", 0) or 0) for s in samples)
-
-    longest_sid, longest_samples = max(by_session.items(), key=lambda kv: _session_tokens(kv[1]))
-    total_tokens = _session_tokens(longest_samples)
-    if total_tokens <= 0:
-        return
-
-    longest_samples = sorted(
-        longest_samples,
-        key=lambda s: int((s.metadata.get("polar") or {}).get("trace_index", 0) or 0),
+        logger.info("Stopping Polar rollout worker before committing a cancelled batch")
+        stop_global_worker()
+        raise TaskCancelledError(error_message="Polar rollout generation was cancelled")
+    post_commit_metrics = async_worker._consume_reservations(
+        [completed.reservation_id for completed in accepted_completions],
+        outcome="accepted",
     )
-    traces = []
-    for sample in longest_samples:
-        polar_meta = sample.metadata.get("polar") or {}
+    # Snapshot exactly once per delivered rollout, after reservation commit,
+    # so *_delta means "during this rollout" and lifetime counters carry an
+    # explicit worker-local scope across Slurm restarts.
+    metrics.update(async_worker.snapshot_metrics())
+    metrics.update(post_commit_metrics)
+    return output
+
+
+def _configured_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid %s=%r; using %d", name, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("Ignoring non-positive %s=%r; using %d", name, raw, default)
+        return default
+    return value
+
+
+def _sample_reward_for_example(sample: Any) -> float:
+    reward = getattr(sample, "reward", None)
+    if isinstance(reward, dict):
+        value = reward.get("score", next(iter(reward.values()), 0.0))
+    else:
+        value = reward
+    try:
+        parsed = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
+
+
+def _trajectory_example_payload(session_id: str, samples: list[Any]) -> dict[str, Any]:
+    ordered = sorted(
+        samples,
+        key=lambda sample: int(
+            ((getattr(sample, "metadata", {}) or {}).get("polar") or {}).get("trace_index", 0) or 0
+        ),
+    )
+    trace_rewards = [_sample_reward_for_example(sample) for sample in ordered]
+    traces: list[dict[str, Any]] = []
+    for sample in ordered:
+        polar_meta = (getattr(sample, "metadata", {}) or {}).get("polar") or {}
         trace_debug = polar_meta.get("trace_debug") or {}
         status = getattr(sample, "status", None)
-        traces.append({
-            "trace_index": polar_meta.get("trace_index"),
-            "finish_reason": trace_debug.get("finish_reason"),
-            "response_length": int(getattr(sample, "response_length", 0) or 0),
-            "status": getattr(status, "value", None) if status is not None else None,
-            "prompt_messages": sample.prompt if isinstance(sample.prompt, list) else [],
-            "response_messages": trace_debug.get("response_messages") or [],
-        })
+        status_value = getattr(status, "value", status)
+        traces.append(
+            {
+                "trace_index": polar_meta.get("trace_index"),
+                "finish_reason": trace_debug.get("finish_reason"),
+                "response_length": int(getattr(sample, "response_length", 0) or 0),
+                "status": str(status_value) if status_value is not None else None,
+                "remove_sample": bool(getattr(sample, "remove_sample", False)),
+                "training_filter": polar_meta.get("training_filter"),
+                "token_clipping": polar_meta.get("token_clipping"),
+                "prompt_messages": (
+                    sample.prompt if isinstance(getattr(sample, "prompt", None), list) else []
+                ),
+                # This is deliberately unabridged. W&B receives the same JSON
+                # file as the local log so a full multi-turn trajectory can be
+                # inspected without placing 65k-token text in scalar history.
+                "response_messages": trace_debug.get("response_messages") or [],
+            }
+        )
 
-    first = longest_samples[0]
-    first_meta = first.metadata.get("polar") or {}
-    reward = getattr(first, "reward", None)
-    if isinstance(reward, dict):
-        session_reward = float(reward.get("score", 0.0))
-    elif isinstance(reward, (int, float)):
-        session_reward = float(reward)
-    else:
-        session_reward = 0.0
-
-    payload = {
-        "rollout_id": int(rollout_id),
-        "session_id": longest_sid,
+    first = ordered[0]
+    first_meta = (getattr(first, "metadata", {}) or {}).get("polar") or {}
+    total_tokens = sum(int(getattr(sample, "response_length", 0) or 0) for sample in ordered)
+    return {
+        "session_id": session_id,
         "task_id": first_meta.get("task_id"),
         "node_id": first_meta.get("node_id"),
-        "total_assistant_tokens": int(total_tokens),
-        "session_reward": session_reward,
+        "session_status": first_meta.get("session_status"),
+        "result_error": first_meta.get("result_error"),
+        "trajectory_status": first_meta.get("trajectory_status"),
+        "trajectory_error": first_meta.get("trajectory_error"),
+        "total_response_tokens": total_tokens,
+        "session_reward_mean": (sum(trace_rewards) / len(trace_rewards) if trace_rewards else 0.0),
+        "trace_rewards": trace_rewards,
         "num_traces": len(traces),
         "traces": traces,
     }
 
+
+def _select_trajectory_examples(
+    by_session: dict[str, list[Any]], count: int
+) -> list[dict[str, Any]]:
+    payloads = [
+        _trajectory_example_payload(session_id, samples)
+        for session_id, samples in by_session.items()
+        if samples
+    ]
+    payloads = [payload for payload in payloads if payload["total_response_tokens"] > 0]
+    if len(payloads) <= count:
+        selected = sorted(
+            payloads,
+            key=lambda payload: (
+                -payload["session_reward_mean"],
+                -payload["total_response_tokens"],
+                payload["session_id"],
+            ),
+        )
+        return [
+            {**payload, "selection_reason": "available_by_reward_and_length"}
+            for payload in selected
+        ]
+
+    # Prefer one high-reward and one low-reward long trajectory. This exposes
+    # both successful and unsuccessful behavior; if every reward is identical,
+    # fall back to the longest distinct sessions.
+    high = max(
+        payloads,
+        key=lambda payload: (
+            payload["session_reward_mean"],
+            payload["total_response_tokens"],
+            payload["session_id"],
+        ),
+    )
+    low = max(
+        payloads,
+        key=lambda payload: (
+            -payload["session_reward_mean"],
+            payload["total_response_tokens"],
+            payload["session_id"],
+        ),
+    )
+    selected = [{**high, "selection_reason": "highest_reward_longest"}]
+    if low["session_id"] != high["session_id"]:
+        selected.append({**low, "selection_reason": "lowest_reward_longest"})
+    for payload in sorted(
+        payloads,
+        key=lambda item: (-item["total_response_tokens"], item["session_id"]),
+    ):
+        if len(selected) >= count:
+            break
+        if all(payload["session_id"] != item["session_id"] for item in selected):
+            selected.append({**payload, "selection_reason": "longest_remaining"})
+    return selected[:count]
+
+
+def _trajectory_examples_output_dir() -> Path | None:
+    configured = os.environ.get("POLAR_ROLLOUT_EXAMPLES_DIR", "").strip()
+    if not configured:
+        rollout_dir = os.environ.get("POLAR_ROLLOUT_SAVE_DIR", "").strip()
+        if rollout_dir:
+            configured = str(Path(rollout_dir) / "trajectory_examples")
+    if not configured:
+        return None
+    output_dir = Path(configured)
+    if not output_dir.is_absolute():
+        logger.warning("POLAR_ROLLOUT_EXAMPLES_DIR must be absolute: %s", output_dir)
+        return None
+    return output_dir
+
+
+_AUTHORIZATION_SECRET_RE = re.compile(
+    r"(?i)(\bauthorization\s*:\s*(?:bearer|basic)\s+)[^\s,;}\]]+"
+)
+_NAMED_SECRET_RE = re.compile(
+    r"(?i)(\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|password|passwd|secret|cookie)"
+    r"\b\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"
+)
+_ENV_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?im)(\b(?:[A-Z][A-Z0-9]*_)*(?:API_KEY|TOKEN|SECRET_ACCESS_KEY|SECRET|"
+    r"PASSWORD|PASSWD|COOKIE|AUTHORIZATION)\b\s*=\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"
+)
+_COMMON_SECRET_RE = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|"
+    r"hf_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16})\b"
+)
+_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+_SECRET_MAPPING_KEYS = frozenset(
+    {
+        "authorization",
+        "proxy_authorization",
+        "api_key",
+        "apikey",
+        "token",
+        "access_token",
+        "auth_token",
+        "refresh_token",
+        "id_token",
+        "password",
+        "passwd",
+        "cookie",
+        "set_cookie",
+        "secret",
+        "client_secret",
+        "private_key",
+        "credentials",
+        "secret_access_key",
+    }
+)
+_SECRET_MAPPING_KEY_SUFFIXES = tuple(
+    f"_{key}" for key in _SECRET_MAPPING_KEYS if key not in {"authorization", "apikey", "secret"}
+)
+
+
+def _is_secret_mapping_key(key: str) -> bool:
+    normalized = key.strip().lower().replace("-", "_")
+    return normalized in _SECRET_MAPPING_KEYS or normalized.endswith(_SECRET_MAPPING_KEY_SUFFIXES)
+
+
+def _redact_trajectory_value(value: Any) -> tuple[Any, int]:
+    """Recursively remove credentials without truncating trajectory content."""
+
+    if isinstance(value, str):
+        redacted = value
+        count = 0
+        for pattern, replacement in (
+            (_PRIVATE_KEY_RE, "<redacted-private-key>"),
+            (_AUTHORIZATION_SECRET_RE, r"\1<redacted>"),
+            (_ENV_SECRET_ASSIGNMENT_RE, r"\1<redacted>"),
+            (_NAMED_SECRET_RE, r"\1<redacted>"),
+            (_COMMON_SECRET_RE, "<redacted-secret>"),
+        ):
+            redacted, replacements = pattern.subn(replacement, redacted)
+            count += replacements
+        return redacted, count
+    if isinstance(value, dict):
+        output: dict[Any, Any] = {}
+        count = 0
+        for key, item in value.items():
+            if isinstance(key, str) and _is_secret_mapping_key(key):
+                output[key] = "<redacted>"
+                count += 1
+                continue
+            output_item, replacements = _redact_trajectory_value(item)
+            output[key] = output_item
+            count += replacements
+        return output, count
+    if isinstance(value, list):
+        output_list: list[Any] = []
+        count = 0
+        for item in value:
+            output_item, replacements = _redact_trajectory_value(item)
+            output_list.append(output_item)
+            count += replacements
+        return output_list, count
+    if isinstance(value, tuple):
+        output_tuple: list[Any] = []
+        count = 0
+        for item in value:
+            output_item, replacements = _redact_trajectory_value(item)
+            output_tuple.append(output_item)
+            count += replacements
+        return output_tuple, count
+    return value, 0
+
+
+def _telemetry_error_detail(exc: Exception) -> str:
+    detail = " ".join(str(exc).splitlines())
+    redacted, _ = _redact_trajectory_value(detail)
+    return str(redacted)[:300]
+
+
+def _flatten_trajectory_samples(samples: Any) -> list[Any]:
+    if isinstance(samples, list | tuple):
+        flattened: list[Any] = []
+        for item in samples:
+            flattened.extend(_flatten_trajectory_samples(item))
+        return flattened
+    return [samples]
+
+
+def _sample_rollout_key(sample: Any, position: int) -> Any:
+    key = getattr(sample, "rollout_id", None)
+    if key is None:
+        key = getattr(sample, "index", None)
+    if key is None:
+        key = _sample_session_id(sample)
+    if key is None:
+        return ("position", position)
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            fpath = Path(tmp) / f"longest_trace_r{rollout_id}.json"
-            fpath.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
-            artifact = wandb.Artifact(
-                name=f"longest_trace_r{rollout_id}", type="rollout-trace"
-            )
-            artifact.add_file(str(fpath))
-            wandb.run.log_artifact(artifact)
-    except Exception:
-        logger.exception("Failed to log longest-trace wandb artifact")
+        hash(key)
+    except TypeError:
+        return ("value", repr(key))
+    return ("value", key)
+
+
+def _train_step_sample_slices(
+    args: Any,
+    rollout_id: int,
+    samples: list[Any],
+    interval: int,
+) -> list[tuple[int, list[Any]]]:
+    """Return exact optimizer-step subsets that cross the configured cadence."""
+
+    rollout_batch_size = int(getattr(args, "rollout_batch_size"))
+    samples_per_prompt = int(getattr(args, "n_samples_per_prompt"))
+    global_batch_size = int(getattr(args, "global_batch_size"))
+    product = rollout_batch_size * samples_per_prompt
+    if min(rollout_batch_size, samples_per_prompt, global_batch_size) <= 0:
+        raise ValueError("rollout/global batch sizes must be positive")
+    if product % global_batch_size:
+        raise ValueError(
+            "rollout_batch_size*n_samples_per_prompt must be divisible by global_batch_size"
+        )
+    steps_per_rollout = product // global_batch_size
+    configured_steps = getattr(args, "num_steps_per_rollout", None)
+    if configured_steps is not None and int(configured_steps) != steps_per_rollout:
+        raise ValueError(
+            f"num_steps_per_rollout={configured_steps} does not match {steps_per_rollout}"
+        )
+
+    rollout_order: list[Any] = []
+    samples_by_rollout: dict[Any, list[Any]] = {}
+    for position, sample in enumerate(samples):
+        key = _sample_rollout_key(sample, position)
+        if key not in samples_by_rollout:
+            rollout_order.append(key)
+            samples_by_rollout[key] = []
+        samples_by_rollout[key].append(sample)
+    if len(rollout_order) < product:
+        raise ValueError(
+            f"received {len(rollout_order)} unique trajectories, expected at least {product}"
+        )
+
+    selected_steps: list[tuple[int, list[Any]]] = []
+    first_train_step = int(rollout_id) * steps_per_rollout
+    for local_step in range(steps_per_rollout):
+        train_step = first_train_step + local_step
+        # train/step is zero-based; cadence 10 means the first periodic sample
+        # is attached to the completed optimizer step 10, then 20, 30, ... .
+        if train_step <= 0 or train_step % interval:
+            continue
+        begin = local_step * global_batch_size
+        end = begin + global_batch_size
+        step_keys = rollout_order[begin:end]
+        step_samples = [sample for key in step_keys for sample in samples_by_rollout[key]]
+        selected_steps.append((train_step, step_samples))
+    return selected_steps
+
+
+def _trajectory_example_records(
+    train_step: int,
+    samples: list[Any],
+    count: int,
+) -> list[dict[str, Any]]:
+    by_session: dict[str, list[Any]] = {}
+    for position, sample in enumerate(samples):
+        session_id = _sample_session_id(sample) or f"unknown-{position}"
+        by_session.setdefault(session_id, []).append(sample)
+    selected = _select_trajectory_examples(by_session, count)
+    records: list[dict[str, Any]] = []
+    for selection_rank, example in enumerate(selected):
+        raw_session_id = str(example.get("session_id") or "unknown")
+        example_to_redact = dict(example)
+        # Session ids such as ``sk-polar-*`` resemble API credentials but are
+        # only internal correlation handles. Keep them in the mode-0600 local
+        # log and precompute a distinct non-reversible value for W&B.
+        example_to_redact["session_id"] = "<internal-session-id>"
+        redacted, redaction_count = _redact_trajectory_value(example_to_redact)
+        redacted["session_id"] = raw_session_id
+        records.append(
+            {
+                "schema_version": 2,
+                "train_step": int(train_step),
+                "selection_rank": selection_rank,
+                "redaction_count": redaction_count,
+                "session_hash": hashlib.sha256(raw_session_id.encode()).hexdigest()[:16],
+                "trajectory": redacted,
+            }
+        )
+    return records
+
+
+def _persist_trajectory_example_records(
+    train_step: int,
+    records: list[dict[str, Any]],
+) -> Path:
+    output_dir = _trajectory_examples_output_dir()
+    if output_dir is None:
+        raise ValueError(
+            "set POLAR_ROLLOUT_EXAMPLES_DIR or POLAR_ROLLOUT_SAVE_DIR to an absolute path"
+        )
+    output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(output_dir, 0o700)
+    output_path = output_dir / f"trajectory_examples_step_{train_step:06d}.jsonl"
+    temporary_path = output_dir / (f".{output_path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        with temporary_path.open("x", encoding="utf-8") as stream:
+            for record in records:
+                stream.write(json.dumps(record, ensure_ascii=False, default=str))
+                stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary_path, 0o600)
+        temporary_path.replace(output_path)
+    finally:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return output_path
+
+
+def _log_trajectory_examples_to_wandb(
+    args: Any,
+    train_step: int,
+    records: list[dict[str, Any]],
+) -> None:
+    if os.environ.get("POLAR_ROLLOUT_EXAMPLES_WANDB", "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    } or not bool(getattr(args, "use_wandb", False)):
         return
 
-    logger.info(
-        "Logged longest-trace artifact rollout=%d session=%s traces=%d tokens=%d",
-        rollout_id, longest_sid, len(traces), total_tokens,
+    import wandb
+    from slime.utils import wandb_utils
+
+    if getattr(wandb, "run", None) is None:
+        return
+    rows: list[list[Any]] = []
+    for record in records:
+        trajectory = dict(record["trajectory"])
+        session_hash = str(record["session_hash"])
+        trajectory["session_id"] = session_hash
+        rows.append(
+            [
+                int(train_step),
+                session_hash,
+                trajectory.get("task_id"),
+                trajectory.get("session_reward_mean"),
+                trajectory.get("total_response_tokens"),
+                trajectory.get("selection_reason"),
+                json.dumps(trajectory, ensure_ascii=False, indent=2, default=str),
+            ]
+        )
+    table = wandb.Table(
+        columns=[
+            "train_step",
+            "session_hash",
+            "task_id",
+            "reward",
+            "response_tokens",
+            "selection_reason",
+            "full_trajectory_json",
+        ],
+        data=rows,
+        log_mode="IMMUTABLE",
     )
+    metrics = {
+        "train/step": int(train_step),
+        "examples/rollout_trajectories": table,
+    }
+    wandb_utils.define_logged_metric_axes(metrics, step_metric="train/step")
+    wandb.log(metrics)
+
+
+def log_rollout_trajectory_examples(
+    rollout_id: int,
+    args: Any,
+    samples: Any,
+    rollout_extra_metrics: dict[str, Any] | None,
+    rollout_time: float,
+) -> bool:
+    """Slime post-train hook for periodic full trajectory examples.
+
+    Slime invokes this from ``commit_rollout_metrics`` only after every actor
+    optimizer step in the rollout batch succeeds. Telemetry is deliberately
+    fail-open: local or W&B failures can never fail or cancel training.
+    """
+
+    del rollout_extra_metrics, rollout_time
+    if bool(getattr(args, "debug_rollout_only", False)):
+        # Slime invokes custom rollout log hooks before any actor train in this
+        # diagnostics-only mode; do not label such generations as committed
+        # optimizer-step examples.
+        return False
+    try:
+        interval = _configured_positive_int(
+            "POLAR_ROLLOUT_EXAMPLE_INTERVAL", _TRAJECTORY_EXAMPLE_INTERVAL
+        )
+        count = _configured_positive_int("POLAR_ROLLOUT_EXAMPLE_COUNT", _TRAJECTORY_EXAMPLE_COUNT)
+        flat_samples = _flatten_trajectory_samples(samples)
+        step_slices = _train_step_sample_slices(
+            args,
+            rollout_id,
+            flat_samples,
+            interval,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Skipping trajectory-example telemetry for rollout %s (%s): %.300s",
+            rollout_id,
+            type(exc).__name__,
+            _telemetry_error_detail(exc),
+        )
+        return False
+
+    for train_step, step_samples in step_slices:
+        try:
+            records = _trajectory_example_records(train_step, step_samples, count)
+        except Exception as exc:
+            logger.warning(
+                "Failed to prepare trajectory examples at train step %d (%s): %.300s",
+                train_step,
+                type(exc).__name__,
+                _telemetry_error_detail(exc),
+            )
+            continue
+        if not records:
+            continue
+
+        try:
+            output_path = _persist_trajectory_example_records(train_step, records)
+        except Exception as exc:
+            logger.warning(
+                "Failed to persist trajectory examples at train step %d (%s): %.300s",
+                train_step,
+                type(exc).__name__,
+                _telemetry_error_detail(exc),
+            )
+        else:
+            summary = ",".join(
+                f"{record['session_hash']}@"
+                f"r={record['trajectory']['session_reward_mean']:.3g}/"
+                f"t={record['trajectory']['total_response_tokens']}"
+                for record in records
+            )
+            logger.info(
+                "Saved %d full trajectory example(s) for train step %d to %s [%s]",
+                len(records),
+                train_step,
+                output_path,
+                summary,
+            )
+
+        try:
+            _log_trajectory_examples_to_wandb(args, train_step, records)
+        except Exception as exc:
+            logger.warning(
+                "Failed to log full-trajectory W&B Table at train step %d (%s): %.300s",
+                train_step,
+                type(exc).__name__,
+                _telemetry_error_detail(exc),
+            )
+    return False
 
 
 def _group_index_for(group: list[Any]) -> int:
@@ -1323,6 +2995,37 @@ def _extract_sample_reward(sample: Any, reward_key: str) -> float:
     return 0.0
 
 
+def _is_trainable_agent_timeout_sample(sample: Any) -> bool:
+    if bool(getattr(sample, "remove_sample", False)):
+        return False
+    status = getattr(sample, "status", None)
+    status_name = getattr(status, "name", None) or str(status).rsplit(".", 1)[-1]
+    if status_name.upper() in {"FAILED", "ABORTED"}:
+        return False
+    loss_mask = getattr(sample, "loss_mask", None)
+    if loss_mask is not None and not any(int(value) != 0 for value in loss_mask):
+        return False
+    metadata = getattr(sample, "metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    polar_meta = metadata.get("polar")
+    if not isinstance(polar_meta, dict):
+        return False
+    training_filter = polar_meta.get("training_filter")
+    return (
+        isinstance(training_filter, dict)
+        and training_filter.get("reason") == "agent_timeout"
+        and training_filter.get("trainable") is True
+        and training_filter.get("masked") is not True
+    )
+
+
+def _effective_trainable_reward(sample: Any, reward_key: str) -> float:
+    if _is_trainable_agent_timeout_sample(sample):
+        return 0.0
+    return _extract_sample_reward(sample, reward_key)
+
+
 def _polar_extra_metrics(
     flat_samples: list[Any],
     rewards: list[float],
@@ -1331,71 +3034,384 @@ def _polar_extra_metrics(
     """Compact user-facing Polar metrics for W&B."""
     out: dict[str, float] = {}
     seen: set[str] = set()
-    register_to_init_queue_ms: list[float] = []
-    init_ms: list[float] = []
-    run_ms: list[float] = []
-    postrun_ms: list[float] = []
+    stage_timing_values = {field: [] for field, _ in _SESSION_STAGE_TIMING_FIELDS}
+    runtime_exec_values = {
+        "runtime_exec_ms": [],
+        "runtime_exec_count": [],
+        "runtime_exec_timeout_count": [],
+        "runtime_exec_failure_count": [],
+        "runtime_exec_exception_count": [],
+        "runtime_exec_cancelled_count": [],
+        "mini_swe_command_ms": [],
+        "mini_swe_command_count": [],
+        "mini_swe_command_timeout_count": [],
+        "mini_swe_command_failure_count": [],
+    }
+    command_category_totals = {
+        "runtime_exec_ms_by_category": {category: 0.0 for category in RUNTIME_EXEC_CATEGORIES},
+        "runtime_exec_count_by_category": {category: 0.0 for category in RUNTIME_EXEC_CATEGORIES},
+        "mini_swe_command_ms_by_category": {category: 0.0 for category in RUNTIME_EXEC_CATEGORIES},
+        "mini_swe_command_count_by_category": {
+            category: 0.0 for category in RUNTIME_EXEC_CATEGORIES
+        },
+    }
+    inference_timing_values: dict[str, list[float]] = {
+        field: [] for field in _INFERENCE_TIMING_FIELDS
+    }
+    inference_timing_count = 0
+    seen_inference_traces: set[tuple[str, int]] = set()
+    timed_session_count = 0
     session_is_placeholder: dict[str, bool] = {}
     session_report: dict[str, dict[str, Any]] = {}
-    completed_session_rewards: list[float] = []
+    completed_session_trace_rewards: dict[str, list[float]] = {}
+    agent_timeout_session_trace_rewards: dict[str, list[float]] = {}
+    trusted_model_failure_sessions: set[str] = set()
     policy_staleness: list[float] = []
+    parser_invalid_traces = 0
+    parser_invalid_sessions: set[str] = set()
+    agent_timeout_traces = 0
+    agent_timeout_sessions: set[str] = set()
+    early_stop_cancelled_sessions: set[str] = set()
+    early_stop_elapsed_ms: list[float] = []
+    trainable_traces = 0
+    trajectory_rewards_by_group: dict[Any, dict[Any, list[float]]] = {}
     for sample in flat_samples:
         polar_meta = sample.metadata.get("polar", {})
+        training_filter = polar_meta.get("training_filter") or {}
+        parser_invalid = (
+            isinstance(training_filter, dict)
+            and training_filter.get("reason") == "parser_invalid_tool_call"
+        )
+        agent_timeout = _is_trainable_agent_timeout_sample(sample)
+        if parser_invalid:
+            parser_invalid_traces += 1
+        if agent_timeout:
+            agent_timeout_traces += 1
         if "policy_staleness" in polar_meta:
             policy_staleness.append(float(polar_meta["policy_staleness"]))
         session_id = polar_meta.get("session_id")
+        trace_index = int(polar_meta.get("trace_index", 0) or 0)
+        inference_trace_key = (str(session_id or ""), trace_index)
+        if inference_trace_key not in seen_inference_traces:
+            seen_inference_traces.add(inference_trace_key)
+            trace_metadata = polar_meta.get("trace_metadata")
+            for inference_timing in _iter_inference_timings(trace_metadata):
+                inference_timing_count += 1
+                for field, values in inference_timing_values.items():
+                    value = _optional_nonnegative_finite_float(inference_timing.get(field))
+                    if value is not None:
+                        values.append(value)
+        if parser_invalid and session_id:
+            parser_invalid_sessions.add(str(session_id))
+        if agent_timeout and session_id:
+            agent_timeout_sessions.add(str(session_id))
+        result_metadata = polar_meta.get("result_metadata") or {}
+        early_stop_cancelled = (
+            session_id
+            and isinstance(result_metadata, dict)
+            and result_metadata.get("early_stop_cancelled") is True
+        )
+        if early_stop_cancelled:
+            early_stop_cancelled_sessions.add(str(session_id))
+            elapsed = _optional_nonnegative_finite_float(
+                result_metadata.get("early_stop_elapsed_ms")
+            )
+            if elapsed is not None:
+                early_stop_elapsed_ms.append(elapsed)
+        sample_is_trainable = _sample_has_trainable_tokens(sample)
+        if sample_is_trainable:
+            trainable_traces += 1
+            group_id = getattr(sample, "group_index", None)
+            trajectory_id = getattr(sample, "rollout_id", None)
+            if trajectory_id is None:
+                trajectory_id = getattr(sample, "index", None)
+            if trajectory_id is None:
+                trajectory_id = session_id or id(sample)
+            trajectory_rewards_by_group.setdefault(group_id, {}).setdefault(
+                trajectory_id, []
+            ).append(_effective_trainable_reward(sample, reward_key))
         is_placeholder = bool(polar_meta.get("placeholder"))
         if not session_id:
             continue
         if session_id not in seen:
             seen.add(session_id)
             timing = polar_meta.get("timing") or {}
-            if timing:
-                register_to_init_queue_ms.append(
-                    float(timing.get("register_to_init_queue_ms", 0.0))
-                )
-                init_ms.append(float(timing.get("init_ms", 0.0)))
-                run_ms.append(float(timing.get("run_ms", 0.0)))
-                postrun_ms.append(float(timing.get("postrun_ms", 0.0)))
+            # Synthetic straggler placeholders contain rollout-server time to
+            # cancellation, not completed gateway stage timings. Keep them out
+            # of stage means and report their elapsed time separately below.
+            if isinstance(timing, dict) and timing and not early_stop_cancelled:
+                timed_session_count += 1
+                for field, _ in _SESSION_STAGE_TIMING_FIELDS:
+                    stage_timing_values[field].append(_nonnegative_finite_float(timing.get(field)))
+                for field, values in runtime_exec_values.items():
+                    values.append(_nonnegative_finite_float(timing.get(field)))
+                for field, category_totals in command_category_totals.items():
+                    category_values = timing.get(field)
+                    if not isinstance(category_values, dict):
+                        continue
+                    for category in RUNTIME_EXEC_CATEGORIES:
+                        category_totals[category] += _nonnegative_finite_float(
+                            category_values.get(category)
+                        )
             session_is_placeholder[session_id] = is_placeholder
             evaluation = (polar_meta.get("trajectory_metadata") or {}).get("evaluation") or {}
             report = evaluation.get("report") or {}
             if isinstance(report, dict) and report:
                 session_report[session_id] = report
-            if _sample_session_status(sample) == "COMPLETED" and not is_placeholder:
-                completed_session_rewards.append(
-                    _extract_sample_reward(sample, reward_key)
+        if session_id and not early_stop_cancelled:
+            session_key = str(session_id)
+            session_status = str(_sample_session_status(sample) or "").upper()
+            if agent_timeout and not is_placeholder:
+                # The model exhausted its own agent budget. This is a real,
+                # aligned zero-reward policy outcome rather than missing
+                # infrastructure, so include it in primary quality metrics.
+                agent_timeout_session_trace_rewards.setdefault(session_key, []).append(0.0)
+            elif session_status == "COMPLETED" and not is_placeholder:
+                # Include parser-invalid/fully-masked real traces as zero
+                # quality outcomes. The adapter already fail-closes their
+                # scalar reward, and quality reporting should not make model
+                # failures disappear merely because they are untrainable.
+                completed_session_trace_rewards.setdefault(session_key, []).append(
+                    _extract_sample_reward(sample, reward_key) if sample_is_trainable else 0.0
                 )
+            elif session_status in {"ERROR", "FAILED"} and _has_trusted_eval_failure(sample):
+                # The verifier ran successfully and accepted the outcome, so
+                # this is a real model failure rather than missing infra data.
+                # Force zero even if a stale artifact carries positive reward.
+                trusted_model_failure_sessions.add(session_key)
 
-    if init_ms:
-        out["polar/session_ms/register_to_init_queue_mean"] = (
-            sum(register_to_init_queue_ms) / len(register_to_init_queue_ms)
+    if timed_session_count:
+        for field, metric_suffix in _SESSION_STAGE_TIMING_FIELDS:
+            out[f"timing/session_ms/{metric_suffix}"] = (
+                sum(stage_timing_values[field]) / timed_session_count
+            )
+        for field, values in runtime_exec_values.items():
+            family = "runtime_exec" if field.startswith("runtime_exec") else "mini_swe_command"
+            suffix = field.removeprefix(f"{family}_")
+            namespace = "timing" if suffix == "ms" else "polar"
+            out[f"{namespace}/{family}/{suffix}_per_session_mean"] = (
+                sum(values) / timed_session_count
+            )
+
+        for family in ("runtime_exec", "mini_swe_command"):
+            total_ms = sum(runtime_exec_values[f"{family}_ms"])
+            total_count = sum(runtime_exec_values[f"{family}_count"])
+            if total_count > 0.0:
+                out[f"timing/{family}/ms_per_command_mean"] = total_ms / total_count
+
+        category_metric_names = (
+            ("runtime_exec_ms_by_category", "runtime_exec", "ms"),
+            ("runtime_exec_count_by_category", "runtime_exec", "count"),
+            ("mini_swe_command_ms_by_category", "mini_swe_command", "ms"),
+            ("mini_swe_command_count_by_category", "mini_swe_command", "count"),
         )
-        out["polar/session_ms/init_mean"] = sum(init_ms) / len(init_ms)
-        out["polar/session_ms/run_mean"] = sum(run_ms) / len(run_ms)
-        out["polar/session_ms/postrun_mean"] = sum(postrun_ms) / len(postrun_ms)
+        for field, family, unit in category_metric_names:
+            for category, total in command_category_totals[field].items():
+                if total > 0.0:
+                    namespace = "timing" if unit == "ms" else "polar"
+                    out[f"{namespace}/{family}/{category}_{unit}_per_session_mean"] = (
+                        total / timed_session_count
+                    )
+                    if unit == "ms":
+                        count = command_category_totals[
+                            field.replace("ms_by_category", "count_by_category")
+                        ][category]
+                        if count > 0.0:
+                            out[f"timing/{family}/{category}_ms_per_command_mean"] = total / count
+    if inference_timing_count:
+        out["polar/inference/timed_completion_count"] = float(inference_timing_count)
+        for field, values in inference_timing_values.items():
+            if not values:
+                continue
+            namespace = "timing" if field.endswith("_ms") else "polar"
+            out[f"{namespace}/inference/{field}_mean"] = sum(values) / len(values)
+            out[f"{namespace}/inference/{field}_p95"] = _nearest_rank_percentile(values, 0.95)
+            out[f"{namespace}/inference/{field}_max"] = max(values)
     if rewards:
-        out["polar/reward_mean"] = sum(rewards) / len(rewards)
-    if len(rewards) > 1:
-        out["polar/reward_std"] = statistics.pstdev(rewards)
+        # Retain the old trace/placeholder-weighted view under an explicit
+        # diagnostic name. It is not an exchangeable GRPO outcome: a session
+        # can emit multiple traces, while an early-stop cancellation emits a
+        # synthetic zero-gradient placeholder.
+        out["polar/reward_mean_all_samples"] = sum(rewards) / len(rewards)
+    completed_session_rewards = [
+        sum(trace_rewards) / len(trace_rewards)
+        for trace_rewards in completed_session_trace_rewards.values()
+        if trace_rewards
+    ]
+    agent_timeout_session_rewards = [
+        sum(trace_rewards) / len(trace_rewards)
+        for trace_rewards in agent_timeout_session_trace_rewards.values()
+        if trace_rewards
+    ]
+    accounted_session_keys = (
+        completed_session_trace_rewards.keys() | agent_timeout_session_trace_rewards.keys()
+    )
+    accounted_session_rewards = (
+        completed_session_rewards
+        + agent_timeout_session_rewards
+        + [
+            0.0
+            for session_id in trusted_model_failure_sessions
+            if session_id not in accounted_session_keys
+        ]
+    )
     if completed_session_rewards:
-        out["polar/reward_mean_completed"] = (
-            sum(completed_session_rewards) / len(completed_session_rewards)
+        reward_mean_completed = sum(completed_session_rewards) / len(completed_session_rewards)
+        out["polar/reward_mean_completed"] = reward_mean_completed
+    if accounted_session_rewards:
+        # Primary quality is one outcome per real session: completed sessions
+        # contribute their mean trace reward, trustworthy model failures
+        # contribute zero, and intentional early-stop cancellations are absent.
+        # This avoids both trace fan-out weighting and synthetic placeholder
+        # dilution while still making genuine model errors hurt quality.
+        out["polar/reward_mean"] = sum(accounted_session_rewards) / len(accounted_session_rewards)
+        out["polar/reward_std"] = (
+            statistics.pstdev(accounted_session_rewards)
+            if len(accounted_session_rewards) > 1
+            else 0.0
+        )
+        out["polar/reward_accounted_sessions"] = float(len(accounted_session_rewards))
+        out["polar/reward_trainable_agent_timeout_sessions"] = float(
+            len(agent_timeout_session_trace_rewards)
+        )
+        out["polar/reward_model_failure_sessions"] = float(
+            len(
+                (trusted_model_failure_sessions | agent_timeout_session_trace_rewards.keys())
+                - completed_session_trace_rewards.keys()
+            )
         )
     if policy_staleness:
         out["polar/staleness/mean"] = sum(policy_staleness) / len(policy_staleness)
 
+    if flat_samples:
+        out["polar/training_filter/parser_invalid_trace_fraction"] = parser_invalid_traces / len(
+            flat_samples
+        )
+        out["polar/training_filter/agent_timeout_trace_fraction"] = agent_timeout_traces / len(
+            flat_samples
+        )
+        out["polar/training_filter/trainable_trace_fraction"] = trainable_traces / len(
+            flat_samples
+        )
+
+    group_count = len(trajectory_rewards_by_group)
+    if group_count:
+        mixed_groups = 0
+        trainable_reward_groups = 0
+        for trajectories in trajectory_rewards_by_group.values():
+            means = [sum(values) / len(values) for values in trajectories.values() if values]
+            distinct = {float(value) for value in means}
+            if len(distinct) > 1:
+                mixed_groups += 1
+            # This mirrors the custom LOO post-processor: with two or more
+            # trajectories, an all-equal group has zero scale and therefore
+            # zero advantages. A single valid trajectory retains an unscaled
+            # nonzero reward against the empty-peer baseline.
+            if len(distinct) > 1 or (len(means) == 1 and means[0] != 0.0):
+                trainable_reward_groups += 1
+        out["polar/reward_groups/count"] = float(group_count)
+        out["polar/reward_groups/mixed_fraction"] = mixed_groups / group_count
+        out["polar/reward_groups/trainable_fraction"] = trainable_reward_groups / group_count
+
     total_sessions = len(seen)
     empty_sessions = sum(1 for p in session_is_placeholder.values() if p)
     if total_sessions > 0:
-        out["polar/rollout_success_rate"] = (
+        # Slot completion keeps the scheduler/capacity view, where intentional
+        # early-stop placeholders occupy real requested slots. Model-quality
+        # success excludes those deliberately unexecuted stragglers and treats
+        # both unexpected empty sessions and model agent timeouts as failures.
+        out["polar/rollout_slot_completion_rate"] = (
             total_sessions - empty_sessions
         ) / total_sessions
+        attempted_sessions = seen - early_stop_cancelled_sessions
+        if attempted_sessions:
+            failed_attempted_sessions = {
+                session_id
+                for session_id, placeholder in session_is_placeholder.items()
+                if placeholder and session_id in attempted_sessions
+            } | (agent_timeout_sessions & attempted_sessions)
+            out["polar/rollout_success_rate"] = (
+                len(attempted_sessions) - len(failed_attempted_sessions)
+            ) / len(attempted_sessions)
+            out["polar/training_filter/parser_invalid_session_fraction"] = len(
+                parser_invalid_sessions & attempted_sessions
+            ) / len(attempted_sessions)
+            out["polar/training_filter/agent_timeout_session_fraction"] = len(
+                agent_timeout_sessions & attempted_sessions
+            ) / len(attempted_sessions)
+        out["polar/early_stop/cancelled_sessions"] = float(len(early_stop_cancelled_sessions))
+        out["polar/early_stop/cancelled_session_fraction"] = (
+            len(early_stop_cancelled_sessions) / total_sessions
+        )
+        if early_stop_elapsed_ms:
+            out["timing/early_stop/elapsed_ms_mean"] = sum(early_stop_elapsed_ms) / len(
+                early_stop_elapsed_ms
+            )
+            out["timing/early_stop/elapsed_ms_max"] = max(early_stop_elapsed_ms)
     if session_report:
         graded_sessions = len(session_report)
         resolved = sum(1 for r in session_report.values() if r.get("resolved"))
-        out["polar/eval/resolved_rate"] = resolved / graded_sessions
+        out["polar/resolved_rate"] = resolved / graded_sessions
     return out
+
+
+def _nonnegative_finite_float(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if parsed < 0.0 or not math.isfinite(parsed):
+        return 0.0
+    return parsed
+
+
+def _optional_nonnegative_finite_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0.0 or not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _iter_inference_timings(trace_metadata: Any):
+    """Yield sanitized per-choice timings without duplicating merged metadata."""
+
+    if not isinstance(trace_metadata, dict):
+        return
+    completion_metadata = trace_metadata.get("completion_metadata")
+    metadata_items = (
+        completion_metadata if isinstance(completion_metadata, list) else [trace_metadata]
+    )
+    for metadata in metadata_items:
+        if not isinstance(metadata, dict):
+            continue
+        timings = metadata.get("inference_timings")
+        if not isinstance(timings, list):
+            continue
+        for timing in timings:
+            if isinstance(timing, dict):
+                yield timing
+
+
+def _nearest_rank_percentile(values: list[float], percentile: float) -> float:
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, math.ceil(percentile * len(ordered)) - 1))
+    return ordered[index]
+
+
+def _sample_has_trainable_tokens(sample: Any) -> bool:
+    if bool(getattr(sample, "remove_sample", False)):
+        return False
+    status = getattr(sample, "status", None)
+    status_name = getattr(status, "name", None) or str(status).rsplit(".", 1)[-1]
+    if status_name.upper() in ("FAILED", "ABORTED"):
+        return False
+    loss_mask = getattr(sample, "loss_mask", None)
+    if loss_mask is None:
+        return int(getattr(sample, "response_length", 0) or 0) > 0
+    return any(int(value) != 0 for value in loss_mask)
 
 
 def _is_truncated(sample: Any) -> bool:
@@ -1407,9 +3423,7 @@ def _load_rollout_train_output_type() -> Any:
     try:
         from slime.rollout.base_types import RolloutFnTrainOutput
     except ImportError as exc:
-        raise ImportError(
-            "Slime is required to run Polar rollouts from a Slime trainer."
-        ) from exc
+        raise ImportError("Slime is required to run Polar rollouts from a Slime trainer.") from exc
     return RolloutFnTrainOutput
 
 
@@ -1432,5 +3446,10 @@ def _load_sample_type() -> Any:
         ) from exc
     return Sample
 
+
+# Slime's RolloutManager recognizes an optional callable ``dispose`` attribute
+# on a custom rollout function. Stop speculative work before it finishes W&B
+# and releases the Ray actor.
+setattr(generate_rollout_polar_async, "dispose", stop_global_worker)
 
 atexit.register(stop_global_worker)

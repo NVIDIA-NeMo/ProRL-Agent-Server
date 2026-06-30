@@ -2,7 +2,7 @@ rollout:
   host: "${POLAR_ROLLOUT_HOST}"
   port: ${POLAR_ROLLOUT_PORT}
   public_url: "${POLAR_ROLLOUT_URL}"
-  save_dir: ./rollout_results
+  save_dir: "${POLAR_ROLLOUT_SAVE_DIR}"
 
 gateway:
   heartbeat_interval_seconds: 30
@@ -11,9 +11,9 @@ gateway:
       host: "${POLAR_GATEWAY_HOST}"
       port: ${POLAR_GATEWAY_PORT}
       public_url: "${POLAR_GATEWAY_URL}"
-      max_init_workers: ${POLAR_MAX_INIT_WORKERS}
-      max_run_workers: ${POLAR_MAX_RUN_WORKERS}
-      max_postrun_workers: ${POLAR_MAX_POSTRUN_WORKERS}
+      max_init_workers: ${POLAR_GATEWAY_MAX_INIT_WORKERS}
+      max_run_workers: ${POLAR_GATEWAY_MAX_RUN_WORKERS}
+      max_postrun_workers: ${POLAR_GATEWAY_MAX_POSTRUN_WORKERS}
       model_served: Qwen/Qwen3.5-4B
       inference:
         engine: sglang

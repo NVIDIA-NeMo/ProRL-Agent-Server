@@ -38,6 +38,37 @@ def test_topology_defaults_public_urls_and_rollout_url(tmp_path: Path) -> None:
     assert topology.rollout.public_url == "http://127.0.0.1:8080"
     assert topology.gateway.nodes[0].public_url == "http://127.0.0.1:8100"
     assert topology.gateway.rollout_server_url == topology.rollout.public_url
+    persistence = topology.gateway.completion_persistence
+    assert persistence.queue_size == 16_384
+    assert persistence.write_workers == 8
+    assert persistence.batch_size == 16
+
+
+def test_completion_persistence_settings_are_configurable(tmp_path: Path) -> None:
+    path = _write_yaml(
+        tmp_path / "topology.yaml",
+        {
+            "gateway": {
+                "completion_persistence": {
+                    "queue_size": 32_768,
+                    "write_workers": 16,
+                    "batch_size": 32,
+                    "write_max_attempts": 5,
+                    "retry_backoff_seconds": 0.25,
+                },
+                "nodes": [
+                    {"id": "node-a", "public_url": "http://127.0.0.1:8100"}
+                ],
+            },
+        },
+    )
+
+    persistence = TopologyConfig.load(path).gateway.completion_persistence
+    assert persistence.queue_size == 32_768
+    assert persistence.write_workers == 16
+    assert persistence.batch_size == 32
+    assert persistence.write_max_attempts == 5
+    assert persistence.retry_backoff_seconds == 0.25
 
 
 def test_topology_rejects_unknown_keys(tmp_path: Path) -> None:

@@ -84,14 +84,17 @@ def _coerce(value: object, caster: type, default: object) -> object:
         return default
 
 
-def _load_task(task_dir: Path) -> TmaxTask | None:
+def _load_task(task_dir: Path) -> TmaxTask:
     toml_path = task_dir / "task.toml"
     tests_dir = task_dir / "tests"
     environment_dir = task_dir / "environment"
-    if not (toml_path.is_file() and (tests_dir / "test.sh").is_file()):
-        return None
-    if not (environment_dir / "Dockerfile").is_file():
-        return None
+    required = (toml_path, tests_dir / "test.sh", environment_dir / "Dockerfile")
+    missing = [str(path.relative_to(task_dir)) for path in required if not path.is_file()]
+    if missing:
+        raise SystemExit(
+            f"Invalid TMax task directory {task_dir}: missing required file(s): "
+            f"{', '.join(missing)}"
+        )
 
     meta = tomllib.loads(toml_path.read_text())
     agent = meta.get("agent", {})
@@ -135,7 +138,16 @@ def load_tasks(
     """Enumerate tasks under *dataset_dir* (any depth — robust to export nesting)."""
     root = find_dataset_dir(dataset_dir)
     task_dirs = sorted({p.parent for p in root.rglob("task.toml")})
-    tasks = [t for t in (_load_task(d) for d in task_dirs) if t is not None]
+    tasks: list[TmaxTask] = []
+    # Keep selection deterministic while avoiding a full metadata/content read
+    # when callers request only a prefix. SIF array workers used to parse all
+    # ~15K TOMLs and instructions independently before slicing to 1K tasks,
+    # causing minutes of duplicated Lustre small-file traffic per worker.
+    for task_dir in task_dirs:
+        task = _load_task(task_dir)
+        tasks.append(task)
+        if not names and max_tasks > 0 and len(tasks) >= max_tasks:
+            break
     if not tasks:
         raise SystemExit(
             f"No tasks found under {root}. Expected per-task dirs with "
@@ -148,6 +160,4 @@ def load_tasks(
         if missing:
             raise SystemExit(f"Unknown task(s): {', '.join(missing)}")
         return selected
-    if max_tasks > 0:
-        return tasks[:max_tasks]
     return tasks

@@ -2,19 +2,27 @@ rollout:
   host: "${POLAR_ROLLOUT_HOST}"
   port: ${POLAR_ROLLOUT_PORT}
   public_url: "${POLAR_ROLLOUT_URL}"
-  save_dir: ./rollout_results
+  save_dir: "${POLAR_ROLLOUT_SAVE_DIR}"
 
 gateway:
   heartbeat_interval_seconds: 30
+  completion_persistence:
+    enabled: true
+    max_field_bytes: 1048576
+    queue_size: ${POLAR_GATEWAY_COMPLETION_QUEUE_SIZE}
+    write_workers: ${POLAR_GATEWAY_COMPLETION_WRITE_WORKERS}
+    batch_size: ${POLAR_COMPLETION_BATCH_SIZE}
+    write_max_attempts: ${POLAR_COMPLETION_WRITE_MAX_ATTEMPTS}
+    retry_backoff_seconds: ${POLAR_COMPLETION_RETRY_BACKOFF_SECONDS}
   nodes:
     - id: localhost-node-01
       host: "${POLAR_GATEWAY_HOST}"
       port: ${POLAR_GATEWAY_PORT}
       public_url: "${POLAR_GATEWAY_URL}"
-      max_init_workers: ${POLAR_MAX_INIT_WORKERS}
-      max_run_workers: ${POLAR_MAX_RUN_WORKERS}
-      max_postrun_workers: ${POLAR_MAX_POSTRUN_WORKERS}
-      model_served: Qwen/Qwen3.5-4B
+      max_init_workers: ${POLAR_GATEWAY_MAX_INIT_WORKERS}
+      max_run_workers: ${POLAR_GATEWAY_MAX_RUN_WORKERS}
+      max_postrun_workers: ${POLAR_GATEWAY_MAX_POSTRUN_WORKERS}
+      model_served: ${POLAR_AGENT_MODEL_NAME}
       inference:
         engine: sglang
         base_url: ${SGLANG_ROUTER_BASE_URL}

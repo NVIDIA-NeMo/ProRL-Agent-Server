@@ -23,10 +23,40 @@ from polar.rollout.models import (
     TaskStatus,
 )
 from polar.rollout.pipeline import Pipeline
+from polar.runtime.assets import validate_runtime_assets
 
 logger = logging.getLogger(__name__)
 
 _CALLBACK_TIMEOUT_SECONDS = 10.0
+_CANCEL_TOMBSTONE_TTL_SECONDS = 300.0
+_EVAL_SAMPLING_SEED_METADATA_KEY = "eval_sampling_seed_base"
+
+
+def _request_for_sample(request: TaskRequest, sample_index: int) -> TaskRequest:
+    """Clone an eval request with a stable, distinct seed for one sample."""
+
+    seed_base = request.metadata.get(_EVAL_SAMPLING_SEED_METADATA_KEY)
+    if seed_base is None:
+        return request
+    if isinstance(seed_base, bool):
+        raise ValueError(f"{_EVAL_SAMPLING_SEED_METADATA_KEY} must be an integer")
+    try:
+        sampling_seed = int(seed_base) + sample_index
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{_EVAL_SAMPLING_SEED_METADATA_KEY} must be an integer") from exc
+    if sampling_seed < 0:
+        raise ValueError("eval sampling seeds must be non-negative")
+
+    settings = {
+        **request.agent.settings,
+        "sampling_seed": sampling_seed,
+    }
+    agent = request.agent.model_copy(update={"settings": settings})
+    metadata = {
+        **request.metadata,
+        "eval_sampling_seed": sampling_seed,
+    }
+    return request.model_copy(update={"agent": agent, "metadata": metadata})
 
 
 @dataclass(slots=True)
@@ -84,8 +114,7 @@ def _mean_completions(results: list[SessionResult]) -> float | None:
     if not results:
         return None
     counts = [
-        int(r.trajectory.metadata.get("record_count") or len(r.trajectory.traces))
-        for r in results
+        int(r.trajectory.metadata.get("record_count") or len(r.trajectory.traces)) for r in results
     ]
     return sum(counts) / len(counts)
 
@@ -104,6 +133,11 @@ class RolloutManager:
         self.scheduler = scheduler
         self.event_bus = event_bus or EventBus()
         self._tasks: dict[str, _TaskRecord] = {}
+        self._background_tasks: dict[str, asyncio.Task[None]] = {}
+        # A trainer can be cancelled while its submit response is still in
+        # flight. Remember that task id briefly so a late submit cannot create
+        # an orphan rollout after DELETE has already returned.
+        self._cancel_tombstones: dict[str, float] = {}
         self._lock = threading.RLock()
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -119,8 +153,16 @@ class RolloutManager:
 
     async def submit_task(self, request: TaskRequest) -> str:
         """Register a task and run it in the background. Returns task_id immediately."""
+        # Validate once per task before num_samples fans out into sessions.  A
+        # shared image/runtime directory can disappear during a long-running
+        # training allocation; rejecting the task here prevents an outage from
+        # becoming hundreds of identical per-session initialization failures.
+        validate_runtime_assets(request.runtime)
         self._loop = asyncio.get_running_loop()
         with self._lock:
+            self._prune_cancel_tombstones_locked()
+            if request.task_id in self._cancel_tombstones:
+                raise ValueError(f"task {request.task_id} was cancelled before submission")
             existing = self._tasks.get(request.task_id)
             if existing is not None and existing.status == "running":
                 raise ValueError(f"task {request.task_id} is already running")
@@ -131,6 +173,14 @@ class RolloutManager:
                 harness=_harness_from_request(request),
                 model=_model_from_request(request),
             )
+            # Install the handle under the same lock as the record. Otherwise
+            # DELETE can observe a running record before its cancellable task
+            # handle exists and a late background task escapes cancellation.
+            task = asyncio.create_task(
+                self._run_task_background(request),
+                name=f"polar-rollout-{request.task_id}",
+            )
+            self._background_tasks[request.task_id] = task
         self._emit(
             "task.created",
             {
@@ -141,7 +191,11 @@ class RolloutManager:
                 "num_samples": request.num_samples,
             },
         )
-        asyncio.create_task(self._run_task_background(request))
+        task.add_done_callback(
+            lambda completed, task_id=request.task_id: self._forget_background_task(
+                task_id, completed
+            )
+        )
         return request.task_id
 
     async def _run_task_background(self, request: TaskRequest) -> None:
@@ -149,8 +203,21 @@ class RolloutManager:
         try:
             result = await self._execute_task(request)
             logger.info("Task %s completed with %d results", request.task_id, len(result.results))
+        except asyncio.CancelledError:
+            with self._lock:
+                record = self._tasks.get(request.task_id)
+                if record is not None and record.status != "completed":
+                    record.status = "cancelled"
+                    record.updated_at = time.time()
+            self._emit("task.completed", {"task_id": request.task_id, "status": "cancelled"})
+            raise
         except Exception:
             logger.exception("Background task %s failed", request.task_id)
+            with self._lock:
+                record = self._tasks.get(request.task_id)
+                if record is not None:
+                    record.status = "failed"
+                    record.updated_at = time.time()
             self._emit("task.completed", {"task_id": request.task_id, "status": "failed"})
             return
         self._emit(
@@ -163,6 +230,93 @@ class RolloutManager:
         )
         if request.callback_url:
             await self._post_callback(request.callback_url, result)
+
+    async def cancel_task(
+        self,
+        task_id: str,
+        *,
+        register_if_missing: bool = False,
+    ) -> TaskStatus | None:
+        """Cancel a task and cascade cancellation to its gateway sessions.
+
+        ``register_if_missing`` closes the submit-ACK race: a DELETE that wins
+        the race records a short-lived tombstone, and a later submit using the
+        same id is rejected before any sessions are dispatched.
+        """
+        task: asyncio.Task[None] | None
+        with self._lock:
+            self._prune_cancel_tombstones_locked()
+            record = self._tasks.get(task_id)
+            if record is None:
+                if not register_if_missing:
+                    return None
+                self._cancel_tombstones[task_id] = time.monotonic() + _CANCEL_TOMBSTONE_TTL_SECONDS
+                return TaskStatus(
+                    task_id=task_id,
+                    status="cancelled",
+                    total_sessions=0,
+                    completed_sessions=0,
+                )
+            if record.status != "running":
+                return self._task_status_locked(record)
+            record.status = "cancelling"
+            record.updated_at = time.time()
+            task = self._background_tasks.get(task_id)
+
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        with self._lock:
+            record = self._tasks.get(task_id)
+            if record is None:
+                return None
+            if record.status != "completed":
+                record.status = "cancelled"
+                record.updated_at = time.time()
+            return self._task_status_locked(record)
+
+    async def close(self) -> None:
+        """Cancel every live task before the rollout pipeline is closed."""
+        with self._lock:
+            task_ids = [
+                task_id
+                for task_id, record in self._tasks.items()
+                if record.status in {"running", "cancelling"}
+            ]
+        if task_ids:
+            await asyncio.gather(
+                *(self.cancel_task(task_id) for task_id in task_ids),
+                return_exceptions=True,
+            )
+
+    def _forget_background_task(
+        self,
+        task_id: str,
+        completed: asyncio.Task[None],
+    ) -> None:
+        with self._lock:
+            if self._background_tasks.get(task_id) is completed:
+                self._background_tasks.pop(task_id, None)
+
+    def _prune_cancel_tombstones_locked(self) -> None:
+        now = time.monotonic()
+        expired = [
+            task_id for task_id, expires_at in self._cancel_tombstones.items() if expires_at <= now
+        ]
+        for task_id in expired:
+            self._cancel_tombstones.pop(task_id, None)
+
+    @staticmethod
+    def _task_status_locked(record: _TaskRecord) -> TaskStatus:
+        return TaskStatus(
+            task_id=record.task_id,
+            status=record.status,
+            total_sessions=record.total_sessions,
+            completed_sessions=record.completed_sessions,
+            results=list(record.results),
+            result_paths=list(record.result_paths),
+        )
 
     async def _post_callback(self, callback_url: str, result: TaskResult) -> None:
         """Best-effort POST the terminal TaskResult to the trainer's callback URL."""
@@ -198,10 +352,10 @@ class RolloutManager:
             SessionContext(
                 session_id=f"sk-polar-{uuid.uuid4()}",
                 task_id=request.task_id,
-                request=request,
+                request=_request_for_sample(request, sample_index),
                 deadline_monotonic=time.monotonic() + request.timeout_seconds,
             )
-            for _ in range(request.num_samples)
+            for sample_index in range(request.num_samples)
         ]
 
         async def _on_result(result: SessionResult) -> None:
@@ -262,34 +416,29 @@ class RolloutManager:
             record = self._tasks.get(task_id)
             if record is None:
                 return None
-            return TaskStatus(
-                task_id=record.task_id,
-                status=record.status,
-                total_sessions=record.total_sessions,
-                completed_sessions=record.completed_sessions,
-                results=list(record.results),
-                result_paths=list(record.result_paths),
-            )
+            return self._task_status_locked(record)
 
     def list_tasks(self) -> list[dict[str, Any]]:
         with self._lock:
             out: list[dict[str, Any]] = []
             for record in self._tasks.values():
-                out.append({
-                    "task_id": record.task_id,
-                    "status": record.status,
-                    "harness": record.harness,
-                    "model": record.model,
-                    "num_samples": record.total_sessions,
-                    "completed_sessions": record.completed_sessions,
-                    "errored_sessions": record.errored_sessions,
-                    "mean_reward": _mean_reward(record.results),
-                    "mean_traces": _mean_traces(record.results),
-                    "mean_completions": _mean_completions(record.results),
-                    "created_at": record.created_at,
-                    "updated_at": record.updated_at,
-                    "source": "live",
-                })
+                out.append(
+                    {
+                        "task_id": record.task_id,
+                        "status": record.status,
+                        "harness": record.harness,
+                        "model": record.model,
+                        "num_samples": record.total_sessions,
+                        "completed_sessions": record.completed_sessions,
+                        "errored_sessions": record.errored_sessions,
+                        "mean_reward": _mean_reward(record.results),
+                        "mean_traces": _mean_traces(record.results),
+                        "mean_completions": _mean_completions(record.results),
+                        "created_at": record.created_at,
+                        "updated_at": record.updated_at,
+                        "source": "live",
+                    }
+                )
             return out
 
     def list_sessions_for(self, task_id: str) -> list[dict[str, Any]] | None:
@@ -304,29 +453,30 @@ class RolloutManager:
                 if result is not None:
                     traces = result.trajectory.traces
                     reward = traces[-1].reward if traces else None
-                    out.append({
-                        "session_id": result.session_id,
-                        "task_id": result.task_id,
-                        "status": str(result.status),
-                        "node_id": result.node_id,
-                        "reward": reward,
-                        "timing": result.timing.model_dump(),
-                        "error": result.error,
-                    })
+                    out.append(
+                        {
+                            "session_id": result.session_id,
+                            "task_id": result.task_id,
+                            "status": str(result.status),
+                            "node_id": result.node_id,
+                            "reward": reward,
+                            "timing": result.timing.model_dump(),
+                            "error": result.error,
+                        }
+                    )
                 else:
-                    out.append({
-                        "session_id": session_id,
-                        "task_id": task_id,
-                        "status": status,
-                    })
+                    out.append(
+                        {
+                            "session_id": session_id,
+                            "task_id": task_id,
+                            "status": status,
+                        }
+                    )
             return out
 
     def status(self) -> dict[str, object]:
         with self._lock:
-            task_statuses = {
-                task_id: record.status
-                for task_id, record in self._tasks.items()
-            }
+            task_statuses = {task_id: record.status for task_id, record in self._tasks.items()}
         return {
             "tasks": task_statuses,
             "pipeline": self.pipeline.status(),

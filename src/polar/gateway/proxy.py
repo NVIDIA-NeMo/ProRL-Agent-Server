@@ -10,9 +10,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 import httpx
+import orjson
 
 from polar.gateway.engine import InferenceEngine
 
@@ -66,6 +68,7 @@ class InferenceClient:
     """
 
     _LIVENESS_TIMEOUT_SECONDS = 900.0
+    _WORKER_CACHE_TTL_SECONDS = 5.0
 
     def __init__(self, base_url: str, engine: InferenceEngine):
         self.base_url = base_url.rstrip("/")
@@ -74,6 +77,11 @@ class InferenceClient:
         self._generation_paused = False
         self._inflight_generations = 0
         self._generation_condition = asyncio.Condition()
+        self._worker_discovery_lock = asyncio.Lock()
+        self._worker_urls: tuple[str, ...] = ()
+        self._worker_cache_expires_at = 0.0
+        self._next_worker_index = 0
+        self._next_tokenizer_index = 0
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -122,8 +130,9 @@ class InferenceClient:
         request_copy["stream"] = False
         request_copy = self.engine.prepare_request(request_copy)
         try:
+            completion_url = await self._completion_url(client)
             resp = await client.post(
-                "/v1/chat/completions",
+                completion_url,
                 json=request_copy,
                 headers={"Content-Type": "application/json"},
             )
@@ -133,7 +142,112 @@ class InferenceClient:
             await self._release_generation_slot()
 
         await self._raise_for_status(resp)
-        return self.engine.normalize_response(resp.json())
+        # Completion payloads can contain hundreds of thousands of token and
+        # logprob values.  orjson materially shortens this synchronous decode
+        # section on the gateway's event-loop thread.
+        return self.engine.normalize_response(orjson.loads(resp.content))
+
+    async def tokenize(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Tokenize a prompt with the inference server's exact chat template.
+
+        This deliberately bypasses ``InferenceEngine.prepare_request``: the
+        OpenAI-compatible ``/v1/tokenize`` schema accepts messages, tools and
+        chat-template kwargs, but not generation-only fields such as logprob
+        metadata flags.  Tokenization is read-only and is therefore also not
+        counted as an in-flight generation while trainer weight updates pause
+        new completion requests.
+        """
+
+        client = await self._get_client()
+        try:
+            tokenize_url = await self._tokenize_url(client)
+            resp = await client.post(
+                tokenize_url,
+                json=request,
+                headers={"Content-Type": "application/json"},
+            )
+        except httpx.RequestError as exc:
+            raise self._translate_transport_error(exc) from exc
+
+        await self._raise_for_status(resp)
+        return orjson.loads(resp.content)
+
+    async def _tokenize_url(self, client: httpx.AsyncClient) -> str:
+        """Resolve tokenization to a regular SGLang worker when available."""
+
+        if self.engine.name != "sglang":
+            return "/v1/tokenize"
+        worker_urls = await self._regular_worker_urls(client)
+        if not worker_urls:
+            return "/v1/tokenize"
+        index = self._next_tokenizer_index
+        self._next_tokenizer_index += 1
+        return f"{worker_urls[index % len(worker_urls)]}/v1/tokenize"
+
+    async def _completion_url(self, client: httpx.AsyncClient) -> str:
+        """Resolve SGLang routers to regular workers, with a short-lived cache.
+
+        Source SGLang's router does not consistently preserve the token metadata
+        Polar needs for TIS. Regular workers expose the same OpenAI endpoint and
+        do preserve it, so requests are distributed directly across them. PD
+        (prefill/decode) layouts still go through the router because the router
+        must coordinate both worker types.
+        """
+
+        if self.engine.name != "sglang":
+            return "/v1/chat/completions"
+
+        worker_urls = await self._regular_worker_urls(client)
+        if not worker_urls:
+            return "/v1/chat/completions"
+
+        index = self._next_worker_index
+        self._next_worker_index += 1
+        return f"{worker_urls[index % len(worker_urls)]}/v1/chat/completions"
+
+    async def _regular_worker_urls(self, client: httpx.AsyncClient) -> tuple[str, ...]:
+        now = time.monotonic()
+        if now < self._worker_cache_expires_at:
+            return self._worker_urls
+
+        async with self._worker_discovery_lock:
+            now = time.monotonic()
+            if now < self._worker_cache_expires_at:
+                return self._worker_urls
+
+            worker_urls: tuple[str, ...] = ()
+            try:
+                response = await client.get("/workers")
+                if response.is_success:
+                    payload = response.json()
+                    workers = payload.get("workers") if isinstance(payload, dict) else None
+                    if isinstance(workers, list):
+                        worker_types = {
+                            worker.get("worker_type")
+                            for worker in workers
+                            if isinstance(worker, dict)
+                        }
+                        if not worker_types.intersection({"prefill", "decode"}):
+                            worker_urls = tuple(
+                                url.rstrip("/")
+                                for worker in workers
+                                if isinstance(worker, dict)
+                                and worker.get("worker_type", "regular") == "regular"
+                                and isinstance((url := worker.get("url")), str)
+                                and url.startswith(("http://", "https://"))
+                            )
+                else:
+                    await response.aclose()
+            except (httpx.RequestError, json.JSONDecodeError, TypeError, ValueError):
+                logger.warning(
+                    "Could not discover SGLang workers at %s; using the router",
+                    self.base_url,
+                    exc_info=True,
+                )
+
+            self._worker_urls = tuple(dict.fromkeys(worker_urls))
+            self._worker_cache_expires_at = now + self._WORKER_CACHE_TTL_SECONDS
+            return self._worker_urls
 
     async def _acquire_generation_slot(self) -> None:
         async with self._generation_condition:

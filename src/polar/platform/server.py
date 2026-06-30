@@ -7,11 +7,10 @@ import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from polar.platform.api import (
@@ -140,15 +139,24 @@ def create_app(config: PlatformConfig) -> FastAPI:
 def _mount_static(app: FastAPI) -> None:
     web_dist = _web_dist_path()
     if web_dist is None:
-        # Provide a placeholder so /docs and /api still work without a built frontend.
+        # Keep the same HTML fallback contract as the built SPA. API and docs
+        # routes were registered first and still take precedence; unknown GETs
+        # must not look like live JSON API endpoints merely because the local
+        # frontend has not been built.
+        placeholder = """<!doctype html>
+<html><body><h1>Polar platform service</h1>
+<p>Frontend not built yet. Run <code>cd web &amp;&amp; pnpm install &amp;&amp; pnpm build</code>.</p>
+<p><a href="/docs">API docs</a></p></body></html>"""
+
         @app.get("/")
-        async def _no_frontend() -> dict[str, Any]:
-            return {
-                "status": "ok",
-                "message": "Polar platform service running. Frontend not built yet.",
-                "build_with": "cd web && pnpm install && pnpm build",
-                "api_docs": "/docs",
-            }
+        async def _no_frontend() -> HTMLResponse:
+            return HTMLResponse(placeholder)
+
+        @app.get("/{path:path}", include_in_schema=False)
+        async def _no_frontend_fallback(path: str) -> HTMLResponse:
+            del path
+            return HTMLResponse(placeholder)
+
         return
 
     index_file = web_dist / "index.html"

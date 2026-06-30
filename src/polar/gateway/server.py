@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-import hashlib
 import json
 import logging
 import os
@@ -13,12 +12,17 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+import orjson
 
 from polar.config import GatewayNodeConfig, TopologyConfig
 from polar.gateway.completion_writer import CompletionWriter
 from polar.gateway.detection import APIType, detect, extract_model
-from polar.gateway.engine import get_engine
+from polar.gateway.engine import (
+    POLAR_INFERENCE_TIMINGS_KEY,
+    get_engine,
+    sanitize_inference_timings,
+)
 from polar.gateway.node import GatewayNodeManager
 from polar.gateway.proxy import (
     InferenceClient,
@@ -40,9 +44,9 @@ from polar.gateway.session import (
 from polar.gateway.storage import SessionStore
 from polar.gateway.transform import TransformManager
 from polar.gateway.transform.base import BaseTransformer
+from polar.http_logging import uvicorn_access_log_enabled
 from polar.platform.events import SSE_HEADERS, EventBus
 from polar.rollout.models import SessionDispatchRequest, SessionDispatchResponse, SessionStatus
-from polar.runtime.models import RuntimeSpec
 from polar.trajectory.registry import default_builder_registry, default_evaluator_registry
 
 logging.basicConfig(
@@ -88,6 +92,10 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
         save_dir=save_dir if save_dir else None,
         max_field_bytes=persistence_config.max_field_bytes,
         queue_size=persistence_config.queue_size,
+        write_workers=persistence_config.write_workers,
+        batch_size=persistence_config.batch_size,
+        write_max_attempts=persistence_config.write_max_attempts,
+        retry_backoff_seconds=persistence_config.retry_backoff_seconds,
         enabled=persistence_config.enabled and bool(save_dir),
     )
     storage = SessionStore(completion_writer=completion_writer)
@@ -244,7 +252,9 @@ def _build_error_body(
 ) -> dict[str, Any]:
     if api_type == APIType.ANTHROPIC:
         if isinstance(upstream_body, dict):
-            if upstream_body.get("type") == "error" and isinstance(upstream_body.get("error"), dict):
+            if upstream_body.get("type") == "error" and isinstance(
+                upstream_body.get("error"), dict
+            ):
                 return upstream_body
             error = upstream_body.get("error")
             if isinstance(error, dict):
@@ -267,7 +277,68 @@ def _build_error_body(
     return {"error": {"message": message, "type": error_type}}
 
 
-def _upstream_error_response(api_type: APIType, exc: Exception) -> JSONResponse:
+def _is_openai_context_length_error(message: str) -> bool:
+    """Return whether an upstream message unambiguously reports a context limit."""
+
+    normalized = " ".join(message.lower().split())
+    if any(
+        phrase in normalized
+        for phrase in (
+            "context length exceeded",
+            "context window exceeded",
+            "exceeds the context length",
+            "exceeds context length",
+            "exceeds the context window",
+            "exceeds context window",
+        )
+    ):
+        return True
+
+    # Match both SGLang's "requested token count exceeds the model's maximum
+    # context length" and OpenAI's "model's maximum context length ... your
+    # messages resulted in ... tokens" without reclassifying generic errors
+    # that merely mention context.
+    return "maximum context" in normalized and any(
+        marker in normalized
+        for marker in ("exceed", "requested", "token count", "messages resulted")
+    )
+
+
+def _standardize_openai_context_length_error(
+    api_type: APIType,
+    upstream_body: dict[str, Any] | str | None,
+) -> dict[str, Any] | str | None:
+    """Add the OpenAI fields LiteLLM uses to identify context overflow."""
+
+    if api_type not in (APIType.OPENAI_CHAT, APIType.OPENAI_RESPONSES):
+        return upstream_body
+    if not isinstance(upstream_body, dict):
+        return upstream_body
+    error = upstream_body.get("error")
+    if not isinstance(error, dict):
+        return upstream_body
+    message = error.get("message")
+    if not isinstance(message, str) or not _is_openai_context_length_error(message):
+        return upstream_body
+
+    return {
+        **upstream_body,
+        "error": {
+            **error,
+            "message": message,
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "param": "messages",
+        },
+    }
+
+
+def _upstream_error_response(
+    api_type: APIType,
+    exc: Exception,
+    *,
+    standardize_openai_context_length: bool = False,
+) -> JSONResponse:
     if isinstance(exc, UpstreamHTTPError):
         status_code = exc.status_code
         upstream_body = exc.body
@@ -280,6 +351,9 @@ def _upstream_error_response(api_type: APIType, exc: Exception) -> JSONResponse:
     else:
         status_code = 502
         upstream_body = None
+
+    if standardize_openai_context_length:
+        upstream_body = _standardize_openai_context_length_error(api_type, upstream_body)
 
     return JSONResponse(
         _build_error_body(
@@ -297,10 +371,14 @@ def _stream_error_output(api_type: APIType, exc: Exception) -> str:
     error_type = _error_type_name(exc)
 
     if api_type == APIType.ANTHROPIC:
-        return _format_anthropic_events([{
-            "type": "error",
-            "error": {"type": error_type, "message": message},
-        }])
+        return _format_anthropic_events(
+            [
+                {
+                    "type": "error",
+                    "error": {"type": error_type, "message": message},
+                }
+            ]
+        )
     if api_type == APIType.OPENAI_RESPONSES:
         return _format_responses_events([{"type": "error", "message": message}])
     if api_type == APIType.GOOGLE:
@@ -368,12 +446,22 @@ def _format_stream_events(api_type: APIType, events: list[dict[str, Any]]) -> st
     return _format_openai_sse(events[0]) if events else ""
 
 
-def _completion_metadata(session_info: Any | None) -> dict[str, Any]:
+def _completion_metadata(
+    session_info: Any | None,
+    response: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     metadata = dict(getattr(session_info, "metadata", None) or {})
     if session_info is not None:
         metadata.setdefault("session_id", session_info.session_id)
         if session_info.task_id is not None:
             metadata.setdefault("task_id", session_info.task_id)
+    if response is not None:
+        # Internal engine annotations must not leak into the OpenAI payload.
+        # Store only the sanitized values alongside this exact completion so
+        # trajectory-level aggregation can attribute inference time correctly.
+        timings = sanitize_inference_timings(response.pop(POLAR_INFERENCE_TIMINGS_KEY, None))
+        if timings:
+            metadata["inference_timings"] = timings
     return metadata
 
 
@@ -406,6 +494,45 @@ async def list_models():
         return JSONResponse({"error": str(exc)}, status_code=502)
 
 
+@app.post("/v1/tokenize")
+async def tokenize_request(request: Request) -> Response:
+    """Proxy exact chat-template tokenization without recording a completion.
+
+    Agent-side trajectory budgets need the same tokenizer, tool schema and
+    chat template as generation.  Sending this through the gateway keeps
+    rootless network-isolated sandboxes on their existing UDS transport while
+    intentionally bypassing completion persistence and generation accounting.
+    """
+
+    state = get_state()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
+
+    tokenize_body = dict(body)
+    tokenize_body["model"] = state.node.model_served
+    try:
+        response = await state.inference.tokenize(tokenize_body)
+    except UpstreamError as exc:
+        logger.warning("Upstream tokenization error: %s", exc)
+        return _upstream_error_response(APIType.OPENAI_CHAT, exc)
+    # SGLang also returns every token id.  The budget client only needs the
+    # scalar count; dropping the potentially 262k-element list avoids copying
+    # it over the sandbox UDS and serializing it a second time.
+    compact_response = {
+        key: response[key]
+        for key in ("count", "max_model_len")
+        if key in response
+    }
+    return Response(
+        content=orjson.dumps(compact_response),
+        media_type="application/json",
+    )
+
+
 @app.get("/health")
 async def health():
     state = get_state()
@@ -420,6 +547,7 @@ async def health():
         "gateway_url": state.node.public_url,
         "inference": upstream,
         "metrics": metrics.model_dump(mode="json"),
+        "completion_persistence": state.completion_writer.stats(),
         "active_status_counts": state.session_registry.active_status_counts(),
         "active_sessions": state.session_registry.active_sessions(),
         "available_init": max(0, state.node.max_init_workers - metrics.init_inflight),
@@ -473,15 +601,17 @@ async def list_sessions(
         if task_id and entry.get("task_id") != task_id:
             continue
         metadata = state.storage.get_session_metadata(entry["session_id"]) or {}
-        rows.append({
-            **entry,
-            "completion_count": int(metadata.get("completion_count") or 0),
-            "model_requested": metadata.get("model_requested"),
-            "model_used": metadata.get("model_used"),
-            "api_type": metadata.get("api_type"),
-            "created_at": metadata.get("created_at"),
-            "node_id": state.node.id,
-        })
+        rows.append(
+            {
+                **entry,
+                "completion_count": int(metadata.get("completion_count") or 0),
+                "model_requested": metadata.get("model_requested"),
+                "model_used": metadata.get("model_used"),
+                "api_type": metadata.get("api_type"),
+                "created_at": metadata.get("created_at"),
+                "node_id": state.node.id,
+            }
+        )
     return {"sessions": rows[:limit], "node_id": state.node.id}
 
 
@@ -592,7 +722,17 @@ async def delete_session(session_id: str):
     if safe_session_id is None:
         raise HTTPException(status_code=400, detail="Session ID cannot be empty")
 
-    await state.node_manager.cancel(safe_session_id)
+    cancellation_accepted = await state.node_manager.cancel(safe_session_id)
+    if cancellation_accepted:
+        # Runtime kill/reap and session-directory removal continue in tracked
+        # gateway tasks.  Acknowledge immediately so hundreds of concurrent
+        # early-stop DELETEs do not occupy the rollout client's connections.
+        return SessionDeleteResponse(
+            session_id=safe_session_id,
+            deleted=True,
+            messages_deleted=0,
+        )
+
     info = state.session_registry.get(safe_session_id)
     deleted_count = state.storage.delete_session(safe_session_id)
     if info is None and deleted_count == 0:
@@ -622,8 +762,7 @@ async def proxy_request(request: Request, path: str):
             headers,
             body,
             query_session_id=(
-                request.query_params.get("session_id")
-                or request.query_params.get("key")
+                request.query_params.get("session_id") or request.query_params.get("key")
             ),
         )
     except InvalidSessionIdError as exc:
@@ -633,9 +772,13 @@ async def proxy_request(request: Request, path: str):
     transformer = state.transform_manager.get(api_type)
     session_info = state.session_registry.get(session_id)
 
-    logger.info(
+    logger.debug(
         "← %s %s | api=%s model=%s session=%s",
-        request.method, full_path, api_type.value, original_model, session_id,
+        request.method,
+        full_path,
+        api_type.value,
+        original_model,
+        session_id,
     )
 
     if api_type == APIType.GOOGLE and "streamGenerateContent" in full_path:
@@ -677,13 +820,17 @@ async def _handle_non_streaming(
     *,
     original_model: str,
     session_info: Any | None,
-) -> JSONResponse:
+) -> Response:
     state = get_state()
     try:
         response = await state.inference.completion(openai_request)
     except UpstreamError as exc:
         logger.warning("Non-streaming upstream error for session %s: %s", session_id, exc)
-        return _upstream_error_response(api_type, exc)
+        return _upstream_error_response(
+            api_type,
+            exc,
+            standardize_openai_context_length=True,
+        )
 
     state.storage.save_message(
         session_id,
@@ -695,10 +842,13 @@ async def _handle_non_streaming(
         api_type=api_type.value,
         task_id=session_info.task_id if session_info else None,
         created_at=session_info.created_at.isoformat() if session_info else None,
-        metadata=_completion_metadata(session_info),
+        metadata=_completion_metadata(session_info, response),
     )
     transformed = transformer.transform_response(response, original_request)
-    return JSONResponse(transformed)
+    # Non-streaming SGLang responses carry large token/logprob arrays.  Use the
+    # optimized encoder so serializing them does not monopolize the gateway's
+    # only event-loop thread.
+    return Response(content=orjson.dumps(transformed), media_type="application/json")
 
 
 async def _handle_streaming(
@@ -730,7 +880,7 @@ async def _handle_streaming(
         api_type=api_type.value,
         task_id=session_info.task_id if session_info else None,
         created_at=session_info.created_at.isoformat() if session_info else None,
-        metadata=_completion_metadata(session_info),
+        metadata=_completion_metadata(session_info, response),
     )
 
     synthetic_chunk = _response_to_stream_chunk(response)
@@ -747,7 +897,11 @@ async def _handle_streaming(
                     yield _format_stream_events(api_type, final_events)
             else:
                 output = format_stream_output(
-                    api_type, transformer, synthetic_chunk, original_request, True,
+                    api_type,
+                    transformer,
+                    synthetic_chunk,
+                    original_request,
+                    True,
                 )
                 if output:
                     yield output
@@ -778,15 +932,17 @@ def _response_to_stream_chunk(response: dict[str, Any]) -> dict[str, Any]:
     tool_calls_delta: list[dict[str, Any]] = []
     for i, tc in enumerate(message.get("tool_calls") or []):
         func = tc.get("function", {}) or {}
-        tool_calls_delta.append({
-            "index": i,
-            "id": tc.get("id"),
-            "type": tc.get("type", "function"),
-            "function": {
-                "name": func.get("name", ""),
-                "arguments": func.get("arguments", ""),
-            },
-        })
+        tool_calls_delta.append(
+            {
+                "index": i,
+                "id": tc.get("id"),
+                "type": tc.get("type", "function"),
+                "function": {
+                    "name": func.get("name", ""),
+                    "arguments": func.get("arguments", ""),
+                },
+            }
+        )
 
     delta: dict[str, Any] = {"role": "assistant"}
     if message.get("content") is not None:
@@ -801,11 +957,13 @@ def _response_to_stream_chunk(response: dict[str, Any]) -> dict[str, Any]:
         "object": "chat.completion.chunk",
         "created": response.get("created"),
         "model": response.get("model"),
-        "choices": [{
-            "index": 0,
-            "delta": delta,
-            "finish_reason": choice.get("finish_reason"),
-        }],
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "finish_reason": choice.get("finish_reason"),
+            }
+        ],
         "usage": response.get("usage"),
     }
 
@@ -825,6 +983,7 @@ def serve(
         host=state.node.host,
         port=state.node.port,
         log_level=log_level,
+        access_log=uvicorn_access_log_enabled(),
     )
 
 

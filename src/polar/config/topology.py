@@ -80,7 +80,14 @@ class GatewayNodeConfig(_StrictModel):
 class _CompletionPersistenceConfig(_StrictModel):
     enabled: bool = True
     max_field_bytes: int = Field(default=1 * 1024 * 1024, gt=0)
-    queue_size: int = Field(default=1024, gt=0)
+    # One 576-session fully-async rollout can create more than ten thousand
+    # turn-level completion records.  Keep a bounded burst buffer, then apply
+    # lossless backpressure if storage remains slower than producers.
+    queue_size: int = Field(default=16_384, gt=0)
+    write_workers: int = Field(default=8, gt=0, le=64)
+    batch_size: int = Field(default=16, gt=0, le=1024)
+    write_max_attempts: int = Field(default=3, gt=0, le=10)
+    retry_backoff_seconds: float = Field(default=0.1, ge=0, le=60)
 
 
 class GatewayConfig(_StrictModel):
@@ -115,6 +122,14 @@ class RolloutServiceConfig(_StrictModel):
     save_dir: str | None = None
     dispatch_poll_interval_seconds: float = Field(default=1.0, gt=0)
     callback_grace_seconds: float = Field(default=120.0, ge=0)
+    # A fully-async trainer can keep hundreds of sessions in flight.  httpx's
+    # default of 100 connections is too small for the 576-session production
+    # topology and makes terminal DELETE requests fail with PoolTimeout.
+    http_max_connections: int = Field(default=1024, gt=0)
+    http_max_keepalive_connections: int = Field(default=256, ge=0)
+    cleanup_max_concurrency: int = Field(default=128, gt=0)
+    cleanup_max_attempts: int = Field(default=3, ge=1, le=10)
+    cleanup_retry_backoff_seconds: float = Field(default=0.1, ge=0)
 
     @model_validator(mode="before")
     @classmethod
@@ -147,6 +162,20 @@ class RolloutServiceConfig(_StrictModel):
     @classmethod
     def _validate_public_url(cls, value: str) -> str:
         return _normalize_http_url(value, "rollout.public_url")
+
+    @model_validator(mode="after")
+    def _validate_http_concurrency(self) -> "RolloutServiceConfig":
+        if self.http_max_keepalive_connections > self.http_max_connections:
+            raise ValueError(
+                "rollout.http_max_keepalive_connections cannot exceed "
+                "rollout.http_max_connections"
+            )
+        if self.cleanup_max_concurrency > self.http_max_connections:
+            raise ValueError(
+                "rollout.cleanup_max_concurrency cannot exceed "
+                "rollout.http_max_connections"
+            )
+        return self
 
 
 class TopologyConfig(_StrictModel):

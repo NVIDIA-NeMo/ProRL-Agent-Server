@@ -5,31 +5,83 @@ polar_reward_key: "score"
 polar_max_async_level: ${POLAR_MAX_ASYNC_LEVEL}
 polar_fully_async: ${POLAR_FULLY_ASYNC}
 polar_request_timeout: ${POLAR_REQUEST_TIMEOUT}
+# Infrastructure/session budget. The bridge takes max(dataset timeout, floor),
+# while metadata.agent_timeout remains a separate active RUN-stage model cap.
+polar_task_timeout_floor: ${POLAR_TASK_TIMEOUT_FLOOR_SECONDS}
+# Train-only active RUN-stage cap. Eval payloads deliberately keep each
+# dataset row's metadata.agent_timeout instead of inheriting this override.
+polar_train_agent_timeout: ${TMAX_TRAIN_AGENT_TIMEOUT_SECONDS}
 polar_callback_host: "${POLAR_CALLBACK_HOST}"
 polar_min_complete_accept_fraction: ${POLAR_MIN_COMPLETE_ACCEPT_FRACTION}
+polar_early_stop_grace_sessions: ${POLAR_EARLY_STOP_GRACE_SESSIONS}
+# Exact trainer-side acceptance cap. This is prompt (2,048) plus the complete
+# multi-turn response budget (65,536), not Slime's per-turn generation cap.
+polar_max_trajectory_tokens: ${TMAX_TRAIN_PACK_LENGTH}
 polar_agent_cli_dir: ${AGENT_CLI_DIR}
 polar_apptainer_image_dir: ${APPTAINER_IMAGE_DIR}
+polar_eval_aggregate_weights:
+  "${TMAX_EVAL_DATASET_NAME}": ${TMAX_EVAL_WEIGHT}
+  "${TMAX_EXTERNAL_EVAL_DATASET_NAME}": ${TMAX_EXTERNAL_EVAL_WEIGHT}
 
 polar_task_template:
   timeout_seconds: "{sample.metadata.timeout_seconds}"
   runtime:
     backend: "apptainer"
-    image: "{args.polar_apptainer_image_dir}/{sample.metadata.task_name}.sif"
-    network: "host"
+    # Each row pins its exact local image. This supports both TMax SIFs and
+    # external Harbor/Terminal-Bench raw SquashFS (.sqsh) images.
+    image: "{sample.metadata.sif_path}"
+    network: "${POLAR_SANDBOX_NETWORK}"
     allow_internet: "{sample.metadata.allow_internet}"
     workdir: "{sample.metadata.workdir}"
+    # Under nested direct Apptainer exec + --pid, image env hooks run under
+    # appinit. Re-run only TMax's standardized service hook in the actual
+    # workload shell (once in a broker owner, or once per fresh exec), so its
+    # background services remain alive while that command runs. No task SIF
+    # rebuild is required.
+    direct_exec_init_command: >-
+      if [ -f /.singularity.d/env/99-rogue.sh ]; then
+        . /.singularity.d/env/99-rogue.sh;
+      fi
     env:
       HOME: "/polar/session/home"
       PATH: "${POLAR_AGENT_PATH}"
+      OMP_NUM_THREADS: "${OMP_NUM_THREADS}"
+      OPENBLAS_NUM_THREADS: "${OPENBLAS_NUM_THREADS}"
+      MKL_NUM_THREADS: "${MKL_NUM_THREADS}"
+      NUMEXPR_NUM_THREADS: "${NUMEXPR_NUM_THREADS}"
+      TOKENIZERS_PARALLELISM: "${TOKENIZERS_PARALLELISM}"
+      # With rootless network=none, the injected mini-SWE runner connects
+      # LiteLLM directly to the first UDS and exposes the second as a private
+      # loopback HTTP proxy for action subprocesses (pip/curl/git HTTP).
+      POLAR_GATEWAY_UDS: "${POLAR_SANDBOX_GATEWAY_UDS}"
+      POLAR_HTTP_PROXY_UDS: "${POLAR_SANDBOX_HTTP_PROXY_UDS}"
+      POLAR_HTTP_PROXY_PORT: "${POLAR_SANDBOX_HTTP_PROXY_PORT}"
+      # The nested direct-exec broker is deliberately stdlib-only, but some
+      # task images do not ship Python. Reuse the read-only portable interpreter
+      # already mounted for mini-SWE-agent; no task SIF rebuild is required.
+      POLAR_APPTAINER_BROKER_PYTHON: "/opt/polar-mini-swe-agent/venv/bin/python"
+      POLAR_APT_HTTP_SOURCE_POLICY: "${POLAR_APT_HTTP_SOURCE_POLICY}"
+      http_proxy: "${http_proxy}"
+      https_proxy: "${https_proxy}"
+      HTTP_PROXY: "${HTTP_PROXY}"
+      HTTPS_PROXY: "${HTTPS_PROXY}"
+      no_proxy: "${no_proxy}"
+      NO_PROXY: "${NO_PROXY}"
     kwargs:
       volumes:
         - "{args.polar_agent_cli_dir}:/opt/node:ro"
+        - "${POLAR_GATEWAY_UDS_DIR}:/polar/gateway:ro"
 ${POLAR_AGENT_RUNTIME_VOLUME}
+${POLAR_INTERNET_RUNTIME_VOLUME}
     prepare:
       - type: exec
         command: >-
           mkdir -p /polar/session/home /polar/session/logs/agent &&
-          git config --global core.pager ''
+          if command -v git >/dev/null 2>&1; then
+            git config --global core.pager '';
+          fi
+        max_attempts: 3
+        retry_backoff_seconds: 0.1
   agent:
     harness: "${POLAR_AGENT_HARNESS}"
     model_name: "${POLAR_AGENT_MODEL_NAME}"
@@ -37,6 +89,14 @@ ${POLAR_AGENT_RUNTIME_VOLUME}
       version: ""
       step_limit: ${POLAR_AGENT_STEP_LIMIT}
       cost_limit: ${POLAR_AGENT_COST_LIMIT}
+      response_token_budget: ${TMAX_MAX_TOTAL_RESPONSE_LEN}
+      model_kwargs:
+        temperature: ${POLAR_AGENT_TEMPERATURE}
+        top_p: ${POLAR_AGENT_TOP_P}
+        max_tokens: ${POLAR_AGENT_MAX_TOKENS}
+        extra_body:
+          chat_template_kwargs:
+            enable_thinking: ${POLAR_AGENT_ENABLE_THINKING}
   builder:
     strategy: "prefix_merging"
   evaluator:

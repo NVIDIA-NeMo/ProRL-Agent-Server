@@ -1,0 +1,4 @@
+# Torch 2.11/cu130's resolver otherwise selects nvidia-cublas 13.1.0.3,
+# which is ABI-incompatible with Transformer Engine 2.16.1. Keep this override
+# on every uv transaction that targets the shared Polar training environment.
+nvidia-cublas==13.3.0.5

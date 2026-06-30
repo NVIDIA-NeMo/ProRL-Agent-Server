@@ -53,7 +53,7 @@ rendered topology that `run.sh` writes at launch.)
 | `launch_e2e.sh` | One-shot entry: setup + run |
 | `run.sh` | Launches Polar services + Ray + Slime training job |
 | `convert_weights.sh` | HF checkpoint → Megatron torch_dist |
-| `model_args.sh` | Qwen3.5-4B Megatron args, shared by `run.sh` + `convert_weights.sh` |
+| `model_args.sh` | Default Qwen3.5-4B Megatron args; set `MODEL_ARGS_FILE` for another architecture |
 | `topology.yaml` | Polar topology template (`${SGLANG_ROUTER_BASE_URL}` filled at runtime) |
 | `polar_config.yaml` | Polar bridge config template (`${AGENT_CLI_DIR}`, `${APPTAINER_IMAGE_DIR}` filled at runtime) |
 | `prepare_data.py` | Builds `swegym_train_293.jsonl` |
@@ -69,4 +69,4 @@ rendered topology that `run.sh` writes at launch.)
 | Per-task timeout, async level, callback host | `polar_config.yaml` → `polar_*` keys |
 | Gateway/rollout host & port, model served | `topology.yaml` |
 | Which SWE-Gym dataset / split | `sample_tasks.py` → `DATASET_NAME`, `DATASET_SPLITS` |
-| Model architecture args (don't change unless swapping models) | `model_args.sh` |
+| Model architecture args | `MODEL_ARGS_FILE` (defaults to `model_args.sh`) |

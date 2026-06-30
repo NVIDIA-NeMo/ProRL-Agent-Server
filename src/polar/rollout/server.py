@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from polar.config import RolloutServiceConfig, TopologyConfig
+from polar.http_logging import uvicorn_access_log_enabled
 from polar.platform.events import SSE_HEADERS, EventBus
 from polar.rollout.balancer import NodeScheduler
 from polar.rollout.manager import RolloutManager
@@ -23,6 +24,7 @@ from polar.rollout.models import (
     TaskStatus,
 )
 from polar.rollout.pipeline import Pipeline
+from polar.runtime.assets import RuntimeAssetUnavailableError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,6 +65,11 @@ def _build_state(topology: TopologyConfig) -> RolloutState:
         scheduler=scheduler,
         dispatch_poll_interval_seconds=rollout.dispatch_poll_interval_seconds,
         callback_grace_seconds=rollout.callback_grace_seconds,
+        http_max_connections=rollout.http_max_connections,
+        http_max_keepalive_connections=rollout.http_max_keepalive_connections,
+        cleanup_max_concurrency=rollout.cleanup_max_concurrency,
+        cleanup_max_attempts=rollout.cleanup_max_attempts,
+        cleanup_retry_backoff_seconds=rollout.cleanup_retry_backoff_seconds,
         event_bus=event_bus,
     )
     manager = RolloutManager(pipeline=pipeline, scheduler=scheduler, event_bus=event_bus)
@@ -94,6 +101,7 @@ async def _lifespan(_: FastAPI):
     try:
         yield
     finally:
+        await state.manager.close()
         await state.pipeline.close()
 
 
@@ -115,6 +123,9 @@ async def submit_task_async(request: TaskRequest):
     state = get_state()
     try:
         task_id = await state.manager.submit_task(request)
+    except RuntimeAssetUnavailableError as exc:
+        logger.error("Rejecting rollout task %s: %s", request.task_id, exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"task_id": task_id, "status": "running"}
@@ -123,6 +134,21 @@ async def submit_task_async(request: TaskRequest):
 @app.get("/rollout/task/{task_id}", response_model=TaskStatus)
 async def get_task(task_id: str):
     task = get_state().manager.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
+@app.delete("/rollout/task/{task_id}", response_model=TaskStatus)
+async def cancel_task(
+    task_id: str,
+    register_if_missing: bool = Query(default=False),
+):
+    """Cancel a rollout task and all gateway sessions owned by it."""
+    task = await get_state().manager.cancel_task(
+        task_id,
+        register_if_missing=register_if_missing,
+    )
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
@@ -230,6 +256,7 @@ def serve(topology_path: str = "topology.yaml", *, log_level: str = "info") -> N
         host=state.rollout.host,
         port=state.rollout.port,
         log_level=log_level,
+        access_log=uvicorn_access_log_enabled(),
     )
 
 

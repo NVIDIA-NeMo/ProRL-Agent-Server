@@ -49,6 +49,7 @@ EXPERIMENT_NAME="${EXPERIMENT_NAME:-swegym-slime-grpo-qwen35-4b-4n8h100}"
 RUN_ID="${RUN_ID:-${EXPERIMENT_NAME}}"
 SAVE_DIR="${SAVE_DIR:-${DATA_ROOT}/ckpt/${RUN_ID}}"
 RUN_DIR="${RUN_DIR:-}"
+POLAR_ROLLOUT_SAVE_DIR="${POLAR_ROLLOUT_SAVE_DIR:-}"
 
 if [ ! -f "${MEGATRON_DIR}/megatron/training/tokenizer/tokenizer.py" ]; then
     echo "ERROR: slime requires a Megatron checkout with megatron.training.tokenizer: ${MEGATRON_DIR}" >&2
@@ -68,9 +69,10 @@ case "$TRAIN_SQSH" in
     *) : ;;  # docker:// or registry ref — leave it to pyxis/enroot to resolve
 esac
 LOG_DIR="${PROJECT_ROOT}/logs/slurm"; mkdir -p "${LOG_DIR}"
+POLAR_LAUNCHER_LABEL="${POLAR_LAUNCHER_LABEL:-Polar SWE-Gym Slime-GRPO (Route A)}"
 
 echo "============================================="
-echo "Polar SWE-Gym Slime-GRPO (Route A) — SLURM submission"
+echo "${POLAR_LAUNCHER_LABEL} — SLURM submission"
 echo "  Train sqsh: ${TRAIN_SQSH}"
 echo "  SIF dir:    ${APPTAINER_IMAGE_DIR}   (<instance_id>.sif)"
 echo "  apptainer:  ${APPT_BIN}  NO_INSTANCE=${NO_INSTANCE}"
@@ -105,6 +107,7 @@ export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_PROJECT="${WANDB_PROJECT:-polar-swegym-grpo}"
 export WANDB_GROUP="${WANDB_GROUP:-swegym-qwen35-4b-async-grpo}"
 export EXPERIMENT_NAME RUN_ID SAVE_DIR RUN_DIR SLURM_GPUS
+export POLAR_ROLLOUT_SAVE_DIR
 export RAY_NUM_GPUS_PER_NODE="${RAY_NUM_GPUS_PER_NODE:-${SLURM_GPUS}}"
 CONTAINER_ENTRYPOINT="${SCRIPT_DIR}/run_in_container.sh"
 if [ ! -f "${CONTAINER_ENTRYPOINT}" ]; then
@@ -115,6 +118,7 @@ fi
 # Do not propagate the submit shell's SLURM/PMIx state into a new allocation.
 # Persist only the training contract and pass one short env-file pointer through
 # sbatch; the file is private because it can contain W&B/HF credentials.
+export SLIME_SUBMIT_UNIX_NS="$(date +%s%N)"
 TRAIN_ENV_DIR="${DATA_ROOT}/runs/${RUN_ID}/submit"
 mkdir -p "${TRAIN_ENV_DIR}"
 POLAR_TRAIN_ENV_FILE="${TRAIN_ENV_DIR}/env-$(date -u +%Y%m%dT%H%M%SZ)-$$.sh"
@@ -124,19 +128,26 @@ umask 077
     while IFS= read -r name; do
         case "$name" in
             POLAR_*|POLR_*|TMAX_*|MINI_SWE_*|WANDB_*|HF_*|HUGGINGFACE_*|\
-            ACTOR_*|ROLLOUT_*|RAY_NUM_*|GPU_MONITOR_*|SGLANG_*|\
+            ACTOR_*|ROLLOUT_*|RAY_NUM_*|GPU_MONITOR_*|SGLANG_*|FLASHINFER_*|\
             APPTAINER_IMAGE_DIR|AGENT_CLI_DIR|TRAIN_CONTAINER_MOUNTS|\
-            SLIME_DIR|SLIME_ROLLOUT_BASE_PORT|MEGATRON_DIR|REF_LOAD|TORCH_DIST_DIR|\
+            SLIME_DIR|SLIME_ROLLOUT_BASE_PORT|SLIME_ROLLOUT_BASE_PORT_FALLBACK|\
+            SLIME_EPHEMERAL_PORT_LOWER_BOUND|SLIME_IP_LOCAL_PORT_RANGE_PATH|\
+            SLIME_GRACEFUL_EXIT_AT_UNIX_TIME|SLIME_PROFILE_CUDA_PHASES|\
+            SLIME_SUBMIT_UNIX_NS|MEGATRON_DIR|REF_LOAD|TORCH_DIST_DIR|MODEL_ARGS_FILE|\
             ACCOUNT|PARTITION|NUM_NODES|WALL_TIME|CPUS_PER_TASK|SLURM_GPUS|\
             N_SAMPLES_PER_PROMPT|NUM_STEPS_PER_ROLLOUT|NUM_EPOCH|\
-            SEQ_LENGTH|MAX_TOKENS_PER_GPU|SAVE_INTERVAL|SEQUENCE_PARALLEL|\
+            SEQ_LENGTH|MAX_TOKENS_PER_GPU|SAVE_INTERVAL|SEQUENCE_PARALLEL|CONTEXT_PARALLEL_SIZE|\
+            TRAIN_LR|KL_LOSS_COEF|POLICY_LOSS_TYPE|USE_TIS|GRPO_STD_NORMALIZATION|\
+            DPPO_DIVERGENCE_TYPE|DPPO_DIVERGENCE_THRESHOLD|\
+            MAX_TRAIN_ROLLOUT_LOGPROB_ABS_DIFF|\
+            CALCULATE_PER_TOKEN_LOSS|\
             DIST_CKPT_STRICTNESS|ATTENTION_BACKEND|\
             GLOBAL_BATCH_SIZE|EVAL_GLOBAL_BATCH_SIZE|EXPERIMENT_NAME|RUN_ID|\
-            SAVE_DIR|RUN_DIR|PROMPT_DATA|REQUIRE_SWEGYM_HARNESS|\
+            SAVE_DIR|LOAD_DIR|RUN_DIR|PROMPT_DATA|REQUIRE_SWEGYM_HARNESS|\
             OMP_NUM_THREADS|OPENBLAS_NUM_THREADS|MKL_NUM_THREADS|\
             NUMEXPR_NUM_THREADS|TOKENIZERS_PARALLELISM|\
             TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD|\
-            http_proxy|https_proxy|no_proxy|NO_PROXY)
+            http_proxy|https_proxy|HTTP_PROXY|HTTPS_PROXY|no_proxy|NO_PROXY)
                 printf 'export %s=%q\n' "$name" "${!name}"
                 ;;
         esac
@@ -159,7 +170,7 @@ SLURM_STEP_CPUS_PER_TASK="${SLURM_STEP_CPUS_PER_TASK:-96}"
 # the entire 128-CPU allocation on an overlapping step makes the NVIDIA select
 # plugin reject step creation. Leave CPU headroom for the batch shell and let
 # the step inherit job-level GPU and memory TRES.
-WRAP_CMD="umask 077; chmod 600 ${LOG_Q}/\"\${SLURM_JOB_NAME}-\${SLURM_JOB_ID}.out\" ${LOG_Q}/\"\${SLURM_JOB_NAME}-\${SLURM_JOB_ID}.err\" 2>/dev/null || true; ${SRUN_Q} --overlap --nodes=${NUM_NODES} --ntasks=${NUM_NODES} --ntasks-per-node=1 --cpus-per-task=${SLURM_STEP_CPUS_PER_TASK} --cpu-bind=none --kill-on-bad-exit=1 --container-image=${SQSH_Q} --container-mounts=${MNT_Q} --container-workdir=${PR_Q} --container-writable --no-container-mount-home bash ${ENTRY_Q}"
+WRAP_CMD="umask 077; chmod 600 ${LOG_Q}/\"\${SLURM_JOB_NAME}-\${SLURM_JOB_ID}.out\" ${LOG_Q}/\"\${SLURM_JOB_NAME}-\${SLURM_JOB_ID}.err\" 2>/dev/null || true; export SLIME_SLURM_BATCH_START_UNIX_NS=\$(date +%s%N); ${SRUN_Q} --overlap --nodes=${NUM_NODES} --ntasks=${NUM_NODES} --ntasks-per-node=1 --cpus-per-task=${SLURM_STEP_CPUS_PER_TASK} --cpu-bind=none --kill-on-bad-exit=1 --container-image=${SQSH_Q} --container-mounts=${MNT_Q} --container-workdir=${PR_Q} --container-writable --no-container-mount-home bash ${ENTRY_Q}"
 
 SBATCH_CONSTRAINT_ARG=()
 if [ -n "${SLURM_CONSTRAINT}" ]; then
@@ -171,6 +182,19 @@ if [ -n "${SBATCH_DEPENDENCY}" ]; then
 fi
 
 SUBMIT_BACKEND="${SUBMIT_BACKEND:-srun}"
+if [ -n "${POLAR_SUBMIT_RECEIPT_FILE:-}" ] && [ "${SUBMIT_BACKEND}" != "sbatch" ]; then
+    echo "ERROR: POLAR_SUBMIT_RECEIPT_FILE requires SUBMIT_BACKEND=sbatch" >&2
+    exit 1
+fi
+if [ -n "${POLAR_SUBMIT_RECEIPT_FILE:-}" ] && [ "${SUBMIT_DRY_RUN:-0}" != "1" ]; then
+    # Check writability before submitting; after sbatch succeeds, failure to
+    # record its id would make an automated watcher unable to avoid duplicates.
+    RECEIPT_DIR="$(dirname "${POLAR_SUBMIT_RECEIPT_FILE}")"
+    RECEIPT_PROBE="${POLAR_SUBMIT_RECEIPT_FILE}.probe.$$"
+    mkdir -p "${RECEIPT_DIR}"
+    (umask 077; : >"${RECEIPT_PROBE}")
+    rm -f "${RECEIPT_PROBE}"
+fi
 if [ "${SUBMIT_BACKEND}" = "srun" ]; then
     if [ -n "${SBATCH_DEPENDENCY}" ]; then
         echo "ERROR: SUBMIT_BACKEND=srun does not support SBATCH_DEPENDENCY" >&2
@@ -230,6 +254,7 @@ if [ "${SUBMIT_BACKEND}" = "srun" ]; then
         exit 0
     fi
 
+    export SLIME_SLURM_BATCH_START_UNIX_NS="$(date +%s%N)"
     nohup "${SRUN_LAUNCH[@]}" >"${SRUN_OUT}" 2>"${SRUN_ERR}" </dev/null &
     SRUN_PID=$!
     echo ""
@@ -245,6 +270,11 @@ if [ "${SUBMIT_DRY_RUN:-0}" = "1" ]; then
     exit 0
 fi
 
+# Slurm propagates SLURM_* variables even with a restrictive --export list.
+# When a CPU watcher submits this GPU allocation, an inherited
+# SLURM_MEM_PER_NODE (for example 2 GiB) is otherwise consumed by the nested
+# srun below and shrinks that step to the watcher's memory limit even though
+# the new job itself was allocated all node memory via --mem=0.
 JOB_ID=$(env \
     -u SLURM_JOB_ID \
     -u SLURM_JOBID \
@@ -261,6 +291,12 @@ JOB_ID=$(env \
     -u SLURM_GPUS \
     -u SLURM_CONSTRAINT \
     -u SLURM_STEP_CPUS_PER_TASK \
+    -u SLURM_MEM_PER_NODE \
+    -u SLURM_MEM_PER_CPU \
+    -u SLURM_MEM_PER_GPU \
+    -u SBATCH_MEM_PER_NODE \
+    -u SBATCH_MEM_PER_CPU \
+    -u SBATCH_MEM_PER_GPU \
     sbatch \
     --nodes="${NUM_NODES}" \
     --ntasks="${NUM_NODES}" \
@@ -279,6 +315,19 @@ JOB_ID=$(env \
     --export="POLAR_TRAIN_ENV_FILE=${POLAR_TRAIN_ENV_FILE}" \
     --parsable \
     --wrap="${WRAP_CMD}")
+JOB_ID="${JOB_ID%%;*}"
+
+if [ -n "${POLAR_SUBMIT_RECEIPT_FILE:-}" ]; then
+    RECEIPT_TMP="${POLAR_SUBMIT_RECEIPT_FILE}.tmp.$$"
+    SUBMITTED_AT_UNIX="$(date +%s)"
+    umask 077
+    {
+        printf 'export POLAR_SUBMITTED_JOB_ID=%q\n' "${JOB_ID}"
+        printf 'export POLAR_SUBMITTED_AT_UNIX=%q\n' "${SUBMITTED_AT_UNIX}"
+    } >"${RECEIPT_TMP}"
+    chmod 600 "${RECEIPT_TMP}"
+    mv "${RECEIPT_TMP}" "${POLAR_SUBMIT_RECEIPT_FILE}"
+fi
 
 echo ""
 echo "Submitted SLURM job: ${JOB_ID}"

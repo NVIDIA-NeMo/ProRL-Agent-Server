@@ -1,0 +1,109 @@
+# Minimal mini-SWE 2.x config matching the Tmax paper's Vanillux2 protocol.
+# Prompt source: hamishivi/tmax@1cce58a, Apache-2.0.
+agent:
+  system_template: |
+    You are a helpful assistant that can interact with a computer.
+
+    Your response must include a THOUGHT section before your action where you
+    explain your reasoning. After the THOUGHT, you must call the `bash` tool
+    with EXACTLY ONE bash command (multiple commands chained with `&&` or `||`
+    count as a single action).
+
+    Failure to follow these rules — calling no tool, calling a tool other than
+    `bash`, or omitting the THOUGHT — will cause your response to be rejected.
+
+  instance_template: |
+    Please solve this task:
+
+    {{task}}
+
+    You can execute bash commands and edit files (with `sed`, `cat > file << 'EOF'`,
+    etc.) to implement the necessary changes.
+
+    ## Recommended Workflow
+
+    This workflow should be done step-by-step so that you can iterate on your
+    changes and any possible problems.
+
+    1. Analyze the codebase / environment by finding and reading relevant files.
+    2. If applicable, create a script to reproduce the issue or expected behaviour.
+    3. Implement the change(s) by editing the source code or environment state.
+    4. Verify your fix works by running your script (or relevant test) again.
+    5. Test edge cases to ensure your fix is robust.
+    6. Submit your changes and finish your work by issuing the following command:
+       `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+       Do not combine it with any other command. After this command, you cannot
+       continue working on this task.
+
+    ## Important Rules
+
+    1. Every response must contain exactly one tool call to `bash`.
+    2. Directory and environment-variable changes ARE persistent across calls
+       in this harness — you can `cd` and `export` and subsequent commands will
+       see the change. (This differs from upstream mini-swe-agent's subshell
+       model; treat the shell as a long-running login shell.)
+    3. Long-running commands: wrap with `timeout`, e.g. `timeout 30 <command>`.
+    4. Interactive commands are not possible. Use `yes`/`no` piping or
+       non-interactive flags as appropriate.
+    5. Output may be truncated. Use `head`, `tail`, `grep`, `sed -n 'A,Bp'`,
+       etc. to filter large outputs.
+
+    ## Useful command examples
+
+    ### Create a new file:
+    `cat <<'EOF' > newfile.py
+    import numpy as np
+    hello = "world"
+    print(hello)
+    EOF`
+
+    ### Edit files with sed:
+    `sed -i 's/old_string/new_string/g' filename.py`        # all occurrences
+    `sed -i '1s/old_string/new_string/' filename.py`         # first on line 1
+    `sed -i '1,10s/old_string/new_string/g' filename.py`     # lines 1-10
+
+    ### View file content:
+    `nl -ba filename.py | sed -n '10,20p'`
+
+  step_limit: 64
+  cost_limit: 0.0
+  max_consecutive_format_errors: 64
+
+environment:
+  timeout: 120
+  max_output_chars: 10000
+  state_dir: /polar/session/home/.vanillux2
+  env:
+    PAGER: cat
+    MANPAGER: cat
+    LESS: -R
+    PIP_PROGRESS_BAR: "off"
+    TQDM_DISABLE: "1"
+
+model:
+  # Cumulative multi-turn trajectory growth (current rendered prompt minus
+  # first rendered prompt). The model adapter enforces this with the serving
+  # tokenizer; max_tokens below remains the per-turn cap.
+  response_token_budget: 65536
+  model_kwargs:
+    drop_params: true
+    max_tokens: 16384
+    temperature: 0.7
+    top_p: 0.95
+  observation_template: |
+    {%- if output.output -%}
+    {{ output.output }}
+    {%- else -%}
+    (no output)
+    {%- endif %}
+    {%- if output.exception_info %}
+    {{ output.exception_info }}
+    {%- endif %}
+
+    (exit_code={{ output.returncode }})
+  format_error_template: |
+    Format error: {{error}}
+
+    Please always provide EXACTLY ONE call to the `bash` tool. If you want to
+    end the task, please issue the command `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+    via the `bash` tool, with no other content in the command.

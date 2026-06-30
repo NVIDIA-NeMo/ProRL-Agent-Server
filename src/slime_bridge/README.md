@@ -18,8 +18,9 @@ Slime calls one entry point, `generate_rollout_polar_async`, wired in via
   async admission bounded to the current request or an explicitly enabled
   fixed fully-async prefetch window;
 - converts each Polar `Trajectory` back into Slime `Sample`s (one per trace,
-  grouped with `rollout_id` so all traces from a trajectory count once), clipping
-  overlong prompt history and dropping unusable traces;
+  grouped with `rollout_id` so all traces from a trajectory count once), keeping
+  an exact causal prefix of overlong traces and dropping traces whose full prompt
+  leaves no trainable-token budget;
 - computes dynamic-trace leave-one-trajectory-out advantages and zeroes out
   failed/aborted trajectories.
 
@@ -40,6 +41,10 @@ Slime calls one entry point, `generate_rollout_polar_async`, wired in via
 ## What the bridge owns
 
 - Turn Slime samples + prompts into Polar task requests and submit async batches.
+- Optionally apply `polar_task_timeout_floor` to the rendered task budget while
+  preserving any larger dataset timeout. A validated
+  `sample.metadata.agent_timeout` is forwarded separately; gateways start that
+  active-agent budget at RUN rather than spending it in INIT/READY queues.
 - Track rollout ids / policy versions and bound async admission.
 - When `polar_fully_async: true`, keep a fixed
   `rollout_batch_size * polar_max_async_level` prefetch window warm across
@@ -49,6 +54,29 @@ Slime calls one entry point, `generate_rollout_polar_async`, wired in via
 - Convert Polar trajectories back into Slime samples; compute dynamic-trace
   advantages.
 - Run the evaluation path over `eval_datasets` and emit W&B metrics.
+
+## Optional eval-data integrity pin
+
+Launchers can set `POLAR_EVAL_DATA_INTEGRITY_B64` to a base64-encoded JSON
+manifest. The bridge remains backward compatible when it is unset. When set,
+every configured eval dataset must have a canonical-path entry, and the bridge
+SHA-256 hashes the exact bytes it parses on every evaluation. A changed or
+unlisted file fails before any Polar task is submitted. The version-1 envelope
+is intentionally launcher-agnostic:
+
+```json
+{
+  "schema_version": 1,
+  "algorithm": "sha256",
+  "datasets": [
+    {"name": "holdout", "path": "/abs/eval.jsonl", "sha256": "<64 hex>"}
+  ]
+}
+```
+
+Keep the encoded JSON in the worker environment rather than passing only a
+mutable manifest path; an on-disk copy may still be retained for experiment
+auditing. The TMax launcher generates both forms automatically.
 
 ## Slime installation
 

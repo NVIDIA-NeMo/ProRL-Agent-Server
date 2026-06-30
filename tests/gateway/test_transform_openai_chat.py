@@ -121,6 +121,20 @@ def test_openai_chat_merges_developer_role_for_non_qwen_models() -> None:
     assert "chat_template_kwargs" not in transformed
 
 
+def test_qwen35_explicit_thinking_request_is_not_disabled() -> None:
+    transformer = OpenAIChatTransformer()
+
+    transformed = transformer.transform_request(
+        {
+            "_polar_model_served": "Qwen/Qwen3.5-9B",
+            "messages": [{"role": "user", "content": "use bash"}],
+            "chat_template_kwargs": {"enable_thinking": True},
+        }
+    )
+
+    assert transformed["chat_template_kwargs"]["enable_thinking"] is True
+
+
 def test_openai_chat_preserves_tool_turns_and_reasoning_content() -> None:
     transformer = OpenAIChatTransformer()
     body = {

@@ -23,17 +23,26 @@ Config schema (:class:`~polar.trajectory.models.EvaluatorSpec.config`)
 - ``tests_target`` *(str, default ``/tests``)* — where the verifier is injected.
 - ``verifier_dir`` *(str, default ``/logs/verifier``)* — where ``test.sh`` writes.
 - ``test_command`` *(str, default ``bash /tests/test.sh``)* — verifier entrypoint.
+- ``upload_attempts`` *(int, default 3)* — attempts for transient verifier upload
+  failures before the sample is marked erroneous.
+- ``upload_retry_backoff_seconds`` *(float, default 0.1)* — initial exponential
+  backoff between upload attempts.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
-from polar.runtime.base import BaseRuntime
+from polar.runtime.base import BaseRuntime, RuntimeDestroyedError
 from polar.trajectory.evaluator.base import BaseTrajectoryEvaluator
 from polar.trajectory.models import EvalResult, Trajectory
+
+
+logger = logging.getLogger(__name__)
 
 
 class HarborEvaluator(BaseTrajectoryEvaluator):
@@ -49,6 +58,8 @@ class HarborEvaluator(BaseTrajectoryEvaluator):
         tests_target: str = "/tests",
         verifier_dir: str = "/logs/verifier",
         test_command: str = "bash /tests/test.sh",
+        upload_attempts: int = 3,
+        upload_retry_backoff_seconds: float = 0.1,
     ) -> None:
         self.tests_dir = str(tests_dir).strip()
         if not self.tests_dir:
@@ -63,6 +74,14 @@ class HarborEvaluator(BaseTrajectoryEvaluator):
         self.test_command = test_command.strip()
         if not self.test_command:
             raise ValueError("harbor evaluator requires a non-empty 'test_command'")
+        self.upload_attempts = int(upload_attempts)
+        if not 1 <= self.upload_attempts <= 10:
+            raise ValueError("upload_attempts must be between 1 and 10")
+        self.upload_retry_backoff_seconds = float(upload_retry_backoff_seconds)
+        if not 0.0 <= self.upload_retry_backoff_seconds <= 60.0:
+            raise ValueError(
+                "upload_retry_backoff_seconds must be between 0 and 60"
+            )
 
     async def evaluate(self, trajectory: Trajectory, **runtime: Any) -> EvalResult:
         rt = runtime.get("runtime")
@@ -85,27 +104,65 @@ class HarborEvaluator(BaseTrajectoryEvaluator):
             f"mkdir -p {self.tests_target} {self.verifier_dir}",
             env=eval_env,
         )
-        await rt.upload_dir(self.tests_dir, self.tests_target)
+        await self._upload_tests(rt)
         await rt.exec(f"chmod -R +x {self.tests_target} 2>/dev/null || true", env=eval_env)
 
         # 2. Run the verifier (writes 0/1 to reward.txt, the Harbor contract).
         result = await rt.exec(self.test_command, env=eval_env, timeout_sec=test_timeout)
         test_output = (result.stdout or "") + (result.stderr or "")
         test_output_path = artifacts_dir / "verifier.stdout.log"
+        # The verifier awaits a subprocess, so a concurrent session cleanup
+        # may remove the directory after the initial mkdir above.
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
         test_output_path.write_text(test_output)
 
-        # 3. Read the reward back, clamped to [0, 1] (mirrors Harbor's reward parsing).
-        reward = await self._read_reward(rt, eval_env)
+        # 3. Read the verifier's reported reward for diagnostics, but only
+        # accept it when the verifier itself exited successfully.  A crashed
+        # or timed-out verifier can leave a stale/partial reward file behind;
+        # treating that as success would train on an invalid evaluation.
+        reported_reward = await self._read_reward(rt, eval_env)
+        verifier_succeeded = result.return_code == 0
+        reward = reported_reward if verifier_succeeded else 0.0
 
         metadata: dict[str, Any] = {
             "mode": self.MODE,
             "resolved": reward >= 1.0,
             "reward": reward,
+            "verifier_reported_reward": reported_reward,
+            "verifier_reward_accepted": verifier_succeeded,
             "verifier_exit_code": result.return_code,
             "verifier_timeout": result.return_code == -1,
             "test_output_path": str(test_output_path),
         }
         return EvalResult(outcome_reward=reward, metadata=metadata)
+
+    async def _upload_tests(self, rt: BaseRuntime) -> None:
+        """Retry transient Apptainer/tar setup failures before losing a sample."""
+
+        for attempt in range(1, self.upload_attempts + 1):
+            try:
+                await rt.upload_dir(self.tests_dir, self.tests_target)
+                return
+            except RuntimeDestroyedError:
+                # Cancellation tears down the direct-exec runtime. Retrying it
+                # would start fresh Apptainer commands after DELETE was acked.
+                raise
+            except Exception as exc:
+                if rt.destroyed or attempt >= self.upload_attempts:
+                    raise
+                logger.warning(
+                    "Harbor tests upload failed (attempt %d/%d): %s",
+                    attempt,
+                    self.upload_attempts,
+                    exc,
+                )
+                if self.upload_retry_backoff_seconds > 0.0:
+                    await asyncio.sleep(
+                        min(
+                            self.upload_retry_backoff_seconds * (2 ** (attempt - 1)),
+                            60.0,
+                        )
+                    )
 
     async def _read_reward(self, rt: BaseRuntime, env: dict[str, str]) -> float:
         text = await rt.exec(f"cat {self.verifier_dir}/reward.txt 2>/dev/null", env=env)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+import math
 from pathlib import Path
 import re
 from types import SimpleNamespace
@@ -27,9 +28,12 @@ class PolarSlimeConfig:
     fully_async: bool
     max_off_policy_steps: int
     request_timeout: float | None
+    task_timeout_floor: float | None
+    train_agent_timeout: float | None
     callback_host: str
     scoring_mode: str
     min_complete_accept_fraction: float
+    early_stop_grace_sessions: int
     tokenizer_name_or_path: str | None
     add_generation_prompt: bool
     eval_dataset_name: str
@@ -84,14 +88,29 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
     request_timeout = getattr(args, "polar_request_timeout", None)
     if request_timeout is not None:
         request_timeout = float(request_timeout)
-        if request_timeout <= 0:
+        if not math.isfinite(request_timeout) or request_timeout <= 0:
             raise ValueError("polar_request_timeout must be greater than 0")
+
+    task_timeout_floor = getattr(args, "polar_task_timeout_floor", None)
+    if task_timeout_floor is not None:
+        task_timeout_floor = float(task_timeout_floor)
+        if not math.isfinite(task_timeout_floor) or task_timeout_floor <= 0:
+            raise ValueError("polar_task_timeout_floor must be greater than 0")
+
+    train_agent_timeout = getattr(args, "polar_train_agent_timeout", None)
+    if train_agent_timeout is not None:
+        train_agent_timeout = _positive_finite_number(
+            train_agent_timeout,
+            field="polar_train_agent_timeout",
+        )
 
     callback_host = str(getattr(args, "polar_callback_host", "127.0.0.1")).strip()
     if not callback_host:
         raise ValueError("polar_callback_host must be a non-empty host or IP")
     if callback_host in {"0.0.0.0", "::"}:
-        raise ValueError("polar_callback_host must be reachable by the rollout server, not a wildcard bind address")
+        raise ValueError(
+            "polar_callback_host must be reachable by the rollout server, not a wildcard bind address"
+        )
 
     scoring_mode = str(getattr(args, "polar_scoring_mode", "group")).strip().lower()
     if scoring_mode not in {"group", "individual"}:
@@ -102,18 +121,21 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
     )
     if not 0.0 <= min_complete_accept_fraction <= 1.0:
         raise ValueError("polar_min_complete_accept_fraction must be between 0 and 1")
+    early_stop_grace_sessions = int(getattr(args, "polar_early_stop_grace_sessions", 2) or 0)
+    if early_stop_grace_sessions < 0:
+        raise ValueError("polar_early_stop_grace_sessions must be non-negative")
 
     return PolarSlimeConfig(
         rollout_server_url=str(rollout_server_url).rstrip("/"),
         task_template=task_template,
         task_id_template=str(
-            getattr(args, "polar_task_id_template", "polar-slime-{rollout_id}-{sample.group_index}")
+            getattr(
+                args, "polar_task_id_template", "polar-slime-{rollout_id}-{sample.group_index}"
+            )
         ),
         instruction_template=getattr(args, "polar_instruction_template", None),
         reward_key=str(
-            getattr(args, "polar_reward_key", None)
-            or getattr(args, "reward_key", None)
-            or "score"
+            getattr(args, "polar_reward_key", None) or getattr(args, "reward_key", None) or "score"
         ),
         max_concurrency=max_concurrency,
         max_session_concurrency=max_session_concurrency,
@@ -121,9 +143,12 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
         fully_async=fully_async,
         max_off_policy_steps=max_off_policy_steps,
         request_timeout=request_timeout,
+        task_timeout_floor=task_timeout_floor,
+        train_agent_timeout=train_agent_timeout,
         callback_host=callback_host,
         scoring_mode=scoring_mode,
         min_complete_accept_fraction=min_complete_accept_fraction,
+        early_stop_grace_sessions=early_stop_grace_sessions,
         tokenizer_name_or_path=getattr(args, "hf_checkpoint", None),
         add_generation_prompt=bool(getattr(args, "polar_add_generation_prompt", True)),
         eval_dataset_name=str(getattr(args, "polar_eval_dataset_name", "polar_eval")),
@@ -147,6 +172,7 @@ def render_task_payload(
     rollout_id: int,
     task_position: int,
     num_rollouts: int,
+    is_eval: bool = False,
 ) -> dict[str, Any]:
     context = _build_context(
         args=args,
@@ -163,7 +189,128 @@ def render_task_payload(
     payload["task_id"] = str(_render_template_value(config.task_id_template, context))
     payload["instruction"] = instruction
     payload["num_samples"] = num_rollouts
+    _apply_task_timeout_floor(payload, config.task_timeout_floor)
+    metadata = getattr(sample, "metadata", None) or {}
+    if isinstance(metadata, dict):
+        _apply_sample_runtime_metadata(payload, metadata)
+        _apply_sample_agent_timeout(payload, metadata)
+    if config.train_agent_timeout is not None and not is_eval:
+        task_metadata = payload.setdefault("metadata", {})
+        if not isinstance(task_metadata, dict):
+            raise ValueError("rendered task payload metadata must be a mapping")
+        task_metadata["agent_timeout"] = config.train_agent_timeout
+    if isinstance(metadata, dict) and metadata.get("agent_step_limit") is not None:
+        try:
+            step_limit = int(metadata["agent_step_limit"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("sample.metadata.agent_step_limit must be an integer") from exc
+        if step_limit <= 0:
+            raise ValueError("sample.metadata.agent_step_limit must be positive")
+        agent = payload.get("agent")
+        if not isinstance(agent, dict):
+            raise ValueError("rendered task payload must include an agent mapping")
+        settings = agent.setdefault("settings", {})
+        if not isinstance(settings, dict):
+            raise ValueError("rendered task payload agent.settings must be a mapping")
+        settings["step_limit"] = step_limit
+    if 0.0 < config.min_complete_accept_fraction < 1.0:
+        required = math.ceil(num_rollouts * config.min_complete_accept_fraction)
+        # Waiting for a small buffer above the eventual trainer acceptance
+        # threshold absorbs parser-invalid/empty completions while avoiding
+        # the slowest group members becoming a hard all-session barrier.
+        payload["early_stop_min_usable_sessions"] = min(
+            num_rollouts,
+            required + config.early_stop_grace_sessions,
+        )
     return payload
+
+
+def _positive_finite_number(value: Any, *, field: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a positive finite number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a positive finite number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError(f"{field} must be a positive finite number")
+    return parsed
+
+
+def _apply_task_timeout_floor(payload: dict[str, Any], timeout_floor: float | None) -> None:
+    """Clamp the rendered infrastructure budget without changing dataset rows."""
+
+    if timeout_floor is None:
+        return
+    rendered_timeout = payload.get("timeout_seconds")
+    if rendered_timeout is None:
+        payload["timeout_seconds"] = timeout_floor
+        return
+    parsed_timeout = _positive_finite_number(
+        rendered_timeout,
+        field="rendered task timeout_seconds",
+    )
+    payload["timeout_seconds"] = max(parsed_timeout, timeout_floor)
+
+
+def _apply_sample_agent_timeout(payload: dict[str, Any], metadata: dict[str, Any]) -> None:
+    """Copy the benchmark's agent budget into the trusted task metadata."""
+
+    if "agent_timeout" not in metadata:
+        return
+    agent_timeout = _positive_finite_number(
+        metadata["agent_timeout"],
+        field="sample.metadata.agent_timeout",
+    )
+    task_metadata = payload.setdefault("metadata", {})
+    if not isinstance(task_metadata, dict):
+        raise ValueError("rendered task payload metadata must be a mapping")
+    task_metadata["agent_timeout"] = agent_timeout
+
+
+def _apply_sample_runtime_metadata(payload: dict[str, Any], metadata: dict[str, Any]) -> None:
+    """Merge trusted dataset runtime semantics that cannot be YAML-templated.
+
+    Slime's scalar placeholder renderer cannot splice an arbitrary environment
+    mapping into ``RuntimeSpec.env``.  Exported Harbor datasets need that for
+    OCI ``ENV`` values, and occasionally need an image ``CMD``/``ENTRYPOINT``
+    started once by the long-lived direct-exec broker.  Keep the extension
+    narrow, typed, and fail-closed so malformed dataset rows never silently run
+    under different container semantics.
+    """
+
+    runtime_env = metadata.get("runtime_env")
+    runtime_init = metadata.get("runtime_init_command")
+    if runtime_env is None and runtime_init is None:
+        return
+
+    runtime = payload.get("runtime")
+    if not isinstance(runtime, dict):
+        raise ValueError("sample runtime metadata requires a rendered runtime mapping")
+
+    if runtime_env is not None:
+        if not isinstance(runtime_env, dict) or not all(
+            isinstance(key, str) and key and isinstance(value, str)
+            for key, value in runtime_env.items()
+        ):
+            raise ValueError("sample.metadata.runtime_env must map non-empty strings to strings")
+        environment = runtime.setdefault("env", {})
+        if not isinstance(environment, dict):
+            raise ValueError("rendered runtime.env must be a mapping")
+        environment.update(runtime_env)
+
+    if runtime_init is not None:
+        if not isinstance(runtime_init, str) or not runtime_init.strip():
+            raise ValueError("sample.metadata.runtime_init_command must be a non-empty string")
+        existing_init = runtime.get("direct_exec_init_command")
+        if existing_init is None:
+            runtime["direct_exec_init_command"] = runtime_init.strip()
+        elif not isinstance(existing_init, str) or not existing_init.strip():
+            raise ValueError("rendered runtime.direct_exec_init_command must be non-empty")
+        else:
+            existing = existing_init.strip().rstrip(";").rstrip()
+            additional = runtime_init.strip().rstrip(";").rstrip()
+            runtime["direct_exec_init_command"] = f"{{ {existing}; }} && {{ {additional}; }}"
 
 
 def render_instruction(
@@ -208,6 +355,11 @@ def render_topology_template(topology_path: str | Path, args: Any) -> dict[str, 
             "save_dir": topology.rollout.save_dir,
             "dispatch_poll_interval_seconds": topology.rollout.dispatch_poll_interval_seconds,
             "callback_grace_seconds": topology.rollout.callback_grace_seconds,
+            "http_max_connections": topology.rollout.http_max_connections,
+            "http_max_keepalive_connections": (topology.rollout.http_max_keepalive_connections),
+            "cleanup_max_concurrency": topology.rollout.cleanup_max_concurrency,
+            "cleanup_max_attempts": topology.rollout.cleanup_max_attempts,
+            "cleanup_retry_backoff_seconds": (topology.rollout.cleanup_retry_backoff_seconds),
         },
         "gateway": {
             "heartbeat_interval_seconds": topology.gateway.heartbeat_interval_seconds,
@@ -284,10 +436,7 @@ def _render_template_value(value: Any, context: dict[str, Any]) -> Any:
         return [_render_template_value(item, context) for item in value]
 
     if isinstance(value, dict):
-        return {
-            str(key): _render_template_value(item, context)
-            for key, item in value.items()
-        }
+        return {str(key): _render_template_value(item, context) for key, item in value.items()}
 
     return value
 

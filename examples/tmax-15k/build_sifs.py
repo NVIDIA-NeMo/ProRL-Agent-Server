@@ -23,15 +23,20 @@ import fcntl
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
 from build_images import IMAGE_LAYOUT_VERSION, IMAGE_VERSION_LABEL
-from dataset import TmaxTask, load_tasks, runtime_image_for, sif_filename_for
+from dataset import TmaxTask, load_tasks, runtime_image_for, sanitize, sif_filename_for
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
 RUNTIME_DOCKERFILE_DIR = EXAMPLE_DIR / "runtime"
@@ -39,6 +44,7 @@ DEFAULT_DATA_ROOT = Path("/lustre/fsw/portfolios/nvr/projects/nvr_lpr_llm/users/
 DEFAULT_DATASET_DIR = DEFAULT_DATA_ROOT / "tmax-15k"
 DEFAULT_IMAGE_DIR = DEFAULT_DATA_ROOT / "tmax-15k-sif"
 DIRECT_CONTEXT_DIR = "/opt/polar-tmax-context"
+DIRECT_FINAL_PACK_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -373,7 +379,151 @@ def build_docker_runtime(
 
 
 def sif_ready(path: Path) -> bool:
-    return path.is_file() and path.stat().st_size > 0
+    return not path.is_symlink() and path.is_file() and path.stat().st_size > 0
+
+
+@contextmanager
+def isolated_build_workspace(
+    task_name: str,
+    env: dict[str, str],
+) -> Iterator[tuple[dict[str, str], Path, Path]]:
+    """Give each Apptainer build an independent host temporary workspace.
+
+    TMax Dockerfiles commonly use fixed helper names such as
+    ``/tmp/post_install.sh``. Isolating all Apptainer/process temporary roots
+    prevents concurrent builders from sharing scratch state while leaving the
+    image's own ``/tmp`` semantics intact.
+    """
+    tmp_root_value = (
+        env.get("APPTAINER_TMPDIR")
+        or env.get("SINGULARITY_TMPDIR")
+        or env.get("TMPDIR")
+        or tempfile.gettempdir()
+    )
+    tmp_root = Path(tmp_root_value).expanduser()
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    prefix = (sanitize(task_name) or "task")[:48]
+    workspace = Path(tempfile.mkdtemp(prefix=f"{prefix}-", dir=tmp_root))
+    apptainer_tmp = workspace / "apptainer-tmp"
+    process_tmp = workspace / "process-tmp"
+    container_tmp = workspace / "container-tmp"
+    for path in (apptainer_tmp, process_tmp, container_tmp):
+        path.mkdir()
+    container_tmp.chmod(0o1777)
+    sandbox = workspace / "rootfs"
+
+    build_env = {
+        **env,
+        "APPTAINER_TMPDIR": str(apptainer_tmp),
+        "SINGULARITY_TMPDIR": str(apptainer_tmp),
+        "TMPDIR": str(process_tmp),
+    }
+    try:
+        yield build_env, container_tmp, sandbox
+    finally:
+        try:
+            shutil.rmtree(workspace)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            # A failed %post can leave unusual ownership/modes behind. Never
+            # replace the primary build exception with a cleanup exception,
+            # but make the leaked node-local scratch visible to operators.
+            print(
+                f"WARNING: failed to remove isolated build workspace {workspace}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+def merge_private_tmp(
+    container_tmp: Path,
+    sandbox: Path,
+    *,
+    env: dict[str, str],
+) -> None:
+    """Persist the build-time private ``/tmp`` into the sandbox rootfs.
+
+    Apptainer bind mounts are intentionally absent from the completed image.
+    Building to a sandbox first lets concurrent ``%post`` sections use private
+    host ``/tmp`` directories, after which this merge restores Docker's layer
+    semantics before the sandbox is squashed into the final SIF.
+    """
+    sandbox_tmp = sandbox / "tmp"
+    try:
+        sandbox_tmp_mode = sandbox_tmp.lstat().st_mode
+    except FileNotFoundError:
+        sandbox_tmp.mkdir(parents=True)
+    else:
+        if stat.S_ISLNK(sandbox_tmp_mode) or not stat.S_ISDIR(sandbox_tmp_mode):
+            raise RuntimeError(
+                f"refusing to merge private /tmp through non-directory sandbox path: {sandbox_tmp}"
+            )
+    run_command(["cp", "-a", f"{container_tmp}/.", str(sandbox_tmp)], env=env)
+
+
+def pack_final_sif(
+    command: list[str],
+    *,
+    env: dict[str, str],
+    tmp: Path,
+    attempts: int,
+) -> None:
+    """Run final image packaging without rebuilding the prepared sandbox.
+
+    squashfs-tools 4.7.5 has a confirmed duplicate-checking race that can
+    abort with ``BUG in get_virt_disk``. The sandbox is already complete at
+    this point, so retry only this deterministic-input compression stage.
+    """
+    if attempts < 1:
+        raise ValueError("final SIF packaging attempts must be positive")
+
+    for attempt in range(1, attempts + 1):
+        attempt_command = command
+        if attempts > 1 and attempt == attempts:
+            # The known 4.7.5 race lives only in duplicate checking. Preserve
+            # normal deduplication for successful images, but make the final
+            # retry deterministic instead of repeatedly exercising that path.
+            attempt_command = _disable_mksquashfs_duplicates(command)
+        tmp.unlink(missing_ok=True)
+        try:
+            run_command(attempt_command, env=env)
+        except subprocess.CalledProcessError:
+            tmp.unlink(missing_ok=True)
+            if attempt >= attempts:
+                raise
+            delay_seconds = attempt
+            print(
+                f"WARNING: final SIF packaging failed (attempt {attempt}/{attempts}); "
+                f"retrying in {delay_seconds}s: {tmp}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay_seconds)
+            continue
+
+        if not sif_ready(tmp):
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"final SIF packaging returned success without a non-empty regular file: {tmp}"
+            )
+        return
+
+
+def _disable_mksquashfs_duplicates(command: list[str]) -> list[str]:
+    fallback = list(command)
+    try:
+        args_index = fallback.index("--mksquashfs-args") + 1
+    except ValueError:
+        # The final two arguments are always output SIF and input sandbox/image.
+        fallback[-2:-2] = ["--mksquashfs-args", "-no-duplicates"]
+        return fallback
+
+    mksquashfs_args = shlex.split(fallback[args_index])
+    if "-no-duplicates" not in mksquashfs_args:
+        mksquashfs_args.append("-no-duplicates")
+        fallback[args_index] = shlex.join(mksquashfs_args)
+    return fallback
 
 
 def build_one(
@@ -402,40 +552,75 @@ def build_one(
             if sif_ready(target) and not force:
                 return ("skip", task.name, str(target))
 
-            tmp = target.with_name(
-                f".{target.name}.tmp-{os.getpid()}-{threading.get_ident()}"
-            )
-            if tmp.exists():
-                tmp.unlink()
-            cmd = [binary, "build", "--force"]
-            if apptainer_fakeroot and builder == "direct-apptainer":
-                cmd.append("--fakeroot")
-            if mksquashfs_args:
-                cmd.extend(["--mksquashfs-args", mksquashfs_args])
-            if builder == "direct-apptainer":
-                definition_path = definition_dir / f"{task.name}.def"
-                render_direct_definition(task, definition_path, base_sif=base_sif)
-                cmd.extend([str(tmp), str(definition_path)])
-            elif builder == "docker-daemon":
-                if docker_bin is None:
-                    raise RuntimeError("docker-daemon builder requires Docker")
-                if not skip_docker_build:
-                    build_docker_runtime(task, docker_bin=docker_bin, force=force_docker, env=env)
-                docker_ref = runtime_image_for(task.name)
-                if not image_exists(docker_ref, docker_bin=docker_bin):
-                    raise RuntimeError(
-                        f"docker image {docker_ref} not found; run without --skip-docker-build "
-                        "or build it on this node first"
-                    )
-                cmd.extend([str(tmp), f"docker-daemon://{docker_ref}"])
-            else:
-                raise RuntimeError(f"unknown builder: {builder}")
-            try:
-                run_command(cmd, env=env)
-                tmp.replace(target)
-            finally:
+            with isolated_build_workspace(task.name, env) as (
+                build_env,
+                container_tmp,
+                sandbox,
+            ):
+                tmp = target.with_name(
+                    f".{target.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+                )
                 if tmp.exists():
                     tmp.unlink()
+                if builder == "direct-apptainer":
+                    definition_path = definition_dir / f"{task.name}.def"
+                    render_direct_definition(task, definition_path, base_sif=base_sif)
+                    sandbox_cmd = [binary, "build", "--force", "--sandbox"]
+                    if apptainer_fakeroot:
+                        sandbox_cmd.append("--fakeroot")
+                    sandbox_cmd.extend(
+                        [
+                            "--bind",
+                            f"{container_tmp}:/tmp",
+                            str(sandbox),
+                            str(definition_path),
+                        ]
+                    )
+                    run_command(sandbox_cmd, env=build_env)
+                    merge_private_tmp(container_tmp, sandbox, env=build_env)
+
+                    cmd = [binary, "build", "--force"]
+                    if apptainer_fakeroot:
+                        cmd.append("--fakeroot")
+                    if mksquashfs_args:
+                        cmd.extend(["--mksquashfs-args", mksquashfs_args])
+                    cmd.extend([str(tmp), str(sandbox)])
+                elif builder == "docker-daemon":
+                    cmd = [binary, "build", "--force"]
+                    if mksquashfs_args:
+                        cmd.extend(["--mksquashfs-args", mksquashfs_args])
+                    if docker_bin is None:
+                        raise RuntimeError("docker-daemon builder requires Docker")
+                    if not skip_docker_build:
+                        build_docker_runtime(
+                            task,
+                            docker_bin=docker_bin,
+                            force=force_docker,
+                            env=build_env,
+                        )
+                    docker_ref = runtime_image_for(task.name)
+                    if not image_exists(docker_ref, docker_bin=docker_bin):
+                        raise RuntimeError(
+                            f"docker image {docker_ref} not found; run without --skip-docker-build "
+                            "or build it on this node first"
+                        )
+                    cmd.extend([str(tmp), f"docker-daemon://{docker_ref}"])
+                else:
+                    raise RuntimeError(f"unknown builder: {builder}")
+                try:
+                    pack_final_sif(
+                        cmd,
+                        env=build_env,
+                        tmp=tmp,
+                        attempts=(
+                            DIRECT_FINAL_PACK_ATTEMPTS
+                            if builder == "direct-apptainer"
+                            else 1
+                        ),
+                    )
+                    tmp.replace(target)
+                finally:
+                    tmp.unlink(missing_ok=True)
         finally:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
     return ("built", task.name, str(target))

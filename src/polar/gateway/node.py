@@ -8,6 +8,7 @@ import shutil
 from contextlib import suppress
 from pathlib import Path
 from tempfile import mkdtemp
+from typing import Any
 
 import httpx
 
@@ -22,6 +23,7 @@ from polar.gateway.storage import SessionStore
 from polar.agent.base import BaseHarness
 from polar.agent.factory import create_harness
 from polar.agent.models import AgentRunResult
+from polar.agent.presets.mini_swe_agent import load_mini_swe_command_timing
 from polar.rollout.models import (
     NodeHeartbeatRequest,
     NodeRegistrationRequest,
@@ -34,14 +36,26 @@ from polar.rollout.timer import StageTimer
 from polar.runtime.base import BaseRuntime
 from polar.runtime.factory import create_runtime
 from polar.runtime.models import ExecInput, RuntimeSpec
-from polar.trajectory.models import EvalResult, EvaluatorSpec, StrategySpec, Trajectory
+from polar.trajectory.models import EvalResult, EvaluatorSpec, StrategySpec, Trace, Trajectory
 from polar.trajectory.registry import StrategyRegistry
+from polar.trajectory.training_filter import zero_reward_parser_invalid_tool_call_trace
 
 logger = logging.getLogger(__name__)
+
+_CALLBACK_MAX_ATTEMPTS = 3
+_CALLBACK_RETRY_BACKOFF_SECONDS = 0.1
+_CALLBACK_REQUEST_TIMEOUT_SECONDS = 5.0
+_CALLBACK_RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_AGENT_RESULT_METADATA_KEY = "agent_result"
+_TRAINABLE_AGENT_TIMEOUT_REASON = "agent_timeout"
 
 
 class GatewayExecutionTimeout(TimeoutError):
     """Raised when a session exhausts its shared gateway execution budget."""
+
+
+class GatewayExecutionCancelled(RuntimeError):
+    """Raised when cancellation wins a race with post-run evaluation."""
 
 
 class GatewayNodeManager:
@@ -90,6 +104,8 @@ class GatewayNodeManager:
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
         self._control_client: httpx.AsyncClient | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._cancel_finalizers: dict[str, asyncio.Task[None]] = {}
+        self._cancel_lock = asyncio.Lock()
 
     async def start(self) -> None:
         await self._dispatcher.start()
@@ -109,6 +125,11 @@ class GatewayNodeManager:
             await self._control_client.aclose()
             self._control_client = None
         await self._dispatcher.stop()
+        if self._cancel_finalizers:
+            await asyncio.gather(
+                *tuple(self._cancel_finalizers.values()),
+                return_exceptions=True,
+            )
         await self._client.aclose()
 
     async def _register_with_rollout_server(self) -> None:
@@ -199,7 +220,40 @@ class GatewayNodeManager:
             raise
 
     async def cancel(self, session_id: str) -> bool:
-        return await self._dispatcher.cancel(session_id)
+        """Accept cancellation quickly and finalize registry cleanup in background."""
+        async with self._cancel_lock:
+            existing = self._cancel_finalizers.get(session_id)
+            if existing is not None:
+                return True
+            done_event = await self._dispatcher.cancel(session_id)
+            if done_event is None:
+                return False
+            task = asyncio.create_task(
+                self._finalize_cancelled_session(session_id, done_event),
+                name=f"polar-session-cancel-finalize-{session_id}",
+            )
+            self._cancel_finalizers[session_id] = task
+            task.add_done_callback(
+                lambda completed, sid=session_id: self._forget_cancel_finalizer(sid, completed)
+            )
+            return True
+
+    async def _finalize_cancelled_session(
+        self,
+        session_id: str,
+        done_event: asyncio.Event,
+    ) -> None:
+        await done_event.wait()
+        self.storage.delete_session(session_id)
+        self.session_registry.remove(session_id)
+
+    def _forget_cancel_finalizer(
+        self,
+        session_id: str,
+        completed: asyncio.Task[None],
+    ) -> None:
+        if self._cancel_finalizers.get(session_id) is completed:
+            self._cancel_finalizers.pop(session_id, None)
 
     async def active_sessions(self) -> int:
         return await self._dispatcher.active_count()
@@ -230,9 +284,17 @@ class GatewayNodeManager:
             runtime_spec = self._resolve_runtime_spec(request)
             runtime = create_runtime(runtime_spec, request.session_id, managed.session_dir)
             managed.runtime = runtime
-            await self._await_with_budget(runtime.start(), managed)
+            managed.timer.mark("runtime_validation", "started")
+            try:
+                await self._await_with_budget(runtime.start, managed)
+            finally:
+                managed.timer.mark("runtime_validation", "finished")
             # Run ordered prepare actions
-            await self._run_runtime_prepare(runtime, runtime_spec, request, managed)
+            managed.timer.mark("prepare", "started")
+            try:
+                await self._run_runtime_prepare(runtime, runtime_spec, request, managed)
+            finally:
+                managed.timer.mark("prepare", "finished")
         except GatewayExecutionTimeout as exc:
             managed.final_result = self._timeout_result(request, managed.timer, str(exc))
         except Exception as exc:
@@ -280,17 +342,41 @@ class GatewayNodeManager:
             elif action.type == "exec":
                 merged_env = {**base_env, **(action.env or {})}
                 effective_cwd = action.cwd or runtime.runtime_session_dir
-                result = await runtime.exec(
-                    action.command,
-                    cwd=effective_cwd,
-                    env=merged_env,
-                    timeout_sec=self._remaining_budget(managed),
-                )
-                log_dir = managed.session_dir / "logs"
-                log_dir.mkdir(parents=True, exist_ok=True)
-                self._write_exec_log(
-                    log_dir, f"{log_prefix}.{i:02d}", result.stdout, result.stderr
-                )
+                result = None
+                for attempt in range(1, action.max_attempts + 1):
+                    result = await runtime.exec(
+                        action.command,
+                        cwd=effective_cwd,
+                        env=merged_env,
+                        timeout_sec=self._remaining_budget(managed),
+                    )
+                    log_dir = managed.session_dir / "logs"
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    attempt_suffix = "" if action.max_attempts == 1 else f".attempt-{attempt:02d}"
+                    self._write_exec_log(
+                        log_dir,
+                        f"{log_prefix}.{i:02d}{attempt_suffix}",
+                        result.stdout,
+                        result.stderr,
+                    )
+                    if result.return_code in (0, -1):
+                        break
+                    if attempt < action.max_attempts:
+                        logger.warning(
+                            "%s action %d failed on attempt %d/%d with exit code %d; retrying",
+                            log_prefix,
+                            i,
+                            attempt,
+                            action.max_attempts,
+                            result.return_code,
+                        )
+                        delay = min(
+                            action.retry_backoff_seconds * (2 ** (attempt - 1)),
+                            5.0,
+                        )
+                        if delay:
+                            await asyncio.sleep(delay)
+                assert result is not None
                 if result.return_code == -1:
                     raise RuntimeError(f"{log_prefix} action {i} timed out")
                 if result.return_code != 0:
@@ -307,8 +393,10 @@ class GatewayNodeManager:
         if managed.final_result is not None or managed.cancel_requested:
             return
         managed.timer.mark("run", "started")
+        self._start_agent_deadline(managed)
 
         harness: BaseHarness | None = None
+        timeout_stage = "setup"
         try:
             runtime = managed.runtime
             if runtime is None:
@@ -318,23 +406,46 @@ class GatewayNodeManager:
             harness = self._resolve_agent_harness(request)
 
             # Setup
-            await self._await_with_budget(harness.setup(runtime), managed)
+            managed.timer.mark("agent_setup", "started")
+            try:
+                await self._await_with_agent_budget(lambda: harness.setup(runtime), managed)
+            finally:
+                managed.timer.mark("agent_setup", "finished")
 
             # Run
+            timeout_stage = "exec"
             steps = harness.run_steps(request.instruction)
             env = self._runtime_env(request, managed, include_agent_env=True)
-            agent_result = await self._run_exec_inputs(runtime, steps, env, managed)
+            managed.timer.mark("agent_exec", "started")
+            try:
+                agent_result = await self._run_exec_inputs(runtime, steps, env, managed)
+            finally:
+                managed.timer.mark("agent_exec", "finished")
+            managed.agent_result = agent_result
+            if managed.cancel_requested:
+                return
 
             # Postprocess always runs so harnesses can collect artifacts from
             # failed or timed-out agent runs before post-run evaluation.
-            await self._await_with_budget(harness.postprocess(runtime, agent_result), managed)
-            managed.agent_result = agent_result
-
+            timeout_stage = "postprocess"
+            managed.timer.mark("agent_postprocess", "started")
+            try:
+                await self._await_with_agent_budget(
+                    lambda: harness.postprocess(runtime, agent_result), managed
+                )
+            finally:
+                managed.timer.mark("agent_postprocess", "finished")
         except GatewayExecutionTimeout as exc:
             # Don't set final_result — let _handle_postrun build a partial
             # trajectory from the completions captured so far.
             managed.agent_result = AgentRunResult(
-                status="timeout", return_code=-1, error=str(exc),
+                status="timeout",
+                return_code=-1,
+                error=str(exc),
+                metadata={
+                    "timeout_source": self._timeout_source_from_error(exc),
+                    "timeout_stage": timeout_stage,
+                },
             )
         except Exception as exc:
             if managed.cancel_requested:
@@ -367,25 +478,24 @@ class GatewayNodeManager:
 
         for i, step in enumerate(steps):
             if managed.cancel_requested:
-                return AgentRunResult(
-                    status="failed", return_code=-1, error="cancelled"
-                )
+                return AgentRunResult(status="failed", return_code=-1, error="cancelled")
             merged_env = {**env, **(step.env or {})}
             result = await runtime.exec(
                 step.command,
                 cwd=step.cwd,
                 env=merged_env,
-                timeout_sec=self._remaining_budget(managed),
+                timeout_sec=self._remaining_agent_budget(managed),
             )
-            self._write_exec_log(
-                log_dir, f"step.{i:02d}", result.stdout, result.stderr
-            )
+            self._write_exec_log(log_dir, f"step.{i:02d}", result.stdout, result.stderr)
             if result.return_code == -1:
+                metadata = self._step_metadata(log_dir, i, managed)
+                metadata["timeout_source"] = self._active_timeout_source(managed)
+                metadata["timeout_stage"] = "exec"
                 return AgentRunResult(
                     status="timeout",
                     return_code=-1,
                     error=f"step {i} timed out",
-                    metadata=self._step_metadata(log_dir, i, managed),
+                    metadata=metadata,
                 )
             if result.return_code != 0:
                 return AgentRunResult(
@@ -412,13 +522,9 @@ class GatewayNodeManager:
             return
         if managed.eval_prewarm_task is not None:
             return
-        managed.eval_prewarm_task = asyncio.create_task(
-            self._prepare_eval_runtime(managed)
-        )
+        managed.eval_prewarm_task = asyncio.create_task(self._prepare_eval_runtime(managed))
 
-    async def _prepare_eval_runtime(
-        self, managed: ManagedSession
-    ) -> BaseRuntime | None:
+    async def _prepare_eval_runtime(self, managed: ManagedSession) -> BaseRuntime | None:
         """Create and prepare a fresh runtime for the evaluator. Returns None on failure."""
         request = managed.request
         runtime_spec = self._resolve_runtime_spec(request)
@@ -426,28 +532,35 @@ class GatewayNodeManager:
         eval_artifacts_dir = eval_session_dir / "artifacts"
         eval_artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-        eval_runtime = create_runtime(
-            runtime_spec, f"{request.session_id}-eval", eval_session_dir
-        )
+        eval_runtime = create_runtime(runtime_spec, f"{request.session_id}-eval", eval_session_dir)
         try:
-            await self._await_with_budget(eval_runtime.start(), managed)
+            managed.timer.mark("eval_runtime_validation", "started")
+            try:
+                await self._await_with_budget(eval_runtime.start, managed)
+            finally:
+                managed.timer.mark("eval_runtime_validation", "finished")
             eval_actions = (
                 runtime_spec.eval_prepare
                 if runtime_spec.eval_prepare is not None
                 else runtime_spec.prepare
             )
-            await self._run_runtime_prepare(
-                eval_runtime,
-                runtime_spec,
-                request,
-                managed,
-                actions=eval_actions,
-                log_prefix="eval_prepare",
-            )
+            managed.timer.mark("eval_prepare", "started")
+            try:
+                await self._run_runtime_prepare(
+                    eval_runtime,
+                    runtime_spec,
+                    request,
+                    managed,
+                    actions=eval_actions,
+                    log_prefix="eval_prepare",
+                )
+            finally:
+                managed.timer.mark("eval_prepare", "finished")
             return eval_runtime
         except asyncio.CancelledError:
             with suppress(Exception):
                 await eval_runtime.stop()
+            managed.timer.add_runtime_exec_summary(eval_runtime.exec_timing_summary())
             raise
         except Exception as exc:
             logger.warning(
@@ -457,11 +570,10 @@ class GatewayNodeManager:
             )
             with suppress(Exception):
                 await eval_runtime.stop()
+            managed.timer.add_runtime_exec_summary(eval_runtime.exec_timing_summary())
             return None
 
-    async def _acquire_prepared_eval_runtime(
-        self, managed: ManagedSession
-    ) -> BaseRuntime | None:
+    async def _acquire_prepared_eval_runtime(self, managed: ManagedSession) -> BaseRuntime | None:
         """Await the prewarm task and return its runtime, if any."""
         task = managed.eval_prewarm_task
         if task is None:
@@ -475,9 +587,7 @@ class GatewayNodeManager:
                 "timed out waiting for a fresh evaluator runtime"
             ) from exc
 
-    async def _drain_eval_prewarm_task(
-        self, managed: ManagedSession
-    ) -> BaseRuntime | None:
+    async def _drain_eval_prewarm_task(self, managed: ManagedSession) -> BaseRuntime | None:
         """Resolve the prewarm task during teardown. Cancel if still running."""
         task = managed.eval_prewarm_task
         if task is None:
@@ -505,32 +615,61 @@ class GatewayNodeManager:
                     result = await self._build_session_result(managed)
         except GatewayExecutionTimeout as exc:
             result = self._timeout_result(request, managed.timer, str(exc))
+        except GatewayExecutionCancelled:
+            result = self._cancelled_result(request, managed.timer)
         except Exception as exc:
             logger.exception("Post-run handling failed for session %s", request.session_id)
             result = self._error_result(request, managed.timer, f"post-run failed: {exc}")
         finally:
             managed.timer.mark("postrun", "finished")
-            managed.timer.mark("teardown", "started")
-            await self._run_postrun_steps(managed)
-            stop_tasks = []
-            eval_runtime = await self._drain_eval_prewarm_task(managed)
-            if eval_runtime is not None:
-                stop_tasks.append(
-                    self._stop_runtime_best_effort(
-                        eval_runtime, request.session_id, "eval runtime"
-                    )
-                )
             if managed.runtime is not None:
-                stop_tasks.append(
-                    self._stop_runtime_best_effort(
-                        managed.runtime, request.session_id, "runtime"
-                    )
+                # Read the bind-mounted JSONL directly. This deliberately does
+                # not consume the exhausted execution budget, so failed and
+                # timed-out agent actions retain their most useful telemetry.
+                managed.timer.add_mini_swe_command_summary(
+                    load_mini_swe_command_timing(managed.runtime)
                 )
-            if stop_tasks:
-                await asyncio.gather(*stop_tasks, return_exceptions=True)
+            managed.timer.mark("teardown", "started")
+            managed.timer.mark("postrun_exec", "started")
+            try:
+                if not managed.cancel_requested:
+                    await self._run_postrun_steps(managed)
+            finally:
+                managed.timer.mark("postrun_exec", "finished")
+
+            runtimes: list[BaseRuntime] = []
+            managed.timer.mark("runtime_stop", "started")
+            try:
+                stop_tasks = []
+                eval_runtime = await self._drain_eval_prewarm_task(managed)
+                if eval_runtime is not None:
+                    runtimes.append(eval_runtime)
+                    stop_tasks.append(
+                        self._stop_runtime_best_effort(
+                            eval_runtime, request.session_id, "eval runtime"
+                        )
+                    )
+                if managed.runtime is not None:
+                    runtimes.append(managed.runtime)
+                    stop_tasks.append(
+                        self._stop_runtime_best_effort(
+                            managed.runtime, request.session_id, "runtime"
+                        )
+                    )
+                if stop_tasks:
+                    await asyncio.gather(*stop_tasks, return_exceptions=True)
+            finally:
+                managed.timer.mark("runtime_stop", "finished")
+                for runtime in runtimes:
+                    managed.timer.add_runtime_exec_summary(runtime.exec_timing_summary())
             managed.timer.mark("teardown", "finished")
             managed.timer.mark("return", "finished")
 
+        # DELETE can arrive after evaluator completion but while teardown is
+        # awaiting runtime cleanup. The scheduler has already discarded that
+        # session, so never publish the previously built trainable payload.
+        if managed.cancel_event.is_set():
+            result = self._cancelled_result(request, managed.timer)
         if result is None:
             result = self._error_result(
                 request,
@@ -552,9 +691,7 @@ class GatewayNodeManager:
                 # status/task_id visible for debugging via the polling endpoint.
                 self.session_registry.clear_result_payload(request.session_id)
         finally:
-            await self._remove_session_dir_best_effort(
-                managed.session_dir, request.session_id
-            )
+            await self._remove_session_dir_best_effort(managed.session_dir, request.session_id)
 
     async def _build_session_result(self, managed: ManagedSession) -> SessionResult:
         request = managed.request
@@ -570,12 +707,13 @@ class GatewayNodeManager:
         managed.timer.mark("build", "started")
         try:
             trajectory = await self._await_with_budget(
-                asyncio.to_thread(self._build_trajectory, request),
+                lambda: asyncio.to_thread(self._build_trajectory, request),
                 managed,
             )
         finally:
             managed.timer.mark("build", "finished")
 
+        trajectory = self._attach_agent_result_metadata(trajectory, agent_result)
         error = trajectory.error
         if agent_result.status == "timeout":
             trajectory = trajectory.model_copy(
@@ -596,13 +734,28 @@ class GatewayNodeManager:
                     agent_result=agent_result,
                     managed=managed,
                 )
+        except GatewayExecutionCancelled:
+            raise
         except GatewayExecutionTimeout as exc:
             # Preserve the built trajectory even when eval times out.
             logger.warning("Eval timed out for session %s: %s", request.session_id, exc)
+            evaluation = trajectory.metadata.get("evaluation")
+            evaluation_metadata = dict(evaluation) if isinstance(evaluation, dict) else {}
+            evaluation_metadata.update(
+                {
+                    "verifier_timeout": True,
+                    "verifier_timeout_error": str(exc),
+                }
+            )
+            update: dict[str, Any] = {
+                "metadata": {
+                    **trajectory.metadata,
+                    "evaluation": evaluation_metadata,
+                }
+            }
             if trajectory.status not in ("TIMEOUT", "ERROR"):
-                trajectory = trajectory.model_copy(
-                    update={"status": "TIMEOUT", "error": f"eval timed out: {exc}"}
-                )
+                update.update({"status": "TIMEOUT", "error": f"eval timed out: {exc}"})
+            trajectory = trajectory.model_copy(update=update)
         except Exception as exc:
             logger.exception("Eval failed for session %s", request.session_id)
             trajectory = trajectory.model_copy(
@@ -611,6 +764,13 @@ class GatewayNodeManager:
         finally:
             managed.timer.mark("eval", "finished")
 
+        # Evaluation is deliberately allowed to run after a failed agent so
+        # its verifier output remains available for diagnosis. Agent-budget
+        # timeouts are aligned sampled policy actions and remain trainable as
+        # explicit zero-reward negatives; evaluator, infrastructure, and ERROR
+        # outcomes remain diagnostic-only. Enforce the distinction at the
+        # persisted gateway boundary and again in the trainer adapter.
+        trajectory = self._mask_noncompleted_trajectory(trajectory)
         error = trajectory.error or error
         return SessionResult(
             session_id=request.session_id,
@@ -644,6 +804,8 @@ class GatewayNodeManager:
         evaluator_spec = request.evaluator
         if evaluator_spec is None:
             return trajectory
+        if managed.cancel_event.is_set():
+            raise GatewayExecutionCancelled("session cancelled during evaluation")
 
         live_runtime = managed.runtime
         if live_runtime is None:
@@ -651,7 +813,10 @@ class GatewayNodeManager:
 
         fresh_eval_runtime: BaseRuntime | None = None
         if evaluator_spec.refresh_runtime:
-            fresh_eval_runtime = await self._acquire_prepared_eval_runtime(managed)
+            fresh_eval_runtime = await self._await_eval_with_budget_or_cancel(
+                self._acquire_prepared_eval_runtime(managed),
+                managed,
+            )
             if fresh_eval_runtime is None:
                 return trajectory.model_copy(
                     update={
@@ -668,7 +833,7 @@ class GatewayNodeManager:
 
         try:
             evaluator = self.evaluators.create(strategy_spec)
-            eval_result = await self._await_with_budget(
+            eval_result = await self._await_eval_with_budget_or_cancel(
                 evaluator.evaluate(
                     trajectory,
                     session_id=request.session_id,
@@ -685,6 +850,8 @@ class GatewayNodeManager:
                 ),
                 managed,
             )
+        except GatewayExecutionCancelled:
+            raise
         except Exception as exc:
             logger.exception(
                 "Evaluator %s failed for session %s",
@@ -722,11 +889,24 @@ class GatewayNodeManager:
                 for trace, reward in zip(traces, eval_result.trace_rewards)
             ]
         elif eval_result.outcome_reward is not None and traces:
-            # Broadcast trajectory-level reward 
+            # Broadcast trajectory-level reward.
             traces = [
-                trace.model_copy(update={"reward": eval_result.outcome_reward})
-                for trace in traces
+                trace.model_copy(update={"reward": eval_result.outcome_reward}) for trace in traces
             ]
+
+        # A successful session can contain abandoned retry chains. Never let a
+        # terminal outcome positively reinforce a chain whose attempted tool
+        # call could not be parsed. This is still a sampled policy action: if
+        # token/log-prob alignment is intact, keep its loss mask so reward=0
+        # gives it a negative centered advantage when sibling rollouts solve.
+        filtered_traces = []
+        parser_invalid_traces_zero_rewarded = 0
+        for trace in traces:
+            filtered_trace, invalid_reason = zero_reward_parser_invalid_tool_call_trace(trace)
+            filtered_traces.append(filtered_trace)
+            if invalid_reason is not None:
+                parser_invalid_traces_zero_rewarded += 1
+        traces = filtered_traces
 
         eval_metadata = {
             "strategy": evaluator_spec.strategy,
@@ -734,8 +914,156 @@ class GatewayNodeManager:
             "trace_rewards": eval_result.trace_rewards,
             **eval_result.metadata,
         }
+        if parser_invalid_traces_zero_rewarded:
+            eval_metadata["parser_invalid_traces_zero_rewarded"] = (
+                parser_invalid_traces_zero_rewarded
+            )
         metadata = {**trajectory.metadata, "evaluation": eval_metadata}
-        return trajectory.model_copy(update={"traces": traces, "metadata": metadata})
+        merged = trajectory.model_copy(update={"traces": traces, "metadata": metadata})
+        return GatewayNodeManager._mask_noncompleted_trajectory(merged)
+
+    @staticmethod
+    def _mask_noncompleted_trajectory(trajectory: Trajectory) -> Trajectory:
+        """Fail-close non-completed trajectories at the gateway boundary.
+
+        Evaluators may still inspect a failed agent's final container state.
+        A timeout caused specifically by the model agent exhausting its own
+        budget is a valid sampled policy failure: preserve aligned masks and
+        old-policy logprobs but force its effective reward to zero. All other
+        TIMEOUT/ERROR outcomes remain diagnostic-only and fully masked.
+        """
+
+        if trajectory.status == "COMPLETED":
+            return trajectory
+
+        trainable_agent_timeout = GatewayNodeManager._is_trainable_agent_timeout(trajectory)
+        filter_reason = (
+            _TRAINABLE_AGENT_TIMEOUT_REASON
+            if trainable_agent_timeout
+            else "session_timeout"
+            if trajectory.status == "TIMEOUT"
+            else "session_error"
+        )
+        filtered_traces: list[Trace] = []
+        for trace in trajectory.traces:
+            trace_metadata = dict(trace.metadata)
+            current_filter = trace_metadata.get("training_filter")
+            training_filter = dict(current_filter) if isinstance(current_filter, dict) else {}
+            aligned_agent_timeout = (
+                trainable_agent_timeout and GatewayNodeManager._has_aligned_policy_data(trace)
+            )
+            filter_update: dict[str, Any] = {
+                "masked": not aligned_agent_timeout,
+                "reason": (
+                    filter_reason
+                    if aligned_agent_timeout or not trainable_agent_timeout
+                    else "agent_timeout_unaligned"
+                ),
+                "detail": trajectory.error or trajectory.status,
+            }
+            if trainable_agent_timeout:
+                filter_update["trainable"] = aligned_agent_timeout
+            training_filter.update(filter_update)
+            training_filter.setdefault("original_reward", trace.reward)
+            trace_metadata["training_filter"] = training_filter
+            updates: dict[str, Any] = {
+                "reward": 0.0,
+                "metadata": trace_metadata,
+            }
+            if not aligned_agent_timeout:
+                updates["loss_mask"] = [0] * len(trace.response_ids)
+            filtered_traces.append(trace.model_copy(update=updates))
+
+        metadata = dict(trajectory.metadata)
+        evaluation = metadata.get("evaluation")
+        if isinstance(evaluation, dict):
+            evaluation = dict(evaluation)
+            outcome_reward = evaluation.get("outcome_reward")
+            trace_rewards = evaluation.get("trace_rewards")
+            if outcome_reward is not None:
+                evaluation.setdefault("discarded_outcome_reward", outcome_reward)
+            if trace_rewards is not None:
+                evaluation.setdefault("discarded_trace_rewards", trace_rewards)
+            # ``reward`` and ``resolved`` are common evaluator convenience
+            # fields (including Harbor).  Keep verifier_reported_reward intact
+            # as the raw diagnostic while making these effective fields agree
+            # with the terminal session status.
+            if evaluation.get("reward") is not None:
+                evaluation.setdefault("discarded_reward", evaluation["reward"])
+                evaluation["reward"] = 0.0
+            if evaluation.get("resolved") is not None:
+                evaluation["resolved"] = False
+            evaluation["outcome_reward"] = 0.0
+            if isinstance(trace_rewards, list):
+                evaluation["trace_rewards"] = [0.0] * len(trace_rewards)
+            evaluation["reward_discarded"] = True
+            evaluation["reward_discard_reason"] = filter_reason
+            metadata["evaluation"] = evaluation
+
+        return trajectory.model_copy(update={"traces": filtered_traces, "metadata": metadata})
+
+    @staticmethod
+    def _attach_agent_result_metadata(
+        trajectory: Trajectory,
+        agent_result: AgentRunResult,
+    ) -> Trajectory:
+        """Persist the trusted gateway classification of the agent lifecycle."""
+
+        metadata = dict(trajectory.metadata)
+        agent_metadata: dict[str, Any] = {
+            "status": agent_result.status,
+            "return_code": agent_result.return_code,
+        }
+        if agent_result.error:
+            agent_metadata["error"] = agent_result.error
+        timeout_source = agent_result.metadata.get("timeout_source")
+        if timeout_source in {"agent", "session"}:
+            agent_metadata["timeout_source"] = timeout_source
+        timeout_stage = agent_result.metadata.get("timeout_stage")
+        if timeout_stage in {"setup", "exec", "postprocess"}:
+            agent_metadata["timeout_stage"] = timeout_stage
+        metadata[_AGENT_RESULT_METADATA_KEY] = agent_metadata
+        return trajectory.model_copy(update={"metadata": metadata})
+
+    @staticmethod
+    def _is_trainable_agent_timeout(trajectory: Trajectory) -> bool:
+        if trajectory.status != "TIMEOUT":
+            return False
+        agent_result = trajectory.metadata.get(_AGENT_RESULT_METADATA_KEY)
+        if not isinstance(agent_result, dict):
+            return False
+        if agent_result.get("status") != "timeout":
+            return False
+        if agent_result.get("timeout_source") != "agent":
+            return False
+        if agent_result.get("timeout_stage") != "exec":
+            return False
+        evaluation = trajectory.metadata.get("evaluation")
+        return not (isinstance(evaluation, dict) and evaluation.get("verifier_timeout") is True)
+
+    @staticmethod
+    def _has_aligned_policy_data(trace: Trace) -> bool:
+        return (
+            bool(trace.response_ids)
+            and len(trace.loss_mask) == len(trace.response_ids)
+            and any(trace.loss_mask)
+            and trace.response_logprobs is not None
+            and len(trace.response_logprobs) == len(trace.response_ids)
+        )
+
+    @staticmethod
+    def _timeout_source_from_error(error: BaseException) -> str:
+        return "agent" if str(error) == "agent execution timeout" else "session"
+
+    @staticmethod
+    def _active_timeout_source(managed: ManagedSession) -> str:
+        agent_deadline = managed.agent_deadline
+        session_deadline = managed.execution_deadline
+        if agent_deadline is not None and (
+            session_deadline is None or agent_deadline < session_deadline
+        ):
+            return "agent"
+        return "session"
 
     # ------------------------------------------------------------------
     # Environment and helpers
@@ -763,7 +1091,7 @@ class GatewayNodeManager:
             agent_log_dir = runtime.runtime_agent_log_dir
             runtime_env = dict(runtime.spec.env)
         agent_env = dict(request.agent.env) if include_agent_env else {}
-        return {
+        environment = {
             "ANTHROPIC_BASE_URL": self.gateway_url,
             "ANTHROPIC_API_KEY": request.session_id,
             "OPENAI_BASE_URL": f"{self.gateway_url.rstrip('/')}/v1",
@@ -779,11 +1107,25 @@ class GatewayNodeManager:
             **{key: str(value) for key, value in runtime_env.items()},
             **{key: str(value) for key, value in agent_env.items()},
         }
+        if runtime is not None:
+            # Keep RuntimeSpec.env strictly string-valued while still exposing
+            # the authoritative policy to an injected network helper. Put this
+            # after both runtime and agent env so an offline task cannot regain
+            # the job's HTTP proxy by overriding the marker in its payload.
+            environment["POLAR_ALLOW_INTERNET"] = (
+                "true" if runtime.spec.allow_internet else "false"
+            )
+        return environment
 
     @staticmethod
     def _write_exec_log(
         log_dir: Path, prefix: str, stdout: str | None, stderr: str | None
     ) -> None:
+        # A session can be cancelled and cleaned while an in-flight runtime
+        # command is returning. Recreate the leaf on the write side so log
+        # persistence does not turn that otherwise-benign race into a session
+        # execution failure.
+        log_dir.mkdir(parents=True, exist_ok=True)
         if stdout:
             (log_dir / f"{prefix}.stdout.log").write_text(stdout)
         if stderr:
@@ -849,25 +1191,62 @@ class GatewayNodeManager:
             metadata=dict(request.metadata),
         )
 
-    def _cancelled_result(self, request: SessionDispatchRequest, timer: StageTimer) -> SessionResult:
+    def _cancelled_result(
+        self, request: SessionDispatchRequest, timer: StageTimer
+    ) -> SessionResult:
         return self._error_result(request, timer, "session cancelled")
 
     async def _push_result(self, callback_url: str | None, result: SessionResult) -> bool:
         """POST the terminal result to the rollout server. Return True on success."""
         if not callback_url:
             return False
-        try:
-            response = await self._client.post(callback_url, json=result.model_dump(mode="json"))
-            response.raise_for_status()
-            return True
-        except Exception:
+        payload = result.model_dump(mode="json")
+        for attempt in range(1, _CALLBACK_MAX_ATTEMPTS + 1):
+            retryable = False
+            last_error: Exception | None = None
+            try:
+                response = await self._client.post(
+                    callback_url,
+                    json=payload,
+                    timeout=_CALLBACK_REQUEST_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                return True
+            except asyncio.CancelledError:
+                raise
+            except httpx.HTTPStatusError as exc:
+                retryable = exc.response.status_code in _CALLBACK_RETRYABLE_STATUS_CODES
+                last_error = exc
+            except httpx.TransportError as exc:
+                # A dropped response can mean the rollout server accepted the
+                # first POST but its acknowledgement was lost. The callback
+                # endpoint is idempotent for a terminal session id, so retrying
+                # is safe and lets the gateway release its retained payload.
+                retryable = True
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+
+            if retryable and attempt < _CALLBACK_MAX_ATTEMPTS:
+                logger.debug(
+                    "Callback attempt %d/%d failed for session %s (%s); retrying",
+                    attempt,
+                    _CALLBACK_MAX_ATTEMPTS,
+                    result.session_id,
+                    last_error,
+                )
+                await asyncio.sleep(_CALLBACK_RETRY_BACKOFF_SECONDS * attempt)
+                continue
+
             logger.warning(
-                "Failed to deliver callback for session %s to %s",
+                "Failed to deliver callback for session %s to %s after %d attempt(s): %s",
                 result.session_id,
                 callback_url,
-                exc_info=True,
+                attempt,
+                last_error,
             )
             return False
+        return False
 
     @staticmethod
     def _snapshot_to_metrics(snapshot: DispatcherSnapshot) -> NodeStageMetrics:
@@ -891,25 +1270,106 @@ class GatewayNodeManager:
 
     async def _await_with_budget(
         self,
-        awaitable,
+        awaitable_factory,
         managed: ManagedSession,
     ):
+        # Check the budget before constructing the coroutine.  Callers used to
+        # pass an already-created coroutine here; when the budget had expired,
+        # _remaining_budget raised before wait_for could schedule (or close) it,
+        # producing "coroutine was never awaited" warnings at timeout boundaries.
+        timeout = self._remaining_budget(managed)
         try:
             return await asyncio.wait_for(
-                awaitable,
-                timeout=self._remaining_budget(managed),
+                awaitable_factory(),
+                timeout=timeout,
             )
         except asyncio.TimeoutError as exc:
             raise GatewayExecutionTimeout("session execution timeout") from exc
+
+    def _remaining_agent_budget(self, managed: ManagedSession) -> float:
+        """Return the smaller active-agent and total-session budget."""
+
+        total_remaining = self._remaining_budget(managed)
+        deadline = managed.agent_deadline
+        if deadline is None:
+            return total_remaining
+        agent_remaining = deadline - asyncio.get_running_loop().time()
+        if agent_remaining <= 0:
+            raise GatewayExecutionTimeout("agent execution timeout")
+        return min(total_remaining, agent_remaining)
+
+    async def _await_with_agent_budget(
+        self,
+        awaitable_factory,
+        managed: ManagedSession,
+    ):
+        timeout = self._remaining_agent_budget(managed)
+        total_deadline = managed.execution_deadline
+        agent_deadline = managed.agent_deadline
+        try:
+            return await asyncio.wait_for(awaitable_factory(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            # If both expire together, preserve the stronger total-session cap.
+            if total_deadline is not None and (
+                agent_deadline is None or total_deadline <= agent_deadline
+            ):
+                raise GatewayExecutionTimeout("session execution timeout") from exc
+            raise GatewayExecutionTimeout("agent execution timeout") from exc
+
+    async def _await_eval_with_budget_or_cancel(
+        self,
+        awaitable,
+        managed: ManagedSession,
+    ):
+        """Await evaluator work until completion, deadline, or session DELETE."""
+
+        operation = asyncio.ensure_future(awaitable)
+        cancel_wait = asyncio.create_task(managed.cancel_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {operation, cancel_wait},
+                timeout=self._remaining_budget(managed),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # Cancellation wins ties. A terminal result delivered after the
+            # scheduler discarded this session must never regain trainability.
+            if cancel_wait in done and managed.cancel_event.is_set():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+                raise GatewayExecutionCancelled("session cancelled during evaluation")
+            if operation in done:
+                return operation.result()
+
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+            raise GatewayExecutionTimeout("session execution timeout")
+        except BaseException:
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+            raise
+        finally:
+            cancel_wait.cancel()
+            await asyncio.gather(cancel_wait, return_exceptions=True)
 
     @staticmethod
     def _start_execution_deadline(managed: ManagedSession) -> None:
         if managed.execution_deadline is not None:
             return
         managed.execution_deadline = (
-            asyncio.get_running_loop().time()
-            + managed.request.remaining_timeout_seconds
+            asyncio.get_running_loop().time() + managed.request.remaining_timeout_seconds
         )
+
+    @staticmethod
+    def _start_agent_deadline(managed: ManagedSession) -> None:
+        if managed.agent_deadline is not None:
+            return
+        value = managed.request.metadata.get("agent_timeout")
+        if value is None:
+            return
+        # SessionDispatchRequest validates this trusted metadata at the API
+        # boundary. Keep the conversion local so the deadline uses monotonic
+        # time and begins only after the READY queue grants a RUN worker.
+        managed.agent_deadline = asyncio.get_running_loop().time() + float(value)
 
     async def _run_postrun_steps(self, managed: ManagedSession) -> None:
         if not managed.postrun_steps or managed.runtime is None:

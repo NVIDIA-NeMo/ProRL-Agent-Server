@@ -27,6 +27,8 @@ class PrepareAction(BaseModel):
     command: str | None = None
     cwd: str | None = None
     env: dict[str, str] | None = None
+    max_attempts: int = Field(default=1, ge=1, le=10)
+    retry_backoff_seconds: float = Field(default=0.0, ge=0.0, le=60.0)
 
     @model_validator(mode="after")
     def _validate_fields(self) -> PrepareAction:
@@ -36,6 +38,10 @@ class PrepareAction(BaseModel):
             for field_name in ("command", "cwd", "env"):
                 if getattr(self, field_name) is not None:
                     raise ValueError(f"{self.type} must not set {field_name}")
+            if self.max_attempts != 1 or self.retry_backoff_seconds != 0.0:
+                raise ValueError(
+                    f"{self.type} does not support exec retry settings"
+                )
         elif self.type == "exec":
             if not self.command:
                 raise ValueError("exec requires command")
@@ -63,11 +69,22 @@ class RuntimeSpec(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     network: str | None = "host"
     workdir: str | None = None
+    # Optional setup for nested direct-exec runtimes. It runs once in the
+    # persistent broker owner shell, or once per workload shell when legacy
+    # fresh-exec mode is selected. This is distinct from an image environment
+    # hook: with Apptainer ``--pid``, those hooks run under PID 1 (appinit),
+    # which can discard hook-spawned background jobs before it starts the
+    # workload. Persistent instance / Docker runtimes deliberately ignore it.
+    direct_exec_init_command: str | None = None
     cpus: int | None = None
     memory_mb: int | None = None
     storage_mb: int | None = None
     gpus: int = 0
     allow_internet: bool = True
+    # Host paths that are visible only to runtimes whose internet policy is
+    # enabled. Keep network egress capabilities (for example a proxy UDS) out
+    # of offline sandboxes even when both policies share one task template.
+    internet_volumes: list[str] = Field(default_factory=list)
     import_path: str | None = None
     kwargs: dict[str, Any] = Field(default_factory=dict)
 
@@ -87,4 +104,16 @@ class RuntimeSpec(BaseModel):
         normalized = value.strip()
         if not normalized:
             raise ValueError("workdir must be non-empty when provided")
+        return normalized
+
+    @field_validator("direct_exec_init_command")
+    @classmethod
+    def _validate_direct_exec_init_command(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(
+                "direct_exec_init_command must be non-empty when provided"
+            )
         return normalized

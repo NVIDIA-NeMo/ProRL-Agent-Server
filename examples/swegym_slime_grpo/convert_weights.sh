@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Convert Qwen3.5-4B HF weights to Megatron torch_dist format for Slime training.
-# Qwen3.5-4B is a VLM checkpoint (Qwen3_5ForConditionalGeneration) with hybrid
+# Convert Qwen3.5 HF weights to Megatron torch_dist format for Slime training.
+# Qwen3.5 is a VLM checkpoint (Qwen3_5ForConditionalGeneration) with hybrid
 # attention (1 full + 3 GatedDeltaNet linear per 4 layers).  Weight loading goes
 # through slime_plugins.mbridge.qwen3_5 (text_config-aware).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+# shellcheck source=./launcher_utils.sh
+source "${SCRIPT_DIR}/launcher_utils.sh"
 
 SLIME_DIR="${SLIME_DIR:-${PROJECT_ROOT}/slime}"
 MEGATRON_DIR="${MEGATRON_DIR:-${PROJECT_ROOT}/Megatron-LM}"
@@ -27,8 +29,18 @@ HF_CHECKPOINT="${HF_CHECKPOINT:-Qwen/Qwen3.5-4B}"
 OUTPUT_DIR="${TORCH_DIST_DIR:-${PROJECT_ROOT}/tmp/checkpoints/Qwen3.5-4B_torch_dist}"
 mkdir -p "$OUTPUT_DIR"
 
-# shellcheck source=./model_args.sh
-source "${SCRIPT_DIR}/model_args.sh"
+MODEL_ARGS_FILE="${MODEL_ARGS_FILE:-${SCRIPT_DIR}/model_args.sh}"
+if [ ! -r "${MODEL_ARGS_FILE}" ]; then
+    echo "ERROR: Megatron model args file is not readable: ${MODEL_ARGS_FILE}" >&2
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "${MODEL_ARGS_FILE}"
+if ! declare -p MODEL_ARGS >/dev/null 2>&1; then
+    echo "ERROR: ${MODEL_ARGS_FILE} did not define the MODEL_ARGS array" >&2
+    exit 1
+fi
+polar_validate_model_args "${MODEL_ARGS[@]}"
 
 echo "Converting ${HF_CHECKPOINT} -> ${OUTPUT_DIR}"
 

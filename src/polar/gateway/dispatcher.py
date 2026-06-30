@@ -9,6 +9,7 @@ ad-hoc background task owned by the session handler, not a dedicated stage.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
@@ -69,9 +70,14 @@ class ManagedSession:
     final_result: SessionResult | None = None
     postrun_steps: list[ExecInput] = field(default_factory=list)
     eval_prewarm_task: asyncio.Task | None = None
+    runtime_cancel_task: asyncio.Task[None] | None = None
+    done_event: asyncio.Event = field(default_factory=asyncio.Event)
     cancel_requested: bool = False
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     execution_deadline: float | None = None
+    # Starts only when a RUN worker begins active agent work. READY queue time
+    # still consumes the total execution deadline, but never this model budget.
+    agent_deadline: float | None = None
     stage: SessionStage = SessionStage.INIT
     inflight: bool = False
 
@@ -99,13 +105,20 @@ class SessionDispatcher:
         self.on_run: StageCallback | None = None
         self.on_postrun: StageCallback | None = None
         self.on_stage_change: StageTransitionCallback | None = None
-        self._init_queue: asyncio.Queue[str | object] = asyncio.Queue()
+        # INIT is the only stage where a short fixed evaluation can otherwise
+        # sit behind an already-filled fully-async training window. Use a
+        # stable priority queue here: higher request priority wins, while FIFO
+        # ordering is preserved within the same priority. Inflight work is
+        # deliberately never preempted.
+        self._init_queue: asyncio.PriorityQueue[tuple[int, int, str]] = asyncio.PriorityQueue()
+        self._init_sequence = itertools.count()
         self._ready_queue: asyncio.Queue[str | object] = asyncio.Queue()
         self._postrun_queue: asyncio.Queue[str | object] = asyncio.Queue()
         self._ready_slots = asyncio.Semaphore(max_run_workers)
         self._sessions: dict[str, ManagedSession] = {}
         self._lock = asyncio.Lock()
         self._workers: list[asyncio.Task[None]] = []
+        self._runtime_cancel_tasks: set[asyncio.Task[None]] = set()
         self._started = False
 
     async def start(self) -> None:
@@ -114,7 +127,10 @@ class SessionDispatcher:
         self._workers = [
             *(asyncio.create_task(self._init_worker()) for _ in range(self.max_init_workers)),
             *(asyncio.create_task(self._run_worker()) for _ in range(self.max_run_workers)),
-            *(asyncio.create_task(self._postrun_worker()) for _ in range(self.max_postrun_workers)),
+            *(
+                asyncio.create_task(self._postrun_worker())
+                for _ in range(self.max_postrun_workers)
+            ),
         ]
         self._started = True
 
@@ -124,16 +140,24 @@ class SessionDispatcher:
         async with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
-        for managed in sessions:
-            managed.cancel_requested = True
-            managed.cancel_event.set()
-            if managed.runtime is not None:
-                await managed.runtime.cancel()
+            for managed in sessions:
+                managed.cancel_requested = True
+                managed.cancel_event.set()
+                self._schedule_runtime_cancel_locked(managed)
+            cancel_tasks = [
+                managed.runtime_cancel_task
+                for managed in sessions
+                if managed.runtime_cancel_task is not None
+            ]
+        if cancel_tasks:
+            await asyncio.gather(*cancel_tasks, return_exceptions=True)
         for task in self._workers:
             task.cancel()
         if self._workers:
             await asyncio.gather(*self._workers, return_exceptions=True)
         self._workers.clear()
+        for managed in sessions:
+            managed.done_event.set()
         self._started = False
 
     async def enqueue(self, managed: ManagedSession) -> None:
@@ -143,35 +167,88 @@ class SessionDispatcher:
             if managed.session_id in self._sessions:
                 raise ValueError(f"session {managed.session_id} is already enqueued")
             self._sessions[managed.session_id] = managed
-        await self._init_queue.put(managed.session_id)
+        await self._init_queue.put(
+            (
+                -managed.request.dispatch_priority,
+                next(self._init_sequence),
+                managed.session_id,
+            )
+        )
 
-    async def cancel(self, session_id: str) -> bool:
+    async def cancel(self, session_id: str) -> asyncio.Event | None:
+        """Accept cancellation without waiting for a runtime process to exit.
+
+        Runtime kill/reap runs in a tracked task.  The post-run worker waits
+        for it before finalization, and ``stop`` drains every such task, so a
+        fast DELETE acknowledgement never turns into an orphan subprocess.
+        """
         should_enqueue_postrun = False
         async with self._lock:
             managed = self._sessions.get(session_id)
             if managed is None:
-                return False
-            if managed.cancel_requested:
-                return True
-            managed.cancel_requested = True
-            managed.cancel_event.set()
-            # If the session is parked in READY (holding a ready slot), release it
-            # and transition to POSTRUN so the postrun worker picks it up.
-            if managed.stage == SessionStage.READY and not managed.inflight:
-                self._ready_slots.release()
-                managed.stage = SessionStage.POSTRUN
-                managed.inflight = False
-                should_enqueue_postrun = True
-            elif managed.stage == SessionStage.INIT and not managed.inflight:
-                managed.stage = SessionStage.POSTRUN
-                managed.inflight = False
-                should_enqueue_postrun = True
-        if managed.runtime is not None:
-            await managed.runtime.cancel()
+                return None
+            if not managed.cancel_requested:
+                managed.cancel_requested = True
+                managed.cancel_event.set()
+                # If the session is parked in READY (holding a ready slot),
+                # release it and transition to POSTRUN so a worker finalizes it.
+                if managed.stage == SessionStage.READY and not managed.inflight:
+                    self._ready_slots.release()
+                    managed.stage = SessionStage.POSTRUN
+                    managed.inflight = False
+                    should_enqueue_postrun = True
+                elif managed.stage == SessionStage.INIT and not managed.inflight:
+                    managed.stage = SessionStage.POSTRUN
+                    managed.inflight = False
+                    should_enqueue_postrun = True
+            # A repeated DELETE can arrive after the first request marked a
+            # not-yet-initialized session.  Re-check runtime availability so
+            # that request remains idempotent and still schedules the kill.
+            self._schedule_runtime_cancel_locked(managed)
         if should_enqueue_postrun:
             self._notify_stage_change(managed)
             await self._postrun_queue.put(session_id)
-        return True
+        return managed.done_event
+
+    def _schedule_runtime_cancel_locked(
+        self,
+        managed: ManagedSession,
+    ) -> asyncio.Task[None] | None:
+        existing = managed.runtime_cancel_task
+        if existing is not None:
+            return existing
+        if managed.runtime is None:
+            return None
+        task = asyncio.create_task(
+            self._cancel_runtime_best_effort(managed),
+            name=f"polar-runtime-cancel-{managed.session_id}",
+        )
+        managed.runtime_cancel_task = task
+        self._runtime_cancel_tasks.add(task)
+        task.add_done_callback(self._runtime_cancel_tasks.discard)
+        return task
+
+    async def _cancel_runtime_best_effort(self, managed: ManagedSession) -> None:
+        runtime = managed.runtime
+        if runtime is None:
+            return
+        try:
+            await runtime.cancel()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Failed to cancel runtime for session %s",
+                managed.session_id,
+            )
+
+    async def _await_runtime_cancel(self, managed: ManagedSession) -> None:
+        async with self._lock:
+            task = (
+                self._schedule_runtime_cancel_locked(managed) if managed.cancel_requested else None
+            )
+        if task is not None:
+            await asyncio.shield(task)
 
     async def active_count(self) -> int:
         return (await self.snapshot()).active_count
@@ -202,10 +279,7 @@ class SessionDispatcher:
 
     async def _init_worker(self) -> None:
         while True:
-            item = await self._init_queue.get()
-            if item is _STOP:
-                return
-            session_id = str(item)
+            _, _, session_id = await self._init_queue.get()
             managed = await self._begin(session_id, SessionStage.INIT)
             if managed is None:
                 continue
@@ -235,9 +309,13 @@ class SessionDispatcher:
             managed = await self._begin(session_id, SessionStage.POSTRUN)
             if managed is None:
                 continue
-            await self._safe_invoke(self.on_postrun, managed, SessionStage.POSTRUN)
-            async with self._lock:
-                self._sessions.pop(session_id, None)
+            try:
+                await self._await_runtime_cancel(managed)
+                await self._safe_invoke(self.on_postrun, managed, SessionStage.POSTRUN)
+            finally:
+                async with self._lock:
+                    self._sessions.pop(session_id, None)
+                managed.done_event.set()
 
     async def _safe_invoke(
         self, callback: StageCallback | None, managed: ManagedSession, stage: SessionStage
@@ -334,7 +412,11 @@ class SessionDispatcher:
                 acquire_task.cancel()
         # If we managed to acquire the semaphore despite cancellation, release it
         # so it doesn't leak to a later session.
-        acquired = acquire_task in done and not acquire_task.cancelled() and acquire_task.exception() is None
+        acquired = (
+            acquire_task in done
+            and not acquire_task.cancelled()
+            and acquire_task.exception() is None
+        )
         if managed.cancel_event.is_set() or managed.final_result is not None:
             if acquired:
                 self._ready_slots.release()

@@ -21,7 +21,7 @@ export interface SessionTiming {
   init_ms?: number;
   run_ms?: number;
   postrun_ms?: number;
-  [key: string]: number | undefined;
+  [key: string]: number | Record<string, number> | undefined;
 }
 
 export interface SessionSummary {
@@ -104,4 +104,3 @@ export interface TopologyPayload {
     health: any;
   }[];
 }
-

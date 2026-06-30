@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 
 from polar.runtime.base import BaseRuntime
@@ -61,6 +63,9 @@ class DockerRuntime(BaseRuntime):
         # Additional volumes from kwargs (e.g., Docker socket for agents that need DinD)
         for vol in self.spec.kwargs.get("volumes", []):
             create_args.extend(["-v", vol])
+        if self.spec.allow_internet:
+            for vol in self.spec.internet_volumes:
+                create_args.extend(["-v", vol])
         create_args.extend([self.spec.image, "sleep", "infinity"])
         rc, _, stderr = await self._run_local_command(
             *create_args, capture=True, timeout=self._START_TIMEOUT,
@@ -140,6 +145,10 @@ class DockerRuntime(BaseRuntime):
         env: dict[str, str] | None = None,
         timeout_sec: float | None = None,
     ) -> ExecResult:
+        started_at = time.perf_counter()
+        return_code: int | None = None
+        raised_exception = False
+        cancelled = False
         args = ["docker", "exec"]
         effective_workdir = cwd or self.spec.workdir or self.runtime_session_dir
         if effective_workdir:
@@ -147,14 +156,32 @@ class DockerRuntime(BaseRuntime):
         for key, value in (env or {}).items():
             args.extend(["-e", f"{key}={value}"])
         args.extend([self._container_name, "bash", "-lc", command])
-        rc, stdout, stderr = await self._run_local_command(
-            *args, timeout=timeout_sec, capture=True
-        )
-        return ExecResult(stdout=stdout, stderr=stderr, return_code=rc)
+        try:
+            rc, stdout, stderr = await self._run_local_command(
+                *args, timeout=timeout_sec, capture=True
+            )
+            return_code = rc
+            return ExecResult(stdout=stdout, stderr=stderr, return_code=rc)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except Exception:
+            raised_exception = True
+            raise
+        finally:
+            self._record_exec_timing(
+                command,
+                started_at,
+                return_code,
+                raised_exception=raised_exception,
+                cancelled=cancelled,
+            )
 
     async def upload_file(self, local_path: str, remote_path: str) -> None:
         try:
-            if self._copy_to_bind_mount(local_path, remote_path):
+            if await asyncio.to_thread(
+                self._copy_to_bind_mount, local_path, remote_path
+            ):
                 await self._make_runtime_path_writable(remote_path, recursive=False)
                 return
         except PermissionError:
@@ -172,7 +199,9 @@ class DockerRuntime(BaseRuntime):
 
     async def upload_dir(self, local_path: str, remote_path: str) -> None:
         try:
-            if self._copy_to_bind_mount(local_path, remote_path):
+            if await asyncio.to_thread(
+                self._copy_to_bind_mount, local_path, remote_path
+            ):
                 await self._make_runtime_path_writable(remote_path, recursive=True)
                 return
         except PermissionError:
@@ -208,7 +237,9 @@ class DockerRuntime(BaseRuntime):
 
     async def download_file(self, remote_path: str, local_path: str) -> None:
         try:
-            if self._copy_from_bind_mount(remote_path, Path(local_path)):
+            if await asyncio.to_thread(
+                self._copy_from_bind_mount, remote_path, Path(local_path)
+            ):
                 return
         except PermissionError:
             pass
@@ -221,7 +252,9 @@ class DockerRuntime(BaseRuntime):
 
     async def download_dir(self, remote_path: str, local_path: str) -> None:
         try:
-            if self._copy_from_bind_mount(remote_path, Path(local_path)):
+            if await asyncio.to_thread(
+                self._copy_from_bind_mount, remote_path, Path(local_path)
+            ):
                 return
         except PermissionError:
             pass

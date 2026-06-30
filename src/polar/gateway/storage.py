@@ -116,7 +116,8 @@ class SessionStore:
             state.completion_count = len(state.completions)
             effective_task_id = state.task_id
 
-        # Off the hot path: best-effort persist to disk.
+        # Persist through the bounded background writer.  Normal enqueues are
+        # immediate; sustained storage overload applies lossless backpressure.
         if self._completion_writer is not None:
             self._completion_writer.enqueue(
                 task_id=effective_task_id,

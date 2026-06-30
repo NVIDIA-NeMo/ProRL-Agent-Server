@@ -86,3 +86,29 @@ def test_postrun_backlog_blocks_admission() -> None:
     )
 
     assert scheduler.acquire_node() is None
+
+
+def test_four_gateway_fleet_balances_initial_dispatch_reservations() -> None:
+    scheduler = NodeScheduler()
+    for index in range(4):
+        _register(
+            scheduler,
+            f"slurm-rank-{index}",
+            max_init_workers=12,
+            max_run_workers=96,
+            max_postrun_workers=24,
+        )
+
+    selected = [scheduler.acquire_node() for _ in range(40)]
+
+    assert all(node is not None for node in selected)
+    counts = {
+        node_id: sum(node is not None and node.node_id == node_id for node in selected)
+        for node_id in (f"slurm-rank-{index}" for index in range(4))
+    }
+    assert counts == {
+        "slurm-rank-0": 10,
+        "slurm-rank-1": 10,
+        "slurm-rank-2": 10,
+        "slurm-rank-3": 10,
+    }
