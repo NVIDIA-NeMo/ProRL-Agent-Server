@@ -5,9 +5,17 @@
 #   TMAX_DATASET_DIR      $TMAX_DATA_ROOT/tmax-15k
 #   APPTAINER_IMAGE_DIR   $TMAX_DATA_ROOT/tmax-15k-sif
 #
-# Example:
-#   TMAX_SIF_BUILD_SHARDS=1000 TMAX_SIF_BUILD_ARRAY_PARALLEL=50 \
-#     bash examples/tmax-15k/submit_build_sifs_slurm.sh
+# Defaults are tuned for max-concurrency builds on the cpu_short partition
+# (QOS caps users at node=10, not jobs; nodes are shared, so pack small jobs):
+#   ARRAY_PARALLEL=200  MEM=12G  CPUS_PER_TASK=4  JOBS_PER_TASK=4
+#   -> ~20 jobs/node x 10 nodes ~= 200 concurrent. MEM<10G gives no extra
+#      concurrency (CPU-bound at 96/4=24 jobs/node) and 4G OOM-kills builds.
+#   BASE_SIF defaults to the local ubuntu-22.04-base.sif if present (faster
+#      than docker://ubuntu:22.04). Builder is idempotent: re-run to recover.
+#
+# Example (defaults already give a full 1000-shard concurrent build):
+#   bash examples/tmax-15k/submit_build_sifs_slurm.sh
+#   TMAX_SIF_BUILD_DRY_RUN=1 bash examples/tmax-15k/submit_build_sifs_slurm.sh  # preview only
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -34,15 +42,22 @@ LOG_DIR="${TMAX_SIF_BUILD_LOG_DIR:-${PROJECT_ROOT}/logs/slurm}"
 PYTHON_BIN="${TMAX_SIF_PYTHON_BIN:-${PYTHON_BIN:-/lustre/fsw/portfolios/nvr/projects/nvr_lpr_llm/users/jiaruiy/.python/polar/bin/python}}"
 
 SHARDS="${TMAX_SIF_BUILD_SHARDS:-1000}"
-ARRAY_PARALLEL="${TMAX_SIF_BUILD_ARRAY_PARALLEL:-50}"
-JOBS_PER_TASK="${TMAX_SIF_BUILD_JOBS_PER_TASK:-1}"
+ARRAY_PARALLEL="${TMAX_SIF_BUILD_ARRAY_PARALLEL:-200}"
+JOBS_PER_TASK="${TMAX_SIF_BUILD_JOBS_PER_TASK:-4}"
 CPUS_PER_TASK="${TMAX_SIF_BUILD_CPUS_PER_TASK:-4}"
 BATCH_CPUS_PER_TASK="${TMAX_SIF_BUILD_BATCH_CPUS_PER_TASK:-${CPUS_PER_TASK}}"
-MEM="${TMAX_SIF_BUILD_MEM:-32G}"
+MEM="${TMAX_SIF_BUILD_MEM:-12G}"
 MAX_TASKS="${TMAX_SIF_MAX_TASKS:--1}"
 BUILDER="${TMAX_SIF_BUILDER:-direct-apptainer}"
 APPTAINER_FAKEROOT="${TMAX_SIF_APPTAINER_FAKEROOT:-0}"
-BASE_SIF="${TMAX_SIF_BASE_SIF:-}"
+DEFAULT_BASE_SIF="${TMAX_DATA_ROOT}/container/ubuntu-22.04-base.sif"
+if [ -n "${TMAX_SIF_BASE_SIF:-}" ]; then
+    BASE_SIF="${TMAX_SIF_BASE_SIF}"
+elif [ -f "${DEFAULT_BASE_SIF}" ]; then
+    BASE_SIF="${DEFAULT_BASE_SIF}"
+else
+    BASE_SIF=""
+fi
 if [ "${TMAX_SIF_MKSQUASHFS_ARGS+x}" = "x" ]; then
     MKSQUASHFS_ARGS="${TMAX_SIF_MKSQUASHFS_ARGS}"
 else
