@@ -421,6 +421,7 @@ export POLAR_SUBMIT_RECEIPT_FILE="${TMAX_SUBMIT_RECEIPT_FILE}"
 export WANDB_PROJECT WANDB_GROUP RUN_ID SAVE_DIR LOAD_DIR
 
 if [ "${TMAX_PERSIST_RUN_STATE:-1}" = "1" ] && [ "${SUBMIT_DRY_RUN:-0}" != "1" ]; then
+    tmax_pin_source_revisions "${PROJECT_ROOT}" "${SLIME_DIR}" "${MEGATRON_DIR}"
     tmax_write_run_state "${TMAX_RUN_STATE_FILE}"
     echo "[tmax submit] run state: ${TMAX_RUN_STATE_FILE}"
 fi

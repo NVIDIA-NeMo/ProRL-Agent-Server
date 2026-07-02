@@ -27,7 +27,7 @@ export TMAX_RUN_STATE_FILE="${TMAX_RUN_STATE_FILE:-${POLAR_DATA_ROOT}/runs/tmax_
 # shellcheck source=./run_state.sh
 source "${SCRIPT_DIR}/run_state.sh"
 
-for command in flock squeue sacct python3; do
+for command in flock git squeue sacct python3; do
     command -v "$command" >/dev/null || { echo "ERROR: ${command} is required" >&2; exit 1; }
 done
 mkdir -p "$(dirname "${TMAX_RUN_STATE_FILE}")"
@@ -38,13 +38,16 @@ if ! flock -n 9; then
 fi
 export TMAX_RUN_STATE_LOCK_HELD=1
 
-# An explicit RUN_ID starts or selects that run. Otherwise continue the run
-# recorded by submit_slurm.sh or an earlier watcher invocation.
+# Existing state is authoritative even when RUN_ID is explicit. This prevents
+# a watcher from silently repinning or overwriting the immutable contract of a
+# prior logical run. A new explicit run must use a new state-file path.
 LOADED_RUN_STATE=false
-if [ -z "${RUN_ID:-}" ] && [ -s "${TMAX_RUN_STATE_FILE}" ]; then
-    tmax_load_run_state "${TMAX_RUN_STATE_FILE}"
+_TMAX_REQUESTED_RUN_ID="${RUN_ID:-}"
+if [ -s "${TMAX_RUN_STATE_FILE}" ]; then
+    tmax_load_selected_run_state "${TMAX_RUN_STATE_FILE}" "${_TMAX_REQUESTED_RUN_ID}"
     LOADED_RUN_STATE=true
 fi
+unset _TMAX_REQUESTED_RUN_ID
 # Run-state files written before the fixed-holdout feature must resume with
 # their original prompt/checkpoint semantics. New submissions persist an
 # explicit TMAX_EVAL_ENABLED value, so only legacy state reaches this branch.
@@ -94,6 +97,19 @@ if [ "$LOADED_RUN_STATE" = true ] && \
 fi
 # shellcheck source=./env.cwdfw.sh
 source "${SCRIPT_DIR}/env.cwdfw.sh" >/dev/null
+if tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_PRORL_GIT_COMMIT ||
+   tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_SLIME_GIT_COMMIT ||
+   tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_MEGATRON_GIT_COMMIT; then
+    if ! tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_PRORL_GIT_COMMIT ||
+       ! tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_SLIME_GIT_COMMIT ||
+       ! tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_MEGATRON_GIT_COMMIT; then
+        echo "ERROR: run state has a partial source revision lock; refusing an ambiguous resume" >&2
+        exit 1
+    fi
+    tmax_verify_source_revisions "${PROJECT_ROOT}" "${SLIME_DIR}" "${MEGATRON_DIR}"
+elif [ "$LOADED_RUN_STATE" = true ]; then
+    echo "[tmax watch] legacy run state has no source revision lock" >&2
+fi
 
 export TMAX_WATCH_MAX_QUICK_FAILURES="${TMAX_WATCH_MAX_QUICK_FAILURES:-3}"
 export TMAX_WATCH_QUICK_FAILURE_SECONDS="${TMAX_WATCH_QUICK_FAILURE_SECONDS:-900}"

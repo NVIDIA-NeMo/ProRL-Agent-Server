@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import pickle
 import re
 import shutil
 import subprocess
@@ -53,6 +54,16 @@ def test_shared_launcher_enables_post_train_full_trajectory_examples() -> None:
 def write_command(path: Path, body: str) -> None:
     path.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body)
     path.chmod(0o755)
+
+
+def write_distcp_metadata(model_dir: Path, *shard_names: str) -> None:
+    payload = {
+        "storage_data": [
+            {"relative_path": name, "offset": 0, "length": len(b"weights")}
+            for name in shard_names
+        ]
+    }
+    (model_dir / ".metadata").write_bytes(pickle.dumps(payload, protocol=4))
 
 
 def tmax_submit_env(tmp_path: Path, *, load_pointer: str) -> dict[str, str]:
@@ -467,7 +478,7 @@ def test_hf_export_dry_run_is_generic_and_uses_minimal_slurm_environment(
     model_dir = checkpoint / "iter_0000047"
     model_dir.mkdir(parents=True)
     (model_dir / "common.pt").write_bytes(b"common")
-    (model_dir / ".metadata").write_bytes(b"metadata")
+    write_distcp_metadata(model_dir, "__0_0.distcp")
     (model_dir / "__0_0.distcp").write_bytes(b"weights")
     origin = tmp_path / "origin"
     origin.mkdir()
@@ -475,6 +486,10 @@ def test_hf_export_dry_run_is_generic_and_uses_minimal_slurm_environment(
         json.dumps({"model_type": "test_model", "vocab_size": 123})
     )
     (origin / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {}}))
+    slime_dir = tmp_path / "slime"
+    (slime_dir / "tools").mkdir(parents=True)
+    (slime_dir / "tools" / "convert_torch_dist_to_hf.py").write_text("")
+
     env = os.environ.copy()
     env.update(
         TMAX_HF_EXPORT_RUN_ID="test-run",
@@ -483,6 +498,7 @@ def test_hf_export_dry_run_is_generic_and_uses_minimal_slurm_environment(
         TMAX_HF_EXPORT_ORIGIN=str(origin),
         TMAX_HF_EXPORT_PYTHON=sys.executable,
         TMAX_HF_EXPORT_LOG_DIR=str(tmp_path / "logs"),
+        SLIME_DIR=str(slime_dir),
     )
 
     result = subprocess.run(
@@ -1169,7 +1185,7 @@ def test_tmax_submit_numeric_seed_requires_complete_model_checkpoint(
     assert "model checkpoint 47 is incomplete" in broken_metadata.stderr
     assert ".metadata" in broken_metadata.stderr
 
-    (model_dir / ".metadata").write_bytes(b"metadata")
+    write_distcp_metadata(model_dir, "__0_0.distcp")
     (model_dir / "common.pt").write_bytes(b"")
     broken_common = subprocess.run(
         ["bash", str(TMAX / "submit_slurm.sh")],
@@ -1183,7 +1199,7 @@ def test_tmax_submit_numeric_seed_requires_complete_model_checkpoint(
     assert "common.pt" in broken_common.stderr
 
 
-def test_numbered_checkpoint_helper_requires_nonempty_distcp_shards(
+def test_numbered_checkpoint_helper_requires_complete_nonempty_distcp_shard_set(
     tmp_path: Path,
 ) -> None:
     checkpoint = tmp_path / "checkpoint"
@@ -1191,7 +1207,7 @@ def test_numbered_checkpoint_helper_requires_nonempty_distcp_shards(
     model_dir.mkdir(parents=True)
     (checkpoint / "latest_checkpointed_iteration.txt").write_text("47\n")
     (model_dir / "common.pt").write_bytes(b"common")
-    (model_dir / ".metadata").write_bytes(b"metadata")
+    write_distcp_metadata(model_dir, "__0_0.distcp")
     state = checkpoint / "rollout" / "global_dataset_state_dict_47.pt"
     state.parent.mkdir()
     state.write_bytes(b"state")
@@ -1204,15 +1220,26 @@ def test_numbered_checkpoint_helper_requires_nonempty_distcp_shards(
 
     missing = run_bash(script, env=env, check=False)
     assert missing.returncode != 0
-    assert "no non-empty distcp weight shards" in missing.stderr
+    assert "metadata references missing shard(s): __0_0.distcp" in missing.stderr
 
     shard = model_dir / "__0_0.distcp"
     shard.touch()
     empty = run_bash(script, env=env, check=False)
     assert empty.returncode != 0
-    assert "empty or invalid weight shard" in empty.stderr
+    assert "empty or invalid shard(s): __0_0.distcp" in empty.stderr
+
+    shard.write_bytes(b"x")
+    truncated = run_bash(script, env=env, check=False)
+    assert truncated.returncode != 0
+    assert "expected 7 bytes, found 1" in truncated.stderr
 
     shard.write_bytes(b"weights")
+    write_distcp_metadata(model_dir, "__0_0.distcp", "__1_0.distcp")
+    partial = run_bash(script, env=env, check=False)
+    assert partial.returncode != 0
+    assert "metadata references missing shard(s): __1_0.distcp" in partial.stderr
+
+    (model_dir / "__1_0.distcp").write_bytes(b"weights")
     ready = run_bash(script, env=env)
     assert ready.stdout == "47\n"
 
@@ -1224,7 +1251,7 @@ def test_tmax_submit_numeric_seed_requires_matching_rollout_state(
     model_dir = Path(env["LOAD_DIR"]) / "iter_0000047"
     model_dir.mkdir()
     (model_dir / "common.pt").write_bytes(b"model")
-    (model_dir / ".metadata").write_bytes(b"metadata")
+    write_distcp_metadata(model_dir, "__0_0.distcp")
     (model_dir / "__0_0.distcp").write_bytes(b"weights")
 
     missing = subprocess.run(
@@ -2336,7 +2363,7 @@ def write_checkpoint_pair(save_dir: Path, iteration: int) -> None:
     model_dir = save_dir / f"iter_{iteration:07d}"
     model_dir.mkdir(parents=True, exist_ok=True)
     (model_dir / "common.pt").write_bytes(b"common")
-    (model_dir / ".metadata").write_bytes(b"metadata")
+    write_distcp_metadata(model_dir, "__0_0.distcp")
     (model_dir / "__0_0.distcp").write_bytes(b"weights")
     state = save_dir / "rollout" / f"global_dataset_state_dict_{iteration}.pt"
     state.parent.mkdir(parents=True, exist_ok=True)
@@ -2733,7 +2760,7 @@ def test_watcher_rejects_model_pointer_without_rollout_state(tmp_path: Path):
     model_dir = tmp_path / "save" / "iter_0000005"
     model_dir.mkdir()
     (model_dir / "common.pt").write_bytes(b"common")
-    (model_dir / ".metadata").write_bytes(b"metadata")
+    write_distcp_metadata(model_dir, "__0_0.distcp")
     (model_dir / "__0_0.distcp").write_bytes(b"weights")
 
     result = subprocess.run(

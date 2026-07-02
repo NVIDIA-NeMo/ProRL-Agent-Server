@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+TMAX_LIFECYCLE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+
 tmax_slurm_duration_seconds() {
     local spec="$1" rest days=0 has_days=0
     local -a fields
@@ -75,8 +77,7 @@ tmax_configure_graceful_deadline() {
 tmax_validate_numbered_checkpoint() {
     local root="${1:?missing checkpoint root}"
     local context="${2:-ERROR: checkpoint}"
-    local pointer value iteration_dir model_dir path shard state_path
-    local shard_count=0
+    local pointer value iteration_dir model_dir path state_path validation_error
 
     pointer="${root}/latest_checkpointed_iteration.txt"
     if [ ! -f "${pointer}" ] || [ ! -s "${pointer}" ]; then
@@ -104,16 +105,11 @@ tmax_validate_numbered_checkpoint() {
             return 1
         fi
     done
-    for shard in "${model_dir}"/*.distcp; do
-        [ -e "${shard}" ] || continue
-        if [ ! -f "${shard}" ] || [ ! -s "${shard}" ]; then
-            echo "${context}: model checkpoint ${value} has an empty or invalid weight shard: ${shard}" >&2
-            return 1
+    if ! validation_error="$(python3 "${TMAX_LIFECYCLE_DIR}/validate_torch_dist_checkpoint.py" "${model_dir}" 2>&1)"; then
+        echo "${context}: model checkpoint ${value} has inconsistent distcp metadata" >&2
+        if [ -n "${validation_error}" ]; then
+            printf '  %s\n' "${validation_error}" >&2
         fi
-        shard_count=$((shard_count + 1))
-    done
-    if [ "${shard_count}" -eq 0 ]; then
-        echo "${context}: model checkpoint ${value} has no non-empty distcp weight shards in ${model_dir}" >&2
         return 1
     fi
 

@@ -29,6 +29,81 @@ tmax_load_run_state() {
     [ -n "${RUN_ID:-}" ] && [ -n "${SAVE_DIR:-}" ]
 }
 
+tmax_load_selected_run_state() {
+    local state_file="$1" requested_run_id="${2:-}"
+    tmax_load_run_state "$state_file" || return 1
+    if [ -n "$requested_run_id" ] && [ "$requested_run_id" != "$RUN_ID" ]; then
+        echo "ERROR: requested RUN_ID ${requested_run_id} does not match locked run state ${RUN_ID}" >&2
+        return 1
+    fi
+}
+
+tmax_git_source_revision() {
+    local label="${1:?missing source label}"
+    local source_root="${2:?missing source repository}"
+    local current_revision dirty_state
+
+    if ! command -v git >/dev/null; then
+        echo "ERROR: git is required to pin TMax source revisions" >&2
+        return 1
+    fi
+    if ! current_revision="$(git -C "$source_root" rev-parse --verify HEAD 2>/dev/null)"; then
+        echo "ERROR: ${label} source directory must be a Git worktree: ${source_root}" >&2
+        return 1
+    fi
+    if ! [[ "$current_revision" =~ ^[0-9a-f]{40,64}$ ]]; then
+        echo "ERROR: ${label} returned an invalid Git revision: ${current_revision}" >&2
+        return 1
+    fi
+    if ! dirty_state="$(git -C "$source_root" status --porcelain=v1 --untracked-files=all 2>/dev/null)"; then
+        echo "ERROR: cannot inspect ${label} source worktree: ${source_root}" >&2
+        return 1
+    fi
+    if [ -n "$dirty_state" ]; then
+        echo "ERROR: ${label} source worktree is dirty: ${source_root}" >&2
+        return 1
+    fi
+    printf '%s\n' "$current_revision"
+}
+
+tmax_pin_source_revisions() {
+    local prorl_root="${1:?missing ProRL repository}"
+    local slime_root="${2:?missing Slime repository}"
+    local megatron_root="${3:?missing Megatron repository}"
+    local current_prorl current_slime current_megatron
+
+    current_prorl="$(tmax_git_source_revision ProRL "$prorl_root")" || return 1
+    current_slime="$(tmax_git_source_revision Slime "$slime_root")" || return 1
+    current_megatron="$(tmax_git_source_revision Megatron "$megatron_root")" || return 1
+    if [ -n "${TMAX_PRORL_GIT_COMMIT:-}" ] && [ "$TMAX_PRORL_GIT_COMMIT" != "$current_prorl" ]; then
+        echo "ERROR: ProRL source revision changed: expected ${TMAX_PRORL_GIT_COMMIT}, found ${current_prorl}" >&2
+        return 1
+    fi
+    if [ -n "${TMAX_SLIME_GIT_COMMIT:-}" ] && [ "$TMAX_SLIME_GIT_COMMIT" != "$current_slime" ]; then
+        echo "ERROR: Slime source revision changed: expected ${TMAX_SLIME_GIT_COMMIT}, found ${current_slime}" >&2
+        return 1
+    fi
+    if [ -n "${TMAX_MEGATRON_GIT_COMMIT:-}" ] && [ "$TMAX_MEGATRON_GIT_COMMIT" != "$current_megatron" ]; then
+        echo "ERROR: Megatron source revision changed: expected ${TMAX_MEGATRON_GIT_COMMIT}, found ${current_megatron}" >&2
+        return 1
+    fi
+    export MEGATRON_DIR="$megatron_root"
+    export TMAX_PRORL_GIT_COMMIT="$current_prorl"
+    export TMAX_SLIME_GIT_COMMIT="$current_slime"
+    export TMAX_MEGATRON_GIT_COMMIT="$current_megatron"
+}
+
+tmax_verify_source_revisions() {
+    local name
+    for name in TMAX_PRORL_GIT_COMMIT TMAX_SLIME_GIT_COMMIT TMAX_MEGATRON_GIT_COMMIT; do
+        if [ -z "${!name:-}" ]; then
+            echo "ERROR: source revision lock is incomplete; missing ${name}" >&2
+            return 1
+        fi
+    done
+    tmax_pin_source_revisions "$@"
+}
+
 tmax_write_run_state() {
     local state_file="$1"
     local tmp_file="${state_file}.tmp.$$"
@@ -64,6 +139,8 @@ tmax_write_run_state() {
         TMAX_NUM_ROLLOUT TMAX_TARGET_ITER WALL_TIME TMAX_MIN_WALL_TIME TMAX_ENABLE_GRACEFUL_EXIT
         TMAX_GRACEFUL_EXIT_BUFFER_SECONDS TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS
         EXPERIMENT_NAME
+        MEGATRON_DIR
+        TMAX_PRORL_GIT_COMMIT TMAX_SLIME_GIT_COMMIT TMAX_MEGATRON_GIT_COMMIT
         HF_CHECKPOINT REF_LOAD TORCH_DIST_DIR MODEL_ARGS_FILE
         ACCOUNT PARTITION SLURM_CONSTRAINT SLURM_EXCLUDE NUM_NODES SLURM_GPUS
         CPUS_PER_TASK SLURM_STEP_CPUS_PER_TASK

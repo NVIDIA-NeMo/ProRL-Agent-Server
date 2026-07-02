@@ -59,17 +59,13 @@ normalize_iteration() {
 }
 
 validate_input() {
-    local input_dir="$1" shard
-    local shard_count=0
+    local input_dir="$1" validation_error
     [ -s "${input_dir}/common.pt" ] || die "missing ${input_dir}/common.pt"
     [ -s "${input_dir}/.metadata" ] || die "missing ${input_dir}/.metadata"
-    for shard in "${input_dir}"/*.distcp; do
-        [ -e "${shard}" ] || continue
-        [ -f "${shard}" ] && [ -s "${shard}" ] || die "empty or invalid weight shard: ${shard}"
-        shard_count=$((shard_count + 1))
-    done
-    [ "${shard_count}" -gt 0 ] || die "no non-empty distcp weight shards in ${input_dir}"
     [ -x "${PYTHON_BIN}" ] || die "Python is not executable: ${PYTHON_BIN}"
+    if ! validation_error="$("${PYTHON_BIN}" "${SCRIPT_DIR}/validate_torch_dist_checkpoint.py" "${input_dir}" 2>&1)"; then
+        die "invalid torch distributed checkpoint ${input_dir}: ${validation_error}"
+    fi
     [ -f "${SLIME_DIR}/tools/convert_torch_dist_to_hf.py" ] || die "Slime converter not found"
     [ -s "${ORIGIN_HF_DIR}/config.json" ] || die "origin HF snapshot not found: ${ORIGIN_HF_DIR}"
     [ -s "${ORIGIN_HF_DIR}/model.safetensors.index.json" ] || die "origin HF index not found"
@@ -87,9 +83,17 @@ run_worker() {
 import json
 import sys
 
+def config_value(config, name):
+    value = config.get(name)
+    text_config = config.get("text_config")
+    if value is None and isinstance(text_config, dict):
+        value = text_config.get(name)
+    return value
+
+
 config = json.load(open(sys.argv[1], encoding="utf-8"))
-model_type = config.get("model_type")
-vocab_size = config.get("vocab_size")
+model_type = config_value(config, "model_type")
+vocab_size = config_value(config, "vocab_size")
 if not isinstance(model_type, str) or not model_type:
     raise SystemExit("origin config has no model_type")
 if not isinstance(vocab_size, int) or vocab_size <= 0:
@@ -143,6 +147,16 @@ import sys
 out, origin, source = map(Path, sys.argv[1:4])
 run_id, iteration = sys.argv[4], int(sys.argv[5])
 load = lambda p: json.loads(p.read_text(encoding="utf-8"))
+
+
+def config_value(config, name):
+    value = config.get(name)
+    text_config = config.get("text_config")
+    if value is None and isinstance(text_config, dict):
+        value = text_config.get(name)
+    return value
+
+
 out_map = load(out / "model.safetensors.index.json")["weight_map"]
 origin_map = load(origin / "model.safetensors.index.json")["weight_map"]
 
@@ -175,9 +189,11 @@ if set(dtypes) != {"BF16"}:
 config = load(out / "config.json")
 origin_config = load(origin / "config.json")
 for field in ("model_type", "vocab_size"):
-    if config.get(field) != origin_config.get(field):
+    output_value = config_value(config, field)
+    origin_value = config_value(origin_config, field)
+    if output_value != origin_value:
         raise RuntimeError(
-            f"unexpected {field}: {config.get(field)!r} != {origin_config.get(field)!r}"
+            f"unexpected {field}: {output_value!r} != {origin_value!r}"
         )
 for asset in ("tokenizer_config.json", "tokenizer.json", "chat_template.jinja"):
     if not (out / asset).is_file():
@@ -189,8 +205,8 @@ manifest = {
     "iteration": iteration,
     "source_checkpoint": str(source),
     "origin_hf_dir": str(origin),
-    "model_type": config.get("model_type"),
-    "vocab_size": config.get("vocab_size"),
+    "model_type": config_value(config, "model_type"),
+    "vocab_size": config_value(config, "vocab_size"),
     "weight_key_count": len(out_map),
     "weight_shard_count": len(set(out_map.values())),
     "weight_bytes": weight_bytes,
