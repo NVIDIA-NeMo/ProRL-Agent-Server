@@ -181,9 +181,9 @@ configure_common() {
     # persistent broker or instance state is shared between commands.
     export POLAR_MULTI_GATEWAY=0
     export ACCOUNT=nvr_lpr_llm
-    export PARTITION="${TMAX_MATRIX_PARTITIONS:-backfill,batch}"
+    export PARTITION="${MATRIX_PARTITIONS}"
     export SLURM_CONSTRAINT=H100
-    export SLURM_EXCLUDE="${TMAX_MATRIX_EXCLUDE_NODES:-}"
+    export SLURM_EXCLUDE="${MATRIX_EXCLUDE_NODES}"
     export WALL_TIME=4:00:00
     export TMAX_MIN_WALL_TIME=4:00:00
     export CPUS_PER_TASK=128
@@ -293,7 +293,7 @@ configure_common() {
     export POLAR_APPTAINER_BROKER_RETRY_BACKOFF_MAX_SEC=30
     export POLAR_LOCAL_SUBPROCESS_SPAWN_CONCURRENCY=2
 
-    export WANDB_PROJECT="${TMAX_MATRIX_WANDB_PROJECT:-polar-tmax-grpo}"
+    export WANDB_PROJECT="${MATRIX_WANDB_PROJECT}"
     export WANDB_GROUP="${MATRIX_WANDB_GROUP}"
     export WANDB_RESUME=allow
     export WANDB_ALWAYS_USE_TRAIN_STEP=1
@@ -719,9 +719,9 @@ validate_configured_setting() {
 print_plan_header() {
     echo "TMax mixed 4/8-node x 8-GPU matrix (read-only plan)"
     echo "  stamp:       ${MATRIX_STAMP}"
-    echo "  W&B:         ${TMAX_MATRIX_WANDB_PROJECT:-polar-tmax-grpo} / ${MATRIX_WANDB_GROUP}"
+    echo "  W&B:         ${MATRIX_WANDB_PROJECT} / ${MATRIX_WANDB_GROUP}"
     echo "  dependency:  ${MATRIX_DEPENDENCY:-none}"
-    echo "  exclude:     ${TMAX_MATRIX_EXCLUDE_NODES:-none}"
+    echo "  exclude:     ${MATRIX_EXCLUDE_NODES:-none}"
     echo "  train/eval:  14,498 train (14,598 ready minus fixed 100), TMax holdout pass@1 only; 4n eval every 20 steps, 8n every 10"
     echo "  data source: ${MATRIX_SOURCE_RUN}"
     echo "  filtering:   trajectory-level reward variance; standard 4B early-stop=50%; trajectory arm requires full group8"
@@ -772,12 +772,19 @@ ensure_fresh_run() {
     fi
 }
 
-submit_setting() {
+preflight_setting() {
     local setting="$1"
     (
         configure_setting "${setting}"
         validate_configured_setting "${setting}"
         ensure_fresh_run
+    )
+}
+
+submit_setting() {
+    local setting="$1"
+    (
+        configure_setting "${setting}"
         echo "[matrix] submitting ${setting}: ${RUN_ID}"
         bash "${SUBMIT_SCRIPT}"
     )
@@ -817,6 +824,9 @@ esac
 MATRIX_TOPOLOGY_SCOPE="${TMAX_MATRIX_TOPOLOGY_SCOPE:-all}"
 tmax_matrix_validate_topology_scope "${MATRIX_TOPOLOGY_SCOPE}"
 MATRIX_WANDB_GROUP="${TMAX_MATRIX_WANDB_GROUP:-tmax-fidelity-matrix-${MATRIX_STAMP}}"
+MATRIX_WANDB_PROJECT="${TMAX_MATRIX_WANDB_PROJECT:-polar-tmax-grpo}"
+MATRIX_PARTITIONS="${TMAX_MATRIX_PARTITIONS:-backfill,batch}"
+MATRIX_EXCLUDE_NODES="${TMAX_MATRIX_EXCLUDE_NODES:-}"
 MATRIX_DEPENDENCY="${TMAX_MATRIX_DEPENDENCY:-}"
 MATRIX_QWEN4_LOAD_DIR="${TMAX_MATRIX_QWEN4_LOAD_DIR:-}"
 MATRIX_NUM_ROLLOUT="${TMAX_MATRIX_NUM_ROLLOUT:-}"
@@ -866,13 +876,19 @@ if [ "${ACTION}" = plan ]; then
     echo
     echo "No jobs were submitted. To submit this exact plan, reuse:"
     printf '  TMAX_MATRIX_STAMP=%q' "${MATRIX_STAMP}"
+    printf ' POLAR_DATA_ROOT=%q' "${MATRIX_DATA_ROOT}"
     printf ' TMAX_MATRIX_SOURCE_RUN=%q' "${MATRIX_SOURCE_RUN}"
     printf ' TMAX_MATRIX_TRAIN_SHA256=%q' "${MATRIX_TRAIN_SHA256}"
     printf ' TMAX_MATRIX_HOLDOUT_SHA256=%q' "${MATRIX_HOLDOUT_SHA256}"
     printf ' TMAX_MATRIX_EVAL_BUNDLE_SHA256=%q' "${MATRIX_EVAL_BUNDLE_SHA256}"
-    if [ "${MATRIX_TOPOLOGY_SCOPE}" != all ]; then
-        printf ' TMAX_MATRIX_TOPOLOGY_SCOPE=%q' "${MATRIX_TOPOLOGY_SCOPE}"
-    fi
+    printf ' TMAX_MATRIX_TOPOLOGY_SCOPE=%q' "${MATRIX_TOPOLOGY_SCOPE}"
+    printf ' TMAX_MATRIX_PARTITIONS=%q' "${MATRIX_PARTITIONS}"
+    printf ' TMAX_MATRIX_EXCLUDE_NODES=%q' "${MATRIX_EXCLUDE_NODES}"
+    printf ' TMAX_MATRIX_WANDB_PROJECT=%q' "${MATRIX_WANDB_PROJECT}"
+    printf ' TMAX_MATRIX_WANDB_GROUP=%q' "${MATRIX_WANDB_GROUP}"
+    printf ' TMAX_MATRIX_QWEN4_REF_LOAD=%q' "${QWEN4_REF_LOAD}"
+    printf ' TMAX_MATRIX_QWEN9_HF_CHECKPOINT=%q' "${QWEN9_HF_CHECKPOINT}"
+    printf ' TMAX_MATRIX_QWEN9_REF_LOAD=%q' "${QWEN9_REF_LOAD}"
     if [ -n "${MATRIX_DEPENDENCY}" ]; then
         printf ' TMAX_MATRIX_DEPENDENCY=%q' "${MATRIX_DEPENDENCY}"
     fi
@@ -896,6 +912,10 @@ if [ "${TMAX_MATRIX_CONFIRM:-}" != "${CONFIRM_TOKEN}" ]; then
     echo "ERROR: submission is locked; set TMAX_MATRIX_CONFIRM=${CONFIRM_TOKEN}" >&2
     exit 2
 fi
+for setting in "${SELECTED_SETTINGS[@]}"; do
+    preflight_setting "${setting}"
+done
+echo "[matrix] all selected settings passed preflight"
 for setting in "${SELECTED_SETTINGS[@]}"; do
     submit_setting "${setting}"
 done

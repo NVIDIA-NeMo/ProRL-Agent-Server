@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -171,6 +173,10 @@ def test_matrix_selector_scopes_all_and_rejects_cross_topology_settings() -> Non
     assert invalid_selector.returncode == 2
     assert "scope must be all, 4n32, or 8n64" in invalid_selector.stderr
 
+    duplicate = _select_matrix_settings("all", MATRIX_SETTINGS[0], MATRIX_SETTINGS[0])
+    assert duplicate.returncode == 2
+    assert f"duplicate matrix setting: {MATRIX_SETTINGS[0]}" in duplicate.stderr
+
     invalid_watcher = subprocess.run(
         ["bash", str(WATCH_MATRIX)],
         cwd=ROOT,
@@ -185,6 +191,110 @@ def test_matrix_selector_scopes_all_and_rejects_cross_topology_settings() -> Non
     )
     assert invalid_watcher.returncode == 2
     assert "scope must be all, 4n32, or 8n64" in invalid_watcher.stderr
+
+
+def _matrix_test_environment(tmp_path: Path, *, stamp: str) -> dict[str, str]:
+    source = tmp_path / "source"
+    source.mkdir()
+    train = source / "tmax-train.jsonl"
+    holdout = source / "tmax_holdout-eval.jsonl"
+    train.write_text("{}\n" * 14_498)
+    holdout.write_text("{}\n" * 100)
+
+    qwen4 = tmp_path / "qwen4"
+    qwen9_hf = tmp_path / "qwen9-hf"
+    qwen9_ref = tmp_path / "qwen9-ref"
+    for path in (qwen4, qwen9_hf, qwen9_ref):
+        path.mkdir()
+    (qwen4 / "latest_checkpointed_iteration.txt").write_text("release\n")
+    (qwen9_hf / "config.json").write_text("{}\n")
+    (qwen9_ref / "latest_checkpointed_iteration.txt").write_text("release\n")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    sbatch_marker = tmp_path / "sbatch-called"
+    fake_sbatch = fake_bin / "sbatch"
+    fake_sbatch.write_text(
+        "#!/usr/bin/env bash\n"
+        f"touch {shlex.quote(str(sbatch_marker))}\n"
+        "printf '12345\n'\n"
+    )
+    fake_sbatch.chmod(0o755)
+
+    return {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "POLAR_DATA_ROOT": str(tmp_path / "data"),
+        "TMAX_MATRIX_SOURCE_RUN": str(source),
+        "TMAX_MATRIX_TRAIN_SHA256": hashlib.sha256(train.read_bytes()).hexdigest(),
+        "TMAX_MATRIX_HOLDOUT_SHA256": hashlib.sha256(holdout.read_bytes()).hexdigest(),
+        "TMAX_MATRIX_EVAL_BUNDLE_SHA256": hashlib.sha256(holdout.read_bytes()).hexdigest(),
+        "TMAX_MATRIX_QWEN4_REF_LOAD": str(qwen4),
+        "TMAX_MATRIX_QWEN9_HF_CHECKPOINT": str(qwen9_hf),
+        "TMAX_MATRIX_QWEN9_REF_LOAD": str(qwen9_ref),
+        "TMAX_MATRIX_STAMP": stamp,
+    }
+
+
+def test_matrix_plan_replay_preserves_all_effective_inputs(tmp_path: Path) -> None:
+    env = {
+        **_matrix_test_environment(tmp_path, stamp="replay-test"),
+        "TMAX_MATRIX_TOPOLOGY_SCOPE": "4n32",
+        "TMAX_MATRIX_PARTITIONS": "batch_short",
+        "TMAX_MATRIX_EXCLUDE_NODES": "node-a,node-b",
+        "TMAX_MATRIX_WANDB_PROJECT": "test-project",
+        "TMAX_MATRIX_WANDB_GROUP": "test-group",
+    }
+    completed = subprocess.run(
+        ["bash", str(SUBMIT_MATRIX), "plan", MATRIX_SETTINGS[0]],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    replay = next(line.strip() for line in completed.stdout.splitlines() if "TMAX_MATRIX_CONFIRM=" in line)
+    tokens = shlex.split(replay)
+    bash_index = tokens.index("bash")
+    assignments = dict(token.split("=", 1) for token in tokens[:bash_index])
+    for name in (
+        "POLAR_DATA_ROOT",
+        "TMAX_MATRIX_SOURCE_RUN",
+        "TMAX_MATRIX_TRAIN_SHA256",
+        "TMAX_MATRIX_HOLDOUT_SHA256",
+        "TMAX_MATRIX_EVAL_BUNDLE_SHA256",
+        "TMAX_MATRIX_TOPOLOGY_SCOPE",
+        "TMAX_MATRIX_PARTITIONS",
+        "TMAX_MATRIX_EXCLUDE_NODES",
+        "TMAX_MATRIX_WANDB_PROJECT",
+        "TMAX_MATRIX_WANDB_GROUP",
+        "TMAX_MATRIX_QWEN4_REF_LOAD",
+        "TMAX_MATRIX_QWEN9_HF_CHECKPOINT",
+        "TMAX_MATRIX_QWEN9_REF_LOAD",
+    ):
+        assert assignments[name] == env[name]
+
+
+def test_matrix_preflights_every_arm_before_first_submission(tmp_path: Path) -> None:
+    stamp = "preflight-test"
+    env = {
+        **_matrix_test_environment(tmp_path, stamp=stamp),
+        "TMAX_MATRIX_CONFIRM": "SUBMIT_TMAX_MATRIX",
+    }
+    blocked = Path(env["POLAR_DATA_ROOT"]) / "runs" / f"tmax-4n32-{MATRIX_SETTINGS[3]}-{stamp}"
+    blocked.mkdir(parents=True)
+    completed = subprocess.run(
+        ["bash", str(SUBMIT_MATRIX), "submit", MATRIX_SETTINGS[0], MATRIX_SETTINGS[3]],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "refusing to reuse non-fresh run paths" in completed.stderr
+    assert not (tmp_path / "sbatch-called").exists()
 
 
 def test_tmax_matrix_uses_only_full65k_qwen9b_sweep_arms() -> None:
@@ -239,8 +349,8 @@ def test_matrix_restores_single_gateway_fresh_direct_apptainer() -> None:
         "4n single gateway; 8n one gateway per node; fresh direct Apptainer exec; no broker/instance; retries=3"
         in submit
     )
-    assert 'export SLURM_EXCLUDE="${TMAX_MATRIX_EXCLUDE_NODES:-}"' in submit
-    assert 'echo "  exclude:     ${TMAX_MATRIX_EXCLUDE_NODES:-none}"' in submit
+    assert 'export SLURM_EXCLUDE="${MATRIX_EXCLUDE_NODES}"' in submit
+    assert 'echo "  exclude:     ${MATRIX_EXCLUDE_NODES:-none}"' in submit
 
     shared_submit = (ROOT / "examples" / "swegym_slime_grpo" / "submit_slurm.sh").read_text()
     assert 'SBATCH_EXCLUDE_ARG=(--exclude="${SLURM_EXCLUDE}")' in shared_submit

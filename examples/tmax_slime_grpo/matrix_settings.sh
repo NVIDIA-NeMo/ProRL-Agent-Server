@@ -68,6 +68,7 @@ tmax_matrix_select_settings() {
     shift 2
     local -n output_ref="${output_name}"
     local candidate topology
+    local -A seen=()
     tmax_matrix_validate_topology_scope "${scope}" || return
     output_ref=()
 
@@ -81,6 +82,11 @@ tmax_matrix_select_settings() {
             echo "ERROR: unknown matrix setting: ${candidate}" >&2
             return 2
         fi
+        if [ "${seen[${candidate}]+present}" = present ]; then
+            echo "ERROR: duplicate matrix setting: ${candidate}" >&2
+            return 2
+        fi
+        seen["${candidate}"]=1
         topology="$(tmax_matrix_setting_topology "${candidate}")" || return
         if [ "${scope}" != all ] && [ "${topology}" != "${scope}" ]; then
             echo "ERROR: matrix setting ${candidate} uses topology ${topology}, outside ${scope} scope" >&2
