@@ -109,6 +109,10 @@ while :; do
     # A clean exit is the explicit shutdown RPC.  Signal/non-zero exits are
     # control-plane crashes, usually caused by an agent cleanup command.
     if [ "${status}" -eq 0 ]; then
+        # Normal broker teardown removes these markers.  If a proxy resisted
+        # TERM/KILL long enough for close() to return, its PID marker is kept
+        # deliberately so the supervisor can make this final cleanup attempt.
+        cleanup_crashed_broker
         exit 0
     fi
     restart_count="$((restart_count + 1))"

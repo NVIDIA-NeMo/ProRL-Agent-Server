@@ -47,6 +47,8 @@ _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _BROKER_PROCESS_NAME = "polar-broker"
 _PROXY_PROCESS_NAME = "polar-proxy"
 _PR_SET_NAME = 15
+_PROXY_START_TIMEOUT_SECONDS = 5.0
+_PROXY_START_POLL_SECONDS = 0.01
 
 
 def _current_python_executable() -> str:
@@ -165,14 +167,42 @@ class _LoopbackProxy:
         self.port = port
         self.pid_path = pid_path
         self.process: subprocess.Popen[bytes] | None = None
+        self._process_ready = False
         self._lock = threading.Lock()
         self._stopping = threading.Event()
         self._monitor: threading.Thread | None = None
 
+    @staticmethod
+    def _stop_process(process: subprocess.Popen[bytes], *, terminate_timeout: float) -> bool:
+        """Request termination without ever waiting indefinitely."""
+
+        if process.poll() is not None:
+            return True
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=terminate_timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+        try:
+            process.wait(timeout=1.0)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+
     def _start_process_locked(self) -> None:
         process = self.process
         if process is not None and process.poll() is None:
-            return
+            if self._process_ready:
+                return
+            raise RuntimeError("previous loopback proxy process is still exiting")
         if self.pid_path is not None:
             self.pid_path.unlink(missing_ok=True)
         process = subprocess.Popen(
@@ -188,17 +218,53 @@ class _LoopbackProxy:
             executable=_current_python_executable(),
         )
         self.process = process
+        self._process_ready = False
+        # Publish immediately so the outer supervisor can kill the child even
+        # if the broker itself dies during cold imports below.
         if self.pid_path is not None:
             self.pid_path.write_text(f"{process.pid}\n")
-        # Binding happens before serve_forever.  Give immediate bind/import
-        # failures a chance to surface without probing (and consuming) a real
-        # upstream proxy connection.
+
+        # ``/proc/self/exe`` initially gives the child a generic ``exe`` comm
+        # name. Cold Lustre imports can exceed the old fixed 50 ms delay, so
+        # wait until the child reaches main() and applies PR_SET_NAME. This
+        # avoids returning while broad ``pkill python`` rules can still match
+        # the proxy during startup.
+        if sys.platform.startswith("linux"):
+            deadline = time.monotonic() + _PROXY_START_TIMEOUT_SECONDS
+            last_process_name = "<unavailable>"
+            while process.poll() is None:
+                try:
+                    last_process_name = (
+                        Path(f"/proc/{process.pid}/comm").read_text().strip()
+                    )
+                except OSError:
+                    last_process_name = "<unavailable>"
+                if last_process_name == _PROXY_PROCESS_NAME:
+                    break
+                if time.monotonic() >= deadline:
+                    stopped = self._stop_process(process, terminate_timeout=1.0)
+                    if stopped and self.pid_path is not None:
+                        self.pid_path.unlink(missing_ok=True)
+                    cleanup = "" if stopped else "; process cleanup is still pending"
+                    raise RuntimeError(
+                        "loopback proxy did not finish startup within "
+                        f"{_PROXY_START_TIMEOUT_SECONDS:.0f}s; process name={last_process_name!r}"
+                        f"{cleanup}"
+                    )
+                time.sleep(_PROXY_START_POLL_SECONDS)
+
+        # PR_SET_NAME happens immediately before the bind. Give bind failures
+        # a short chance to surface without consuming a real proxy connection.
         time.sleep(0.05)
         return_code = process.poll()
         if return_code is not None:
+            if self.pid_path is not None:
+                self.pid_path.unlink(missing_ok=True)
             raise RuntimeError(
                 f"loopback proxy exited during startup with code {return_code}"
             )
+
+        self._process_ready = True
 
     def start(self) -> None:
         with self._lock:
@@ -215,7 +281,7 @@ class _LoopbackProxy:
         while not self._stopping.wait(0.1):
             with self._lock:
                 process = self.process
-                if process is None or process.poll() is not None:
+                if process is None or process.poll() is not None or not self._process_ready:
                     try:
                         self._start_process_locked()
                     except Exception as exc:
@@ -234,14 +300,14 @@ class _LoopbackProxy:
         with self._lock:
             process = self.process
             self.process = None
-            if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5.0)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-            if self.pid_path is not None:
+            self._process_ready = False
+            stopped = process is None or self._stop_process(
+                process,
+                terminate_timeout=5.0,
+            )
+            # Keep the PID visible to the outer supervisor if SIGKILL is still
+            # pending on an uninterruptible child.
+            if stopped and self.pid_path is not None:
                 self.pid_path.unlink(missing_ok=True)
         if self._monitor is not None:
             self._monitor.join(timeout=5.0)

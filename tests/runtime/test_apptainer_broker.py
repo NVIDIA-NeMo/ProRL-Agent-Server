@@ -6,6 +6,7 @@ from pathlib import Path
 import signal
 import shlex
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -78,6 +79,108 @@ def _process_identity(pid: int) -> tuple[str, str]:
     command_line = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode()
     process_name = Path(f"/proc/{pid}/comm").read_text().strip()
     return command_line, process_name
+
+
+def test_proxy_stop_never_waits_unbounded_after_sigkill() -> None:
+    class StuckProcess:
+        pid = 123
+
+        def __init__(self) -> None:
+            self.terminate_calls = 0
+            self.kill_calls = 0
+            self.wait_timeouts: list[float] = []
+
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+        def wait(self, *, timeout: float):
+            self.wait_timeouts.append(timeout)
+            raise subprocess.TimeoutExpired("polar-proxy", timeout)
+
+    process = StuckProcess()
+    stopped = apptainer_broker._LoopbackProxy._stop_process(  # noqa: SLF001
+        process,  # type: ignore[arg-type]
+        terminate_timeout=0.25,
+    )
+
+    assert stopped is False
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 1
+    assert process.wait_timeouts == [0.25, 1.0]
+
+
+def test_proxy_close_keeps_unreaped_pid_for_supervisor(monkeypatch, tmp_path: Path) -> None:
+    pid_path = tmp_path / "proxy.pid"
+    pid_path.write_text("123\n")
+    proxy = apptainer_broker._LoopbackProxy("unused.sock", 12345, pid_path=pid_path)  # noqa: SLF001
+    proxy.process = object()  # type: ignore[assignment]
+    monkeypatch.setattr(proxy, "_stop_process", lambda _process, *, terminate_timeout: False)
+
+    proxy.close()
+
+    assert pid_path.read_text() == "123\n"
+
+
+def test_supervisor_cleans_residual_proxy_after_clean_broker_exit(tmp_path: Path) -> None:
+    broker_source = tmp_path / "fake_broker.py"
+    broker_source.write_text(
+        """\
+import os
+from pathlib import Path
+import subprocess
+
+runtime_dir = Path(os.environ["POLAR_APPTAINER_BROKER_RUNTIME_DIR"])
+proxy = subprocess.Popen(
+    ["sleep", "30"],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+(runtime_dir / "proxy.pid").write_text(f"{proxy.pid}\\n")
+(runtime_dir / "spawned_proxy.pid").write_text(f"{proxy.pid}\\n")
+"""
+    )
+    supervisor_source = Path(apptainer_broker.__file__).with_name(
+        "apptainer_broker_supervisor.sh"
+    )
+    environment = {
+        **os.environ,
+        "POLAR_APPTAINER_BROKER_RUNTIME_DIR": str(tmp_path),
+        "POLAR_APPTAINER_BROKER_SCRIPT": str(broker_source),
+        "POLAR_APPTAINER_BROKER_PYTHON": sys.executable,
+    }
+    proxy_pid: int | None = None
+
+    try:
+        completed = subprocess.run(
+            ["bash", str(supervisor_source)],
+            env=environment,
+            timeout=5,
+            check=False,
+        )
+        proxy_pid = int((tmp_path / "spawned_proxy.pid").read_text())
+
+        assert completed.returncode == 0
+        assert not (tmp_path / "proxy.pid").exists()
+        for _ in range(100):
+            process_state = Path(f"/proc/{proxy_pid}/stat")
+            if not process_state.exists() or process_state.read_text().split()[2] == "Z":
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("residual proxy was not terminated by the supervisor")
+    finally:
+        if proxy_pid is not None:
+            try:
+                os.kill(proxy_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_exec_a_python_executable_falls_back_to_procfs(
