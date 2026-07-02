@@ -325,7 +325,7 @@ def _squashfs_environment(image: Path) -> dict[str, str] | None:
             f"unsquashfs is required to verify OCI ENV metadata in {image}"
         )
     result = subprocess.run(
-        [unsquashfs, "-cat", str(image), "etc/environment"],
+        [unsquashfs, "-processors", "1", "-cat", str(image), "etc/environment"],
         text=True,
         capture_output=True,
         check=False,

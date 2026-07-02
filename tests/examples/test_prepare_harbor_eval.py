@@ -205,15 +205,17 @@ def test_harbor_eval_uses_exported_sqsh_environment_values(
     image.write_bytes(b"hsqs-image")
     docker_metadata = module._docker_runtime_metadata(task)
     monkeypatch.setattr(module.shutil, "which", lambda _name: "/usr/bin/unsquashfs")
-    monkeypatch.setattr(
-        module.subprocess,
-        "run",
-        lambda *_args, **_kwargs: SimpleNamespace(
+    commands: list[list[str]] = []
+
+    def fake_run(args: list[str], **_kwargs: object) -> SimpleNamespace:
+        commands.append(args)
+        return SimpleNamespace(
             returncode=0,
             stdout="PATH=/usr/bin:/bin\nPYTHONPATH=/app:/base/python\n",
             stderr="",
-        ),
-    )
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
 
     runtime_env = module._runtime_environment(
         docker_metadata=docker_metadata,
@@ -223,6 +225,16 @@ def test_harbor_eval_uses_exported_sqsh_environment_values(
     )
 
     assert runtime_env == {"PYTHONPATH": "/app:/base/python"}
+    assert commands == [
+        [
+            "/usr/bin/unsquashfs",
+            "-processors",
+            "1",
+            "-cat",
+            str(image),
+            "etc/environment",
+        ]
+    ]
 
 
 @pytest.mark.parametrize(
