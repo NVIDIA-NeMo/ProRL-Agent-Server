@@ -156,7 +156,7 @@ class LoopbackProxy:
             name="polar-mini-swe-http-proxy",
             daemon=True,
         )
-        self.port = port
+        self.port = int(self._server.server_address[1])
 
     def start(self) -> None:
         self._thread.start()
@@ -185,8 +185,8 @@ def _proxy_port_from_env() -> int:
         port = int(raw)
     except ValueError as exc:
         raise ValueError(f"{_PROXY_PORT_ENV} must be an integer, got {raw!r}") from exc
-    if not 1 <= port <= 65535:
-        raise ValueError(f"{_PROXY_PORT_ENV} must be between 1 and 65535, got {port}")
+    if not 0 <= port <= 65535:
+        raise ValueError(f"{_PROXY_PORT_ENV} must be between 0 and 65535, got {port}")
     return port
 
 

@@ -32,8 +32,7 @@ def test_loopback_proxy_relays_to_unix_socket(tmp_path: Path) -> None:
     try:
         with mini_swe_runner.LoopbackProxy(str(socket_path), 0) as proxy:
             # Port zero asks the kernel for a collision-free test port.
-            port = proxy._server.server_address[1]  # noqa: SLF001
-            with socket.create_connection(("127.0.0.1", port), timeout=2.0) as client:
+            with socket.create_connection(("127.0.0.1", proxy.port), timeout=2.0) as client:
                 client.sendall(b"request")
                 assert client.recv(4096) == b"echo:request"
     finally:
@@ -93,15 +92,17 @@ def test_proxy_configuration_rewrites_all_proxy_variables(
     upstream.bind(str(socket_path))
     upstream.listen()
     monkeypatch.setenv("POLAR_HTTP_PROXY_UDS", str(socket_path))
-    monkeypatch.setenv("POLAR_HTTP_PROXY_PORT", "28099")
+    monkeypatch.setenv("POLAR_HTTP_PROXY_PORT", "0")
     monkeypatch.setenv("no_proxy", "metadata.internal,localhost")
     monkeypatch.setenv("NO_PROXY", "registry.internal")
 
     proxy = mini_swe_runner._configure_http_proxy()
     try:
         assert proxy is not None
+        assert proxy.port > 0
+        expected_proxy_url = f"http://127.0.0.1:{proxy.port}"
         for name in mini_swe_runner._PROXY_ENV_NAMES:
-            assert os.environ[name] == "http://127.0.0.1:28099"
+            assert os.environ[name] == expected_proxy_url
         assert os.environ["no_proxy"] == (
             "metadata.internal,localhost,registry.internal,127.0.0.1,::1"
         )
@@ -204,7 +205,15 @@ def test_apt_source_upgrade_requires_https_method(
     assert "http://example.invalid" in source.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("value", ["bad", "0", "65536"])
+def test_zero_proxy_port_requests_an_available_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POLAR_HTTP_PROXY_PORT", "0")
+
+    assert mini_swe_runner._proxy_port_from_env() == 0
+
+
+@pytest.mark.parametrize("value", ["bad", "-1", "65536"])
 def test_invalid_proxy_port_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
     value: str,
