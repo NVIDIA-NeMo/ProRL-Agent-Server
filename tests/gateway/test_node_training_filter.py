@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from polar.agent.models import AgentRunResult
 from polar.gateway.node import GatewayNodeManager
 from polar.trajectory.models import EvalResult, EvaluatorSpec, Trace, Trajectory
@@ -222,6 +224,46 @@ def test_agent_timeout_without_aligned_logprobs_is_not_trainable() -> None:
         tool_calls=[],
         finish_reason="tool_calls",
     ).model_copy(update={"response_logprobs": None})
+    trajectory = Trajectory(
+        status="TIMEOUT",
+        error="agent execution timeout",
+        metadata={
+            "agent_result": {
+                "status": "timeout",
+                "return_code": -1,
+                "timeout_source": "agent",
+                "timeout_stage": "exec",
+            }
+        },
+        traces=[trace],
+    )
+
+    merged = GatewayNodeManager._merge_eval_result(
+        trajectory,
+        EvalResult(outcome_reward=1.0),
+        EvaluatorSpec(strategy="harbor"),
+    )
+
+    assert merged.traces[0].reward == 0.0
+    assert merged.traces[0].loss_mask == [0, 0]
+    assert merged.traces[0].metadata["training_filter"] == {
+        "masked": True,
+        "trainable": False,
+        "reason": "agent_timeout_unaligned",
+        "detail": "agent execution timeout",
+        "original_reward": 1.0,
+    }
+
+
+@pytest.mark.parametrize("nonfinite_logprob", [float("nan"), float("inf"), float("-inf")])
+def test_agent_timeout_with_nonfinite_logprobs_is_not_trainable(
+    nonfinite_logprob: float,
+) -> None:
+    trace = _trace(
+        content="Partial work",
+        tool_calls=[],
+        finish_reason="tool_calls",
+    ).model_copy(update={"response_logprobs": [nonfinite_logprob, -0.2]})
     trajectory = Trajectory(
         status="TIMEOUT",
         error="agent execution timeout",

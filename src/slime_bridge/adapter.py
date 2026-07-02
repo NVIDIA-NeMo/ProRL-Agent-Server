@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import logging
+import math
 from typing import Any, TYPE_CHECKING
 
 from polar.trajectory.training_filter import parser_invalid_tool_call_reason
@@ -507,7 +508,12 @@ def _extract_rollout_log_probs(
     # response_logprobs is one float per response token (interstitials are 0.0,
     # masked out by loss_mask); the builder guarantees trainable tokens carry
     # their real sampled logprob.
-    return [float(value) for value in logprobs]
+    parsed_logprobs = [float(value) for value in logprobs]
+    if not all(math.isfinite(value) for value in parsed_logprobs):
+        raise RolloutLogprobError(
+            f"Session {session_id} trace {trace_index}: non-finite rollout_log_probs"
+        )
+    return parsed_logprobs
 
 
 def _loss_mask_from_trace(
