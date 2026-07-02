@@ -14,6 +14,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+# shellcheck source=../path_safety.sh
+source "${SCRIPT_DIR}/../path_safety.sh"
 TRAIN_RUN_SCRIPT="${POLAR_TRAIN_RUN_SCRIPT:-${SCRIPT_DIR}/run.sh}"
 if [ ! -f "${TRAIN_RUN_SCRIPT}" ]; then
     echo "ERROR: training run script not found: ${TRAIN_RUN_SCRIPT}" >&2
@@ -70,6 +72,7 @@ case "$TRAIN_SQSH" in
     *) : ;;  # docker:// or registry ref — leave it to pyxis/enroot to resolve
 esac
 LOG_DIR="${POLAR_SLURM_LOG_DIR:-${DATA_ROOT}/logs/slurm}"
+polar_require_absolute_path POLAR_SLURM_LOG_DIR "${LOG_DIR}"
 mkdir -p "${LOG_DIR}"
 POLAR_LAUNCHER_LABEL="${POLAR_LAUNCHER_LABEL:-Polar SWE-Gym Slime-GRPO (Route A)}"
 

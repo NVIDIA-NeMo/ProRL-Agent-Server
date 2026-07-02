@@ -10,6 +10,8 @@ cd "${PROJECT_ROOT}"
 
 # shellcheck source=./env.cwdfw.sh
 source "${SCRIPT_DIR}/env.cwdfw.sh"
+# shellcheck source=../path_safety.sh
+source "${SCRIPT_DIR}/../path_safety.sh"
 
 PYTHON_BIN="${PYTHON_BIN:-${POLR_TRAIN_VENV}/bin/python3}"
 if [ ! -x "${PYTHON_BIN}" ]; then
@@ -21,7 +23,7 @@ export VIRTUAL_ENV="${VIRTUAL_ENV:-${POLR_TRAIN_VENV}}"
 export PYTHONNOUSERSITE=1
 
 export POLAR_JOB_CACHE_ROOT="${POLAR_JOB_CACHE_ROOT:-/tmp/polar-assets-${SLURM_JOB_ID:-manual}}"
-rm -rf "${POLAR_JOB_CACHE_ROOT}"
+polar_safe_remove_tree POLAR_JOB_CACHE_ROOT "${POLAR_JOB_CACHE_ROOT}" /tmp polar-
 mkdir -p \
     "${POLAR_JOB_CACHE_ROOT}/home" \
     "${POLAR_JOB_CACHE_ROOT}/apptainer-cache" \
@@ -47,16 +49,9 @@ export XDG_RUNTIME_DIR="${POLAR_JOB_CACHE_ROOT}/xdg-runtime"
 if [ ! -f "${REF_LOAD}/latest_checkpointed_iteration.txt" ]; then
     echo "[prepare-assets] converting weights: ${HF_CHECKPOINT} -> ${TORCH_DIST_DIR}"
     if [ -d "${TORCH_DIST_DIR}" ] && [ ! -f "${TORCH_DIST_DIR}/latest_checkpointed_iteration.txt" ]; then
-        case "${TORCH_DIST_DIR}" in
-            "${POLAR_DATA_ROOT}/checkpoints/"*)
-                echo "[prepare-assets] removing incomplete checkpoint directory: ${TORCH_DIST_DIR}"
-                rm -rf "${TORCH_DIST_DIR}"
-                ;;
-            *)
-                echo "[prepare-assets] refusing to remove unexpected checkpoint directory: ${TORCH_DIST_DIR}" >&2
-                exit 1
-                ;;
-        esac
+        echo "[prepare-assets] removing incomplete checkpoint directory: ${TORCH_DIST_DIR}"
+        polar_safe_remove_tree \
+            TORCH_DIST_DIR "${TORCH_DIST_DIR}" "${POLAR_DATA_ROOT}/checkpoints"
     fi
     bash "${SCRIPT_DIR}/convert_weights.sh"
 else
