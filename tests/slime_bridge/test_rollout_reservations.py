@@ -13,6 +13,7 @@ from slime_bridge import rollout as rollout_module
 from slime_bridge.rollout import (
     AsyncPolarRolloutWorker,
     PolarLowCompleteAcceptFractionError,
+    _CandidateQualityAccumulator,
     _CompletedGroup,
     _PendingGroup,
     _completed_service_metrics,
@@ -249,8 +250,13 @@ class _GenerateWorker:
         return len(self.completions)
 
     def snapshot_metrics(self):
+        consumed_count = sum(self.consumed_by_outcome.values())
         return {
             "polar/reservations/outstanding_groups": 1.0,
+            "polar/reservations/consumed_delta": float(consumed_count),
+            "polar/reservations/consumed_accepted_delta": float(
+                self.consumed_by_outcome.get("accepted", 0)
+            ),
             "polar/dropped_dynamic_filter_groups_delta": float(len(self.dynamic_filter_drops)),
         }
 
@@ -309,13 +315,69 @@ def _completion_with_rewards(reservation_id: int, rewards: list[float]) -> _Comp
             reward={"score": reward},
             response_length=1,
             loss_mask=[1],
-            metadata={"polar": {}},
+            metadata={
+                "polar": {
+                    "session_id": f"{reservation_id}-{index}",
+                    "session_status": "COMPLETED",
+                    "placeholder": False,
+                }
+            },
             status=Sample.Status.COMPLETED,
         )
         for index, reward in enumerate(rewards)
     ]
     completed.session_count = len(rewards)
     return completed
+
+
+def test_candidate_quality_aggregates_session_diagnostics_before_filtering() -> None:
+    dropped = _completion_with_rewards(101, [0.0, 0.0])
+    masked_timeout = dropped.samples[1]
+    masked_timeout.status = Sample.Status.ABORTED
+    masked_timeout.loss_mask = [0]
+    masked_timeout.remove_sample = True
+    masked_timeout.metadata["polar"].update(
+        {
+            "session_status": "TIMEOUT",
+            "trajectory_metadata": {
+                "agent_result": {
+                    "status": "timeout",
+                    "timeout_source": "agent",
+                    "timeout_stage": "postprocess",
+                }
+            },
+        }
+    )
+    accepted = _completion_with_rewards(102, [0.0, 1.0])
+    sibling_trace = SimpleNamespace(**accepted.samples[0].__dict__)
+    sibling_trace.metadata = {
+        "polar": {
+            **accepted.samples[0].metadata["polar"],
+            "trace_index": 1,
+        }
+    }
+    accepted.samples.append(sibling_trace)
+
+    accumulator = _CandidateQualityAccumulator()
+    accumulator.add(dropped, reward_key="score")
+    accumulator.add(accepted, reward_key="score")
+    metrics = accumulator.as_metrics(accepted_group_count=1)
+
+    assert metrics["polar/candidate/attempted_sessions"] == 4.0
+    assert metrics["polar/candidate/attempted_session_fraction"] == 1.0
+    assert metrics["polar/candidate/trainable_sessions"] == 3.0
+    assert metrics["polar/candidate/trainable_session_fraction"] == 0.75
+    assert metrics["polar/candidate/fully_masked_sessions"] == 1.0
+    assert metrics["polar/candidate/fully_masked_session_fraction"] == 0.25
+    assert metrics["polar/candidate/terminal_timeout_sessions"] == 1.0
+    assert metrics["polar/candidate/terminal_error_sessions"] == 0.0
+    assert metrics["polar/candidate/timeout_agent_exec_sessions"] == 0.0
+    assert metrics["polar/candidate/timeout_agent_postprocess_sessions"] == 1.0
+    assert metrics["polar/candidate/timeout_trainable_sessions"] == 0.0
+    assert metrics["polar/candidate/timeout_masked_sessions"] == 1.0
+    assert metrics["polar/candidate/successful_sessions"] == 3.0
+    assert metrics["polar/candidate/rollout_success_rate"] == 0.75
+    assert metrics["polar/candidate/trainable_samples"] == 4.0
 
 
 def test_generate_commits_accepted_reservations_only_after_full_output(monkeypatch) -> None:
@@ -387,14 +449,127 @@ def test_training_dynamic_filter_replaces_zero_std_groups_and_commits_mixed_grou
     ]
     assert output.metrics["rollout/dynamic_filter/drop_zero_std_0.0"] == 1.0
     assert output.metrics["rollout/dynamic_filter/drop_zero_std_1.0"] == 1.0
+    assert output.metrics["polar/candidate/group_count"] == 3.0
+    assert output.metrics["polar/candidate/accepted_group_count"] == 1.0
+    assert output.metrics["polar/candidate/accept_fraction"] == pytest.approx(1 / 3)
+    assert not any(key.startswith("polar/candidate/dynamic_filter_") for key in output.metrics)
+    assert output.metrics["polar/candidate/all_wrong_count"] == 1.0
+    assert output.metrics["polar/candidate/all_correct_count"] == 1.0
+    assert output.metrics["polar/candidate/mixed_count"] == 1.0
+    assert output.metrics["polar/candidate/reward_mean"] == 0.5
+    assert output.metrics["polar/candidate/group_reward_mean"] == 0.5
+    assert output.metrics["polar/candidate/trainable_reward_mean"] == 0.5
+    assert output.metrics["polar/candidate/quality_coverage_fraction"] == 1.0
+    assert output.metrics["polar/accepted/reward_mean"] == 0.5
     assert output.metrics["polar/dropped_dynamic_filter_groups_delta"] == 2.0
     assert output.metrics["polar/reservations/consumed_dynamic_filter_since_worker_start"] == 2.0
     assert output.metrics["polar/reservations/consumed_accepted_since_worker_start"] == 1.0
+    assert output.metrics["polar/decision_window/consumed_window_group_count"] == 3.0
+    assert output.metrics["polar/decision_window/accepted_group_count"] == 1.0
+    assert output.metrics[
+        "polar/decision_window/end_to_end_consumed_accept_fraction"
+    ] == pytest.approx(1 / 3)
+
+
+def test_candidate_quality_telemetry_error_is_fail_open_and_atomic(
+    monkeypatch,
+    caplog,
+) -> None:
+    all_zero = _completion_with_rewards(96, [0.0, 0.0])
+    mixed = _completion_with_rewards(97, [0.0, 1.0])
+    worker = _GenerateWorker([all_zero, mixed])
+    monkeypatch.setattr(rollout_module, "get_global_async_worker", lambda *_args: worker)
+    monkeypatch.setattr(rollout_module, "_current_ray_task_is_canceled", lambda: False)
+    monkeypatch.setattr(
+        rollout_module,
+        "_load_rollout_train_output_type",
+        lambda: RolloutFnTrainOutput,
+    )
+    real_extra_metrics = rollout_module._polar_extra_metrics
+    calls = 0
+
+    def flaky_extra_metrics(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("candidate telemetry boom")
+        return real_extra_metrics(*args, **kwargs)
+
+    monkeypatch.setattr(rollout_module, "_polar_extra_metrics", flaky_extra_metrics)
+
+    output = generate_rollout_polar_async(
+        SimpleNamespace(
+            rollout_batch_size=1,
+            reward_key="score",
+            dynamic_sampling_filter_path=(
+                "slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std"
+            ),
+        ),
+        rollout_id=1,
+        data_source=SimpleNamespace(),
+    )
+
+    assert output.samples == [mixed.samples]
+    assert worker.requested == [1, 1]
+    assert worker.dynamic_filter_drops == [(96, "zero_std_0.0")]
+    assert worker.consumed == [
+        ([96], "dynamic_filter"),
+        ([97], "accepted"),
+    ]
+    assert output.metrics["polar/candidate/group_count"] == 2.0
+    assert output.metrics["polar/candidate/telemetry_error_count"] == 1.0
+    assert output.metrics["polar/candidate/all_wrong_count"] == 0.0
+    assert output.metrics["polar/candidate/mixed_count"] == 1.0
+    assert output.metrics["polar/candidate/trainable_samples"] == 2.0
+    assert output.metrics["polar/decision_window/accepted_group_count"] == 1.0
+    assert output.metrics["polar/decision_window/end_to_end_consumed_accept_fraction"] == 0.5
+    assert "candidate telemetry boom" in caplog.text
+    assert "continuing with filtering and reservation handling" in caplog.text
+
+
+def test_candidate_quality_export_error_does_not_block_reservation_commit(
+    monkeypatch,
+    caplog,
+) -> None:
+    accepted = _completion_with_rewards(98, [0.0, 1.0])
+    worker = _GenerateWorker([accepted])
+    monkeypatch.setattr(rollout_module, "get_global_async_worker", lambda *_args: worker)
+    monkeypatch.setattr(rollout_module, "_current_ray_task_is_canceled", lambda: False)
+    monkeypatch.setattr(
+        rollout_module,
+        "_load_rollout_train_output_type",
+        lambda: RolloutFnTrainOutput,
+    )
+
+    def fail_export(*_args, **_kwargs):
+        raise RuntimeError("candidate export boom")
+
+    monkeypatch.setattr(
+        rollout_module._CandidateQualityAccumulator,
+        "as_metrics",
+        fail_export,
+    )
+
+    output = generate_rollout_polar_async(
+        SimpleNamespace(rollout_batch_size=1),
+        rollout_id=1,
+        data_source=SimpleNamespace(),
+    )
+
+    assert output.samples == [accepted.samples]
+    assert worker.consumed == [([98], "accepted")]
+    assert output.metrics["polar/candidate/group_count"] == 1.0
+    assert output.metrics["polar/candidate/telemetry_error_count"] == 1.0
+    assert output.metrics["polar/decision_window/consumed_window_group_count"] == 1.0
+    assert output.metrics["polar/decision_window/accepted_group_count"] == 1.0
+    assert "candidate export boom" in caplog.text
+    assert "continuing without optional details" in caplog.text
 
 
 def test_training_dynamic_filter_ignores_failed_zero_reward_samples(monkeypatch) -> None:
     false_mixed = _completion_with_rewards(94, [1.0, 1.0, 0.0])
     false_mixed.samples[-1].status = Sample.Status.FAILED
+    false_mixed.samples[-1].metadata["polar"]["session_status"] = "FAILED"
     false_mixed.samples[-1].loss_mask = [0]
     false_mixed.samples[-1].remove_sample = True
     true_mixed = _completion_with_rewards(95, [1.0, 0.0])
@@ -426,6 +601,10 @@ def test_training_dynamic_filter_ignores_failed_zero_reward_samples(monkeypatch)
         ([95], "accepted"),
     ]
     assert output.metrics["rollout/dynamic_filter/drop_zero_std_1.0"] == 1.0
+    assert output.metrics["polar/candidate/group_count"] == 2.0
+    assert output.metrics["polar/candidate/all_correct_count"] == 1.0
+    assert output.metrics["polar/candidate/mixed_count"] == 1.0
+    assert output.metrics["polar/candidate/trainable_samples"] == 4.0
 
 
 def test_eval_bypasses_training_dynamic_filter(monkeypatch) -> None:

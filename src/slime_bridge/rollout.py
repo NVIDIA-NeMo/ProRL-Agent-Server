@@ -51,6 +51,9 @@ logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL = 2.0  # seconds between task-status polls (eval / no-callback path)
 _CALLBACK_FALLBACK_POLL_SECONDS = 60.0  # defensive backstop for dropped callbacks
+_TASK_STATUS_GET_MAX_ATTEMPTS = 5
+_TASK_STATUS_GET_RETRY_BACKOFF_SECONDS = 0.5
+_TASK_STATUS_GET_RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _TRAJECTORY_EXAMPLE_INTERVAL = 10
 _TRAJECTORY_EXAMPLE_COUNT = 2
 _EVAL_DATA_INTEGRITY_ENV = "POLAR_EVAL_DATA_INTEGRITY_B64"
@@ -382,6 +385,45 @@ def _attach_scheduler_metadata(
         "policy_version": policy_version,
         "rollout_step": rollout_step,
     }
+
+
+async def _get_task_status_with_retry(
+    client: httpx.AsyncClient,
+    base_url: str,
+    task_id: str,
+) -> TaskStatus:
+    """Read an existing task status through transient transport failures."""
+    url = f"{base_url}/rollout/task/{task_id}"
+    for attempt in range(1, _TASK_STATUS_GET_MAX_ATTEMPTS + 1):
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if (
+                exc.response.status_code not in _TASK_STATUS_GET_RETRYABLE_STATUS_CODES
+                or attempt >= _TASK_STATUS_GET_MAX_ATTEMPTS
+            ):
+                raise
+            error_text = str(exc)
+        except httpx.TransportError as exc:
+            if attempt >= _TASK_STATUS_GET_MAX_ATTEMPTS:
+                raise
+            error_text = str(exc)
+        else:
+            return TaskStatus.model_validate(response.json())
+
+        backoff_seconds = _TASK_STATUS_GET_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+        logger.warning(
+            "Polar task %s status GET failed (attempt %s/%s); retrying in %.1fs: %s",
+            task_id,
+            attempt,
+            _TASK_STATUS_GET_MAX_ATTEMPTS,
+            backoff_seconds,
+            error_text,
+        )
+        await asyncio.sleep(backoff_seconds)
+
+    raise AssertionError("unreachable task-status retry state")
 
 
 async def _submit_and_wait_for_task(
@@ -1488,9 +1530,7 @@ class AsyncPolarRolloutWorker:
             try:
                 await asyncio.wait_for(event.wait(), timeout=_CALLBACK_FALLBACK_POLL_SECONDS)
             except asyncio.TimeoutError:
-                status_resp = await client.get(f"{base_url}/rollout/task/{task_id}")
-                status_resp.raise_for_status()
-                status = TaskStatus.model_validate(status_resp.json())
+                status = await _get_task_status_with_retry(client, base_url, task_id)
                 if status.status in ("completed", "failed"):
                     return TaskResult(
                         task_id=task_id,
@@ -1503,9 +1543,7 @@ class AsyncPolarRolloutWorker:
             if result is not None:
                 return result
             # Race: event set but result missing — re-poll once.
-            status_resp = await client.get(f"{base_url}/rollout/task/{task_id}")
-            status_resp.raise_for_status()
-            status = TaskStatus.model_validate(status_resp.json())
+            status = await _get_task_status_with_retry(client, base_url, task_id)
             return TaskResult(
                 task_id=task_id,
                 status=status.status,
@@ -1753,6 +1791,11 @@ async def _submit_eval_groups(
             metrics.pop(metric_name)
     if rewards:
         metrics["polar/reward_mean"] = sum(rewards) / len(rewards)
+    if trusted_rewards:
+        metrics["polar/reward_mean_valid"] = sum(trusted_rewards) / len(trusted_rewards)
+        metrics["polar/reward_std_valid"] = (
+            statistics.pstdev(trusted_rewards) if len(trusted_rewards) > 1 else 0.0
+        )
     if len(rewards) > 1:
         metrics["polar/reward_std"] = statistics.pstdev(rewards)
     elif rewards:
@@ -2308,6 +2351,220 @@ def _call_training_dynamic_filter(dynamic_filter: Any, args: Any, samples: list[
     return call_dynamic_filter(dynamic_filter, args, trainable_samples)
 
 
+_CANDIDATE_SESSION_COUNT_METRICS = {
+    "attempted_sessions": "polar/rollout_attempted_sessions",
+    "trainable_sessions": "polar/rollout_trainable_sessions",
+    "fully_masked_sessions": "polar/rollout_fully_masked_sessions",
+    "successful_sessions": "polar/rollout_successful_sessions",
+    "terminal_timeout_sessions": "polar/terminal_timeout_sessions",
+    "terminal_error_sessions": "polar/terminal_error_sessions",
+    "timeout_agent_exec_sessions": "polar/timeout_agent_exec_sessions",
+    "timeout_agent_postprocess_sessions": "polar/timeout_agent_postprocess_sessions",
+    "timeout_trainable_sessions": "polar/timeout_trainable_sessions",
+    "timeout_masked_sessions": "polar/timeout_masked_sessions",
+}
+
+
+@dataclass(slots=True)
+class _CandidateQualityAccumulator:
+    """Streaming quality summary before dynamic-sampling selection."""
+
+    group_count: int = 0
+    telemetry_error_count: int = 0
+    accounted_sessions: float = 0.0
+    quality_eligible_sessions: float = 0.0
+    early_stop_cancelled_sessions: float = 0.0
+    reward_sum: float = 0.0
+    reward_square_sum: float = 0.0
+    quality_group_count: int = 0
+    group_reward_sum: float = 0.0
+    group_reward_square_sum: float = 0.0
+    trainable_samples: int = 0
+    trainable_reward_sum: float = 0.0
+    session_counts: dict[str, float] = field(
+        default_factory=lambda: {name: 0.0 for name in _CANDIDATE_SESSION_COUNT_METRICS}
+    )
+    category_counts: dict[str, int] = field(
+        default_factory=lambda: {
+            "all_correct": 0,
+            "all_wrong": 0,
+            "mixed": 0,
+            "constant_other": 0,
+            "no_trainable": 0,
+        }
+    )
+
+    def add(self, completed: _CompletedGroup, *, reward_key: str) -> None:
+        """Atomically add one candidate group's optional quality telemetry."""
+
+        samples = completed.samples
+        trainable_rewards = [
+            _extract_sample_reward(sample, reward_key)
+            for sample in samples
+            if _sample_has_trainable_tokens(sample)
+        ]
+        if not trainable_rewards:
+            category = "no_trainable"
+        else:
+            unique_rewards = set(trainable_rewards)
+            if len(unique_rewards) > 1:
+                category = "mixed"
+            elif trainable_rewards[0] == 0.0:
+                category = "all_wrong"
+            elif trainable_rewards[0] == 1.0:
+                category = "all_correct"
+            else:
+                category = "constant_other"
+
+        flat_rewards = [_extract_sample_reward(sample, reward_key) for sample in samples]
+        quality = _polar_extra_metrics(samples, flat_rewards, reward_key)
+        accounted = float(quality.get("polar/reward_accounted_sessions", 0.0))
+        reward_mean = quality.get("polar/reward_mean")
+        reward_std = float(quality.get("polar/reward_std", 0.0))
+        parsed_reward_mean: float | None = None
+        if accounted > 0.0 and reward_mean is not None:
+            parsed_reward_mean = float(reward_mean)
+
+        cancelled = float(quality.get("polar/early_stop/cancelled_sessions", 0.0))
+        quality_eligible_sessions = max(
+            0.0,
+            float(completed.session_count) - cancelled,
+        )
+        session_counts = {
+            name: float(quality.get(source, 0.0))
+            for name, source in _CANDIDATE_SESSION_COUNT_METRICS.items()
+        }
+
+        # Commit only after every optional extraction and conversion succeeds.
+        # The caller can therefore count a telemetry error without retaining a
+        # partially-observed candidate group.
+        self.group_count += 1
+        self.category_counts[category] += 1
+        self.trainable_samples += len(trainable_rewards)
+        self.trainable_reward_sum += sum(trainable_rewards)
+        for name, count in session_counts.items():
+            self.session_counts[name] += count
+        if parsed_reward_mean is not None:
+            self.accounted_sessions += accounted
+            self.reward_sum += accounted * parsed_reward_mean
+            self.reward_square_sum += accounted * (reward_std**2 + parsed_reward_mean**2)
+            self.quality_group_count += 1
+            self.group_reward_sum += parsed_reward_mean
+            self.group_reward_square_sum += parsed_reward_mean**2
+        self.early_stop_cancelled_sessions += cancelled
+        self.quality_eligible_sessions += quality_eligible_sessions
+
+    def record_group_error(self) -> None:
+        """Account for a candidate whose optional telemetry could not be read."""
+
+        self.group_count += 1
+        self.telemetry_error_count += 1
+
+    def record_export_error(self) -> None:
+        self.telemetry_error_count += 1
+
+    def as_metrics(self, *, accepted_group_count: int) -> dict[str, float]:
+        if self.group_count <= 0:
+            return {}
+        group_count = float(self.group_count)
+        metrics = {
+            "polar/candidate/group_count": group_count,
+            "polar/candidate/accepted_group_count": float(accepted_group_count),
+            "polar/candidate/accept_fraction": float(accepted_group_count) / group_count,
+            "polar/candidate/telemetry_error_count": float(self.telemetry_error_count),
+            "polar/candidate/accounted_sessions": self.accounted_sessions,
+            "polar/candidate/quality_eligible_sessions": self.quality_eligible_sessions,
+            "polar/candidate/early_stop_cancelled_sessions": (self.early_stop_cancelled_sessions),
+            "polar/candidate/trainable_samples": float(self.trainable_samples),
+        }
+        for name, count in self.session_counts.items():
+            metrics[f"polar/candidate/{name}"] = count
+        attempted_sessions = self.session_counts["attempted_sessions"]
+        total_sessions = attempted_sessions + self.early_stop_cancelled_sessions
+        if total_sessions > 0.0:
+            metrics["polar/candidate/attempted_session_fraction"] = (
+                attempted_sessions / total_sessions
+            )
+        if attempted_sessions > 0.0:
+            metrics["polar/candidate/trainable_session_fraction"] = (
+                self.session_counts["trainable_sessions"] / attempted_sessions
+            )
+            metrics["polar/candidate/fully_masked_session_fraction"] = (
+                self.session_counts["fully_masked_sessions"] / attempted_sessions
+            )
+            metrics["polar/candidate/rollout_success_rate"] = (
+                self.session_counts["successful_sessions"] / attempted_sessions
+            )
+        for category, count in self.category_counts.items():
+            metrics[f"polar/candidate/{category}_fraction"] = float(count) / group_count
+            metrics[f"polar/candidate/{category}_count"] = float(count)
+        if self.accounted_sessions > 0.0:
+            reward_mean = self.reward_sum / self.accounted_sessions
+            metrics["polar/candidate/reward_mean"] = reward_mean
+            metrics["polar/candidate/reward_std"] = (
+                max(0.0, self.reward_square_sum / self.accounted_sessions - reward_mean**2) ** 0.5
+            )
+        if self.quality_group_count > 0:
+            quality_group_count = float(self.quality_group_count)
+            group_reward_mean = self.group_reward_sum / quality_group_count
+            metrics["polar/candidate/group_reward_mean"] = group_reward_mean
+            metrics["polar/candidate/group_reward_std"] = (
+                max(
+                    0.0,
+                    self.group_reward_square_sum / quality_group_count - group_reward_mean**2,
+                )
+                ** 0.5
+            )
+        if self.trainable_samples > 0:
+            metrics["polar/candidate/trainable_reward_mean"] = (
+                self.trainable_reward_sum / self.trainable_samples
+            )
+        if self.quality_eligible_sessions > 0.0:
+            metrics["polar/candidate/quality_coverage_fraction"] = (
+                self.accounted_sessions / self.quality_eligible_sessions
+            )
+        return metrics
+
+
+def _candidate_quality_metrics_fail_open(
+    accumulator: _CandidateQualityAccumulator,
+    *,
+    accepted_group_count: int,
+) -> dict[str, float]:
+    try:
+        return accumulator.as_metrics(accepted_group_count=accepted_group_count)
+    except Exception:
+        accumulator.record_export_error()
+        logger.warning(
+            "Candidate-quality telemetry export failed; continuing without optional details",
+            exc_info=True,
+        )
+        group_count = float(accumulator.group_count)
+        accepted_count = float(accepted_group_count)
+        accept_fraction = accepted_count / group_count if group_count > 0.0 else 0.0
+        return {
+            "polar/candidate/group_count": group_count,
+            "polar/candidate/accepted_group_count": accepted_count,
+            "polar/candidate/accept_fraction": accept_fraction,
+            "polar/candidate/telemetry_error_count": float(accumulator.telemetry_error_count),
+        }
+
+
+def _decision_window_metrics(scheduler_metrics: dict[str, float]) -> dict[str, float]:
+    consumed_key = "polar/reservations/consumed_delta"
+    if consumed_key not in scheduler_metrics:
+        return {}
+    consumed = float(scheduler_metrics[consumed_key])
+    accepted = float(scheduler_metrics.get("polar/reservations/consumed_accepted_delta", 0.0))
+    return {
+        "polar/decision_window/consumed_window_group_count": consumed,
+        "polar/decision_window/accepted_group_count": accepted,
+        "polar/decision_window/end_to_end_consumed_accept_fraction": (
+            accepted / consumed if consumed > 0.0 else 0.0
+        ),
+    }
+
+
 def generate_rollout_polar_async(
     args: Any, rollout_id: int, data_source: Any, evaluation: bool = False
 ) -> Any:
@@ -2329,6 +2586,7 @@ def generate_rollout_polar_async(
 
     data: list[list[Any]] = []
     accepted_completions: list[_CompletedGroup] = []
+    candidate_quality = _CandidateQualityAccumulator()
     dynamic_filter_metrics: dict[str, float] = {}
     dynamic_filter_reservation_metrics: dict[str, float] = {}
     start = time.monotonic()
@@ -2348,6 +2606,20 @@ def generate_rollout_polar_async(
         )
         replacement_groups = 0
         for completed in completed_groups:
+            try:
+                candidate_quality.add(
+                    completed,
+                    reward_key=async_worker.config.reward_key,
+                )
+            except Exception:
+                candidate_quality.record_group_error()
+                logger.warning(
+                    "Candidate-quality telemetry failed for Polar group %s task=%s; "
+                    "continuing with filtering and reservation handling",
+                    completed.group_id,
+                    completed.task_id,
+                    exc_info=True,
+                )
             if dynamic_filter is not None:
                 filter_output = _call_training_dynamic_filter(
                     dynamic_filter,
@@ -2408,7 +2680,23 @@ def generate_rollout_polar_async(
     rewards = [_extract_sample_reward(s, async_worker.config.reward_key) for s in flat]
     metrics: dict[str, Any] = dict(dynamic_filter_metrics)
     metrics.update(dynamic_filter_reservation_metrics)
-    metrics.update(_polar_extra_metrics(flat, rewards, async_worker.config.reward_key))
+    metrics.update(
+        _candidate_quality_metrics_fail_open(
+            candidate_quality,
+            accepted_group_count=len(data),
+        )
+    )
+    accepted_quality = _polar_extra_metrics(flat, rewards, async_worker.config.reward_key)
+    metrics.update(accepted_quality)
+    metrics["polar/accepted/group_count"] = float(len(data))
+    for source, suffix in (
+        ("polar/reward_mean", "reward_mean"),
+        ("polar/reward_std", "reward_std"),
+        ("polar/reward_accounted_sessions", "accounted_sessions"),
+        ("polar/reward_mean_completed", "reward_mean_completed"),
+    ):
+        if source in accepted_quality:
+            metrics[f"polar/accepted/{suffix}"] = accepted_quality[source]
     metrics.update(_completed_service_metrics(accepted_completions))
     metrics["timing/pipeline_ms/rollout_collect"] = elapsed * 1000.0
     output = RolloutFnTrainOutput(samples=data, metrics=metrics)
@@ -2431,7 +2719,9 @@ def generate_rollout_polar_async(
     # Snapshot exactly once per delivered rollout, after reservation commit,
     # so *_delta means "during this rollout" and lifetime counters carry an
     # explicit worker-local scope across Slurm restarts.
-    metrics.update(async_worker.snapshot_metrics())
+    scheduler_metrics = async_worker.snapshot_metrics()
+    metrics.update(scheduler_metrics)
+    metrics.update(_decision_window_metrics(scheduler_metrics))
     metrics.update(post_commit_metrics)
     return output
 
@@ -3026,6 +3316,41 @@ def _effective_trainable_reward(sample: Any, reward_key: str) -> float:
     return _extract_sample_reward(sample, reward_key)
 
 
+def _sample_trainable_response_tokens(sample: Any) -> float:
+    loss_mask = getattr(sample, "loss_mask", None)
+    if loss_mask is None:
+        return _nonnegative_finite_float(getattr(sample, "response_length", 0))
+    return sum(float(value) for value in loss_mask)
+
+
+def _session_status_bucket(status: Any) -> str:
+    status_name = str(getattr(status, "value", status) or "").upper()
+    if status_name == "COMPLETED":
+        return "completed"
+    if status_name == "TIMEOUT":
+        return "timeout"
+    if status_name in {"ERROR", "FAILED"}:
+        return "error"
+    return "unknown"
+
+
+def _add_distribution_metrics(
+    out: dict[str, float],
+    prefix: str,
+    values: list[float],
+    *,
+    include_count: bool = False,
+) -> None:
+    if not values:
+        return
+    if include_count:
+        out[f"{prefix}/count"] = float(len(values))
+    out[f"{prefix}/mean"] = sum(values) / len(values)
+    out[f"{prefix}/median"] = statistics.median(values)
+    out[f"{prefix}/min"] = min(values)
+    out[f"{prefix}/max"] = max(values)
+
+
 def _polar_extra_metrics(
     flat_samples: list[Any],
     rewards: list[float],
@@ -3071,8 +3396,19 @@ def _polar_extra_metrics(
     parser_invalid_sessions: set[str] = set()
     agent_timeout_traces = 0
     agent_timeout_sessions: set[str] = set()
+    trainable_sessions: set[str] = set()
+    terminal_timeout_sessions: set[str] = set()
+    terminal_error_sessions: set[str] = set()
+    timeout_agent_exec_sessions: set[str] = set()
+    timeout_agent_postprocess_sessions: set[str] = set()
     early_stop_cancelled_sessions: set[str] = set()
     early_stop_elapsed_ms: list[float] = []
+    session_trainable_response_tokens: dict[str, float] = {}
+    session_raw_response_tokens: dict[str, float] = {}
+    session_real_trace_counts: dict[str, int] = {}
+    session_truncated_trace_counts: dict[str, int] = {}
+    session_agent_timeout_trace_counts: dict[str, int] = {}
+    session_status_buckets: dict[str, str] = {}
     trainable_traces = 0
     trajectory_rewards_by_group: dict[Any, dict[Any, list[float]]] = {}
     for sample in flat_samples:
@@ -3090,6 +3426,8 @@ def _polar_extra_metrics(
         if "policy_staleness" in polar_meta:
             policy_staleness.append(float(polar_meta["policy_staleness"]))
         session_id = polar_meta.get("session_id")
+        session_key = str(session_id) if session_id else None
+        session_status = str(_sample_session_status(sample) or "").upper()
         trace_index = int(polar_meta.get("trace_index", 0) or 0)
         inference_trace_key = (str(session_id or ""), trace_index)
         if inference_trace_key not in seen_inference_traces:
@@ -3101,10 +3439,10 @@ def _polar_extra_metrics(
                     value = _optional_nonnegative_finite_float(inference_timing.get(field))
                     if value is not None:
                         values.append(value)
-        if parser_invalid and session_id:
-            parser_invalid_sessions.add(str(session_id))
-        if agent_timeout and session_id:
-            agent_timeout_sessions.add(str(session_id))
+        if parser_invalid and session_key:
+            parser_invalid_sessions.add(session_key)
+        if agent_timeout and session_key:
+            agent_timeout_sessions.add(session_key)
         result_metadata = polar_meta.get("result_metadata") or {}
         early_stop_cancelled = (
             session_id
@@ -3112,7 +3450,7 @@ def _polar_extra_metrics(
             and result_metadata.get("early_stop_cancelled") is True
         )
         if early_stop_cancelled:
-            early_stop_cancelled_sessions.add(str(session_id))
+            early_stop_cancelled_sessions.add(session_key)
             elapsed = _optional_nonnegative_finite_float(
                 result_metadata.get("early_stop_elapsed_ms")
             )
@@ -3121,6 +3459,8 @@ def _polar_extra_metrics(
         sample_is_trainable = _sample_has_trainable_tokens(sample)
         if sample_is_trainable:
             trainable_traces += 1
+            if session_key:
+                trainable_sessions.add(session_key)
             group_id = getattr(sample, "group_index", None)
             trajectory_id = getattr(sample, "rollout_id", None)
             if trajectory_id is None:
@@ -3131,10 +3471,52 @@ def _polar_extra_metrics(
                 trajectory_id, []
             ).append(_effective_trainable_reward(sample, reward_key))
         is_placeholder = bool(polar_meta.get("placeholder"))
-        if not session_id:
+        if not session_key:
             continue
-        if session_id not in seen:
-            seen.add(session_id)
+        status_bucket = _session_status_bucket(session_status)
+        if session_status_buckets.get(session_key, "unknown") == "unknown":
+            session_status_buckets[session_key] = status_bucket
+        if not is_placeholder:
+            session_trainable_response_tokens[session_key] = session_trainable_response_tokens.get(
+                session_key, 0.0
+            ) + _sample_trainable_response_tokens(sample)
+            session_raw_response_tokens[session_key] = session_raw_response_tokens.get(
+                session_key, 0.0
+            ) + _nonnegative_finite_float(getattr(sample, "response_length", 0))
+            session_real_trace_counts[session_key] = (
+                session_real_trace_counts.get(session_key, 0) + 1
+            )
+            if _is_truncated(sample):
+                session_truncated_trace_counts[session_key] = (
+                    session_truncated_trace_counts.get(session_key, 0) + 1
+                )
+                if agent_timeout:
+                    session_agent_timeout_trace_counts[session_key] = (
+                        session_agent_timeout_trace_counts.get(session_key, 0) + 1
+                    )
+        session_is_placeholder[session_key] = (
+            session_is_placeholder.get(session_key, True) and is_placeholder
+        )
+        if not early_stop_cancelled:
+            if session_status == "TIMEOUT":
+                terminal_timeout_sessions.add(session_key)
+                trajectory_metadata = polar_meta.get("trajectory_metadata")
+                agent_result = (
+                    trajectory_metadata.get("agent_result")
+                    if isinstance(trajectory_metadata, dict)
+                    else None
+                )
+                if isinstance(agent_result, dict):
+                    timeout_source = str(agent_result.get("timeout_source") or "").lower()
+                    timeout_stage = str(agent_result.get("timeout_stage") or "").lower()
+                    if timeout_source == "agent" and timeout_stage == "exec":
+                        timeout_agent_exec_sessions.add(session_key)
+                    elif timeout_source == "agent" and timeout_stage == "postprocess":
+                        timeout_agent_postprocess_sessions.add(session_key)
+            elif session_status in {"ERROR", "FAILED"}:
+                terminal_error_sessions.add(session_key)
+        if session_key not in seen:
+            seen.add(session_key)
             timing = polar_meta.get("timing") or {}
             # Synthetic straggler placeholders contain rollout-server time to
             # cancellation, not completed gateway stage timings. Keep them out
@@ -3153,14 +3535,11 @@ def _polar_extra_metrics(
                         category_totals[category] += _nonnegative_finite_float(
                             category_values.get(category)
                         )
-            session_is_placeholder[session_id] = is_placeholder
             evaluation = (polar_meta.get("trajectory_metadata") or {}).get("evaluation") or {}
             report = evaluation.get("report") or {}
             if isinstance(report, dict) and report:
-                session_report[session_id] = report
-        if session_id and not early_stop_cancelled:
-            session_key = str(session_id)
-            session_status = str(_sample_session_status(sample) or "").upper()
+                session_report[session_key] = report
+        if not early_stop_cancelled:
             if agent_timeout and not is_placeholder:
                 # The model exhausted its own agent budget. This is a real,
                 # aligned zero-reward policy outcome rather than missing
@@ -3233,28 +3612,22 @@ def _polar_extra_metrics(
         # can emit multiple traces, while an early-stop cancellation emits a
         # synthetic zero-gradient placeholder.
         out["polar/reward_mean_all_samples"] = sum(rewards) / len(rewards)
-    completed_session_rewards = [
-        sum(trace_rewards) / len(trace_rewards)
-        for trace_rewards in completed_session_trace_rewards.values()
+    completed_session_rewards_by_key = {
+        session_id: sum(trace_rewards) / len(trace_rewards)
+        for session_id, trace_rewards in completed_session_trace_rewards.items()
         if trace_rewards
-    ]
-    agent_timeout_session_rewards = [
-        sum(trace_rewards) / len(trace_rewards)
-        for trace_rewards in agent_timeout_session_trace_rewards.values()
+    }
+    agent_timeout_session_rewards_by_key = {
+        session_id: sum(trace_rewards) / len(trace_rewards)
+        for session_id, trace_rewards in agent_timeout_session_trace_rewards.items()
         if trace_rewards
-    ]
-    accounted_session_keys = (
-        completed_session_trace_rewards.keys() | agent_timeout_session_trace_rewards.keys()
-    )
-    accounted_session_rewards = (
-        completed_session_rewards
-        + agent_timeout_session_rewards
-        + [
-            0.0
-            for session_id in trusted_model_failure_sessions
-            if session_id not in accounted_session_keys
-        ]
-    )
+    }
+    accounted_session_rewards_by_key = dict(completed_session_rewards_by_key)
+    accounted_session_rewards_by_key.update(agent_timeout_session_rewards_by_key)
+    for session_id in trusted_model_failure_sessions:
+        accounted_session_rewards_by_key.setdefault(session_id, 0.0)
+    completed_session_rewards = list(completed_session_rewards_by_key.values())
+    accounted_session_rewards = list(accounted_session_rewards_by_key.values())
     if completed_session_rewards:
         reward_mean_completed = sum(completed_session_rewards) / len(completed_session_rewards)
         out["polar/reward_mean_completed"] = reward_mean_completed
@@ -3280,6 +3653,140 @@ def _polar_extra_metrics(
                 - completed_session_trace_rewards.keys()
             )
         )
+
+    length_session_ids = set(session_trainable_response_tokens) - early_stop_cancelled_sessions
+    if length_session_ids:
+        ordered_length_session_ids = sorted(length_session_ids)
+        effective_lengths = [
+            session_trainable_response_tokens[session_id]
+            for session_id in ordered_length_session_ids
+        ]
+        raw_lengths = [
+            session_raw_response_tokens[session_id] for session_id in ordered_length_session_ids
+        ]
+        _add_distribution_metrics(
+            out,
+            "polar/session_trainable_response_tokens",
+            effective_lengths,
+            include_count=True,
+        )
+        _add_distribution_metrics(out, "polar/session_raw_response_tokens", raw_lengths)
+
+        for status_bucket in ("completed", "timeout", "error", "unknown"):
+            status_lengths = [
+                session_trainable_response_tokens[session_id]
+                for session_id in ordered_length_session_ids
+                if session_status_buckets.get(session_id, "unknown") == status_bucket
+            ]
+            if status_lengths:
+                out[f"polar/session_trainable_response_tokens/by_status/{status_bucket}_mean"] = (
+                    sum(status_lengths) / len(status_lengths)
+                )
+
+        real_trace_count = sum(
+            session_real_trace_counts[session_id] for session_id in length_session_ids
+        )
+        truncated_trace_count = sum(
+            session_truncated_trace_counts.get(session_id, 0) for session_id in length_session_ids
+        )
+        agent_timeout_trace_count = sum(
+            session_agent_timeout_trace_counts.get(session_id, 0)
+            for session_id in length_session_ids
+        )
+        if real_trace_count:
+            out["polar/trace_truncation/truncated_fraction"] = (
+                truncated_trace_count / real_trace_count
+            )
+            out["polar/trace_truncation/agent_timeout_fraction"] = (
+                agent_timeout_trace_count / real_trace_count
+            )
+            out["polar/trace_truncation/non_agent_timeout_fraction"] = (
+                truncated_trace_count - agent_timeout_trace_count
+            ) / real_trace_count
+
+        truncated_session_ids = {
+            session_id
+            for session_id in length_session_ids
+            if session_truncated_trace_counts.get(session_id, 0) > 0
+        }
+        agent_timeout_truncated_session_ids = {
+            session_id
+            for session_id in length_session_ids
+            if session_agent_timeout_trace_counts.get(session_id, 0) > 0
+        }
+        non_agent_timeout_session_ids = truncated_session_ids - agent_timeout_truncated_session_ids
+        length_session_count = len(length_session_ids)
+        out["polar/session_truncation/session_count"] = float(length_session_count)
+        out["polar/session_truncation/truncated_count"] = float(len(truncated_session_ids))
+        out["polar/session_truncation/truncated_fraction"] = (
+            len(truncated_session_ids) / length_session_count
+        )
+        out["polar/session_truncation/agent_timeout_fraction"] = (
+            len(agent_timeout_truncated_session_ids) / length_session_count
+        )
+        out["polar/session_truncation/non_agent_timeout_fraction"] = (
+            len(non_agent_timeout_session_ids) / length_session_count
+        )
+
+    quality_eligible_session_ids = seen - early_stop_cancelled_sessions
+    if quality_eligible_session_ids:
+        quality_eligible_session_count = len(quality_eligible_session_ids)
+        for status_bucket in ("completed", "timeout", "error", "unknown"):
+            status_count = sum(
+                1
+                for session_id in quality_eligible_session_ids
+                if session_status_buckets.get(session_id, "unknown") == status_bucket
+            )
+            out[f"polar/session_status/{status_bucket}_count"] = float(status_count)
+            out[f"polar/session_status/{status_bucket}_fraction"] = (
+                status_count / quality_eligible_session_count
+            )
+
+        accounted_session_ids = (
+            quality_eligible_session_ids & accounted_session_rewards_by_key.keys()
+        )
+        unaccounted_session_ids = quality_eligible_session_ids - accounted_session_ids
+        for outcome_name, session_ids in (
+            ("accounted", accounted_session_ids),
+            ("unaccounted", unaccounted_session_ids),
+        ):
+            out[f"polar/session_outcome/{outcome_name}_count"] = float(len(session_ids))
+            out[f"polar/session_outcome/{outcome_name}_fraction"] = (
+                len(session_ids) / quality_eligible_session_count
+            )
+
+        outcome_session_ids = {
+            "positive": {
+                session_id
+                for session_id in accounted_session_ids
+                if accounted_session_rewards_by_key[session_id] > 0.0
+            },
+            "zero": {
+                session_id
+                for session_id in accounted_session_ids
+                if accounted_session_rewards_by_key[session_id] == 0.0
+            },
+            "negative": {
+                session_id
+                for session_id in accounted_session_ids
+                if accounted_session_rewards_by_key[session_id] < 0.0
+            },
+        }
+        accounted_session_count = len(accounted_session_ids)
+        for outcome_name, session_ids in outcome_session_ids.items():
+            out[f"polar/session_outcome/{outcome_name}_count"] = float(len(session_ids))
+            if accounted_session_count:
+                out[f"polar/session_outcome/{outcome_name}_fraction_of_accounted"] = (
+                    len(session_ids) / accounted_session_count
+                )
+            outcome_lengths = [
+                session_trainable_response_tokens[session_id]
+                for session_id in session_ids & length_session_ids
+            ]
+            if outcome_lengths:
+                out[f"polar/session_trainable_response_tokens/by_outcome/{outcome_name}_mean"] = (
+                    sum(outcome_lengths) / len(outcome_lengths)
+                )
     if policy_staleness:
         out["polar/staleness/mean"] = sum(policy_staleness) / len(policy_staleness)
 
@@ -3324,15 +3831,43 @@ def _polar_extra_metrics(
             total_sessions - empty_sessions
         ) / total_sessions
         attempted_sessions = seen - early_stop_cancelled_sessions
+        attempted_trainable_sessions = attempted_sessions & trainable_sessions
+        fully_masked_sessions = attempted_sessions - attempted_trainable_sessions
+        attempted_terminal_timeouts = attempted_sessions & terminal_timeout_sessions
+        attempted_terminal_errors = attempted_sessions & terminal_error_sessions
+        trainable_timeout_sessions = attempted_terminal_timeouts & trainable_sessions
+        masked_timeout_sessions = attempted_terminal_timeouts - trainable_timeout_sessions
+        out["polar/rollout_attempted_sessions"] = float(len(attempted_sessions))
+        out["polar/rollout_attempted_session_fraction"] = len(attempted_sessions) / total_sessions
+        out["polar/rollout_trainable_sessions"] = float(len(attempted_trainable_sessions))
+        out["polar/rollout_fully_masked_sessions"] = float(len(fully_masked_sessions))
+        out["polar/terminal_timeout_sessions"] = float(len(attempted_terminal_timeouts))
+        out["polar/terminal_error_sessions"] = float(len(attempted_terminal_errors))
+        out["polar/timeout_agent_exec_sessions"] = float(
+            len(timeout_agent_exec_sessions & attempted_sessions)
+        )
+        out["polar/timeout_agent_postprocess_sessions"] = float(
+            len(timeout_agent_postprocess_sessions & attempted_sessions)
+        )
+        out["polar/timeout_trainable_sessions"] = float(len(trainable_timeout_sessions))
+        out["polar/timeout_masked_sessions"] = float(len(masked_timeout_sessions))
         if attempted_sessions:
+            out["polar/rollout_trainable_session_fraction"] = len(
+                attempted_trainable_sessions
+            ) / len(attempted_sessions)
+            out["polar/rollout_fully_masked_session_fraction"] = len(fully_masked_sessions) / len(
+                attempted_sessions
+            )
             failed_attempted_sessions = {
                 session_id
                 for session_id, placeholder in session_is_placeholder.items()
                 if placeholder and session_id in attempted_sessions
             } | (agent_timeout_sessions & attempted_sessions)
-            out["polar/rollout_success_rate"] = (
-                len(attempted_sessions) - len(failed_attempted_sessions)
-            ) / len(attempted_sessions)
+            failed_attempted_sessions |= attempted_terminal_timeouts
+            failed_attempted_sessions |= attempted_terminal_errors
+            successful_sessions = attempted_sessions - failed_attempted_sessions
+            out["polar/rollout_successful_sessions"] = float(len(successful_sessions))
+            out["polar/rollout_success_rate"] = len(successful_sessions) / len(attempted_sessions)
             out["polar/training_filter/parser_invalid_session_fraction"] = len(
                 parser_invalid_sessions & attempted_sessions
             ) / len(attempted_sessions)

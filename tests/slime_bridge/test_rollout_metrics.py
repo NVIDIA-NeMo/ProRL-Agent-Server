@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from types import SimpleNamespace
 
 from slime_bridge.rollout import (
@@ -29,6 +30,10 @@ def _sample(
     trace_index: int = 0,
     early_stop_cancelled: bool = False,
     agent_timeout: bool = False,
+    response_length: int = 1,
+    loss_mask: list[int] | None = None,
+    missing_loss_mask: bool = False,
+    truncated: bool | None = None,
 ) -> SimpleNamespace:
     polar = {
         "session_id": session_id,
@@ -90,16 +95,24 @@ def _sample(
             "trainable": True,
             "reason": "agent_timeout",
         }
+    sample_is_truncated = agent_timeout if truncated is None else truncated
     return SimpleNamespace(
         reward={"score": reward},
         metadata={"polar": polar},
         group_index=group_index,
         rollout_id=rollout_id,
         index=rollout_id,
-        response_length=1,
-        loss_mask=[1] if trainable else [0],
+        response_length=response_length,
+        loss_mask=(
+            None
+            if missing_loss_mask
+            else (loss_mask if loss_mask is not None else ([1] if trainable else [0]))
+        ),
         remove_sample=not trainable,
-        status="TRUNCATED" if agent_timeout else "COMPLETED",
+        status=SimpleNamespace(
+            name="TRUNCATED" if sample_is_truncated else "COMPLETED",
+            value="truncated" if sample_is_truncated else "completed",
+        ),
     )
 
 
@@ -261,6 +274,325 @@ def test_polar_metrics_count_trainable_agent_timeout_as_model_failure() -> None:
     assert metrics["polar/rollout_success_rate"] == 0.5
 
 
+def test_polar_metrics_report_session_trainability_and_terminal_failures() -> None:
+    samples = [
+        _sample("usable", 1.0, trace_index=0),
+        _sample("usable", 1.0, trace_index=1),
+        _sample("empty-completed", 0.0, placeholder=True, trainable=False),
+        _sample("timeout", 0.0, status="TIMEOUT", trainable=False),
+        _sample("error", 0.0, status="ERROR", trainable=False),
+        _sample(
+            "early-stop",
+            0.0,
+            status="ERROR",
+            placeholder=True,
+            trainable=False,
+            early_stop_cancelled=True,
+        ),
+    ]
+
+    metrics = _polar_extra_metrics(
+        samples,
+        rewards=[1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        reward_key="score",
+    )
+
+    assert metrics["polar/rollout_attempted_sessions"] == 4.0
+    assert metrics["polar/rollout_attempted_session_fraction"] == 0.8
+    assert metrics["polar/rollout_trainable_sessions"] == 1.0
+    assert metrics["polar/rollout_trainable_session_fraction"] == 0.25
+    assert metrics["polar/rollout_fully_masked_sessions"] == 3.0
+    assert metrics["polar/rollout_fully_masked_session_fraction"] == 0.75
+    assert metrics["polar/terminal_timeout_sessions"] == 1.0
+    assert metrics["polar/terminal_error_sessions"] == 1.0
+    assert metrics["polar/rollout_successful_sessions"] == 1.0
+    assert metrics["polar/rollout_success_rate"] == 0.25
+
+
+def test_polar_metrics_split_timeout_source_stage_and_trainability_by_session() -> None:
+    exec_trace_0 = _sample(
+        "agent-exec",
+        0.0,
+        status="TIMEOUT",
+        agent_timeout=True,
+        trace_index=0,
+    )
+    exec_trace_1 = _sample(
+        "agent-exec",
+        0.0,
+        status="TIMEOUT",
+        agent_timeout=True,
+        trace_index=1,
+    )
+    postprocess = _sample("agent-postprocess", 0.0, status="TIMEOUT", trainable=False)
+    session_timeout = _sample("session-exec", 0.0, status="TIMEOUT", trainable=False)
+    for sample, timeout_source, timeout_stage in (
+        (exec_trace_0, "agent", "exec"),
+        (exec_trace_1, "agent", "exec"),
+        (postprocess, "agent", "postprocess"),
+        (session_timeout, "session", "exec"),
+    ):
+        sample.metadata["polar"]["trajectory_metadata"] = {
+            "agent_result": {
+                "status": "timeout",
+                "timeout_source": timeout_source,
+                "timeout_stage": timeout_stage,
+            }
+        }
+
+    samples = [exec_trace_0, exec_trace_1, postprocess, session_timeout]
+    metrics = _polar_extra_metrics(
+        samples,
+        rewards=[0.0] * len(samples),
+        reward_key="score",
+    )
+
+    assert metrics["polar/rollout_attempted_sessions"] == 3.0
+    assert metrics["polar/rollout_trainable_sessions"] == 1.0
+    assert metrics["polar/rollout_fully_masked_sessions"] == 2.0
+    assert metrics["polar/terminal_timeout_sessions"] == 3.0
+    assert metrics["polar/timeout_agent_exec_sessions"] == 1.0
+    assert metrics["polar/timeout_agent_postprocess_sessions"] == 1.0
+    assert metrics["polar/timeout_trainable_sessions"] == 1.0
+    assert metrics["polar/timeout_masked_sessions"] == 2.0
+    assert metrics["polar/rollout_success_rate"] == 0.0
+
+
+def test_polar_metrics_aggregate_response_lengths_by_session() -> None:
+    samples = [
+        _sample(
+            "multi",
+            1.0,
+            trace_index=0,
+            response_length=5,
+            loss_mask=[1, 1, 0],
+        ),
+        _sample(
+            "multi",
+            1.0,
+            trace_index=1,
+            response_length=7,
+            loss_mask=[1, 0, 1, 1],
+        ),
+        _sample("single", 0.0, response_length=9, loss_mask=[1]),
+        _sample(
+            "placeholder",
+            0.0,
+            placeholder=True,
+            trainable=False,
+            response_length=99,
+            loss_mask=[0] * 99,
+        ),
+        # Intentional early-stop traces are excluded even if malformed input
+        # carries real-looking tokens instead of the normal placeholder.
+        _sample(
+            "early-stop",
+            0.0,
+            early_stop_cancelled=True,
+            response_length=50,
+            loss_mask=[1] * 50,
+        ),
+    ]
+
+    metrics = _polar_extra_metrics(
+        samples,
+        rewards=[1.0, 1.0, 0.0, 0.0, 0.0],
+        reward_key="score",
+    )
+
+    assert metrics["polar/session_trainable_response_tokens/count"] == 2.0
+    assert metrics["polar/session_trainable_response_tokens/mean"] == 3.0
+    assert metrics["polar/session_trainable_response_tokens/median"] == 3.0
+    assert metrics["polar/session_trainable_response_tokens/min"] == 1.0
+    assert metrics["polar/session_trainable_response_tokens/max"] == 5.0
+    assert metrics["polar/session_raw_response_tokens/mean"] == 10.5
+    assert metrics["polar/session_raw_response_tokens/median"] == 10.5
+    assert metrics["polar/session_raw_response_tokens/min"] == 9.0
+    assert metrics["polar/session_raw_response_tokens/max"] == 12.0
+    assert metrics["polar/session_trainable_response_tokens/by_status/completed_mean"] == 3.0
+
+
+def test_polar_metrics_fallback_to_raw_length_when_loss_mask_is_missing() -> None:
+    sample = _sample(
+        "legacy",
+        1.0,
+        response_length=7,
+        missing_loss_mask=True,
+    )
+
+    metrics = _polar_extra_metrics([sample], rewards=[1.0], reward_key="score")
+
+    assert metrics["polar/session_trainable_response_tokens/count"] == 1.0
+    assert metrics["polar/session_trainable_response_tokens/mean"] == 7.0
+    assert metrics["polar/session_raw_response_tokens/mean"] == 7.0
+
+
+def test_polar_metrics_decompose_trace_and_session_truncation_and_status() -> None:
+    samples = [
+        _sample("completed", 1.0, trace_index=0, truncated=True),
+        _sample("completed", 1.0, trace_index=1),
+        _sample("agent-timeout", 0.0, status="TIMEOUT", agent_timeout=True),
+        _sample(
+            "other-timeout",
+            0.0,
+            status="TIMEOUT",
+            trainable=False,
+            truncated=True,
+        ),
+        _sample("error", 0.0, status="ERROR"),
+        _sample("unknown", 0.0, status="MYSTERY"),
+        # Defensive malformed input: timeout metadata alone must not count as
+        # truncation when the Slime sample status is COMPLETED.
+        _sample(
+            "agent-metadata-completed",
+            0.0,
+            status="COMPLETED",
+            agent_timeout=True,
+            truncated=False,
+        ),
+        _sample(
+            "placeholder-error",
+            0.0,
+            status="ERROR",
+            placeholder=True,
+            trainable=False,
+        ),
+        _sample(
+            "early-stop",
+            0.0,
+            status="ERROR",
+            early_stop_cancelled=True,
+            truncated=True,
+        ),
+    ]
+
+    metrics = _polar_extra_metrics(
+        samples,
+        rewards=[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        reward_key="score",
+    )
+
+    assert metrics["polar/trace_truncation/truncated_fraction"] == 3 / 7
+    assert metrics["polar/trace_truncation/agent_timeout_fraction"] == 1 / 7
+    assert metrics["polar/trace_truncation/non_agent_timeout_fraction"] == 2 / 7
+    assert metrics["polar/trace_truncation/truncated_fraction"] == (
+        metrics["polar/trace_truncation/agent_timeout_fraction"]
+        + metrics["polar/trace_truncation/non_agent_timeout_fraction"]
+    )
+    assert metrics["polar/session_truncation/session_count"] == 6.0
+    assert metrics["polar/session_truncation/truncated_count"] == 3.0
+    assert metrics["polar/session_truncation/truncated_fraction"] == 3 / 6
+    assert metrics["polar/session_truncation/agent_timeout_fraction"] == 1 / 6
+    assert metrics["polar/session_truncation/non_agent_timeout_fraction"] == 2 / 6
+    assert metrics["polar/session_truncation/truncated_fraction"] == (
+        metrics["polar/session_truncation/agent_timeout_fraction"]
+        + metrics["polar/session_truncation/non_agent_timeout_fraction"]
+    )
+
+    # Session fan-out is deduplicated, placeholders remain visible as status
+    # failures, and intentional early-stop cancellation is absent.
+    assert metrics["polar/session_status/completed_count"] == 2.0
+    assert metrics["polar/session_status/timeout_count"] == 2.0
+    assert metrics["polar/session_status/error_count"] == 2.0
+    assert metrics["polar/session_status/unknown_count"] == 1.0
+    assert metrics["polar/session_status/completed_fraction"] == 2 / 7
+    assert metrics["polar/session_status/timeout_fraction"] == 2 / 7
+    assert metrics["polar/session_status/error_fraction"] == 2 / 7
+    assert metrics["polar/session_status/unknown_fraction"] == 1 / 7
+
+
+def test_polar_metrics_report_accounted_outcomes_and_lengths() -> None:
+    positive = _sample("positive", 1.0, response_length=8, loss_mask=[1] * 4)
+    zero = _sample("zero", 0.0, response_length=6, loss_mask=[1] * 2)
+    negative = _sample("negative", -1.0, response_length=10, loss_mask=[1] * 6)
+    agent_timeout = _sample(
+        "agent-timeout",
+        1.0,
+        status="TIMEOUT",
+        agent_timeout=True,
+        response_length=12,
+        loss_mask=[1] * 3,
+    )
+    trusted_failure = _sample(
+        "trusted-failure",
+        1.0,
+        status="ERROR",
+        placeholder=True,
+        trainable=False,
+    )
+    trusted_failure.metadata["polar"]["trajectory_metadata"] = {
+        "evaluation": {
+            "verifier_reward_accepted": True,
+            "verifier_exit_code": 0,
+        }
+    }
+    infra_failure = _sample(
+        "infra-failure",
+        0.0,
+        status="ERROR",
+        placeholder=True,
+        trainable=False,
+    )
+    early_stop = _sample(
+        "early-stop",
+        0.0,
+        status="ERROR",
+        placeholder=True,
+        trainable=False,
+        early_stop_cancelled=True,
+    )
+    samples = [
+        positive,
+        zero,
+        negative,
+        agent_timeout,
+        trusted_failure,
+        infra_failure,
+        early_stop,
+    ]
+
+    metrics = _polar_extra_metrics(
+        samples,
+        rewards=[1.0, 0.0, -1.0, 1.0, 1.0, 0.0, 0.0],
+        reward_key="score",
+    )
+
+    assert metrics["polar/reward_accounted_sessions"] == 5.0
+    assert metrics["polar/session_outcome/accounted_count"] == 5.0
+    assert metrics["polar/session_outcome/unaccounted_count"] == 1.0
+    assert metrics["polar/session_outcome/accounted_fraction"] == 5 / 6
+    assert metrics["polar/session_outcome/unaccounted_fraction"] == 1 / 6
+    assert metrics["polar/session_outcome/positive_count"] == 1.0
+    assert metrics["polar/session_outcome/zero_count"] == 3.0
+    assert metrics["polar/session_outcome/negative_count"] == 1.0
+    assert metrics["polar/session_outcome/positive_fraction_of_accounted"] == 1 / 5
+    assert metrics["polar/session_outcome/zero_fraction_of_accounted"] == 3 / 5
+    assert metrics["polar/session_outcome/negative_fraction_of_accounted"] == 1 / 5
+    assert metrics["polar/session_trainable_response_tokens/by_outcome/positive_mean"] == 4.0
+    assert metrics["polar/session_trainable_response_tokens/by_outcome/zero_mean"] == 2.5
+    assert metrics["polar/session_trainable_response_tokens/by_outcome/negative_mean"] == 6.0
+
+
+def test_polar_metrics_omit_empty_length_and_truncation_distributions() -> None:
+    placeholder = _sample(
+        "infra-failure",
+        0.0,
+        status="ERROR",
+        placeholder=True,
+        trainable=False,
+    )
+
+    metrics = _polar_extra_metrics([placeholder], rewards=[0.0], reward_key="score")
+
+    assert not any(key.startswith("polar/session_trainable_response_tokens/") for key in metrics)
+    assert not any(key.startswith("polar/session_raw_response_tokens/") for key in metrics)
+    assert not any(key.startswith("polar/trace_truncation/") for key in metrics)
+    assert not any(key.startswith("polar/session_truncation/") for key in metrics)
+    assert metrics["polar/session_status/error_count"] == 1.0
+    assert metrics["polar/session_outcome/unaccounted_count"] == 1.0
+    assert all(math.isfinite(value) for value in metrics.values())
+
+
 def test_polar_metrics_aggregate_detailed_pipeline_and_command_timings() -> None:
     samples = [
         _sample("s1", 1.0, detailed_timing=True),
@@ -365,12 +697,16 @@ def test_eval_metrics_use_quality_and_timing_namespaces() -> None:
         {
             "polar/reward_mean": 0.5,
             "polar/resolved_rate": 0.25,
+            "polar/session_trainable_response_tokens/mean": 42.0,
+            "polar/trace_truncation/non_agent_timeout_fraction": 0.125,
             "timing/session_ms/e2e_mean": 123.0,
             "custom_count": 4.0,
         },
     ) == {
         "eval/swebench/reward_mean": 0.5,
         "eval/swebench/resolved_rate": 0.25,
+        "eval/swebench/session_trainable_response_tokens/mean": 42.0,
+        "eval/swebench/trace_truncation/non_agent_timeout_fraction": 0.125,
         "timing/eval/swebench/session_ms/e2e_mean": 123.0,
         "eval/swebench/custom_count": 4.0,
     }
