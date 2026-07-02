@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -10,6 +11,7 @@ SUBMIT_MATRIX = TMAX / "submit_matrix.sh"
 WATCH_MATRIX = TMAX / "watch_matrix.sh"
 LEGACY_SUBMIT_MATRIX = TMAX / "submit_4node_matrix.sh"
 LEGACY_WATCH_MATRIX = TMAX / "watch_4node_matrix.sh"
+MATRIX_SETTINGS_SCRIPT = TMAX / "matrix_settings.sh"
 
 MATRIX_SETTINGS = (
     "qwen35-4b-fidelity",
@@ -20,6 +22,13 @@ MATRIX_SETTINGS = (
     "qwen35-9b-async4-full65k",
     "qwen35-9b-lr5e7-a2-full65k",
     "qwen35-9b-lr2e6-a2-full65k",
+)
+EIGHT_NODE_SETTINGS = (
+    "qwen35-4b-fidelity-8n",
+    "qwen35-4b-fidelity-8n-b16n8-traj",
+)
+FOUR_NODE_SETTINGS = tuple(
+    setting for setting in MATRIX_SETTINGS if setting not in EIGHT_NODE_SETTINGS
 )
 SHORT_CAP_SETTINGS = (
     "qwen35-9b-baseline-a2-mt4k",
@@ -43,6 +52,31 @@ def _bash_array(script: str, name: str) -> tuple[str, ...]:
     return tuple(line.strip() for line in script[start:end].splitlines() if line.strip())
 
 
+def _select_matrix_settings(
+    scope: str, *settings: str
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                'set -euo pipefail; source "$1"; shift; scope="$1"; shift; '
+                "declare -a selected; "
+                'tmax_matrix_select_settings selected "$scope" "$@"; '
+                'printf "%s\\n" "${selected[@]}"'
+            ),
+            "matrix-selector",
+            str(MATRIX_SETTINGS_SCRIPT),
+            scope,
+            *settings,
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def test_tmax_matrix_scripts_remain_valid_bash() -> None:
     subprocess.run(
         [
@@ -52,10 +86,55 @@ def test_tmax_matrix_scripts_remain_valid_bash() -> None:
             str(WATCH_MATRIX),
             str(LEGACY_SUBMIT_MATRIX),
             str(LEGACY_WATCH_MATRIX),
+            str(MATRIX_SETTINGS_SCRIPT),
         ],
         cwd=ROOT,
         check=True,
     )
+
+
+def test_matrix_source_run_is_explicit_absolute_and_help_is_asset_free() -> None:
+    env = os.environ.copy()
+    env.pop("TMAX_MATRIX_SOURCE_RUN", None)
+    env.pop("TMAX_MATRIX_TOPOLOGY_SCOPE", None)
+
+    missing = subprocess.run(
+        ["bash", str(SUBMIT_MATRIX), "plan", "qwen35-4b-fidelity"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert missing.returncode != 0
+    assert "set TMAX_MATRIX_SOURCE_RUN to the reviewed matrix data directory" in missing.stderr
+
+    help_result = subprocess.run(
+        ["bash", str(SUBMIT_MATRIX), "--help"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert help_result.returncode == 0, help_result.stderr
+    assert "TMAX_MATRIX_SOURCE_RUN is required" in help_result.stdout
+    assert "TMAX_MATRIX_TOPOLOGY_SCOPE=all|4n32|8n64" in help_result.stdout
+
+    relative_env = {
+        **env,
+        "TMAX_MATRIX_SOURCE_RUN": "relative/matrix-data",
+    }
+    relative = subprocess.run(
+        ["bash", str(SUBMIT_MATRIX), "plan", "qwen35-4b-fidelity"],
+        cwd=ROOT,
+        env=relative_env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert relative.returncode == 2
+    assert "TMAX_MATRIX_SOURCE_RUN must be an absolute path" in relative.stderr
 
 
 def test_legacy_matrix_wrappers_delegate_to_generic_scripts() -> None:
@@ -64,9 +143,48 @@ def test_legacy_matrix_wrappers_delegate_to_generic_scripts() -> None:
 
     assert "SUBMIT_4NODE_MATRIX" in submit
     assert "SUBMIT_TMAX_MATRIX" in submit
+    assert "export TMAX_MATRIX_TOPOLOGY_SCOPE=4n32" in submit
+    assert "export TMAX_MATRIX_TOPOLOGY_SCOPE=4n32" in watch
     assert 'exec bash "${SCRIPT_DIR}/submit_matrix.sh" "$@"' in submit
     assert 'exec bash "${SCRIPT_DIR}/watch_matrix.sh" "$@"' in watch
     assert 'CONFIRM_TOKEN="SUBMIT_TMAX_MATRIX"' in SUBMIT_MATRIX.read_text()
+
+
+def test_matrix_selector_scopes_all_and_rejects_cross_topology_settings() -> None:
+    generic = _select_matrix_settings("all", "all")
+    assert generic.returncode == 0, generic.stderr
+    assert tuple(generic.stdout.splitlines()) == MATRIX_SETTINGS
+
+    legacy = _select_matrix_settings("4n32", "all")
+    assert legacy.returncode == 0, legacy.stderr
+    assert tuple(legacy.stdout.splitlines()) == FOUR_NODE_SETTINGS
+
+    eight_node = _select_matrix_settings("8n64", "all")
+    assert eight_node.returncode == 0, eight_node.stderr
+    assert tuple(eight_node.stdout.splitlines()) == EIGHT_NODE_SETTINGS
+
+    rejected = _select_matrix_settings("4n32", EIGHT_NODE_SETTINGS[0])
+    assert rejected.returncode == 2
+    assert "outside 4n32 scope" in rejected.stderr
+
+    invalid_selector = _select_matrix_settings("not-a-topology", "all")
+    assert invalid_selector.returncode == 2
+    assert "scope must be all, 4n32, or 8n64" in invalid_selector.stderr
+
+    invalid_watcher = subprocess.run(
+        ["bash", str(WATCH_MATRIX)],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "TMAX_MATRIX_STAMP": "invalid-scope-test",
+            "TMAX_MATRIX_TOPOLOGY_SCOPE": "not-a-topology",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert invalid_watcher.returncode == 2
+    assert "scope must be all, 4n32, or 8n64" in invalid_watcher.stderr
 
 
 def test_tmax_matrix_uses_only_full65k_qwen9b_sweep_arms() -> None:
@@ -269,13 +387,20 @@ def test_8node_continuation_seed_and_afterok_dependency_are_auditable() -> None:
     shared_run = (ROOT / "examples" / "swegym_slime_grpo" / "run.sh").read_text()
     run_state = (TMAX / "run_state.sh").read_text()
     lifecycle = (TMAX / "lifecycle.sh").read_text()
+    checkpoint_validator = (TMAX / "validate_torch_dist_checkpoint.py").read_text()
 
     assert 'MATRIX_QWEN4_LOAD_DIR="${TMAX_MATRIX_QWEN4_LOAD_DIR:-}"' in submit
     assert '"ERROR: Qwen3.5-4B continuation"' in submit
     assert "tmax_validate_numbered_checkpoint" in submit
     assert "common.pt" in lifecycle
     assert ".metadata" in lifecycle
-    assert "*.distcp" in lifecycle
+    assert 'validate_torch_dist_checkpoint.py" "${model_dir}"' in lifecycle
+    assert "expected_sizes = referenced_distcp_shard_sizes(metadata_path)" in checkpoint_validator
+    assert (
+        'present = {path.name for path in model_dir.glob("*.distcp")}'
+        in checkpoint_validator
+    )
+    assert "actual_size != expected_size" in checkpoint_validator
     assert "global_dataset_state_dict_${value}.pt" in lifecycle
     assert "^afterok:[0-9]+(:[0-9]+)*$" in submit
     assert "afterany" not in submit
@@ -323,7 +448,12 @@ def test_matrix_uses_all_ready_complement_and_only_tmax_eval() -> None:
     submit = SUBMIT_MATRIX.read_text()
     run_state = (TMAX / "run_state.sh").read_text()
 
-    assert "tmax-14598r-14498t100h-20260701T011143Z" in submit
+    assert "tmax-14598r-14498t100h-20260701T011143Z" not in submit
+    assert 'MATRIX_SOURCE_RUN="${TMAX_MATRIX_SOURCE_RUN:?' in submit
+    assert "TMAX_MATRIX_SOURCE_RUN=%q" in submit
+    assert "TMAX_MATRIX_TRAIN_SHA256=%q" in submit
+    assert "TMAX_MATRIX_HOLDOUT_SHA256=%q" in submit
+    assert "TMAX_MATRIX_EVAL_BUNDLE_SHA256=%q" in submit
     assert 'verify_jsonl train "${MATRIX_SOURCE_RUN}/tmax-train.jsonl" 14498' in submit
     assert 'export TMAX_EXCLUDE_DATA="${TMAX_EVAL_DATA}"' in submit
     assert "export TMAX_MAX_TASKS=-1" in submit
@@ -337,13 +467,16 @@ def test_matrix_uses_all_ready_complement_and_only_tmax_eval() -> None:
 
 
 def test_submit_and_watcher_matrix_setting_sets_match_exactly() -> None:
-    submitted = _bash_array(SUBMIT_MATRIX.read_text(), "MATRIX_SETTINGS")
-    watched = _bash_array(WATCH_MATRIX.read_text(), "ALL_SETTINGS")
+    shared = _bash_array(MATRIX_SETTINGS_SCRIPT.read_text(), "TMAX_MATRIX_SETTINGS")
+    submit = SUBMIT_MATRIX.read_text()
+    watch = WATCH_MATRIX.read_text()
 
-    assert len(submitted) == len(set(submitted))
-    assert len(watched) == len(set(watched))
-    assert set(watched) == set(submitted)
-    assert watched == submitted
+    assert shared == MATRIX_SETTINGS
+    assert len(shared) == len(set(shared))
+    assert 'source "${SCRIPT_DIR}/matrix_settings.sh"' in submit
+    assert 'source "${SCRIPT_DIR}/matrix_settings.sh"' in watch
+    assert "readonly -a MATRIX_SETTINGS" not in submit
+    assert "readonly -a ALL_SETTINGS" not in watch
 
 
 def test_matrix_watcher_discovers_submitted_subset_for_older_stamps() -> None:
@@ -352,7 +485,8 @@ def test_matrix_watcher_discovers_submitted_subset_for_older_stamps() -> None:
     assert 'TMAX_MATRIX_WATCH_SETTINGS:-}" = all' in watch
     assert 'SETTINGS+=("${setting}")' in watch
     assert "no submitted matrix run states found for stamp" in watch
-    assert "qwen35-4b-fidelity-8n" in watch
-    assert "qwen35-4b-fidelity-8n-b16n8-traj" in watch
-    assert "topology_tag=8n64" in watch
+    assert 'tmax_matrix_settings_for_scope SETTINGS "${MATRIX_TOPOLOGY_SCOPE}"' in watch
+    assert 'tmax_matrix_settings_for_scope SCOPED_SETTINGS "${MATRIX_TOPOLOGY_SCOPE}"' in watch
+    assert 'tmax_matrix_select_settings SETTINGS "${MATRIX_TOPOLOGY_SCOPE}"' in watch
+    assert 'topology_tag="$(tmax_matrix_setting_topology "${setting}")"' in watch
     assert "matrix_run_id" in watch

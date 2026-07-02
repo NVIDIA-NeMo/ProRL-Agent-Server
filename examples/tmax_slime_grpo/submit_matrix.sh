@@ -5,14 +5,17 @@
 #
 # This script is intentionally inert by default:
 #
-#   bash submit_matrix.sh
-#   bash submit_matrix.sh plan
+#   TMAX_MATRIX_SOURCE_RUN=/abs/path/to/reviewed-run \
+#     bash submit_matrix.sh
+#   TMAX_MATRIX_SOURCE_RUN=/abs/path/to/reviewed-run \
+#     bash submit_matrix.sh plan
 #
 # Both commands only validate assets and print the planned runs. To submit,
 # name either `all` or one or more exact settings and provide the confirmation
 # token. Every invocation gets fresh RUN_ID/SAVE_DIR paths unless the caller pins
 # TMAX_MATRIX_STAMP to a reviewed plan stamp.
 #
+#   TMAX_MATRIX_SOURCE_RUN=/abs/path/to/reviewed-run \
 #   TMAX_MATRIX_STAMP=20260630T140000Z \
 #   TMAX_MATRIX_DEPENDENCY=afterok:12345678 \
 #   TMAX_MATRIX_CONFIRM=SUBMIT_TMAX_MATRIX \
@@ -22,6 +25,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # shellcheck source=./lifecycle.sh
 source "${SCRIPT_DIR}/lifecycle.sh"
+# shellcheck source=./matrix_settings.sh
+source "${SCRIPT_DIR}/matrix_settings.sh"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 SPILOT_ROOT="$(cd -- "${PROJECT_ROOT}/../.." && pwd)"
 USER_ROOT="$(dirname "${SPILOT_ROOT}")"
@@ -29,16 +34,6 @@ USER_ROOT="$(dirname "${SPILOT_ROOT}")"
 readonly SUBMIT_SCRIPT="${SCRIPT_DIR}/submit_slurm.sh"
 readonly DYNAMIC_FILTER="slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std"
 readonly CONFIRM_TOKEN="SUBMIT_TMAX_MATRIX"
-readonly -a MATRIX_SETTINGS=(
-    qwen35-4b-fidelity
-    qwen35-4b-fidelity-8n
-    qwen35-4b-fidelity-8n-b16n8-traj
-    qwen35-9b-baseline-a2-full65k
-    qwen35-9b-b16n16-a2-full65k
-    qwen35-9b-async4-full65k
-    qwen35-9b-lr5e7-a2-full65k
-    qwen35-9b-lr2e6-a2-full65k
-)
 
 usage() {
     cat <<'EOF'
@@ -47,14 +42,9 @@ Usage:
   submit_matrix.sh submit <all|SETTING...>
 
 Settings:
-  qwen35-4b-fidelity
-  qwen35-4b-fidelity-8n
-  qwen35-4b-fidelity-8n-b16n8-traj
-  qwen35-9b-baseline-a2-full65k
-  qwen35-9b-b16n16-a2-full65k
-  qwen35-9b-async4-full65k
-  qwen35-9b-lr5e7-a2-full65k
-  qwen35-9b-lr2e6-a2-full65k
+EOF
+    printf '  %s\n' "${TMAX_MATRIX_SETTINGS[@]}"
+    cat <<'EOF'
 
 `plan` is read-only and is the default. `submit` calls sbatch only when
 TMAX_MATRIX_CONFIRM=SUBMIT_TMAX_MATRIX is present. Pin TMAX_MATRIX_STAMP to
@@ -62,35 +52,12 @@ submit the exact fresh RUN_ID values shown by an earlier plan. Optionally set
 TMAX_MATRIX_DEPENDENCY=afterok:JOBID (or a colon-separated list of numeric job
 ids) to queue every arm behind successful completion of existing jobs. Set
 TMAX_MATRIX_NUM_ROLLOUT=N to bound only the b16n8 trajectory diagnostic arm.
+TMAX_MATRIX_SOURCE_RUN is required and must point to the reviewed directory
+containing tmax-train.jsonl and tmax_holdout-eval.jsonl.
+TMAX_MATRIX_TOPOLOGY_SCOPE=all|4n32|8n64 limits both `all` and explicit
+settings (default: all). The submit_4node_matrix.sh compatibility entry point
+always uses 4n32.
 EOF
-}
-
-is_known_setting() {
-    local candidate="$1" setting
-    for setting in "${MATRIX_SETTINGS[@]}"; do
-        [ "${candidate}" = "${setting}" ] && return 0
-    done
-    return 1
-}
-
-select_settings() {
-    local output_name="$1"
-    shift
-    local -n output_ref="${output_name}"
-    local candidate
-    output_ref=()
-    if [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = "all" ]; }; then
-        output_ref=("${MATRIX_SETTINGS[@]}")
-        return
-    fi
-    for candidate in "$@"; do
-        if ! is_known_setting "${candidate}"; then
-            echo "ERROR: unknown matrix setting: ${candidate}" >&2
-            usage >&2
-            return 1
-        fi
-        output_ref+=("${candidate}")
-    done
 }
 
 require_file() {
@@ -131,17 +98,13 @@ reset_matrix_overrides() {
 }
 
 configure_common() {
-    local setting="$1" topology_tag=4n32
+    local setting="$1" topology_tag
     reset_matrix_overrides
     if [ -n "${MATRIX_DEPENDENCY}" ]; then
         export SBATCH_DEPENDENCY="${MATRIX_DEPENDENCY}"
     fi
 
-    case "${setting}" in
-        qwen35-4b-fidelity-8n|qwen35-4b-fidelity-8n-b16n8-traj)
-            topology_tag=8n64
-            ;;
-    esac
+    topology_tag="$(tmax_matrix_setting_topology "${setting}")"
     export RUN_ID="tmax-${topology_tag}-${setting}-${MATRIX_STAMP}"
     export EXPERIMENT_NAME="tmax-${topology_tag}-${setting}"
     export JOB_NAME="polar-${RUN_ID}"
@@ -843,7 +806,16 @@ if ! [[ "${MATRIX_STAMP}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
     exit 2
 fi
 MATRIX_DATA_ROOT="${POLAR_DATA_ROOT:-${SPILOT_ROOT}/data}"
-MATRIX_SOURCE_RUN="${TMAX_MATRIX_SOURCE_RUN:-${MATRIX_DATA_ROOT}/runs/tmax-14598r-14498t100h-20260701T011143Z}"
+MATRIX_SOURCE_RUN="${TMAX_MATRIX_SOURCE_RUN:?set TMAX_MATRIX_SOURCE_RUN to the reviewed matrix data directory}"
+case "${MATRIX_SOURCE_RUN}" in
+    /*) ;;
+    *)
+        echo "ERROR: TMAX_MATRIX_SOURCE_RUN must be an absolute path, got ${MATRIX_SOURCE_RUN}" >&2
+        exit 2
+        ;;
+esac
+MATRIX_TOPOLOGY_SCOPE="${TMAX_MATRIX_TOPOLOGY_SCOPE:-all}"
+tmax_matrix_validate_topology_scope "${MATRIX_TOPOLOGY_SCOPE}"
 MATRIX_WANDB_GROUP="${TMAX_MATRIX_WANDB_GROUP:-tmax-fidelity-matrix-${MATRIX_STAMP}}"
 MATRIX_DEPENDENCY="${TMAX_MATRIX_DEPENDENCY:-}"
 MATRIX_QWEN4_LOAD_DIR="${TMAX_MATRIX_QWEN4_LOAD_DIR:-}"
@@ -881,7 +853,10 @@ require_file "Qwen3.5-4B model args" "${PROJECT_ROOT}/examples/swegym_slime_grpo
 require_file "Qwen3.5-9B model args" "${SCRIPT_DIR}/model_args.sh"
 
 declare -a SELECTED_SETTINGS
-select_settings SELECTED_SETTINGS "$@"
+if ! tmax_matrix_select_settings SELECTED_SETTINGS "${MATRIX_TOPOLOGY_SCOPE}" "$@"; then
+    usage >&2
+    exit 2
+fi
 
 if [ "${ACTION}" = plan ]; then
     print_plan_header
@@ -891,6 +866,13 @@ if [ "${ACTION}" = plan ]; then
     echo
     echo "No jobs were submitted. To submit this exact plan, reuse:"
     printf '  TMAX_MATRIX_STAMP=%q' "${MATRIX_STAMP}"
+    printf ' TMAX_MATRIX_SOURCE_RUN=%q' "${MATRIX_SOURCE_RUN}"
+    printf ' TMAX_MATRIX_TRAIN_SHA256=%q' "${MATRIX_TRAIN_SHA256}"
+    printf ' TMAX_MATRIX_HOLDOUT_SHA256=%q' "${MATRIX_HOLDOUT_SHA256}"
+    printf ' TMAX_MATRIX_EVAL_BUNDLE_SHA256=%q' "${MATRIX_EVAL_BUNDLE_SHA256}"
+    if [ "${MATRIX_TOPOLOGY_SCOPE}" != all ]; then
+        printf ' TMAX_MATRIX_TOPOLOGY_SCOPE=%q' "${MATRIX_TOPOLOGY_SCOPE}"
+    fi
     if [ -n "${MATRIX_DEPENDENCY}" ]; then
         printf ' TMAX_MATRIX_DEPENDENCY=%q' "${MATRIX_DEPENDENCY}"
     fi

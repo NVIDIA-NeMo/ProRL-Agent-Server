@@ -23,6 +23,8 @@ if [ ! -s "${SCRIPT_DIR}/run_every_10_minutes.sh" ]; then
     echo "ERROR: cannot locate run_every_10_minutes.sh from ${SCRIPT_DIR}" >&2
     exit 1
 fi
+# shellcheck source=./matrix_settings.sh
+source "${SCRIPT_DIR}/matrix_settings.sh"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 SPILOT_ROOT="$(cd -- "${PROJECT_ROOT}/../.." && pwd)"
 
@@ -34,48 +36,34 @@ if ! [[ "${SLEEP_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 
-readonly -a ALL_SETTINGS=(
-    qwen35-4b-fidelity
-    qwen35-4b-fidelity-8n
-    qwen35-4b-fidelity-8n-b16n8-traj
-    qwen35-9b-baseline-a2-full65k
-    qwen35-9b-b16n16-a2-full65k
-    qwen35-9b-async4-full65k
-    qwen35-9b-lr5e7-a2-full65k
-    qwen35-9b-lr2e6-a2-full65k
-)
+MATRIX_TOPOLOGY_SCOPE="${TMAX_MATRIX_TOPOLOGY_SCOPE:-all}"
+if ! tmax_matrix_validate_topology_scope "${MATRIX_TOPOLOGY_SCOPE}"; then
+    exit 2
+fi
 
 matrix_run_id() {
-    local setting="$1" topology_tag=4n32
-    case "${setting}" in
-        qwen35-4b-fidelity-8n|qwen35-4b-fidelity-8n-b16n8-traj)
-            topology_tag=8n64
-            ;;
-    esac
+    local setting="$1" topology_tag
+    topology_tag="$(tmax_matrix_setting_topology "${setting}")" || return
     printf "tmax-%s-%s-%s\n" "${topology_tag}" "${setting}" "${MATRIX_STAMP}"
-}
-
-is_known_setting() {
-    local candidate="$1" setting
-    for setting in "${ALL_SETTINGS[@]}"; do
-        [ "${candidate}" = "${setting}" ] && return 0
-    done
-    return 1
 }
 
 declare -a SETTINGS=()
 if [ "${TMAX_MATRIX_WATCH_SETTINGS:-}" = all ]; then
-    SETTINGS=("${ALL_SETTINGS[@]}")
+    if ! tmax_matrix_settings_for_scope SETTINGS "${MATRIX_TOPOLOGY_SCOPE}"; then
+        exit 2
+    fi
 elif [ -n "${TMAX_MATRIX_WATCH_SETTINGS:-}" ]; then
-    read -r -a SETTINGS <<<"${TMAX_MATRIX_WATCH_SETTINGS}"
-    for setting in "${SETTINGS[@]}"; do
-        if ! is_known_setting "${setting}"; then
-            echo "ERROR: unknown TMAX_MATRIX_WATCH_SETTINGS entry: ${setting}" >&2
-            exit 2
-        fi
-    done
+    declare -a REQUESTED_SETTINGS=()
+    read -r -a REQUESTED_SETTINGS <<<"${TMAX_MATRIX_WATCH_SETTINGS}"
+    if ! tmax_matrix_select_settings SETTINGS "${MATRIX_TOPOLOGY_SCOPE}" "${REQUESTED_SETTINGS[@]}"; then
+        exit 2
+    fi
 else
-    for setting in "${ALL_SETTINGS[@]}"; do
+    declare -a SCOPED_SETTINGS=()
+    if ! tmax_matrix_settings_for_scope SCOPED_SETTINGS "${MATRIX_TOPOLOGY_SCOPE}"; then
+        exit 2
+    fi
+    for setting in "${SCOPED_SETTINGS[@]}"; do
         run_id="$(matrix_run_id "${setting}")"
         state_file="${POLAR_DATA_ROOT}/runs/${run_id}/run_state.env"
         if [ -s "${state_file}" ]; then
