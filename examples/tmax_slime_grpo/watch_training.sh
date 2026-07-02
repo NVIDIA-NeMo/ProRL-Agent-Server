@@ -422,6 +422,14 @@ record_submission_failure() {
     fi
 }
 
+import_submission_source_lock() {
+    if tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_PRORL_GIT_COMMIT ||
+       tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_SLIME_GIT_COMMIT ||
+       tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_MEGATRON_GIT_COMMIT; then
+        tmax_import_source_revision_lock "${TMAX_RUN_STATE_FILE}"
+    fi
+}
+
 submit_training() {
     local iter="$1" status
     rm -f "${TMAX_SUBMIT_RECEIPT_FILE}"
@@ -430,6 +438,11 @@ submit_training() {
             # The job may exist but its id is unknown. Retrying here could
             # duplicate it, so stop instead of treating this as a normal error.
             echo "[tmax watch] ERROR: submission returned success without a valid fresh receipt; refusing a duplicate submission" >&2
+            WATCH_ABORT=true
+            return
+        fi
+        if ! import_submission_source_lock; then
+            echo "[tmax watch] ERROR: submitted job but could not retain its source revision lock; refusing another submission" >&2
             WATCH_ABORT=true
             return
         fi
@@ -443,11 +456,21 @@ submit_training() {
             # sbatch succeeded and the wrapper failed in later bookkeeping.
             # The receipt proves a live job may exist, so track it and never
             # issue a second submission for this polling cycle.
+            if ! import_submission_source_lock; then
+                echo "[tmax watch] ERROR: submission receipt exists but its source revision lock is invalid; refusing another submission" >&2
+                WATCH_ABORT=true
+                return
+            fi
             export TMAX_PREPARE_DATA=0
             export TMAX_LAST_JOB_CHECKPOINT_ITER="$iter"
             tmax_write_run_state "${TMAX_RUN_STATE_FILE}"
             echo "[tmax watch] submission wrapper exited ${status}, but receipt confirms job=${TMAX_LAST_JOB_ID}; tracking that job" >&2
         else
+            if ! import_submission_source_lock; then
+                echo "[tmax watch] ERROR: submission failed and its source revision lock is invalid; refusing another submission" >&2
+                WATCH_ABORT=true
+                return
+            fi
             record_submission_failure "$status" "$iter"
         fi
     fi

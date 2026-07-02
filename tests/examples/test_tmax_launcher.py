@@ -2678,6 +2678,7 @@ def test_watcher_records_fresh_receipt_before_next_poll(tmp_path: Path):
         submit,
         """
 mkdir -p "$(dirname "$TMAX_SUBMIT_RECEIPT_FILE")"
+printf 'export TMAX_PRORL_GIT_COMMIT=%040d\\nexport TMAX_SLIME_GIT_COMMIT=%040d\\nexport TMAX_MEGATRON_GIT_COMMIT=%040d\\n' 1 2 3 >> "$TMAX_RUN_STATE_FILE"
 printf 'export POLAR_SUBMITTED_JOB_ID=222\\nexport POLAR_SUBMITTED_AT_UNIX=12345\\n' > "$TMAX_SUBMIT_RECEIPT_FILE"
 """,
     )
@@ -2692,7 +2693,46 @@ printf 'export POLAR_SUBMITTED_JOB_ID=222\\nexport POLAR_SUBMITTED_AT_UNIX=12345
     )
     assert result.returncode == 0, result.stderr
     assert "submission succeeded: job=222" in result.stdout
-    assert "export TMAX_LAST_JOB_ID=222" in (tmp_path / "state.env").read_text()
+    state = (tmp_path / "state.env").read_text()
+    assert "export TMAX_LAST_JOB_ID=222" in state
+    assert f"export TMAX_PRORL_GIT_COMMIT={'1'.zfill(40)}" in state
+    assert f"export TMAX_SLIME_GIT_COMMIT={'2'.zfill(40)}" in state
+    assert f"export TMAX_MEGATRON_GIT_COMMIT={'3'.zfill(40)}" in state
+
+
+def test_watcher_retains_source_lock_after_submission_failure_without_receipt(
+    tmp_path: Path,
+):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_command(bin_dir / "squeue", "exit 0\n")
+    write_command(bin_dir / "sacct", "exit 0\n")
+    submit = tmp_path / "fake-submit.sh"
+    write_command(
+        submit,
+        """
+printf 'export TMAX_PRORL_GIT_COMMIT=%040d\\nexport TMAX_SLIME_GIT_COMMIT=%040d\\nexport TMAX_MEGATRON_GIT_COMMIT=%040d\\n' 4 5 6 >> "$TMAX_RUN_STATE_FILE"
+exit 17
+""",
+    )
+    env = watcher_env(tmp_path, bin_dir)
+    env["TMAX_SUBMIT_SCRIPT"] = str(submit)
+
+    result = subprocess.run(
+        ["bash", str(TMAX / "watch_training.sh"), "--relaunch"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "submission failure 1/3" in result.stderr
+    state = (tmp_path / "state.env").read_text()
+    assert "export TMAX_WATCH_FAILURE_COUNT=1" in state
+    assert f"export TMAX_PRORL_GIT_COMMIT={'4'.zfill(40)}" in state
+    assert f"export TMAX_SLIME_GIT_COMMIT={'5'.zfill(40)}" in state
+    assert f"export TMAX_MEGATRON_GIT_COMMIT={'6'.zfill(40)}" in state
 
 
 def test_watcher_adopts_unique_named_job_when_tracked_receipt_is_stale(tmp_path: Path):
