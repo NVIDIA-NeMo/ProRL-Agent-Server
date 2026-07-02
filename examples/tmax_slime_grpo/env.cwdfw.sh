@@ -254,6 +254,30 @@ export DIST_CKPT_STRICTNESS="${DIST_CKPT_STRICTNESS:-log_all}"
 export ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
 export NUM_EPOCH="${NUM_EPOCH:-1}"
+# Optional absolute rollout-loop boundary. Slime treats --num-rollout as an
+# exclusive upper bound, so the matching final checkpoint/watcher target is
+# always TMAX_NUM_ROLLOUT - 1. Keep the derived target explicit in run state so
+# the trainer and watcher cannot silently follow different stopping contracts.
+if [ -n "${TMAX_TARGET_ITER:-}" ] && \
+   ! [[ "${TMAX_TARGET_ITER}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "ERROR: TMAX_TARGET_ITER must be a non-negative integer" >&2
+    return 1 2>/dev/null || exit 1
+fi
+if [ -n "${TMAX_NUM_ROLLOUT:-}" ]; then
+    if ! [[ "${TMAX_NUM_ROLLOUT}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: TMAX_NUM_ROLLOUT must be a positive integer" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    _tmax_explicit_target="$((TMAX_NUM_ROLLOUT - 1))"
+    if [ -n "${TMAX_TARGET_ITER:-}" ] && \
+       [ "${TMAX_TARGET_ITER}" -ne "${_tmax_explicit_target}" ]; then
+        echo "ERROR: TMAX_TARGET_ITER=${TMAX_TARGET_ITER} must equal TMAX_NUM_ROLLOUT-1=${_tmax_explicit_target}" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    export TMAX_NUM_ROLLOUT
+    export TMAX_TARGET_ITER="${_tmax_explicit_target}"
+    unset _tmax_explicit_target
+fi
 # Match the released TMax recipe: behavior-anchored DPPO with binary-TV 0.1,
 # no reference-policy KL term, and a constant 1e-6 learning rate. The shared
 # SWE-Gym launcher retains PPO+TIS unless these TMax overrides are present.
@@ -594,8 +618,15 @@ esac
 # usable SIF before submission.
 export TMAX_ONLY_READY="${TMAX_ONLY_READY:-0}"
 export TMAX_TRAIN_START_INDEX="${TMAX_TRAIN_START_INDEX:-0}"
+# Optional fail-closed complement selector. The file's task names are removed
+# from the complete deterministic source population before SIF readiness is
+# applied, so a fixed holdout cannot leak into an all-ready training set.
+export TMAX_EXCLUDE_DATA="${TMAX_EXCLUDE_DATA:-}"
 export TMAX_MAX_TASKS="${TMAX_MAX_TASKS:-14501}"
 export TMAX_EVAL_ENABLED="${TMAX_EVAL_ENABLED:-1}"
+# Keep the holdout/data-integrity contract independent from whether this
+# training run schedules baseline, periodic, or final evals.
+export TMAX_TRAINING_EVAL_ENABLED="${TMAX_TRAINING_EVAL_ENABLED:-${TMAX_EVAL_ENABLED}}"
 export TMAX_EVAL_SOURCE="${TMAX_EVAL_SOURCE:-tmax}"
 if [[ "${TMAX_TRAIN_START_INDEX}" =~ ^[0-9]+$ ]] && \
    [[ "${TMAX_MAX_TASKS}" =~ ^[1-9][0-9]*$ ]]; then
@@ -644,8 +675,8 @@ export TMAX_EXTERNAL_EVAL_MAX_TASKS="${TMAX_EXTERNAL_EVAL_MAX_TASKS:-89}"
 export TMAX_EXTERNAL_EVAL_DATASET_NAME="${TMAX_EXTERNAL_EVAL_DATASET_NAME:-terminal_bench_2_0}"
 # Periodic eval uses one attempt per task so it does not consume five complete
 # Terminal-Bench passes at every checkpoint. For a paper-comparable final
-# evaluation, explicitly set this to 5; the dataset mean still weights every
-# attempt equally and the aggregate keeps its 89-task dataset weight.
+# evaluation, explicitly set this to 5. Every accounted attempt contributes
+# one vote to the aggregate reward metric.
 export TMAX_EXTERNAL_EVAL_SAMPLES_PER_PROMPT="${TMAX_EXTERNAL_EVAL_SAMPLES_PER_PROMPT:-1}"
 export TMAX_EXTERNAL_EVAL_TEMPERATURE="${TMAX_EXTERNAL_EVAL_TEMPERATURE:-0.7}"
 export TMAX_EXTERNAL_EVAL_TOP_P="${TMAX_EXTERNAL_EVAL_TOP_P:-0.95}"
@@ -654,8 +685,6 @@ if [ -z "${TMAX_EXTERNAL_EVAL_MIN_VALID_SAMPLES+x}" ]; then
     TMAX_EXTERNAL_EVAL_MIN_VALID_SAMPLES="$((TMAX_EXTERNAL_EVAL_MAX_TASKS * TMAX_EXTERNAL_EVAL_SAMPLES_PER_PROMPT))"
 fi
 export TMAX_EXTERNAL_EVAL_MIN_VALID_SAMPLES
-export TMAX_EVAL_WEIGHT="${TMAX_EVAL_WEIGHT:-${TMAX_EVAL_MAX_TASKS}}"
-export TMAX_EXTERNAL_EVAL_WEIGHT="${TMAX_EXTERNAL_EVAL_WEIGHT:-${TMAX_EXTERNAL_EVAL_MAX_TASKS}}"
 # Cluster-local, revision-pinned Terminal-Bench 2.0 assets. Harbor's immutable
 # ``terminal-bench@2.0`` registry entry pins all 89 tasks to the commit below;
 # do not substitute the repository's moving main branch or TB2.1 task files.
@@ -747,7 +776,7 @@ fi
 unset -f _tmax_validate_generation_limits
 
 _tmax_validate_dataset_split() {
-    local name value train_end eval_end eval_total
+    local name value train_end eval_end eval_total complement_mode=0
     for name in TMAX_TRAIN_START_INDEX TMAX_EVAL_START_INDEX; do
         value="${!name}"
         if ! [[ "$value" =~ ^[0-9]+$ ]]; then
@@ -759,18 +788,37 @@ _tmax_validate_dataset_split() {
         echo "ERROR: TMAX_MAX_TASKS must be a positive integer or -1, got ${TMAX_MAX_TASKS}" >&2
         return 1
     fi
+    if [ -n "${TMAX_EXCLUDE_DATA}" ]; then
+        complement_mode=1
+        if [ "${TMAX_TRAIN_START_INDEX}" -ne 0 ] || [ "${TMAX_MAX_TASKS}" != "-1" ]; then
+            echo "ERROR: TMAX_EXCLUDE_DATA requires TMAX_TRAIN_START_INDEX=0 and TMAX_MAX_TASKS=-1" >&2
+            return 1
+        fi
+        if [ "${TMAX_EVAL_ENABLED}" != "1" ] || [ "${TMAX_EVAL_SOURCE}" != "tmax" ]; then
+            echo "ERROR: TMAX_EXCLUDE_DATA requires an enabled TMax eval dataset" >&2
+            return 1
+        fi
+        if [ "${TMAX_EXTERNAL_EVAL_ENABLED}" != "0" ]; then
+            echo "ERROR: TMAX_EXCLUDE_DATA complement mode requires offline external benchmarks" >&2
+            return 1
+        fi
+        if [ ! -s "${TMAX_EXCLUDE_DATA}" ]; then
+            echo "ERROR: TMAX_EXCLUDE_DATA is missing or empty: ${TMAX_EXCLUDE_DATA}" >&2
+            return 1
+        fi
+    fi
     for name in TMAX_TOTAL_TASKS TMAX_EVAL_MAX_TASKS TMAX_EVAL_INTERVAL \
         TMAX_EVAL_SAMPLES_PER_PROMPT TMAX_EVAL_MIN_VALID_SAMPLES \
         TMAX_EXTERNAL_EVAL_MAX_TASKS TMAX_EXTERNAL_EVAL_SAMPLES_PER_PROMPT \
-        TMAX_EXTERNAL_EVAL_MIN_VALID_SAMPLES TMAX_EXTERNAL_EVAL_WEIGHT \
-        TMAX_EVAL_WEIGHT; do
+        TMAX_EXTERNAL_EVAL_MIN_VALID_SAMPLES; do
         value="${!name}"
         if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
             echo "ERROR: ${name} must be a positive integer, got ${value}" >&2
             return 1
         fi
     done
-    for name in TMAX_EVAL_ENABLED TMAX_EXTERNAL_EVAL_ENABLED \
+    for name in TMAX_EVAL_ENABLED TMAX_TRAINING_EVAL_ENABLED \
+        TMAX_EXTERNAL_EVAL_ENABLED \
         TMAX_REQUIRE_EXACT_TOTAL_TASKS; do
         value="${!name}"
         if ! [[ "$value" =~ ^[01]$ ]]; then
@@ -778,6 +826,11 @@ _tmax_validate_dataset_split() {
             return 1
         fi
     done
+    if [ "${TMAX_TRAINING_EVAL_ENABLED}" = "1" ] && \
+       [ "${TMAX_EVAL_ENABLED}" != "1" ]; then
+        echo "ERROR: TMAX_TRAINING_EVAL_ENABLED=1 requires TMAX_EVAL_ENABLED=1" >&2
+        return 1
+    fi
     if ! [[ "${TMAX_PREPARE_EVAL_DATA}" =~ ^[01]$ ]]; then
         echo "ERROR: TMAX_PREPARE_EVAL_DATA must be 0 or 1, got ${TMAX_PREPARE_EVAL_DATA}" >&2
         return 1
@@ -788,15 +841,17 @@ _tmax_validate_dataset_split() {
             return 1
         fi
         if [ "${TMAX_EVAL_SOURCE}" = "tmax" ] && \
-           [ "${TMAX_MAX_TASKS}" = "-1" ]; then
-            echo "ERROR: TMAX_EVAL_ENABLED=1 requires a finite TMAX_MAX_TASKS for a disjoint holdout" >&2
+           [ "${TMAX_MAX_TASKS}" = "-1" ] && [ "${complement_mode}" -ne 1 ]; then
+            echo "ERROR: TMAX_EVAL_ENABLED=1 requires either a finite training window or TMAX_EXCLUDE_DATA" >&2
             return 1
         fi
-        train_end="$((TMAX_TRAIN_START_INDEX + TMAX_MAX_TASKS))"
-        if [ "${TMAX_EVAL_SOURCE}" = "tmax" ] && \
-           [ "${TMAX_EVAL_START_INDEX}" -lt "${train_end}" ]; then
-            echo "ERROR: fixed eval window begins at ${TMAX_EVAL_START_INDEX}, before the training window ends at ${train_end}" >&2
-            return 1
+        if [ "${complement_mode}" -ne 1 ]; then
+            train_end="$((TMAX_TRAIN_START_INDEX + TMAX_MAX_TASKS))"
+            if [ "${TMAX_EVAL_SOURCE}" = "tmax" ] && \
+               [ "${TMAX_EVAL_START_INDEX}" -lt "${train_end}" ]; then
+                echo "ERROR: fixed eval window begins at ${TMAX_EVAL_START_INDEX}, before the training window ends at ${train_end}" >&2
+                return 1
+            fi
         fi
         if [ -z "${TMAX_EVAL_DATASET_NAME}" ]; then
             echo "ERROR: TMAX_EVAL_DATASET_NAME must be non-empty" >&2

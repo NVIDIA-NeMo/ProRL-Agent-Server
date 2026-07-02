@@ -3,6 +3,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+# shellcheck source=./lifecycle.sh
+source "${SCRIPT_DIR}/lifecycle.sh"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 SPILOT_ROOT="$(cd -- "${PROJECT_ROOT}/../.." && pwd)"
 
@@ -104,6 +106,18 @@ if [ -n "${TMAX_TARGET_ITER:-}" ] && ! [[ "${TMAX_TARGET_ITER}" =~ ^[0-9]+$ ]]; 
     echo "ERROR: TMAX_TARGET_ITER must be a non-negative integer" >&2
     exit 2
 fi
+if [ -n "${TMAX_NUM_ROLLOUT:-}" ]; then
+    if ! [[ "${TMAX_NUM_ROLLOUT}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: TMAX_NUM_ROLLOUT must be a positive integer" >&2
+        exit 2
+    fi
+    _tmax_expected_target="$((TMAX_NUM_ROLLOUT - 1))"
+    if [ "${TMAX_TARGET_ITER:-}" != "${_tmax_expected_target}" ]; then
+        echo "ERROR: watcher target ${TMAX_TARGET_ITER:-unset} must equal TMAX_NUM_ROLLOUT-1=${_tmax_expected_target}" >&2
+        exit 2
+    fi
+    unset _tmax_expected_target
+fi
 if ! [[ "${ROLLOUT_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] || ! [[ "${NUM_EPOCH}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: ROLLOUT_BATCH_SIZE and NUM_EPOCH must be positive integers" >&2
     exit 2
@@ -142,26 +156,19 @@ latest_iter() {
 
 validate_checkpoint_pair() {
     local pointer="${SAVE_DIR}/latest_checkpointed_iteration.txt"
-    local value state_path
-    [ -e "$pointer" ] || return 0
-    if [ ! -s "$pointer" ]; then
-        echo "[tmax watch] ERROR: checkpoint pointer exists but is empty: ${pointer}" >&2
-        return 1
-    fi
-    value="$(tr -d '[:space:]' <"$pointer")"
-    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
-        echo "[tmax watch] ERROR: invalid checkpoint pointer ${pointer}: ${value}" >&2
-        return 1
-    fi
-    state_path="${SAVE_DIR}/rollout/global_dataset_state_dict_${value}.pt"
-    if [ ! -s "$state_path" ]; then
-        echo "[tmax watch] ERROR: model checkpoint ${value} has no matching rollout state: ${state_path}" >&2
+    [ -e "${pointer}" ] || return 0
+    if ! tmax_validate_numbered_checkpoint \
+        "${SAVE_DIR}" "[tmax watch] ERROR" >/dev/null; then
         echo "[tmax watch] refusing to resume from a non-atomic checkpoint" >&2
         return 1
     fi
 }
 
 target_iter() {
+    if [ -n "${TMAX_NUM_ROLLOUT:-}" ]; then
+        printf '%s\n' "$((TMAX_NUM_ROLLOUT - 1))"
+        return
+    fi
     if [ -n "${TMAX_TARGET_ITER:-}" ]; then
         printf '%s\n' "${TMAX_TARGET_ITER}"
         return
@@ -463,7 +470,7 @@ check_once() {
         WATCH_ABORT=true
         return
     fi
-    if [ "${TMAX_EVAL_ENABLED}" = "1" ]; then
+    if [ "${TMAX_TRAINING_EVAL_ENABLED:-${TMAX_EVAL_ENABLED}}" = "1" ]; then
         if { [ -s "${FINAL_EVAL_COMPLETE_MARKER}" ] || \
              { [ -n "$target" ] && [ "$iter" -ge "$target" ]; }; }; then
             eval_data_sha256="$(current_eval_data_sha256 2>/dev/null || true)"

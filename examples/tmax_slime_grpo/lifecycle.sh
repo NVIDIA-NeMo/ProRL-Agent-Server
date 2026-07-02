@@ -71,3 +71,57 @@ tmax_configure_graceful_deadline() {
         return 1
     fi
 }
+
+tmax_validate_numbered_checkpoint() {
+    local root="${1:?missing checkpoint root}"
+    local context="${2:-ERROR: checkpoint}"
+    local pointer value iteration_dir model_dir path shard state_path
+    local shard_count=0
+
+    pointer="${root}/latest_checkpointed_iteration.txt"
+    if [ ! -f "${pointer}" ] || [ ! -s "${pointer}" ]; then
+        echo "${context}: checkpoint pointer is missing or empty: ${pointer}" >&2
+        return 1
+    fi
+    value="$(tr -d '[:space:]' <"${pointer}")"
+    if ! [[ "${value}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+        echo "${context}: invalid checkpoint iteration in ${pointer}: ${value}" >&2
+        return 1
+    fi
+
+    printf -v iteration_dir 'iter_%07s' "${value}"
+    iteration_dir="${iteration_dir// /0}"
+    model_dir="${root}/${iteration_dir}"
+    if [ ! -d "${model_dir}" ]; then
+        echo "${context}: tracker ${value} has no matching model checkpoint directory" >&2
+        echo "  Missing: ${model_dir}" >&2
+        return 1
+    fi
+    for path in "${model_dir}/common.pt" "${model_dir}/.metadata"; do
+        if [ ! -f "${path}" ] || [ ! -s "${path}" ]; then
+            echo "${context}: model checkpoint ${value} is incomplete" >&2
+            echo "  Missing or empty regular file: ${path}" >&2
+            return 1
+        fi
+    done
+    for shard in "${model_dir}"/*.distcp; do
+        [ -e "${shard}" ] || continue
+        if [ ! -f "${shard}" ] || [ ! -s "${shard}" ]; then
+            echo "${context}: model checkpoint ${value} has an empty or invalid weight shard: ${shard}" >&2
+            return 1
+        fi
+        shard_count=$((shard_count + 1))
+    done
+    if [ "${shard_count}" -eq 0 ]; then
+        echo "${context}: model checkpoint ${value} has no non-empty distcp weight shards in ${model_dir}" >&2
+        return 1
+    fi
+
+    state_path="${root}/rollout/global_dataset_state_dict_${value}.pt"
+    if [ ! -f "${state_path}" ] || [ ! -s "${state_path}" ]; then
+        echo "${context}: checkpoint ${value} has no matching rollout state" >&2
+        echo "  Missing or empty regular file: ${state_path}" >&2
+        return 1
+    fi
+    printf '%s\n' "${value}"
+}

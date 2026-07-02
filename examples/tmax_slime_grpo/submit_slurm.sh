@@ -3,6 +3,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+# shellcheck source=./lifecycle.sh
+source "${SCRIPT_DIR}/lifecycle.sh"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 # shellcheck source=../swegym_slime_grpo/launcher_utils.sh
 source "${PROJECT_ROOT}/examples/swegym_slime_grpo/launcher_utils.sh"
@@ -37,6 +39,15 @@ if [ ! -x "${TMAX_SIF_PYTHON_BIN}" ]; then
     echo "ERROR: Python not executable: ${TMAX_SIF_PYTHON_BIN}" >&2
     exit 1
 fi
+
+export TMAX_VALIDATE_EXISTING_ASSETS="${TMAX_VALIDATE_EXISTING_ASSETS:-1}"
+case "${TMAX_VALIDATE_EXISTING_ASSETS}" in
+    0|1) ;;
+    *)
+        echo "ERROR: TMAX_VALIDATE_EXISTING_ASSETS must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
 
 # Fail before requesting GPUs when the shared training venv no longer matches
 # its CUDA/Transformer-Engine ABI.  This caught a real failure where a package
@@ -228,17 +239,20 @@ if [ -n "${LOAD_DIR:-}" ] && \
         echo "  Reuse the exact prompt JSONL whose data-source state is stored in the checkpoint." >&2
         exit 1
     fi
-    if [ ! -s "${LOAD_DIR}/latest_checkpointed_iteration.txt" ] || [ ! -s "${TMAX_TRAIN_DATA}" ]; then
-        echo "ERROR: LOAD_DIR checkpoint or TMAX_TRAIN_DATA is missing" >&2
+    if [ ! -s "${TMAX_TRAIN_DATA}" ]; then
+        echo "ERROR: TMAX_TRAIN_DATA is missing or empty: ${TMAX_TRAIN_DATA}" >&2
         exit 1
     fi
-    _tmax_seed_iter="$(tr -d '[:space:]' <"${LOAD_DIR}/latest_checkpointed_iteration.txt")"
-    if ! [[ "${_tmax_seed_iter}" =~ ^[0-9]+$ ]]; then
-        echo "ERROR: LOAD_DIR must point to a numbered training checkpoint" >&2
+    if ! _tmax_seed_iter="$(tmax_validate_numbered_checkpoint \
+        "${LOAD_DIR}" "ERROR: numbered LOAD_DIR")"; then
         exit 1
     fi
     _tmax_seed_samples="$(awk 'NF { count += 1 } END { print count + 0 }' "${TMAX_TRAIN_DATA}")"
-    _tmax_seed_target="$(( (_tmax_seed_samples + ROLLOUT_BATCH_SIZE - 1) / ROLLOUT_BATCH_SIZE * NUM_EPOCH - 1 ))"
+    if [ -n "${TMAX_NUM_ROLLOUT:-}" ]; then
+        _tmax_seed_target="$((TMAX_NUM_ROLLOUT - 1))"
+    else
+        _tmax_seed_target="$(( (_tmax_seed_samples + ROLLOUT_BATCH_SIZE - 1) / ROLLOUT_BATCH_SIZE * NUM_EPOCH - 1 ))"
+    fi
     if [ "${_tmax_seed_iter}" -ge "${_tmax_seed_target}" ]; then
         echo "ERROR: seed iteration ${_tmax_seed_iter} has already reached target ${_tmax_seed_target} for ${_tmax_seed_samples} prompts" >&2
         echo "  This usually means TMAX_TRAIN_DATA does not match the checkpoint's rollout data-source state." >&2
@@ -254,8 +268,10 @@ PREPARE_ARGS=(
     --start-index "${TMAX_TRAIN_START_INDEX}"
     --max-tasks "${TMAX_MAX_TASKS}"
 )
-if [ "${TMAX_EXTERNAL_EVAL_ENABLED}" = "1" ] && \
-   [ "${TMAX_REQUIRE_EXACT_TOTAL_TASKS}" = "1" ]; then
+if [ -n "${TMAX_EXCLUDE_DATA}" ]; then
+    PREPARE_ARGS+=(--exclude-data "${TMAX_EXCLUDE_DATA}")
+fi
+if [ "${TMAX_REQUIRE_EXACT_TOTAL_TASKS}" = "1" ]; then
     PREPARE_ARGS+=(--expected-total-tasks "${TMAX_TOTAL_TASKS}")
 fi
 if [ "${TMAX_ONLY_READY}" = "1" ]; then
@@ -263,9 +279,11 @@ if [ "${TMAX_ONLY_READY}" = "1" ]; then
 fi
 if [ "${TMAX_PREPARE_DATA:-1}" = "1" ] || [ ! -s "${TMAX_TRAIN_DATA}" ]; then
     "${TMAX_SIF_PYTHON_BIN}" "${SCRIPT_DIR}/prepare_data.py" "${PREPARE_ARGS[@]}"
-else
+elif [ "${TMAX_VALIDATE_EXISTING_ASSETS}" = "1" ]; then
     "${TMAX_SIF_PYTHON_BIN}" "${SCRIPT_DIR}/prepare_data.py" \
         "${PREPARE_ARGS[@]}" --validate-existing
+else
+    echo "[tmax submit] skipping deep validation of existing training assets"
 fi
 
 if [ "${TMAX_EVAL_ENABLED}" = "1" ]; then
@@ -309,16 +327,20 @@ if [ "${TMAX_EVAL_ENABLED}" = "1" ]; then
     fi
     if [ "${TMAX_PREPARE_EVAL_DATA}" = "1" ] || [ ! -s "${TMAX_EVAL_DATA}" ]; then
         "${TMAX_SIF_PYTHON_BIN}" "${EVAL_PREPARE_SCRIPT}" "${EVAL_PREPARE_ARGS[@]}"
-    else
+    elif [ "${TMAX_VALIDATE_EXISTING_ASSETS}" = "1" ]; then
         "${TMAX_SIF_PYTHON_BIN}" "${EVAL_PREPARE_SCRIPT}" \
             "${EVAL_PREPARE_ARGS[@]}" --validate-existing
+    else
+        echo "[tmax submit] skipping deep validation of existing primary eval assets"
     fi
     if [ "${TMAX_EXTERNAL_EVAL_ENABLED}" = "1" ]; then
         if [ "${TMAX_PREPARE_EVAL_DATA}" = "1" ] || [ ! -s "${TMAX_EXTERNAL_EVAL_DATA}" ]; then
             "${TMAX_SIF_PYTHON_BIN}" "${SCRIPT_DIR}/prepare_harbor_eval.py" "${EXTERNAL_PREPARE_ARGS[@]}"
-        else
+        elif [ "${TMAX_VALIDATE_EXISTING_ASSETS}" = "1" ]; then
             "${TMAX_SIF_PYTHON_BIN}" "${SCRIPT_DIR}/prepare_harbor_eval.py" \
                 "${EXTERNAL_PREPARE_ARGS[@]}" --validate-existing
+        else
+            echo "[tmax submit] skipping deep validation of existing external eval assets"
         fi
     fi
     _TMAX_DATA_INTEGRITY_CANDIDATE="${TMAX_DATA_INTEGRITY_MANIFEST}.candidate.$$"

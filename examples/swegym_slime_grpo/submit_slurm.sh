@@ -28,6 +28,7 @@ NUM_NODES="${NUM_NODES:-4}"
 JOB_NAME="${JOB_NAME:-polar-swegym-grpo}"
 SLURM_GPUS="${SLURM_GPUS:-8}"
 SLURM_CONSTRAINT="${SLURM_CONSTRAINT:-}"   # e.g. H100/H200/B200
+SLURM_EXCLUDE="${SLURM_EXCLUDE:-}"
 SBATCH_DEPENDENCY="${SBATCH_DEPENDENCY:-}"
 
 # ── Training container ───────────────────────────────────────────────
@@ -136,7 +137,7 @@ umask 077
             SLIME_SUBMIT_UNIX_NS|MEGATRON_DIR|REF_LOAD|TORCH_DIST_DIR|MODEL_ARGS_FILE|\
             ACCOUNT|PARTITION|NUM_NODES|WALL_TIME|CPUS_PER_TASK|SLURM_GPUS|\
             N_SAMPLES_PER_PROMPT|NUM_STEPS_PER_ROLLOUT|NUM_EPOCH|\
-            SEQ_LENGTH|MAX_TOKENS_PER_GPU|SAVE_INTERVAL|SEQUENCE_PARALLEL|CONTEXT_PARALLEL_SIZE|\
+            SEQ_LENGTH|MAX_TOKENS_PER_GPU|LOG_PROBS_CHUNK_SIZE|SAVE_INTERVAL|SEQUENCE_PARALLEL|CONTEXT_PARALLEL_SIZE|\
             TRAIN_LR|KL_LOSS_COEF|POLICY_LOSS_TYPE|USE_TIS|GRPO_STD_NORMALIZATION|\
             DPPO_DIVERGENCE_TYPE|DPPO_DIVERGENCE_THRESHOLD|\
             MAX_TRAIN_ROLLOUT_LOGPROB_ABS_DIFF|\
@@ -179,6 +180,10 @@ fi
 SBATCH_DEPENDENCY_ARG=()
 if [ -n "${SBATCH_DEPENDENCY}" ]; then
     SBATCH_DEPENDENCY_ARG=(--dependency="${SBATCH_DEPENDENCY}")
+fi
+SBATCH_EXCLUDE_ARG=()
+if [ -n "${SLURM_EXCLUDE}" ]; then
+    SBATCH_EXCLUDE_ARG=(--exclude="${SLURM_EXCLUDE}")
 fi
 
 SUBMIT_BACKEND="${SUBMIT_BACKEND:-srun}"
@@ -226,6 +231,9 @@ if [ "${SUBMIT_BACKEND}" = "srun" ]; then
     )
     if [ -n "${SLURM_CONSTRAINT}" ]; then
         SRUN_CMD+=(--constraint="${SLURM_CONSTRAINT}")
+    fi
+    if [ -n "${SLURM_EXCLUDE}" ]; then
+        SRUN_CMD+=(--exclude="${SLURM_EXCLUDE}")
     fi
     SRUN_CMD+=(bash "${CONTAINER_ENTRYPOINT}")
     # A submit shell may itself live inside an interactive/CPU allocation.
@@ -310,6 +318,7 @@ JOB_ID=$(env \
     --mem=0 \
     "${SBATCH_CONSTRAINT_ARG[@]}" \
     "${SBATCH_DEPENDENCY_ARG[@]}" \
+    "${SBATCH_EXCLUDE_ARG[@]}" \
     --output="${LOG_DIR}/%x-%j.out" \
     --error="${LOG_DIR}/%x-%j.err" \
     --export="POLAR_TRAIN_ENV_FILE=${POLAR_TRAIN_ENV_FILE}" \

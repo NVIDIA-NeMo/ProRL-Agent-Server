@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
+import subprocess
 from argparse import Namespace
 from pathlib import Path
 
@@ -23,6 +25,100 @@ def _prepare_data_module(monkeypatch):
     monkeypatch.syspath_prepend(str(TMAX_GRPO_DIR))
     sys.modules.pop("prepare_data", None)
     return importlib.import_module("prepare_data")
+
+
+def test_prepare_data_role_flags_do_not_inherit_global_environment(
+    monkeypatch, tmp_path: Path
+) -> None:
+    prepare_data = _prepare_data_module(monkeypatch)
+    holdout = tmp_path / "holdout.jsonl"
+    holdout.write_text("{}\n")
+    monkeypatch.setenv("TMAX_EXCLUDE_DATA", str(holdout))
+    monkeypatch.setenv("TMAX_ONLY_READY", "1")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["prepare_data.py", "--exclude-data", str(holdout), "--only-ready"],
+    )
+    train_args = prepare_data.parse_args()
+    assert train_args.exclude_data == [str(holdout)]
+    assert train_args.only_ready is True
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["prepare_data.py", "--start-index", "900", "--max-tasks", "100"],
+    )
+    eval_args = prepare_data.parse_args()
+    assert eval_args.exclude_data == []
+    assert eval_args.only_ready is False
+
+
+def test_complement_train_and_fixed_eval_survive_deep_validation(
+    tmp_path: Path,
+) -> None:
+    dataset_dir = tmp_path / "dataset"
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    for name in ("task_a", "task_b", "task_c"):
+        _write_task(dataset_dir, name)
+        (image_dir / f"{name}.sif").write_bytes(b"sif")
+
+    holdout = tmp_path / "holdout.jsonl"
+    _write_prompt_row(holdout, "task_b", image_dir / "task_b.sif")
+    train_output = tmp_path / "train.jsonl"
+    eval_output = tmp_path / "eval.jsonl"
+    common = [
+        sys.executable,
+        str(TMAX_GRPO_DIR / "prepare_data.py"),
+        "--dataset-dir",
+        str(dataset_dir),
+        "--image-dir",
+        str(image_dir),
+        "--expected-total-tasks",
+        "3",
+    ]
+    train_command = common + [
+        "--output",
+        str(train_output),
+        "--start-index",
+        "0",
+        "--max-tasks",
+        "-1",
+        "--exclude-data",
+        str(holdout),
+        "--only-ready",
+    ]
+    eval_command = common + [
+        "--output",
+        str(eval_output),
+        "--start-index",
+        "1",
+        "--max-tasks",
+        "1",
+    ]
+    env = os.environ.copy()
+    # These global launcher values must not leak into the eval role.
+    env.update(TMAX_EXCLUDE_DATA=str(holdout), TMAX_ONLY_READY="1")
+
+    for command in (train_command, eval_command):
+        subprocess.run(command, check=True, env=env, cwd=TMAX_GRPO_DIR)
+        subprocess.run(
+            [*command, "--validate-existing"],
+            check=True,
+            env=env,
+            cwd=TMAX_GRPO_DIR,
+        )
+
+    train_tasks = [
+        json.loads(line)["metadata"]["task_name"] for line in train_output.read_text().splitlines()
+    ]
+    eval_tasks = [
+        json.loads(line)["metadata"]["task_name"] for line in eval_output.read_text().splitlines()
+    ]
+    assert train_tasks == ["task_a", "task_c"]
+    assert eval_tasks == ["task_b"]
 
 
 def _write_task(root: Path, name: str, *, task_toml: str = "") -> None:
@@ -150,6 +246,57 @@ def test_prepare_data_full_mode_requires_requested_task_count(monkeypatch, tmp_p
     args.max_tasks = 2
 
     with pytest.raises(SystemExit, match="first 2 TMax task.*only 1 valid"):
+        prepare_data.select_tasks(args)
+
+
+def test_prepare_data_excludes_fixed_holdout_from_full_ready_population(
+    monkeypatch, tmp_path: Path
+) -> None:
+    prepare_data = _prepare_data_module(monkeypatch)
+    dataset_dir = tmp_path / "dataset"
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    for name in ("task_a", "task_b", "task_c", "task_d"):
+        _write_task(dataset_dir, name)
+        (image_dir / f"{name}.sif").write_bytes(b"sif")
+    holdout = tmp_path / "holdout.jsonl"
+    _write_prompt_row(holdout, "task_b", image_dir / "task_b.sif")
+    _write_prompt_row(holdout, "task_d", image_dir / "task_d.sif")
+    args = _selection_args(dataset_dir, image_dir, only_ready=True)
+    args.start_index = 0
+    args.max_tasks = -1
+    args.exclude_data = [str(holdout)]
+    args.expected_total_tasks = 4
+
+    selected, missing_count = prepare_data.select_tasks(args)
+
+    assert [task.name for task in selected] == ["task_a", "task_c"]
+    assert missing_count == 0
+
+
+def test_prepare_data_exclusion_is_fail_closed(monkeypatch, tmp_path: Path) -> None:
+    prepare_data = _prepare_data_module(monkeypatch)
+    dataset_dir = tmp_path / "dataset"
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    _write_task(dataset_dir, "task_a")
+    (image_dir / "task_a.sif").write_bytes(b"sif")
+    holdout = tmp_path / "holdout.jsonl"
+    _write_prompt_row(holdout, "unknown", image_dir / "unknown.sif")
+    args = _selection_args(dataset_dir, image_dir, only_ready=True)
+    args.start_index = 0
+    args.max_tasks = -1
+    args.exclude_data = [str(holdout)]
+    args.expected_total_tasks = 1
+
+    with pytest.raises(SystemExit, match="absent from the selected source"):
+        prepare_data.select_tasks(args)
+
+    args.start_index = 1
+    with pytest.raises(
+        SystemExit,
+        match="exclude-data requires the complete deterministic source population",
+    ):
         prepare_data.select_tasks(args)
 
 

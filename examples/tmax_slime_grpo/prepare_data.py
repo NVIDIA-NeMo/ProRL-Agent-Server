@@ -71,9 +71,19 @@ def parse_args() -> argparse.Namespace:
         help="Select an exact task name. Repeatable.",
     )
     parser.add_argument(
+        "--exclude-data",
+        action="append",
+        default=[],
+        help=(
+            "Exclude every metadata.task_name from this JSONL. This is a "
+            "fail-closed full-dataset complement mode and therefore requires "
+            "--start-index 0 and --max-tasks -1. Repeatable."
+        ),
+    )
+    parser.add_argument(
         "--only-ready",
         action="store_true",
-        default=os.environ.get("TMAX_ONLY_READY", "0") == "1",
+        default=False,
         help=(
             "Explicit partial-data smoke mode: drop missing images from the "
             "selected prefix instead of failing; later tasks never backfill it."
@@ -85,6 +95,33 @@ def parse_args() -> argparse.Namespace:
         help=("Validate an existing --output JSONL and all referenced SIFs without rewriting it."),
     )
     return parser.parse_args()
+
+
+def load_excluded_task_names(paths: list[str]) -> set[str]:
+    excluded: set[str] = set()
+    for raw_path in paths:
+        path = Path(raw_path).expanduser().resolve()
+        if not path.is_file() or path.stat().st_size == 0:
+            raise SystemExit(f"TMax exclusion JSONL is missing or empty: {path}")
+        with path.open() as stream:
+            for line_number, line in enumerate(stream, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    task_name = row["metadata"]["task_name"]
+                    if not isinstance(task_name, str) or not task_name:
+                        raise TypeError("metadata.task_name must be a non-empty string")
+                except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                    raise SystemExit(
+                        f"Invalid TMax exclusion row in {path} at line {line_number}: {exc}"
+                    ) from exc
+                if task_name in excluded:
+                    raise SystemExit(f"Duplicate excluded TMax task_name {task_name!r} in {path}")
+                excluded.add(task_name)
+    if paths and not excluded:
+        raise SystemExit("TMax exclusion JSONL(s) contain no task rows")
+    return excluded
 
 
 def image_path(task: TmaxTask, image_dir: Path) -> Path:
@@ -130,11 +167,15 @@ def load_task_prefix(args: argparse.Namespace) -> list[TmaxTask]:
         raise SystemExit(f"--start-index must be non-negative, got {start_index}")
     if args.task and start_index:
         raise SystemExit("--start-index cannot be combined with explicit --task values")
+    exclude_paths = list(getattr(args, "exclude_data", []) or [])
+    if exclude_paths and (args.task or start_index != 0 or int(args.max_tasks) != -1):
+        raise SystemExit(
+            "--exclude-data requires the complete deterministic source "
+            "population: --start-index 0, --max-tasks -1, and no --task"
+        )
     expected_total = int(getattr(args, "expected_total_tasks", 0))
     if expected_total < 0:
-        raise SystemExit(
-            f"--expected-total-tasks must be non-negative, got {expected_total}"
-        )
+        raise SystemExit(f"--expected-total-tasks must be non-negative, got {expected_total}")
     load_limit = (
         -1
         if expected_total
@@ -155,7 +196,20 @@ def load_task_prefix(args: argparse.Namespace) -> list[TmaxTask]:
         )
     if not args.task:
         tasks = tasks[start_index:]
-    return tasks[: args.max_tasks] if args.max_tasks > 0 else tasks
+    selected = tasks[: args.max_tasks] if args.max_tasks > 0 else tasks
+    excluded = load_excluded_task_names(exclude_paths)
+    if excluded:
+        selected_names = {task.name for task in selected}
+        unknown = sorted(excluded - selected_names)
+        if unknown:
+            preview = ", ".join(unknown[:10])
+            suffix = " ..." if len(unknown) > 10 else ""
+            raise SystemExit(
+                f"Excluded TMax task(s) are absent from the selected source "
+                f"population: {preview}{suffix}"
+            )
+        selected = [task for task in selected if task.name not in excluded]
+    return selected
 
 
 def require_complete_prefix(args: argparse.Namespace, tasks: list[TmaxTask]) -> None:

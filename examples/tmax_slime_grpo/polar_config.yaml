@@ -19,9 +19,6 @@ polar_early_stop_grace_sessions: ${POLAR_EARLY_STOP_GRACE_SESSIONS}
 polar_max_trajectory_tokens: ${TMAX_TRAIN_PACK_LENGTH}
 polar_agent_cli_dir: ${AGENT_CLI_DIR}
 polar_apptainer_image_dir: ${APPTAINER_IMAGE_DIR}
-polar_eval_aggregate_weights:
-  "${TMAX_EVAL_DATASET_NAME}": ${TMAX_EVAL_WEIGHT}
-  "${TMAX_EXTERNAL_EVAL_DATASET_NAME}": ${TMAX_EXTERNAL_EVAL_WEIGHT}
 
 polar_task_template:
   timeout_seconds: "{sample.metadata.timeout_seconds}"

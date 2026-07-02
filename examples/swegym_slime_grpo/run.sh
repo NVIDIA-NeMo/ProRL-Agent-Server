@@ -303,6 +303,52 @@ fi
 polar_validate_model_args "${MODEL_ARGS[@]}"
 echo "Using model args: ${MODEL_ARGS_FILE}"
 
+configure_resumed_checkpoint_eval_args() {
+    RESUMED_CHECKPOINT_EVAL_ARGS=()
+    case "${TMAX_EVAL_RESUMED_CHECKPOINT_BEFORE_TRAIN:-0}" in
+        0|false)
+            return 0
+            ;;
+        1|true) ;;
+        *)
+            echo "ERROR: TMAX_EVAL_RESUMED_CHECKPOINT_BEFORE_TRAIN must be 0/1/false/true" >&2
+            return 1
+            ;;
+    esac
+    case "${TMAX_CONCURRENT_PRETRAIN_EVAL:-1}" in
+        0|false) ;;
+        *)
+            echo "ERROR: resumed-checkpoint eval requires TMAX_CONCURRENT_PRETRAIN_EVAL=0" >&2
+            return 1
+            ;;
+    esac
+    case "${TMAX_TRAINING_EVAL_ENABLED:-${TMAX_EVAL_ENABLED:-0}}" in
+        1|true) ;;
+        *)
+            echo "ERROR: resumed-checkpoint eval requires training-time eval (TMAX_TRAINING_EVAL_ENABLED=1)" >&2
+            return 1
+            ;;
+    esac
+
+    # Enable this exactly once for a logical run: when polar_select_load_dir
+    # chose the caller's external numeric seed. A later allocation selects its
+    # own SAVE_DIR and must not manufacture an extra resume-baseline eval.
+    if [ -z "${REQUESTED_LOAD_DIR}" ] || \
+       [ "${LOAD_DIR}" != "${REQUESTED_LOAD_DIR}" ] || \
+       [ "${LOAD_DIR}" = "${SAVE_DIR}" ] || \
+       polar_checkpoint_is_release_seed "${LOAD_DIR}"; then
+        return 0
+    fi
+    local seed_iteration
+    seed_iteration="$(tr -d '[:space:]' <"${LOAD_DIR}/latest_checkpointed_iteration.txt")"
+    if ! [[ "${seed_iteration}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+        echo "ERROR: resumed-checkpoint eval requires a canonical numeric checkpoint tracker" >&2
+        return 1
+    fi
+    RESUMED_CHECKPOINT_EVAL_ARGS=(--eval-resumed-checkpoint-before-train)
+    echo "Using synchronous fixed eval for external seed checkpoint ${seed_iteration} before rollout $((seed_iteration + 1))"
+}
+
 # LOAD_DIR can seed a new RUN_ID/SAVE_DIR from an existing full checkpoint.
 # After the first save lands, subsequent allocations resume SAVE_DIR instead
 # of repeatedly going back to the seed checkpoint.
@@ -322,6 +368,7 @@ if polar_checkpoint_is_release_seed "$LOAD_DIR"; then
     LOAD_CHECKPOINT_ARGS=(--start-rollout-id 0)
     echo "Using release checkpoint as model seed: start rollout 0"
 fi
+configure_resumed_checkpoint_eval_args || exit 1
 
 # ── Data ───────────────────────────────────────────────────────────
 PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/swegym_train_293.jsonl}"
@@ -579,9 +626,7 @@ for name in (
     "POLAR_AGENT_MAX_TOKENS",
     "POLAR_AGENT_ENABLE_THINKING",
     "TMAX_EVAL_DATASET_NAME",
-    "TMAX_EVAL_WEIGHT",
     "TMAX_EXTERNAL_EVAL_DATASET_NAME",
-    "TMAX_EXTERNAL_EVAL_WEIGHT",
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
     "MKL_NUM_THREADS",
@@ -1140,6 +1185,27 @@ GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$(((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_P
 EVAL_GLOBAL_BATCH_SIZE="${EVAL_GLOBAL_BATCH_SIZE:-${GLOBAL_BATCH_SIZE}}"
 CUSTOM_ROLLOUT_LOG_FUNCTION_PATH="${CUSTOM_ROLLOUT_LOG_FUNCTION_PATH:-slime_bridge.rollout.log_rollout_trajectory_examples}"
 echo "Using rollout/global batch: ${ROLLOUT_BATCH_SIZE}x${N_SAMPLES_PER_PROMPT}/${NUM_STEPS_PER_ROLLOUT}=${GLOBAL_BATCH_SIZE}, eval=${EVAL_GLOBAL_BATCH_SIZE}"
+TRAIN_LENGTH_ARGS=(--num-epoch "${NUM_EPOCH:-1}")
+if [ -n "${TMAX_NUM_ROLLOUT:-}" ]; then
+    if ! [[ "${TMAX_NUM_ROLLOUT}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: TMAX_NUM_ROLLOUT must be a positive integer" >&2
+        exit 1
+    fi
+    TRAIN_LENGTH_ARGS=(--num-rollout "${TMAX_NUM_ROLLOUT}")
+    echo "Using explicit rollout-loop boundary: ${TMAX_NUM_ROLLOUT} (final rollout $((TMAX_NUM_ROLLOUT - 1)))"
+fi
+OPT_PARAM_SCHEDULER_ARGS=()
+case "${TMAX_OVERRIDE_OPT_PARAM_SCHEDULER:-0}" in
+    0|false) ;;
+    1|true)
+        OPT_PARAM_SCHEDULER_ARGS=(--override-opt-param-scheduler)
+        echo "Using runtime optimizer scheduler configuration while preserving checkpoint progress"
+        ;;
+    *)
+        echo "ERROR: TMAX_OVERRIDE_OPT_PARAM_SCHEDULER must be 0/1/false/true" >&2
+        exit 1
+        ;;
+esac
 echo "Using post-train rollout log hook: ${CUSTOM_ROLLOUT_LOG_FUNCTION_PATH}"
 TRAIN_DYNAMIC_SAMPLING_ARGS=()
 if [ -n "${TMAX_DYNAMIC_SAMPLING_FILTER_PATH:-}" ]; then
@@ -1241,6 +1307,28 @@ case "${SGLANG_ENABLE_FP32_LM_HEAD:-0}" in
         exit 1
         ;;
 esac
+configure_sglang_inference_args() {
+    SGLANG_DETERMINISTIC_ARGS=()
+    SGLANG_ATTENTION_BACKEND_ARGS=()
+    case "${SGLANG_ENABLE_DETERMINISTIC_INFERENCE:-0}" in
+        1|true)
+            SGLANG_DETERMINISTIC_ARGS=(--sglang-enable-deterministic-inference)
+            echo "Using SGLang deterministic inference"
+            ;;
+        0|false) ;;
+        *)
+            echo "ERROR: SGLANG_ENABLE_DETERMINISTIC_INFERENCE must be 0/1/false/true, got ${SGLANG_ENABLE_DETERMINISTIC_INFERENCE}" >&2
+            return 1
+            ;;
+    esac
+    if [ -n "${SGLANG_ATTENTION_BACKEND:-}" ]; then
+        SGLANG_ATTENTION_BACKEND_ARGS=(
+            --sglang-attention-backend "${SGLANG_ATTENTION_BACKEND}"
+        )
+        echo "Using explicit SGLang attention backend: ${SGLANG_ATTENTION_BACKEND}"
+    fi
+}
+configure_sglang_inference_args || exit 1
 TRAINER_FP32_LM_HEAD_ARGS=()
 case "${TMAX_ENABLE_FP32_LM_HEAD:-0}" in
     1|true)
@@ -1264,8 +1352,26 @@ case "${CALCULATE_PER_TOKEN_LOSS:-0}" in
         exit 1
         ;;
 esac
+PRETRAIN_EVAL_ARGS=()
+case "${TMAX_CONCURRENT_PRETRAIN_EVAL:-1}" in
+    1|true)
+        PRETRAIN_EVAL_ARGS=(--concurrent-pretrain-eval)
+        PRETRAIN_EVAL_MODE=concurrent-with-rollout-0
+        ;;
+    0|false)
+        PRETRAIN_EVAL_MODE=synchronous-before-rollout-0
+        ;;
+    *)
+        echo "ERROR: TMAX_CONCURRENT_PRETRAIN_EVAL must be 0/1/false/true" >&2
+        exit 1
+        ;;
+esac
+if [ "${#RESUMED_CHECKPOINT_EVAL_ARGS[@]}" -gt 0 ]; then
+    PRETRAIN_EVAL_ARGS+=("${RESUMED_CHECKPOINT_EVAL_ARGS[@]}")
+    PRETRAIN_EVAL_MODE=synchronous-resumed-checkpoint-before-first-rollout
+fi
 EVAL_ARGS=()
-if [ "${TMAX_EVAL_ENABLED:-0}" = "1" ]; then
+if [ "${TMAX_TRAINING_EVAL_ENABLED:-${TMAX_EVAL_ENABLED:-0}}" = "1" ]; then
     if [ ! -s "${TMAX_EVAL_DATA:-}" ]; then
         echo "ERROR: fixed TMax eval data is missing or empty: ${TMAX_EVAL_DATA:-<unset>}" >&2
         exit 1
@@ -1357,7 +1463,7 @@ PY
         fi
         EVAL_ARGS=(
             --eval-interval "${TMAX_EVAL_INTERVAL}"
-            --concurrent-pretrain-eval
+            "${PRETRAIN_EVAL_ARGS[@]}"
             --eval-config "${TMAX_EVAL_CONFIG_PATH}"
             --eval-max-prompt-len "${ROLLOUT_MAX_PROMPT_LEN}"
             --custom-eval-rollout-log-function-path slime_bridge.eval_logging.add_weighted_eval_metric
@@ -1366,7 +1472,7 @@ PY
     else
         EVAL_ARGS=(
             --eval-interval "${TMAX_EVAL_INTERVAL}"
-            --concurrent-pretrain-eval
+            "${PRETRAIN_EVAL_ARGS[@]}"
             --eval-prompt-data "${TMAX_EVAL_DATASET_NAME}" "${TMAX_EVAL_DATA}"
             --n-samples-per-eval-prompt "${TMAX_EVAL_SAMPLES_PER_PROMPT}"
             --min-eval-samples "${TMAX_EVAL_MIN_VALID_SAMPLES}"
@@ -1377,12 +1483,15 @@ PY
         )
         echo "Using fixed eval: ${TMAX_EVAL_DATASET_NAME} (${TMAX_EVAL_DATA}, baseline + every ${TMAX_EVAL_INTERVAL} rollout(s) + final)"
     fi
+    echo "Pretrain eval scheduling: ${PRETRAIN_EVAL_MODE}"
     if [ -n "${FINAL_EVAL_COMPLETE_MARKER:-}" ]; then
         EVAL_ARGS+=(
             --final-eval-complete-marker "${FINAL_EVAL_COMPLETE_MARKER}"
             --final-eval-data-sha256 "${FINAL_EVAL_DATA_SHA256}"
         )
     fi
+else
+    echo "Training-time eval disabled; holdout remains available for data-split and integrity checks."
 fi
 RAY_NUM_GPUS_PER_NODE="${RAY_NUM_GPUS_PER_NODE:-}"
 if [ -z "$RAY_NUM_GPUS_PER_NODE" ]; then
@@ -1640,6 +1749,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     --load "$LOAD_DIR" \
     "${LOAD_CHECKPOINT_ARGS[@]}" \
     --dist-ckpt-strictness "${DIST_CKPT_STRICTNESS:-assume_ok_unexpected}" \
+    "${OPT_PARAM_SCHEDULER_ARGS[@]}" \
     --save "$SAVE_DIR" \
     --save-interval "${SAVE_INTERVAL:-10}" \
     "${TRAINING_LIFECYCLE_ARGS[@]}" \
@@ -1656,7 +1766,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     --metadata-key metadata \
     --rollout-shuffle \
     --reward-key score \
-    --num-epoch "${NUM_EPOCH:-1}" \
+    "${TRAIN_LENGTH_ARGS[@]}" \
     --rollout-batch-size "$ROLLOUT_BATCH_SIZE" \
     --n-samples-per-prompt "$N_SAMPLES_PER_PROMPT" \
     "${TRAIN_DYNAMIC_SAMPLING_ARGS[@]}" \
@@ -1709,6 +1819,8 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     --sglang-tool-call-parser qwen3_coder \
     "${SGLANG_REASONING_ARGS[@]}" \
     "${SGLANG_FP32_LM_HEAD_ARGS[@]}" \
+    "${SGLANG_DETERMINISTIC_ARGS[@]}" \
+    "${SGLANG_ATTENTION_BACKEND_ARGS[@]}" \
     --sglang-log-level-http "${SGLANG_LOG_LEVEL_HTTP:-warning}" \
     --router-policy "${SGLANG_ROUTER_POLICY:-round_robin}" \
     --use-wandb \
