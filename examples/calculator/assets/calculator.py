@@ -2,7 +2,7 @@ class Calculator:
     def __call__(self, expression: str) -> int:
         self.tokens = self._tokenize(expression)
         self.index = 0
-        value = self._parse_expr()
+        value = self._parse_expr()  # noqa: F841 - intentional repair-task starter
         if self.index != len(self.tokens):
             raise ValueError("trailing input")
         return 0  # TODO: return the parsed value

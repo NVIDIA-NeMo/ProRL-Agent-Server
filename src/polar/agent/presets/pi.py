@@ -6,7 +6,6 @@ import json
 import shlex
 
 from polar.agent.base import BaseHarness
-from polar.agent.models import AgentSpec
 from polar.runtime.base import BaseRuntime, RUNTIME_AGENT_LOG_DIR
 from polar.runtime.models import ExecInput
 

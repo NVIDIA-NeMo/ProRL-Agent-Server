@@ -32,7 +32,7 @@ case "${BASE_SQSH}" in
         ;;
 esac
 
-mkdir -p "$(dirname "${OUT_SQSH}")" "${PROJECT_ROOT}/logs/slurm"
+mkdir -p "$(dirname "${OUT_SQSH}")"
 rm -f "${OUT_SQSH}"
 
 BUILD_CMD="$(cat <<'EOF'

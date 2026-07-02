@@ -261,7 +261,7 @@ if [ -s "${output_dir}/.export_complete.json" ]; then
 fi
 [ ! -e "${output_dir}" ] || die "refusing to overwrite incomplete output: ${output_dir}"
 
-log_dir="${TMAX_HF_EXPORT_LOG_DIR:-${PROJECT_ROOT}/logs/slurm}"
+log_dir="${TMAX_HF_EXPORT_LOG_DIR:-${DATA_ROOT}/logs/slurm}"
 require_absolute_path TMAX_HF_EXPORT_LOG_DIR "${log_dir}"
 mkdir -p "${log_dir}"
 slurm_export_values=(

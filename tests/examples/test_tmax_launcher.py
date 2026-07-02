@@ -51,6 +51,31 @@ def test_shared_launcher_enables_post_train_full_trajectory_examples() -> None:
     assert "slime_bridge.rollout.log_rollout_trajectory_examples" in launcher
 
 
+def test_launchers_keep_runtime_outputs_under_the_data_root() -> None:
+    shared_run = (SHARED / "run.sh").read_text()
+    shared_submit = (SHARED / "submit_slurm.sh").read_text()
+    swegym_sif_submit = (SHARED / "submit_build_sifs_slurm.sh").read_text()
+    tmax_sif_submit = (ROOT / "examples" / "tmax-15k" / "submit_build_sifs_slurm.sh").read_text()
+    hf_export = (TMAX / "export_hf_checkpoint.sh").read_text()
+
+    assert 'WANDB_DIR="${WANDB_DIR:-${RUN_DIR}/wandb}"' in shared_run
+    assert 'mkdir -p "${RUN_DIR}" "${WANDB_DIR}"' in shared_run
+    assert '\\"WANDB_DIR\\": \\"${WANDB_DIR}\\"' in shared_run
+    assert '${PROJECT_ROOT}/logs' not in shared_run
+
+    assert 'LOG_DIR="${POLAR_SLURM_LOG_DIR:-${DATA_ROOT}/logs/slurm}"' in shared_submit
+    assert '${PROJECT_ROOT}/logs/slurm' not in shared_submit
+    assert (
+        'LOG_DIR="${SIF_BUILD_LOG_DIR:-${POLAR_DATA_ROOT}/logs/slurm}"'
+        in swegym_sif_submit
+    )
+    assert (
+        'LOG_DIR="${TMAX_SIF_BUILD_LOG_DIR:-${TMAX_DATA_ROOT}/logs/slurm}"'
+        in tmax_sif_submit
+    )
+    assert 'log_dir="${TMAX_HF_EXPORT_LOG_DIR:-${DATA_ROOT}/logs/slurm}"' in hf_export
+
+
 def write_command(path: Path, body: str) -> None:
     path.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body)
     path.chmod(0o755)

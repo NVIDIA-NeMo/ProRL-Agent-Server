@@ -38,7 +38,7 @@ CONSTRAINT="${TMAX_SIF_BUILD_CONSTRAINT:-}"
 LAUNCHER="${TMAX_SIF_BUILD_LAUNCHER:-sbatch-container}"
 BUILD_CONTAINER_IMAGE="${TMAX_SIF_BUILD_CONTAINER_IMAGE:-flappydora/ubuntu22.04-cuda13.3:latest}"
 BUILD_CONTAINER_MOUNTS="${TMAX_SIF_BUILD_CONTAINER_MOUNTS:-/lustre/fsw:/lustre/fsw}"
-LOG_DIR="${TMAX_SIF_BUILD_LOG_DIR:-${PROJECT_ROOT}/logs/slurm}"
+LOG_DIR="${TMAX_SIF_BUILD_LOG_DIR:-${TMAX_DATA_ROOT}/logs/slurm}"
 PYTHON_BIN="${TMAX_SIF_PYTHON_BIN:-${PYTHON_BIN:-/lustre/fsw/portfolios/nvr/projects/nvr_lpr_llm/users/jiaruiy/.python/polar/bin/python}}"
 
 SHARDS="${TMAX_SIF_BUILD_SHARDS:-1000}"

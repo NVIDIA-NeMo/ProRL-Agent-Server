@@ -69,7 +69,8 @@ case "$TRAIN_SQSH" in
         fi ;;
     *) : ;;  # docker:// or registry ref — leave it to pyxis/enroot to resolve
 esac
-LOG_DIR="${PROJECT_ROOT}/logs/slurm"; mkdir -p "${LOG_DIR}"
+LOG_DIR="${POLAR_SLURM_LOG_DIR:-${DATA_ROOT}/logs/slurm}"
+mkdir -p "${LOG_DIR}"
 POLAR_LAUNCHER_LABEL="${POLAR_LAUNCHER_LABEL:-Polar SWE-Gym Slime-GRPO (Route A)}"
 
 echo "============================================="

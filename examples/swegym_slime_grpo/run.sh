@@ -26,6 +26,7 @@ PROJECT_ROOT="${POLAR_TRAIN_PROJECT_ROOT:-$(cd -- "${SCRIPT_DIR}/../.." && pwd)}
 # shellcheck source=./launcher_utils.sh
 source "${SCRIPT_DIR}/launcher_utils.sh"
 RUN_DIR="${RUN_DIR:-${PROJECT_ROOT}/tmp/swegym_slime_grpo}"
+WANDB_DIR="${WANDB_DIR:-${RUN_DIR}/wandb}"
 export POLAR_ROLLOUT_SAVE_DIR="${POLAR_ROLLOUT_SAVE_DIR:-${RUN_DIR}/rollout_results}"
 export POLAR_ROLLOUT_EXAMPLES_DIR="${POLAR_ROLLOUT_EXAMPLES_DIR:-${RUN_DIR}/trajectory_examples}"
 export POLAR_ROLLOUT_EXAMPLE_INTERVAL="${POLAR_ROLLOUT_EXAMPLE_INTERVAL:-10}"
@@ -35,6 +36,13 @@ case "${POLAR_ROLLOUT_SAVE_DIR}" in
     /*) ;;
     *)
         echo "ERROR: POLAR_ROLLOUT_SAVE_DIR must be absolute: ${POLAR_ROLLOUT_SAVE_DIR}" >&2
+        exit 1
+        ;;
+esac
+case "${WANDB_DIR}" in
+    /*) ;;
+    *)
+        echo "ERROR: WANDB_DIR must be absolute: ${WANDB_DIR}" >&2
         exit 1
         ;;
 esac
@@ -59,7 +67,7 @@ case "${POLAR_ROLLOUT_EXAMPLES_WANDB}" in
         export POLAR_ROLLOUT_EXAMPLES_WANDB=1
         ;;
 esac
-mkdir -p "${RUN_DIR}" "${PROJECT_ROOT}/logs"
+mkdir -p "${RUN_DIR}" "${WANDB_DIR}"
 if [[ "${POLAR_ROLLOUT_EXAMPLES_DIR}" = /* ]] && \
    ! mkdir -p "${POLAR_ROLLOUT_EXAMPLES_DIR}"; then
     echo "WARNING: could not create trajectory-example directory; training will continue" >&2
@@ -1699,7 +1707,7 @@ RUNTIME_ENV_JSON="{
     \"WANDB_RESUME\": \"${WANDB_RESUME:-allow}\",
     \"HF_TOKEN\": \"${HF_TOKEN:-}\",
     \"HUGGINGFACE_HUB_TOKEN\": \"${HUGGINGFACE_HUB_TOKEN:-${HF_TOKEN:-}}\",
-    \"WANDB_DIR\": \"${PROJECT_ROOT}/logs\",
+    \"WANDB_DIR\": \"${WANDB_DIR}\",
     \"TORCHINDUCTOR_CACHE_DIR\": \"${TORCHINDUCTOR_CACHE_DIR}\",
     \"TRITON_CACHE_DIR\": \"${TRITON_CACHE_DIR}\",
     \"LD_LIBRARY_PATH\": \"${RUNTIME_LD_LIBRARY_PATH}\",
