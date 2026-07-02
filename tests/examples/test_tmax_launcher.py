@@ -58,7 +58,7 @@ def test_launchers_keep_runtime_outputs_under_the_data_root() -> None:
     tmax_sif_submit = (ROOT / "examples" / "tmax-15k" / "submit_build_sifs_slurm.sh").read_text()
     hf_export = (TMAX / "export_hf_checkpoint.sh").read_text()
 
-    assert 'WANDB_DIR="${WANDB_DIR:-${RUN_DIR}/wandb}"' in shared_run
+    assert 'export WANDB_DIR="${WANDB_DIR:-${RUN_DIR}/wandb}"' in shared_run
     assert 'mkdir -p "${RUN_DIR}" "${WANDB_DIR}"' in shared_run
     assert '\\"WANDB_DIR\\": \\"${WANDB_DIR}\\"' in shared_run
     assert '${PROJECT_ROOT}/logs' not in shared_run
@@ -406,14 +406,20 @@ def test_launcher_records_real_startup_barriers_without_fixed_ray_sleep() -> Non
         "SLIME_CONTAINER_ENTRY_UNIX_NS",
         "SLIME_JOB_SCRIPT_START_UNIX_NS",
         "SLIME_RAY_READY_UNIX_NS",
-        "SLIME_POLAR_ROLLOUT_READY_UNIX_NS",
-        "SLIME_POLAR_GATEWAY_READY_UNIX_NS",
-        "SLIME_POLAR_UDS_READY_UNIX_NS",
+        "SLIME_ROLLOUT_SERVICE_START_UNIX_NS",
+        "SLIME_ROLLOUT_SERVICE_READY_UNIX_NS",
+        "SLIME_GATEWAY_START_UNIX_NS",
+        "SLIME_GATEWAY_READY_UNIX_NS",
+        "SLIME_UDS_TUNNEL_START_UNIX_NS",
+        "SLIME_UDS_TUNNEL_READY_UNIX_NS",
+        "SLIME_SERVICES_READY_UNIX_NS",
         "SLIME_RAY_JOB_SUBMIT_UNIX_NS",
     ):
         assert f'\\"{marker}\\"' in shared_run
     assert "export SLIME_SLURM_BATCH_START_UNIX_NS=\\$(date +%s%N)" in shared_submit
     assert '_SLIME_CONTAINER_ENTRY_UNIX_NS="$(date +%s%N)"' in container_entrypoint
+    assert "SLIME_POLAR_" not in shared_run
+    assert "SLIME_POLAR_" not in container_entrypoint
 
 
 def test_ray_primary_receives_gpu_axis_topology() -> None:

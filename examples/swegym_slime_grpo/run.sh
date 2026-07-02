@@ -26,7 +26,7 @@ PROJECT_ROOT="${POLAR_TRAIN_PROJECT_ROOT:-$(cd -- "${SCRIPT_DIR}/../.." && pwd)}
 # shellcheck source=./launcher_utils.sh
 source "${SCRIPT_DIR}/launcher_utils.sh"
 RUN_DIR="${RUN_DIR:-${PROJECT_ROOT}/tmp/swegym_slime_grpo}"
-WANDB_DIR="${WANDB_DIR:-${RUN_DIR}/wandb}"
+export WANDB_DIR="${WANDB_DIR:-${RUN_DIR}/wandb}"
 export POLAR_ROLLOUT_SAVE_DIR="${POLAR_ROLLOUT_SAVE_DIR:-${RUN_DIR}/rollout_results}"
 export POLAR_ROLLOUT_EXAMPLES_DIR="${POLAR_ROLLOUT_EXAMPLES_DIR:-${RUN_DIR}/trajectory_examples}"
 export POLAR_ROLLOUT_EXAMPLE_INTERVAL="${POLAR_ROLLOUT_EXAMPLE_INTERVAL:-10}"
@@ -1614,13 +1614,13 @@ PY
 
     # Keep one authoritative rollout server. Gateway processes on every rank
     # register with it and retain their node-local sandbox/UDS lifecycle.
-    export SLIME_POLAR_ROLLOUT_START_UNIX_NS="$(date +%s%N)"
+    export SLIME_ROLLOUT_SERVICE_START_UNIX_NS="$(date +%s%N)"
     echo "=== Starting Polar rollout server (${POLAR_ROLLOUT_URL}) ==="
     polar serve_rollout -c "${TOPOLOGY_PATH}" &
     POLAR_ROLLOUT_PID=$!
     PIDS+=("${POLAR_ROLLOUT_PID}")
     wait_http_ok "Polar rollout server" "${POLAR_ROLLOUT_LOCAL_URL}/health" 60
-    export SLIME_POLAR_ROLLOUT_READY_UNIX_NS="$(date +%s%N)"
+    export SLIME_ROLLOUT_SERVICE_READY_UNIX_NS="$(date +%s%N)"
     touch "${RAY_READY_DIR}/polar_rollout_ready"
 else
     wait_for_shared_marker \
@@ -1633,8 +1633,8 @@ fi
 # ── Step 2: Polar gateway fleet (node-local CPU + UDS) ─────────────
 if [ "${POLAR_MULTI_GATEWAY}" = "1" ] || [ "${RAY_NODE_RANK}" = "0" ]; then
     if [ "${RAY_NODE_RANK}" = "0" ]; then
-        export SLIME_POLAR_GATEWAY_START_UNIX_NS="$(date +%s%N)"
-        export SLIME_POLAR_UDS_START_UNIX_NS="${SLIME_POLAR_GATEWAY_START_UNIX_NS}"
+        export SLIME_GATEWAY_START_UNIX_NS="$(date +%s%N)"
+        export SLIME_UDS_TUNNEL_START_UNIX_NS="${SLIME_GATEWAY_START_UNIX_NS}"
     fi
     start_polar_gateway
     touch "${RAY_READY_DIR}/gateway_ready_rank_${RAY_NODE_RANK}"
@@ -1642,9 +1642,9 @@ fi
 
 if [ "${RAY_NODE_RANK}" = "0" ]; then
     wait_gateway_fleet_ready "${POLAR_GATEWAY_COUNT}"
-    export SLIME_POLAR_GATEWAY_READY_UNIX_NS="$(date +%s%N)"
-    export SLIME_POLAR_UDS_READY_UNIX_NS="${SLIME_POLAR_GATEWAY_READY_UNIX_NS}"
-    export SLIME_POLAR_READY_UNIX_NS="${SLIME_POLAR_GATEWAY_READY_UNIX_NS}"
+    export SLIME_GATEWAY_READY_UNIX_NS="$(date +%s%N)"
+    export SLIME_UDS_TUNNEL_READY_UNIX_NS="${SLIME_GATEWAY_READY_UNIX_NS}"
+    export SLIME_SERVICES_READY_UNIX_NS="${SLIME_GATEWAY_READY_UNIX_NS}"
 else
     if [ "${POLAR_MULTI_GATEWAY}" = "1" ]; then
         wait_for_run_done_with_sidecars
@@ -1679,13 +1679,13 @@ RUNTIME_ENV_JSON="{
     \"SLIME_CONTAINER_ENTRY_UNIX_NS\": \"${SLIME_CONTAINER_ENTRY_UNIX_NS:-}\",
     \"SLIME_JOB_SCRIPT_START_UNIX_NS\": \"${SLIME_JOB_SCRIPT_START_UNIX_NS}\",
     \"SLIME_RAY_READY_UNIX_NS\": \"${SLIME_RAY_READY_UNIX_NS}\",
-    \"SLIME_POLAR_ROLLOUT_START_UNIX_NS\": \"${SLIME_POLAR_ROLLOUT_START_UNIX_NS}\",
-    \"SLIME_POLAR_ROLLOUT_READY_UNIX_NS\": \"${SLIME_POLAR_ROLLOUT_READY_UNIX_NS}\",
-    \"SLIME_POLAR_GATEWAY_START_UNIX_NS\": \"${SLIME_POLAR_GATEWAY_START_UNIX_NS}\",
-    \"SLIME_POLAR_GATEWAY_READY_UNIX_NS\": \"${SLIME_POLAR_GATEWAY_READY_UNIX_NS}\",
-    \"SLIME_POLAR_UDS_START_UNIX_NS\": \"${SLIME_POLAR_UDS_START_UNIX_NS}\",
-    \"SLIME_POLAR_UDS_READY_UNIX_NS\": \"${SLIME_POLAR_UDS_READY_UNIX_NS}\",
-    \"SLIME_POLAR_READY_UNIX_NS\": \"${SLIME_POLAR_READY_UNIX_NS}\",
+    \"SLIME_ROLLOUT_SERVICE_START_UNIX_NS\": \"${SLIME_ROLLOUT_SERVICE_START_UNIX_NS}\",
+    \"SLIME_ROLLOUT_SERVICE_READY_UNIX_NS\": \"${SLIME_ROLLOUT_SERVICE_READY_UNIX_NS}\",
+    \"SLIME_GATEWAY_START_UNIX_NS\": \"${SLIME_GATEWAY_START_UNIX_NS}\",
+    \"SLIME_GATEWAY_READY_UNIX_NS\": \"${SLIME_GATEWAY_READY_UNIX_NS}\",
+    \"SLIME_UDS_TUNNEL_START_UNIX_NS\": \"${SLIME_UDS_TUNNEL_START_UNIX_NS}\",
+    \"SLIME_UDS_TUNNEL_READY_UNIX_NS\": \"${SLIME_UDS_TUNNEL_READY_UNIX_NS}\",
+    \"SLIME_SERVICES_READY_UNIX_NS\": \"${SLIME_SERVICES_READY_UNIX_NS}\",
     \"SLIME_RAY_JOB_SUBMIT_UNIX_NS\": \"${SLIME_RAY_JOB_SUBMIT_UNIX_NS}\",
     \"SLIME_TRAIN_PROGRESS_FILE\": \"${SLIME_TRAIN_PROGRESS_FILE}\",
     \"GPU_MONITOR_PREFIX\": \"${GPU_MONITOR_PREFIX:-polar_system}\",
