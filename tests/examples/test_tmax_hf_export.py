@@ -23,16 +23,21 @@ def _write_distcp_metadata(model_dir: Path, *shard_names: str) -> None:
     (model_dir / ".metadata").write_bytes(pickle.dumps(payload, protocol=4))
 
 
-def _write_bf16_safetensors(path: Path, tensor_name: str) -> None:
+def _write_safetensors(
+    path: Path, tensor_name: str, *, dtype: str = "BF16"
+) -> None:
+    element_size = {"BF16": 2, "F32": 4}[dtype]
     header = {
         tensor_name: {
-            "dtype": "BF16",
+            "dtype": dtype,
             "shape": [1],
-            "data_offsets": [0, 2],
+            "data_offsets": [0, element_size],
         }
     }
     encoded = json.dumps(header, separators=(",", ":")).encode()
-    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + b"\0\0")
+    path.write_bytes(
+        struct.pack("<Q", len(encoded)) + encoded + b"\0" * element_size
+    )
 
 
 def test_hf_export_worker_supports_nested_qwen_text_config(tmp_path: Path) -> None:
@@ -53,11 +58,23 @@ def test_hf_export_worker_supports_nested_qwen_text_config(tmp_path: Path) -> No
         )
     )
     tensor_name = "model.embed_tokens.weight"
-    shard_name = "model-00001-of-00001.safetensors"
+    lm_head_name = "lm_head.weight"
+    shard_name = "model-00001-of-00002.safetensors"
+    lm_head_shard_name = "model-00002-of-00002.safetensors"
     (origin / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {tensor_name: shard_name}})
+        json.dumps(
+            {
+                "weight_map": {
+                    tensor_name: shard_name,
+                    lm_head_name: lm_head_shard_name,
+                }
+            }
+        )
     )
-    _write_bf16_safetensors(origin / shard_name, tensor_name)
+    _write_safetensors(origin / shard_name, tensor_name)
+    _write_safetensors(
+        origin / lm_head_shard_name, lm_head_name, dtype="F32"
+    )
     for asset in ("tokenizer_config.json", "tokenizer.json", "chat_template.jinja"):
         (origin / asset).write_text("{}" if asset.endswith(".json") else "{{ messages }}")
 
@@ -103,4 +120,4 @@ shutil.copytree(args.origin_hf_dir, args.output_dir)
     manifest = json.loads((output_dir / ".export_complete.json").read_text())
     assert manifest["model_type"] == "qwen3_5"
     assert manifest["vocab_size"] == 248320
-    assert manifest["dtype_counts"] == {"BF16": 1}
+    assert manifest["dtype_counts"] == {"BF16": 1, "F32": 1}

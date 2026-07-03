@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# One-click export of a numbered TMax torch_dist checkpoint to a complete BF16
-# HuggingFace safetensors directory. The public mode submits one Slurm job; the
-# hidden --worker mode performs the conversion inside that allocation.
+# One-click export of a numbered TMax torch_dist checkpoint to a complete
+# HuggingFace safetensors directory while preserving checkpoint dtypes. The
+# public mode submits one Slurm job; the hidden --worker mode performs the
+# conversion inside that allocation.
 set -euo pipefail
 umask 077
 
@@ -165,7 +166,7 @@ extra = sorted(set(out_map) - set(origin_map))
 if missing or extra:
     raise RuntimeError(f"weight-key mismatch: missing={missing[:20]} extra={extra[:20]}")
 
-seen, dtypes, weight_bytes = {}, Counter(), 0
+seen, tensor_dtypes, dtypes, weight_bytes = {}, {}, Counter(), 0
 for name in sorted(set(out_map.values())):
     path = out / name
     if not path.is_file():
@@ -180,12 +181,20 @@ for name in sorted(set(out_map.values())):
         if key in seen:
             raise RuntimeError(f"duplicate tensor: {key}")
         seen[key] = name
+        tensor_dtypes[key] = metadata["dtype"]
         dtypes[metadata["dtype"]] += 1
 
 if seen != out_map:
     raise RuntimeError("safetensors index does not match shard contents")
-if set(dtypes) != {"BF16"}:
-    raise RuntimeError(f"expected BF16 only, found {dict(dtypes)}")
+unexpected_dtypes = {
+    key: dtype
+    for key, dtype in tensor_dtypes.items()
+    if dtype != "BF16" and not (key == "lm_head.weight" and dtype == "F32")
+}
+if unexpected_dtypes:
+    raise RuntimeError(
+        f"unexpected tensor dtypes: {unexpected_dtypes}; counts={dict(dtypes)}"
+    )
 config = load(out / "config.json")
 origin_config = load(origin / "config.json")
 for field in ("model_type", "vocab_size"):
