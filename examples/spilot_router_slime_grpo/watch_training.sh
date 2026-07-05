@@ -3,11 +3,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
-SPILOT_ROOT="$(cd -- "${PROJECT_ROOT}/../.." && pwd)"
-
-export POLAR_DATA_ROOT="${POLAR_DATA_ROOT:-${SPILOT_ROOT}/data}"
-export TMAX_RUN_STATE_FILE="${TMAX_RUN_STATE_FILE:-${POLAR_DATA_ROOT}/runs/spilot_router_slime_grpo/current_run.env}"
+# A watcher with no run state must bootstrap the exact same contract as the
+# first submitter, rather than inheriting the shared TMax example defaults.
+# shellcheck source=./experiment_defaults.sh
+source "${SCRIPT_DIR}/experiment_defaults.sh"
 export TMAX_SUBMIT_SCRIPT="${SCRIPT_DIR}/submit_slurm.sh"
 
 # Credentials are intentionally excluded from TMax run state. Every watcher

@@ -179,33 +179,66 @@ def test_spilot_fixed_eval_payload_normalizes_generic_overrides() -> None:
 
 def test_spilot_submit_wrapper_pins_8_nodes_and_200_steps() -> None:
     script = (EXAMPLE / "submit_slurm.sh").read_text()
+    defaults = (EXAMPLE / "experiment_defaults.sh").read_text()
 
-    assert 'NUM_NODES="${NUM_NODES:-8}"' in script
-    assert 'ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-56}"' in script
-    assert 'ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"' in script
-    assert 'N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"' in script
-    assert 'POLAR_FULLY_ASYNC="${POLAR_FULLY_ASYNC:-false}"' in script
-    assert 'POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-1}"' in script
-    assert 'TMAX_NUM_ROLLOUT="${TMAX_NUM_ROLLOUT:-200}"' in script
-    assert 'SAVE_INTERVAL="${SAVE_INTERVAL:-5}"' in script
-    assert 'TMAX_EVAL_MAX_TASKS="${TMAX_EVAL_MAX_TASKS:-32}"' in script
-    assert 'TMAX_EXTERNAL_EVAL_ENABLED="${TMAX_EXTERNAL_EVAL_ENABLED:-0}"' in script
-    assert 'TMAX_ONLY_READY="${TMAX_ONLY_READY:-1}"' in script
-    assert 'TMAX_REQUIRE_EXACT_TOTAL_TASKS="${TMAX_REQUIRE_EXACT_TOTAL_TASKS:-0}"' in script
+    assert 'source "${SCRIPT_DIR}/experiment_defaults.sh"' in script
+    assert 'NUM_NODES="${NUM_NODES:-8}"' in defaults
+    assert 'ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-56}"' in defaults
+    assert 'ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"' in defaults
+    assert 'N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"' in defaults
+    assert 'POLAR_FULLY_ASYNC="${POLAR_FULLY_ASYNC:-false}"' in defaults
+    assert 'POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-1}"' in defaults
+    assert 'TMAX_NUM_ROLLOUT="${TMAX_NUM_ROLLOUT:-200}"' in defaults
+    assert 'SAVE_INTERVAL="${SAVE_INTERVAL:-5}"' in defaults
+    assert 'TMAX_EVAL_MAX_TASKS="${TMAX_EVAL_MAX_TASKS:-32}"' in defaults
+    assert 'TMAX_EXTERNAL_EVAL_ENABLED="${TMAX_EXTERNAL_EVAL_ENABLED:-0}"' in defaults
+    assert 'TMAX_ONLY_READY="${TMAX_ONLY_READY:-1}"' in defaults
+    assert 'TMAX_REQUIRE_EXACT_TOTAL_TASKS="${TMAX_REQUIRE_EXACT_TOTAL_TASKS:-0}"' in defaults
     assert "POLAR_NVIDIA_API_KEY" in script
     assert "POLAR_CONTROL_PLANE_TOKEN" in script
     assert "/dev/urandom" in script
-    assert "runs/spilot_router_slime_grpo/current_run.env" in script
+    assert "runs/spilot_router_slime_grpo/current_run.env" in defaults
     assert "api_key=" not in (EXAMPLE / "topology.yaml").read_text().lower()
 
 
 def test_spilot_watcher_relaunches_through_spilot_submitter() -> None:
     script = (EXAMPLE / "watch_training.sh").read_text()
+    defaults = (EXAMPLE / "experiment_defaults.sh").read_text()
 
+    assert 'source "${SCRIPT_DIR}/experiment_defaults.sh"' in script
     assert 'TMAX_SUBMIT_SCRIPT="${SCRIPT_DIR}/submit_slurm.sh"' in script
-    assert "runs/spilot_router_slime_grpo/current_run.env" in script
+    assert "runs/spilot_router_slime_grpo/current_run.env" in defaults
     assert "POLAR_NVIDIA_API_KEY" in script
     assert "NVIDIA_API_KEY is not set" in script
+
+
+def test_spilot_shared_defaults_bootstrap_watcher_contract() -> None:
+    completed = subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                "unset NUM_NODES ROLLOUT_NUM_GPUS ROLLOUT_BATCH_SIZE "
+                "N_SAMPLES_PER_PROMPT POLAR_FULLY_ASYNC TMAX_NUM_ROLLOUT "
+                "TMAX_AGENT_HARNESS EXPERIMENT_NAME; "
+                'source "$1"; '
+                "printf '%s|%s|%s|%s|%s|%s|%s|%s' "
+                '"$NUM_NODES" "$ROLLOUT_NUM_GPUS" "$ROLLOUT_BATCH_SIZE" '
+                '"$N_SAMPLES_PER_PROMPT" "$POLAR_FULLY_ASYNC" '
+                '"$TMAX_NUM_ROLLOUT" "$TMAX_AGENT_HARNESS" "$EXPERIMENT_NAME"'
+            ),
+            "bash",
+            str(EXAMPLE / "experiment_defaults.sh"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == (
+        "8|56|8|8|false|200|spilot_router|spilot-router-qwen35-9b-8n-200step"
+    )
 
 
 def test_spilot_smoke_is_one_node_one_step_without_dynamic_filtering() -> None:
@@ -226,7 +259,13 @@ def test_spilot_smoke_is_one_node_one_step_without_dynamic_filtering() -> None:
 
 
 def test_spilot_shell_wrappers_parse() -> None:
-    for name in ("run.sh", "submit_slurm.sh", "submit_smoke.sh", "watch_training.sh"):
+    for name in (
+        "experiment_defaults.sh",
+        "run.sh",
+        "submit_slurm.sh",
+        "submit_smoke.sh",
+        "watch_training.sh",
+    ):
         completed = subprocess.run(
             ["bash", "-n", str(EXAMPLE / name)],
             check=False,
