@@ -875,6 +875,35 @@ printf '%s' "$CONTEXT_PARALLEL_SIZE|$actor_dp|$((MAX_TOKENS_PER_GPU * CONTEXT_PA
     assert '--context-parallel-size "$CONTEXT_PARALLEL_SIZE"' in (SHARED / "run.sh").read_text()
 
 
+def test_tmax_rejects_microbatch_cap_below_full_pack_by_default(tmp_path: Path) -> None:
+    env = clean_env(tmp_path)
+    env["MAX_TOKENS_PER_GPU"] = "24576"
+
+    result = run_bash(f"source {TMAX / 'env.cwdfw.sh'}", env=env, check=False)
+
+    assert result.returncode != 0
+    assert "trainer token capacity MAX_TOKENS_PER_GPU*CP=24576" in result.stderr
+    assert "TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP=1" in result.stderr
+
+
+def test_tmax_explicitly_allows_aggregate_microbatch_cap_below_pack(tmp_path: Path) -> None:
+    env = clean_env(tmp_path)
+    env.update(
+        MAX_TOKENS_PER_GPU="24576",
+        TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP="1",
+    )
+
+    result = run_bash(
+        f"source {TMAX / 'env.cwdfw.sh'} >/dev/null; "
+        'printf \'%s|%s\' "$MAX_TOKENS_PER_GPU" '
+        '"$TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP"',
+        env=env,
+    )
+
+    assert result.stdout == "24576|1"
+    assert "TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP" in (TMAX / "run_state.sh").read_text()
+
+
 def test_tmax_enables_true_trainer_fp32_lm_head_by_default(tmp_path: Path) -> None:
     env = clean_env(tmp_path)
     result = run_bash(

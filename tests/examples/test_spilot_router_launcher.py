@@ -196,6 +196,12 @@ def test_spilot_submit_wrapper_pins_8_nodes_and_200_steps() -> None:
     assert 'N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"' in defaults
     assert 'POLAR_FULLY_ASYNC="${POLAR_FULLY_ASYNC:-false}"' in defaults
     assert 'POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-4}"' in defaults
+    assert 'MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-24576}"' in defaults
+    assert (
+        'TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP="${TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP:-1}"'
+        in defaults
+    )
+    assert 'LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-64}"' in defaults
     assert 'TMAX_NUM_ROLLOUT="${TMAX_NUM_ROLLOUT:-200}"' in defaults
     assert 'SAVE_INTERVAL="${SAVE_INTERVAL:-1}"' in defaults
     assert 'SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-${TMAX_NUM_ROLLOUT}}"' in defaults
@@ -235,16 +241,20 @@ def test_spilot_shared_defaults_bootstrap_watcher_contract() -> None:
                 "TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL ROLLOUT_NUM_GPUS "
                 "POLAR_SLURM_MEM_PER_NODE ROLLOUT_BATCH_SIZE "
                 "N_SAMPLES_PER_PROMPT POLAR_FULLY_ASYNC TMAX_NUM_ROLLOUT "
-                "SAVE_INTERVAL SAVE_RETAIN_INTERVAL TMAX_AGENT_HARNESS EXPERIMENT_NAME; "
+                "MAX_TOKENS_PER_GPU TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP "
+                "LOG_PROBS_CHUNK_SIZE SAVE_INTERVAL SAVE_RETAIN_INTERVAL "
+                "TMAX_AGENT_HARNESS EXPERIMENT_NAME; "
                 'source "$1"; '
-                "printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' "
+                "printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' "
                 '"$NUM_NODES" "$SLURM_GPUS" "$RAY_NUM_GPUS_PER_NODE" '
                 '"$ACTOR_NUM_NODES" "$ACTOR_NUM_GPUS_PER_NODE" '
                 '"$ACTOR_TENSOR_MODEL_PARALLEL_SIZE" '
                 '"$TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL" "$ROLLOUT_NUM_GPUS" '
                 '"$POLAR_SLURM_MEM_PER_NODE" "$ROLLOUT_BATCH_SIZE" '
                 '"$N_SAMPLES_PER_PROMPT" "$POLAR_FULLY_ASYNC" '
-                '"$TMAX_NUM_ROLLOUT" "$SAVE_INTERVAL" "$SAVE_RETAIN_INTERVAL" '
+                '"$TMAX_NUM_ROLLOUT" "$MAX_TOKENS_PER_GPU" '
+                '"$TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP" "$LOG_PROBS_CHUNK_SIZE" '
+                '"$SAVE_INTERVAL" "$SAVE_RETAIN_INTERVAL" '
                 '"$TMAX_AGENT_HARNESS" "$EXPERIMENT_NAME"'
             ),
             "bash",
@@ -257,7 +267,7 @@ def test_spilot_shared_defaults_bootstrap_watcher_contract() -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout == (
-        "8|1|1|4|1|4|1|4|250G|1|8|false|200|1|200|spilot_router|"
+        "8|1|1|4|1|4|1|4|250G|1|8|false|200|24576|1|64|1|200|spilot_router|"
         "spilot-router-qwen35-9b-8n-200step"
     )
 

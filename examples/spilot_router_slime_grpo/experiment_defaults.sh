@@ -46,6 +46,20 @@ export POLAR_MAX_RUN_WORKERS="${POLAR_MAX_RUN_WORKERS:-16}"
 export POLAR_MAX_POSTRUN_WORKERS="${POLAR_MAX_POSTRUN_WORKERS:-8}"
 export POLAR_APPTAINER_BROKER_START_CONCURRENCY="${POLAR_APPTAINER_BROKER_START_CONCURRENCY:-8}"
 
+# After Adam state is materialized, one 40k-token Router group does not leave
+# enough room for the FP32 vocabulary loss on an 80 GiB actor rank.  Keep the
+# full 67,584-token per-trajectory contract, but ask Slime's dynamic scheduler
+# to accumulate the group as <=24,576-token microbatches.  A single unusually
+# long trajectory remains legal and is scheduled alone; Router observations
+# are independently bounded to 12,000 characters by polar_config.yaml.
+export MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-24576}"
+export TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP="${TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP:-1}"
+
+# Also match the validated Qwen3.5-9B TMax recipe's vocabulary chunk size.  It
+# reduces the size of each FP32 allocation even though the microbatch cap is
+# the primary bound on total activation memory.
+export LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-64}"
+
 # Slime's boundary is exclusive: iterations 0..199 are 200 optimizer steps.
 export TMAX_NUM_ROLLOUT="${TMAX_NUM_ROLLOUT:-200}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-1}"

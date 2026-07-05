@@ -475,17 +475,46 @@ async def _submit_and_wait_for_task(
 
 
 def _resolve_max_tokens(args: Any) -> int | None:
-    """Safe per-sample cap for both the dynamic batcher and model sequence.
+    """Resolve the safe per-sample trajectory cap.
 
-    Megatron asserts every sample length <= max_tokens_per_gpu * cp_size.
-    The model's configured ``seq_length`` is an independent upper bound. Deep
-    agent trajectories can exceed either one, so the adapter receives the
-    smaller positive cap and keeps an exact causal prefix.
+    By default the dynamic microbatch budget is also treated as a per-sample
+    bound.  Slime's scheduler can instead admit an oversize individual sample
+    in a microbatch by itself; an explicit opt-in then leaves ``seq_length`` as
+    the hard trajectory bound while ``max_tokens_per_gpu`` controls only the
+    aggregate tokens packed into a microbatch.
     """
     mtpg = getattr(args, "max_tokens_per_gpu", None)
     seq_length = getattr(args, "seq_length", None)
+    raw_allow_oversize = getattr(
+        args,
+        "polar_allow_single_sample_over_token_cap",
+        False,
+    )
+    if isinstance(raw_allow_oversize, bool):
+        allow_oversize = raw_allow_oversize
+    elif isinstance(raw_allow_oversize, int) and raw_allow_oversize in (0, 1):
+        allow_oversize = bool(raw_allow_oversize)
+    elif isinstance(raw_allow_oversize, str) and raw_allow_oversize.strip().lower() in {
+        "0",
+        "1",
+        "false",
+        "true",
+        "no",
+        "yes",
+        "off",
+        "on",
+    }:
+        allow_oversize = raw_allow_oversize.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    else:
+        raise ValueError("polar_allow_single_sample_over_token_cap must be a boolean")
+
     caps: list[int] = []
-    if mtpg:
+    if mtpg and not allow_oversize:
         cp_size = int(getattr(args, "context_parallel_size", 1) or 1)
         caps.append(int(mtpg) * cp_size)
     if seq_length:
@@ -504,7 +533,8 @@ def _resolve_max_tokens(args: Any) -> int | None:
             "polar_max_trajectory_tokens exceeds trainer capacity: "
             f"configured={configured}, capacity={hard_cap} "
             f"(max_tokens_per_gpu={mtpg}, context_parallel_size="
-            f"{getattr(args, 'context_parallel_size', 1)}, seq_length={seq_length})"
+            f"{getattr(args, 'context_parallel_size', 1)}, seq_length={seq_length}, "
+            f"allow_single_sample_over_token_cap={allow_oversize})"
         )
     return configured
 

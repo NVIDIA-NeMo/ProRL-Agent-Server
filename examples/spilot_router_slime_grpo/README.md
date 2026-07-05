@@ -6,14 +6,21 @@ with a trainable Qwen3.5-9B Router and a fixed frozen pool:
 - `pool/qwen3.6-27b` -> `nvidia/qwen/qwen3.6-27b`
 - `pool/gpt-5.5` -> `openai/openai/gpt-5.5`
 
-The default experiment uses eight 8xH100 nodes and an exclusive Slime rollout
-boundary of 200, producing optimizer iterations 0 through 199. One node hosts
-the learner; the remaining 56 GPUs host independent TP1 Router rollout engines.
-Each step contains 8 prompts x 8 samples (64 episodes, 12,800 episodes total).
-Fully-async prefetch is disabled for this first run because the frozen remote
-pool, capped at 32 concurrent requests per model, is the throughput bottleneck.
+The default experiment requests one H100 on each of eight nodes and an
+exclusive Slime rollout boundary of 200, producing optimizer iterations 0
+through 199. Four cross-node GPUs form the TP4 learner and the other four GPUs
+host independent TP1 Router rollout engines. Each synchronous GRPO step
+contains one prompt x eight samples (eight episodes, 1,600 episodes total).
+Fully-async training prefetch is disabled for this first run; the async cap of
+four is used to overlap fixed-evaluation tasks across the rollout engines.
 The integrated baseline/final evaluation uses 32 held-out TMax tasks; the
 larger Terminal-Bench evaluation is intentionally left for a separate run.
+
+The Router keeps the full 67,584-token trajectory ceiling, but the learner
+accumulates groups in at most 24,576-token dynamic microbatches. This leaves
+headroom for Adam state and the TP4 FP32 vocabulary loss without changing the
+eight-episode effective batch. A 64-token log-probability chunk further bounds
+individual FP32 allocations.
 
 ## Credential handling
 

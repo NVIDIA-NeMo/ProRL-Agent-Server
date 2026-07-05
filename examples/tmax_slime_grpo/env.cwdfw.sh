@@ -242,6 +242,11 @@ export SEQ_LENGTH="${SEQ_LENGTH:-${TMAX_TRAIN_PACK_LENGTH}}"
 # must therefore admit one complete 67,584-token pack. TP4 sequence
 # parallelism and full recomputation provide the per-GPU memory reduction.
 export MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${TMAX_TRAIN_PACK_LENGTH}}"
+# The dynamic scheduler safely places an individual sample that exceeds its
+# token cap in a microbatch by itself.  TMax keeps this opt-in disabled because
+# a full 65k trajectory can be expensive; short-action harnesses such as
+# SPilot may opt in to use the cap strictly as an aggregate microbatch bound.
+export TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP="${TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP:-0}"
 # Qwen3.5-9B declares a native 262,144-token context, and the observed TP=2
 # SGLang engine KV pool holds about 1.568M tokens. A native-length request is
 # therefore admissible without lowering the current static-memory fraction.
@@ -344,8 +349,9 @@ _tmax_validate_resource_topology() {
     done
 
     if ! [[ "$TMAX_REQUIRE_FULL_GPU_ALLOCATION" =~ ^[01]$ ]] || \
-       ! [[ "$TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL" =~ ^[01]$ ]]; then
-        echo "ERROR: TMAX_REQUIRE_FULL_GPU_ALLOCATION and TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL must be 0 or 1" >&2
+       ! [[ "$TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL" =~ ^[01]$ ]] || \
+       ! [[ "$TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP" =~ ^[01]$ ]]; then
+        echo "ERROR: TMAX_REQUIRE_FULL_GPU_ALLOCATION, TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL, and TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP must be 0 or 1" >&2
         return 1
     fi
 
@@ -406,8 +412,10 @@ _tmax_validate_resource_topology() {
         echo "ERROR: TMax requires SEQ_LENGTH=prompt+total_response=${TMAX_TRAIN_PACK_LENGTH}, got SEQ_LENGTH=${SEQ_LENGTH}" >&2
         return 1
     fi
-    if [ "$((MAX_TOKENS_PER_GPU * CONTEXT_PARALLEL_SIZE))" -lt "${TMAX_TRAIN_PACK_LENGTH}" ]; then
+    if [ "$((MAX_TOKENS_PER_GPU * CONTEXT_PARALLEL_SIZE))" -lt "${TMAX_TRAIN_PACK_LENGTH}" ] && \
+       [ "${TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP}" -ne 1 ]; then
         echo "ERROR: trainer token capacity MAX_TOKENS_PER_GPU*CP=$((MAX_TOKENS_PER_GPU * CONTEXT_PARALLEL_SIZE)) is smaller than the complete TMax pack ${TMAX_TRAIN_PACK_LENGTH}" >&2
+        echo "  Set TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP=1 only when the harness bounds individual trajectories independently; oversize samples run alone." >&2
         return 1
     fi
     if [ "$((rollout_product % NUM_STEPS_PER_ROLLOUT))" -ne 0 ]; then

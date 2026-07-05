@@ -270,6 +270,30 @@ def test_explicit_trajectory_cap_fails_instead_of_silently_clipping() -> None:
         _resolve_max_tokens(args)
 
 
+def test_explicit_trajectory_cap_can_exceed_aggregate_microbatch_cap() -> None:
+    args = SimpleNamespace(
+        max_tokens_per_gpu=24_576,
+        context_parallel_size=1,
+        seq_length=67_584,
+        polar_max_trajectory_tokens=67_584,
+        polar_allow_single_sample_over_token_cap=True,
+    )
+
+    assert _resolve_max_tokens(args) == 67_584
+
+
+def test_aggregate_microbatch_cap_opt_in_requires_boolean() -> None:
+    args = SimpleNamespace(
+        max_tokens_per_gpu=24_576,
+        context_parallel_size=1,
+        seq_length=67_584,
+        polar_allow_single_sample_over_token_cap="sometimes",
+    )
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        _resolve_max_tokens(args)
+
+
 def test_training_conversion_isolates_one_bad_session(monkeypatch) -> None:
     bad = SimpleNamespace(session_id="bad-session")
     good = SimpleNamespace(session_id="good-session")
