@@ -14,6 +14,7 @@ export TMAX_RUN_STATE_FILE="${TMAX_RUN_STATE_FILE:-${POLAR_DATA_ROOT}/runs/spilo
 # A one-prompt group keeps the train/sync cycle below the cluster's 30-minute
 # idle-GPU reclamation window while retaining eight samples for GRPO.
 export NUM_NODES="${NUM_NODES:-8}"
+export PARTITION="${PARTITION:-batch}"
 export SLURM_GPUS="${SLURM_GPUS:-1}"
 export RAY_NUM_GPUS_PER_NODE="${RAY_NUM_GPUS_PER_NODE:-1}"
 export ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-4}"
@@ -31,10 +32,15 @@ export SLURM_STEP_CPUS_PER_TASK="${SLURM_STEP_CPUS_PER_TASK:-14}"
 export POLAR_SLURM_MEM_PER_NODE="${POLAR_SLURM_MEM_PER_NODE:-250G}"
 
 # One synchronous 1-prompt x 8-sample GRPO batch: 8 episodes/step.
+# The async-level cap also sizes fixed-eval task concurrency.  Keep four eval
+# groups in flight so all four rollout engines overlap remote-model latency and
+# the 32-task baseline/final eval finishes inside the cluster's idle-GPU
+# reclamation window without overloading the remote endpoint.
+# Synchronous training still requests exactly one prompt group at a time.
 export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-1}"
 export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
 export POLAR_FULLY_ASYNC="${POLAR_FULLY_ASYNC:-false}"
-export POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-1}"
+export POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-4}"
 export POLAR_MAX_INIT_WORKERS="${POLAR_MAX_INIT_WORKERS:-8}"
 export POLAR_MAX_RUN_WORKERS="${POLAR_MAX_RUN_WORKERS:-16}"
 export POLAR_MAX_POSTRUN_WORKERS="${POLAR_MAX_POSTRUN_WORKERS:-8}"
@@ -47,6 +53,7 @@ export SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-${TMAX_NUM_ROLLOUT}}"
 export TMAX_AGENT_HARNESS="${TMAX_AGENT_HARNESS:-spilot_router}"
 export POLAR_AGENT_HARNESS="${TMAX_AGENT_HARNESS}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-spilot-router-qwen35-9b-8n-200step}"
+export WANDB_GROUP="${WANDB_GROUP:-spilot-router-qwen35-9b-8n1g}"
 
 export TMAX_TRAIN_AGENT_TIMEOUT_SECONDS="${TMAX_TRAIN_AGENT_TIMEOUT_SECONDS:-3300}"
 export POLAR_TASK_TIMEOUT_FLOOR_SECONDS="${POLAR_TASK_TIMEOUT_FLOOR_SECONDS:-4500}"

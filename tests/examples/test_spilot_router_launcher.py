@@ -183,6 +183,7 @@ def test_spilot_submit_wrapper_pins_8_nodes_and_200_steps() -> None:
 
     assert 'source "${SCRIPT_DIR}/experiment_defaults.sh"' in script
     assert 'NUM_NODES="${NUM_NODES:-8}"' in defaults
+    assert 'PARTITION="${PARTITION:-batch}"' in defaults
     assert 'SLURM_GPUS="${SLURM_GPUS:-1}"' in defaults
     assert 'RAY_NUM_GPUS_PER_NODE="${RAY_NUM_GPUS_PER_NODE:-1}"' in defaults
     assert 'ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-4}"' in defaults
@@ -194,10 +195,11 @@ def test_spilot_submit_wrapper_pins_8_nodes_and_200_steps() -> None:
     assert 'ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-1}"' in defaults
     assert 'N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"' in defaults
     assert 'POLAR_FULLY_ASYNC="${POLAR_FULLY_ASYNC:-false}"' in defaults
-    assert 'POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-1}"' in defaults
+    assert 'POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-4}"' in defaults
     assert 'TMAX_NUM_ROLLOUT="${TMAX_NUM_ROLLOUT:-200}"' in defaults
     assert 'SAVE_INTERVAL="${SAVE_INTERVAL:-1}"' in defaults
     assert 'SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-${TMAX_NUM_ROLLOUT}}"' in defaults
+    assert 'WANDB_GROUP="${WANDB_GROUP:-spilot-router-qwen35-9b-8n1g}"' in defaults
     assert 'TMAX_EVAL_MAX_TASKS="${TMAX_EVAL_MAX_TASKS:-32}"' in defaults
     assert 'TMAX_EXTERNAL_EVAL_ENABLED="${TMAX_EXTERNAL_EVAL_ENABLED:-0}"' in defaults
     assert 'TMAX_CONCURRENT_PRETRAIN_EVAL="${TMAX_CONCURRENT_PRETRAIN_EVAL:-0}"' in defaults
