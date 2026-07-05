@@ -183,15 +183,24 @@ def test_spilot_submit_wrapper_pins_8_nodes_and_200_steps() -> None:
 
     assert 'source "${SCRIPT_DIR}/experiment_defaults.sh"' in script
     assert 'NUM_NODES="${NUM_NODES:-8}"' in defaults
-    assert 'ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-56}"' in defaults
-    assert 'ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"' in defaults
+    assert 'SLURM_GPUS="${SLURM_GPUS:-1}"' in defaults
+    assert 'RAY_NUM_GPUS_PER_NODE="${RAY_NUM_GPUS_PER_NODE:-1}"' in defaults
+    assert 'ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-4}"' in defaults
+    assert 'ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-1}"' in defaults
+    assert 'ACTOR_TENSOR_MODEL_PARALLEL_SIZE="${ACTOR_TENSOR_MODEL_PARALLEL_SIZE:-4}"' in defaults
+    assert 'TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL="${TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL:-1}"' in defaults
+    assert 'ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-4}"' in defaults
+    assert 'POLAR_SLURM_MEM_PER_NODE="${POLAR_SLURM_MEM_PER_NODE:-250G}"' in defaults
+    assert 'ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-1}"' in defaults
     assert 'N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"' in defaults
     assert 'POLAR_FULLY_ASYNC="${POLAR_FULLY_ASYNC:-false}"' in defaults
     assert 'POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-1}"' in defaults
     assert 'TMAX_NUM_ROLLOUT="${TMAX_NUM_ROLLOUT:-200}"' in defaults
-    assert 'SAVE_INTERVAL="${SAVE_INTERVAL:-5}"' in defaults
+    assert 'SAVE_INTERVAL="${SAVE_INTERVAL:-1}"' in defaults
+    assert 'SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-${TMAX_NUM_ROLLOUT}}"' in defaults
     assert 'TMAX_EVAL_MAX_TASKS="${TMAX_EVAL_MAX_TASKS:-32}"' in defaults
     assert 'TMAX_EXTERNAL_EVAL_ENABLED="${TMAX_EXTERNAL_EVAL_ENABLED:-0}"' in defaults
+    assert 'TMAX_CONCURRENT_PRETRAIN_EVAL="${TMAX_CONCURRENT_PRETRAIN_EVAL:-0}"' in defaults
     assert 'TMAX_ONLY_READY="${TMAX_ONLY_READY:-1}"' in defaults
     assert 'TMAX_REQUIRE_EXACT_TOTAL_TASKS="${TMAX_REQUIRE_EXACT_TOTAL_TASKS:-0}"' in defaults
     assert "POLAR_NVIDIA_API_KEY" in script
@@ -218,14 +227,23 @@ def test_spilot_shared_defaults_bootstrap_watcher_contract() -> None:
             "bash",
             "-c",
             (
-                "unset NUM_NODES ROLLOUT_NUM_GPUS ROLLOUT_BATCH_SIZE "
+                "unset NUM_NODES SLURM_GPUS RAY_NUM_GPUS_PER_NODE "
+                "ACTOR_NUM_NODES ACTOR_NUM_GPUS_PER_NODE "
+                "ACTOR_TENSOR_MODEL_PARALLEL_SIZE "
+                "TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL ROLLOUT_NUM_GPUS "
+                "POLAR_SLURM_MEM_PER_NODE ROLLOUT_BATCH_SIZE "
                 "N_SAMPLES_PER_PROMPT POLAR_FULLY_ASYNC TMAX_NUM_ROLLOUT "
-                "TMAX_AGENT_HARNESS EXPERIMENT_NAME; "
+                "SAVE_INTERVAL SAVE_RETAIN_INTERVAL TMAX_AGENT_HARNESS EXPERIMENT_NAME; "
                 'source "$1"; '
-                "printf '%s|%s|%s|%s|%s|%s|%s|%s' "
-                '"$NUM_NODES" "$ROLLOUT_NUM_GPUS" "$ROLLOUT_BATCH_SIZE" '
+                "printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' "
+                '"$NUM_NODES" "$SLURM_GPUS" "$RAY_NUM_GPUS_PER_NODE" '
+                '"$ACTOR_NUM_NODES" "$ACTOR_NUM_GPUS_PER_NODE" '
+                '"$ACTOR_TENSOR_MODEL_PARALLEL_SIZE" '
+                '"$TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL" "$ROLLOUT_NUM_GPUS" '
+                '"$POLAR_SLURM_MEM_PER_NODE" "$ROLLOUT_BATCH_SIZE" '
                 '"$N_SAMPLES_PER_PROMPT" "$POLAR_FULLY_ASYNC" '
-                '"$TMAX_NUM_ROLLOUT" "$TMAX_AGENT_HARNESS" "$EXPERIMENT_NAME"'
+                '"$TMAX_NUM_ROLLOUT" "$SAVE_INTERVAL" "$SAVE_RETAIN_INTERVAL" '
+                '"$TMAX_AGENT_HARNESS" "$EXPERIMENT_NAME"'
             ),
             "bash",
             str(EXAMPLE / "experiment_defaults.sh"),
@@ -237,7 +255,8 @@ def test_spilot_shared_defaults_bootstrap_watcher_contract() -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout == (
-        "8|56|8|8|false|200|spilot_router|spilot-router-qwen35-9b-8n-200step"
+        "8|1|1|4|1|4|1|4|250G|1|8|false|200|1|200|spilot_router|"
+        "spilot-router-qwen35-9b-8n-200step"
     )
 
 

@@ -104,6 +104,11 @@ unset -f _tmax_partition_list_contains
 unset _tmax_wall_seconds _tmax_min_wall_seconds _tmax_total_gpus _tmax_short_limit_seconds
 export CPUS_PER_TASK="${CPUS_PER_TASK:-128}"
 export SLURM_STEP_CPUS_PER_TASK="${SLURM_STEP_CPUS_PER_TASK:-120}"
+export POLAR_SLURM_MEM_PER_NODE="${POLAR_SLURM_MEM_PER_NODE:-0}"
+if ! [[ "${POLAR_SLURM_MEM_PER_NODE}" =~ ^(0|[1-9][0-9]*[KMGTP]?)$ ]]; then
+    echo "ERROR: POLAR_SLURM_MEM_PER_NODE must be 0 or a positive Slurm memory value (for example 250G)" >&2
+    return 1 2>/dev/null || exit 1
+fi
 export SUBMIT_BACKEND="${SUBMIT_BACKEND:-sbatch}"
 
 DEFAULT_TRAIN_SQSH="${POLAR_DATA_ROOT}/container/flappydora-ubuntu22.04-cuda13.3.sqsh"
@@ -212,6 +217,7 @@ export ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-24}"
 export ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
 export RAY_NUM_GPUS_PER_NODE="${RAY_NUM_GPUS_PER_NODE:-8}"
 export TMAX_REQUIRE_FULL_GPU_ALLOCATION="${TMAX_REQUIRE_FULL_GPU_ALLOCATION:-1}"
+export TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL="${TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL:-0}"
 export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 export NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
@@ -253,6 +259,21 @@ export SEQUENCE_PARALLEL="${SEQUENCE_PARALLEL:-1}"
 export DIST_CKPT_STRICTNESS="${DIST_CKPT_STRICTNESS:-log_all}"
 export ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
+export SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-}"
+if ! [[ "${SAVE_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: SAVE_INTERVAL must be a positive integer, got ${SAVE_INTERVAL}" >&2
+    return 1 2>/dev/null || exit 1
+fi
+if [ -n "${SAVE_RETAIN_INTERVAL}" ]; then
+    if ! [[ "${SAVE_RETAIN_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: SAVE_RETAIN_INTERVAL must be a positive integer, got ${SAVE_RETAIN_INTERVAL}" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    if [ "$((SAVE_RETAIN_INTERVAL % SAVE_INTERVAL))" -ne 0 ]; then
+        echo "ERROR: SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL} must be divisible by SAVE_INTERVAL=${SAVE_INTERVAL}" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+fi
 export NUM_EPOCH="${NUM_EPOCH:-1}"
 # Optional absolute rollout-loop boundary. Slime treats --num-rollout as an
 # exclusive upper bound, so the matching final checkpoint/watcher target is
@@ -322,8 +343,9 @@ _tmax_validate_resource_topology() {
         fi
     done
 
-    if ! [[ "$TMAX_REQUIRE_FULL_GPU_ALLOCATION" =~ ^[01]$ ]]; then
-        echo "ERROR: TMAX_REQUIRE_FULL_GPU_ALLOCATION must be 0 or 1" >&2
+    if ! [[ "$TMAX_REQUIRE_FULL_GPU_ALLOCATION" =~ ^[01]$ ]] || \
+       ! [[ "$TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL" =~ ^[01]$ ]]; then
+        echo "ERROR: TMAX_REQUIRE_FULL_GPU_ALLOCATION and TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL must be 0 or 1" >&2
         return 1
     fi
 
@@ -360,8 +382,10 @@ _tmax_validate_resource_topology() {
         echo "ERROR: ROLLOUT_NUM_GPUS must be divisible by ROLLOUT_NUM_GPUS_PER_ENGINE" >&2
         return 1
     fi
-    if [ "$((ACTOR_NUM_GPUS_PER_NODE % ACTOR_TENSOR_MODEL_PARALLEL_SIZE))" -ne 0 ]; then
+    if [ "$((ACTOR_NUM_GPUS_PER_NODE % ACTOR_TENSOR_MODEL_PARALLEL_SIZE))" -ne 0 ] && \
+       [ "${TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL}" != "1" ]; then
         echo "ERROR: actor GPUs per node ${ACTOR_NUM_GPUS_PER_NODE} must be divisible by tensor parallel size ${ACTOR_TENSOR_MODEL_PARALLEL_SIZE}" >&2
+        echo "  Set TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL=1 only when TP ranks intentionally span nodes." >&2
         return 1
     fi
     actor_parallel_size="$((ACTOR_TENSOR_MODEL_PARALLEL_SIZE * CONTEXT_PARALLEL_SIZE))"

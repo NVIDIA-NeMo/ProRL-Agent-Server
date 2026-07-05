@@ -1737,6 +1737,10 @@ fi
 if [ -n "${TRAINING_COMPLETE_MARKER:-}" ]; then
     TRAINING_LIFECYCLE_ARGS+=(--training-complete-marker "${TRAINING_COMPLETE_MARKER}")
 fi
+SAVE_RETENTION_ARGS=()
+if [ -n "${SAVE_RETAIN_INTERVAL:-}" ]; then
+    SAVE_RETENTION_ARGS+=(--save-retain-interval "${SAVE_RETAIN_INTERVAL}")
+fi
 echo "=== Launching train_async.py (Ray submission ${RAY_JOB_SUBMISSION_ID}) ==="
 # The custom reward post-processor already computes prompt-local GRPO
 # advantages.  Slime's --normalize-advantages whitens them again across every
@@ -1752,6 +1756,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     --train-env-vars "$TRAIN_PROGRESS_ENV_JSON" \
     --rollout-num-gpus "$ROLLOUT_NUM_GPUS" \
     --rollout-num-gpus-per-engine "$ROLLOUT_NUM_GPUS_PER_ENGINE" \
+    --num-gpus-per-node "$RAY_NUM_GPUS_PER_NODE" \
     "${MODEL_ARGS[@]}" \
     --hf-checkpoint "$HF_CHECKPOINT" \
     --ref-load "$REF_LOAD" \
@@ -1761,6 +1766,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     "${OPT_PARAM_SCHEDULER_ARGS[@]}" \
     --save "$SAVE_DIR" \
     --save-interval "${SAVE_INTERVAL:-10}" \
+    "${SAVE_RETENTION_ARGS[@]}" \
     "${TRAINING_LIFECYCLE_ARGS[@]}" \
     --update-weights-interval 1 \
     --rollout-function-path slime_bridge.rollout.generate_rollout_polar_async \

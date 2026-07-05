@@ -95,6 +95,21 @@ export ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-4096}"
 export ROLLOUT_MAX_PROMPT_LEN="${ROLLOUT_MAX_PROMPT_LEN:-16000}"
 export MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-20000}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-1}"
+export SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-}"
+if ! [[ "${SAVE_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: SAVE_INTERVAL must be a positive integer, got ${SAVE_INTERVAL}" >&2
+    return 1 2>/dev/null || exit 1
+fi
+if [ -n "${SAVE_RETAIN_INTERVAL}" ]; then
+    if ! [[ "${SAVE_RETAIN_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: SAVE_RETAIN_INTERVAL must be a positive integer, got ${SAVE_RETAIN_INTERVAL}" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    if [ "$((SAVE_RETAIN_INTERVAL % SAVE_INTERVAL))" -ne 0 ]; then
+        echo "ERROR: SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL} must be divisible by SAVE_INTERVAL=${SAVE_INTERVAL}" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+fi
 export POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-2}"
 export POLAR_REQUEST_TIMEOUT="${POLAR_REQUEST_TIMEOUT:-2400}"
 export POLAR_TASK_TIMEOUT_SECONDS="${POLAR_TASK_TIMEOUT_SECONDS:-900}"

@@ -32,6 +32,11 @@ SLURM_GPUS="${SLURM_GPUS:-8}"
 SLURM_CONSTRAINT="${SLURM_CONSTRAINT:-}"   # e.g. H100/H200/B200
 SLURM_EXCLUDE="${SLURM_EXCLUDE:-}"
 SBATCH_DEPENDENCY="${SBATCH_DEPENDENCY:-}"
+POLAR_SLURM_MEM_PER_NODE="${POLAR_SLURM_MEM_PER_NODE:-0}"
+if ! [[ "${POLAR_SLURM_MEM_PER_NODE}" =~ ^(0|[1-9][0-9]*[KMGTP]?)$ ]]; then
+    echo "ERROR: POLAR_SLURM_MEM_PER_NODE must be 0 or a positive Slurm memory value" >&2
+    exit 1
+fi
 
 # ── Training container ───────────────────────────────────────────────
 TRAIN_SQSH="${POLR_TRAIN_SQSH:?set POLR_TRAIN_SQSH (your train.sqsh; build via build_training_sqsh.sh)}"
@@ -141,7 +146,7 @@ umask 077
             SLIME_SUBMIT_UNIX_NS|MEGATRON_DIR|REF_LOAD|TORCH_DIST_DIR|MODEL_ARGS_FILE|\
             ACCOUNT|PARTITION|NUM_NODES|WALL_TIME|CPUS_PER_TASK|SLURM_GPUS|\
             N_SAMPLES_PER_PROMPT|NUM_STEPS_PER_ROLLOUT|NUM_EPOCH|\
-            SEQ_LENGTH|MAX_TOKENS_PER_GPU|LOG_PROBS_CHUNK_SIZE|SAVE_INTERVAL|SEQUENCE_PARALLEL|CONTEXT_PARALLEL_SIZE|\
+            SEQ_LENGTH|MAX_TOKENS_PER_GPU|LOG_PROBS_CHUNK_SIZE|SAVE_INTERVAL|SAVE_RETAIN_INTERVAL|SEQUENCE_PARALLEL|CONTEXT_PARALLEL_SIZE|\
             TRAIN_LR|KL_LOSS_COEF|POLICY_LOSS_TYPE|USE_TIS|GRPO_STD_NORMALIZATION|\
             DPPO_DIVERGENCE_TYPE|DPPO_DIVERGENCE_THRESHOLD|\
             MAX_TRAIN_ROLLOUT_LOGPROB_ABS_DIFF|\
@@ -223,7 +228,7 @@ if [ "${SUBMIT_BACKEND}" = "srun" ]; then
         --ntasks-per-node=1
         --cpus-per-task="${CPUS_PER_TASK}"
         --gpus="${TOTAL_GPUS}"
-        --mem=0
+        --mem="${POLAR_SLURM_MEM_PER_NODE}"
         --exclusive
         --time="${WALL_TIME}"
         --kill-on-bad-exit=1
@@ -286,7 +291,7 @@ fi
 # When a CPU watcher submits this GPU allocation, an inherited
 # SLURM_MEM_PER_NODE (for example 2 GiB) is otherwise consumed by the nested
 # srun below and shrinks that step to the watcher's memory limit even though
-# the new job itself was allocated all node memory via --mem=0.
+# the new job has its own explicit POLAR_SLURM_MEM_PER_NODE allocation.
 JOB_ID=$(env \
     -u SLURM_JOB_ID \
     -u SLURM_JOBID \
@@ -319,7 +324,7 @@ JOB_ID=$(env \
     --time="${WALL_TIME}" \
     --gres="gpu:${SLURM_GPUS}" \
     --cpus-per-task="${CPUS_PER_TASK}" \
-    --mem=0 \
+    --mem="${POLAR_SLURM_MEM_PER_NODE}" \
     "${SBATCH_CONSTRAINT_ARG[@]}" \
     "${SBATCH_DEPENDENCY_ARG[@]}" \
     "${SBATCH_EXCLUDE_ARG[@]}" \

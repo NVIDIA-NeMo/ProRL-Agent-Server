@@ -267,6 +267,37 @@ printf '424242;test-cluster\n'
     assert "Submitted SLURM job: 424242" in result.stdout
 
 
+def test_sbatch_submission_supports_explicit_partial_node_memory(
+    tmp_path: Path,
+) -> None:
+    env = tmax_submit_env(tmp_path, load_pointer="release")
+    bin_dir = tmp_path / "bin"
+    captured_args = tmp_path / "sbatch.args"
+    write_command(
+        bin_dir / "sbatch",
+        """
+printf '%s\n' "$@" > "$SBATCH_ARGS_CAPTURE"
+printf '424243;test-cluster\n'
+""",
+    )
+    env.update(
+        SUBMIT_DRY_RUN="0",
+        POLAR_SLURM_MEM_PER_NODE="250G",
+        SBATCH_ARGS_CAPTURE=str(captured_args),
+    )
+
+    result = subprocess.run(
+        ["bash", str(TMAX / "submit_slurm.sh")],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--mem=250G" in captured_args.read_text().splitlines()
+
+
 def test_tmax_submit_rejects_stale_mini_swe_timing_runtime(tmp_path: Path) -> None:
     env = tmax_submit_env(tmp_path, load_pointer="release")
     runtime = tmp_path / "mini-swe-runtime"
@@ -621,6 +652,58 @@ def test_explicit_num_rollout_is_forwarded_persisted_and_targets_n_minus_one(
     )
     assert mismatch.returncode != 0
     assert "must equal TMAX_NUM_ROLLOUT-1=49" in mismatch.stderr
+
+
+def test_checkpoint_retention_is_optional_validated_and_forwarded(tmp_path: Path) -> None:
+    env_script = (TMAX / "env.cwdfw.sh").read_text()
+    shared_run = (SHARED / "run.sh").read_text()
+    shared_submit = (SHARED / "submit_slurm.sh").read_text()
+    run_state = (TMAX / "run_state.sh").read_text()
+
+    assert 'export SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-}"' in env_script
+    assert 'SAVE_RETENTION_ARGS+=(--save-retain-interval "${SAVE_RETAIN_INTERVAL}")' in shared_run
+    assert '"${SAVE_RETENTION_ARGS[@]}" \\' in shared_run
+    assert "SAVE_INTERVAL|SAVE_RETAIN_INTERVAL|SEQUENCE_PARALLEL" in shared_submit
+    assert "SAVE_INTERVAL SAVE_RETAIN_INTERVAL" in run_state
+
+    optional_env = clean_env(tmp_path)
+    optional = run_bash(
+        f"source {TMAX / 'env.cwdfw.sh'} >/dev/null; "
+        'printf \'%s|%s\' "$SAVE_INTERVAL" "$SAVE_RETAIN_INTERVAL"',
+        env=optional_env,
+    )
+    assert optional.stdout == "10|"
+
+    valid_env = optional_env.copy()
+    valid_env.update(SAVE_INTERVAL="5", SAVE_RETAIN_INTERVAL="20")
+    valid = run_bash(
+        f"source {TMAX / 'env.cwdfw.sh'} >/dev/null; "
+        'printf \'%s|%s\' "$SAVE_INTERVAL" "$SAVE_RETAIN_INTERVAL"',
+        env=valid_env,
+    )
+    assert valid.stdout == "5|20"
+
+    invalid_cases = (
+        ({"SAVE_INTERVAL": "0"}, "SAVE_INTERVAL must be a positive integer"),
+        (
+            {"SAVE_INTERVAL": "5", "SAVE_RETAIN_INTERVAL": "0"},
+            "SAVE_RETAIN_INTERVAL must be a positive integer",
+        ),
+        (
+            {"SAVE_INTERVAL": "6", "SAVE_RETAIN_INTERVAL": "20"},
+            "must be divisible by SAVE_INTERVAL=6",
+        ),
+    )
+    for overrides, message in invalid_cases:
+        invalid_env = optional_env.copy()
+        invalid_env.update(overrides)
+        invalid = run_bash(
+            f"source {TMAX / 'env.cwdfw.sh'} >/dev/null",
+            env=invalid_env,
+            check=False,
+        )
+        assert invalid.returncode != 0
+        assert message in invalid.stderr
 
 
 def test_resumed_checkpoint_eval_flag_only_targets_first_external_numeric_seed(
@@ -1650,6 +1733,40 @@ def test_tmax_topology_rejects_unassigned_slurm_gpus(tmp_path: Path):
     assert "must use all 16 allocated GPUs" in result.stderr
 
 
+def test_tmax_cross_node_tensor_parallel_requires_explicit_opt_in(tmp_path: Path):
+    base = clean_env(tmp_path)
+    base.update(
+        NUM_NODES="8",
+        SLURM_GPUS="1",
+        RAY_NUM_GPUS_PER_NODE="1",
+        ACTOR_NUM_NODES="4",
+        ACTOR_NUM_GPUS_PER_NODE="1",
+        ACTOR_TENSOR_MODEL_PARALLEL_SIZE="4",
+        ROLLOUT_NUM_GPUS="4",
+        ROLLOUT_BATCH_SIZE="1",
+        N_SAMPLES_PER_PROMPT="8",
+        POLAR_FULLY_ASYNC="false",
+    )
+
+    rejected = run_bash(
+        f"source {TMAX / 'env.cwdfw.sh'}",
+        env=base,
+        check=False,
+    )
+    assert rejected.returncode != 0
+    assert "TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL=1" in rejected.stderr
+
+    allowed_env = base.copy()
+    allowed_env["TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL"] = "1"
+    allowed = run_bash(
+        f"source {TMAX / 'env.cwdfw.sh'} >/dev/null; printf ok",
+        env=allowed_env,
+    )
+    assert allowed.stdout == "ok"
+    shared_run = (SHARED / "run.sh").read_text()
+    assert '--num-gpus-per-node "$RAY_NUM_GPUS_PER_NODE"' in shared_run
+
+
 def test_tmax_four_node_defaults_keep_both_gpu_pools_fed(tmp_path: Path):
     env = clean_env(tmp_path)
     script = f"""
@@ -2265,6 +2382,10 @@ def test_run_state_drops_legacy_port_and_persists_topology(tmp_path: Path):
         NUM_NODES="2",
         ACTOR_NUM_NODES="1",
         ROLLOUT_NUM_GPUS="8",
+        POLAR_SLURM_MEM_PER_NODE="250G",
+        TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL="1",
+        SAVE_INTERVAL="1",
+        SAVE_RETAIN_INTERVAL="200",
         POLAR_APPTAINER_NO_MOUNT_TMP="1",
         POLAR_APPTAINER_ISOLATE_PID="1",
         POLAR_APPTAINER_ISOLATE_IPC="1",
@@ -2300,6 +2421,10 @@ printf '%s' "${{SLIME_ROLLOUT_BASE_PORT-unset}}"
     assert "FINAL_EVAL_COMPLETE" in content
     assert f"TMAX_EVAL_DATA_SHA256={'a' * 64}" in content
     assert "ACTOR_NUM_NODES=1" in content
+    assert "POLAR_SLURM_MEM_PER_NODE=250G" in content
+    assert "TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL=1" in content
+    assert "SAVE_INTERVAL=1" in content
+    assert "SAVE_RETAIN_INTERVAL=200" in content
     assert "POLAR_APPTAINER_NO_MOUNT_TMP=1" in content
     assert "POLAR_APPTAINER_ISOLATE_PID=1" in content
     assert "POLAR_APPTAINER_ISOLATE_IPC=1" in content
