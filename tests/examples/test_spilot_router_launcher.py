@@ -202,6 +202,7 @@ def test_spilot_submit_wrapper_pins_8_nodes_and_200_steps() -> None:
         in defaults
     )
     assert 'LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-64}"' in defaults
+    assert 'TMAX_OPTIMIZER_CPU_OFFLOAD="${TMAX_OPTIMIZER_CPU_OFFLOAD:-1}"' in defaults
     assert 'TMAX_NUM_ROLLOUT="${TMAX_NUM_ROLLOUT:-200}"' in defaults
     assert 'SAVE_INTERVAL="${SAVE_INTERVAL:-1}"' in defaults
     assert 'SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-${TMAX_NUM_ROLLOUT}}"' in defaults
@@ -242,10 +243,11 @@ def test_spilot_shared_defaults_bootstrap_watcher_contract() -> None:
                 "POLAR_SLURM_MEM_PER_NODE ROLLOUT_BATCH_SIZE "
                 "N_SAMPLES_PER_PROMPT POLAR_FULLY_ASYNC TMAX_NUM_ROLLOUT "
                 "MAX_TOKENS_PER_GPU TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP "
-                "LOG_PROBS_CHUNK_SIZE SAVE_INTERVAL SAVE_RETAIN_INTERVAL "
+                "LOG_PROBS_CHUNK_SIZE TMAX_OPTIMIZER_CPU_OFFLOAD "
+                "SAVE_INTERVAL SAVE_RETAIN_INTERVAL "
                 "TMAX_AGENT_HARNESS EXPERIMENT_NAME; "
                 'source "$1"; '
-                "printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' "
+                "printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' "
                 '"$NUM_NODES" "$SLURM_GPUS" "$RAY_NUM_GPUS_PER_NODE" '
                 '"$ACTOR_NUM_NODES" "$ACTOR_NUM_GPUS_PER_NODE" '
                 '"$ACTOR_TENSOR_MODEL_PARALLEL_SIZE" '
@@ -254,6 +256,7 @@ def test_spilot_shared_defaults_bootstrap_watcher_contract() -> None:
                 '"$N_SAMPLES_PER_PROMPT" "$POLAR_FULLY_ASYNC" '
                 '"$TMAX_NUM_ROLLOUT" "$MAX_TOKENS_PER_GPU" '
                 '"$TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP" "$LOG_PROBS_CHUNK_SIZE" '
+                '"$TMAX_OPTIMIZER_CPU_OFFLOAD" '
                 '"$SAVE_INTERVAL" "$SAVE_RETAIN_INTERVAL" '
                 '"$TMAX_AGENT_HARNESS" "$EXPERIMENT_NAME"'
             ),
@@ -267,9 +270,21 @@ def test_spilot_shared_defaults_bootstrap_watcher_contract() -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout == (
-        "8|1|1|4|1|4|1|4|250G|1|8|false|200|24576|1|64|1|200|spilot_router|"
+        "8|1|1|4|1|4|1|4|250G|1|8|false|200|24576|1|64|1|1|200|spilot_router|"
         "spilot-router-qwen35-9b-8n-200step"
     )
+
+
+def test_spilot_uses_restartable_cpu_offloaded_adam() -> None:
+    shared_run = (ROOT / "examples" / "swegym_slime_grpo" / "run.sh").read_text()
+    run_state = (ROOT / "examples" / "tmax_slime_grpo" / "run_state.sh").read_text()
+
+    assert "--optimizer-cpu-offload" in shared_run
+    assert "--optimizer-offload-fraction 1.0" in shared_run
+    assert "--overlap-cpu-optimizer-d2h-h2d" in shared_run
+    assert "--use-precision-aware-optimizer" in shared_run
+    assert '"${OPTIMIZER_MEMORY_ARGS[@]}"' in shared_run
+    assert "TMAX_OPTIMIZER_CPU_OFFLOAD" in run_state
 
 
 def test_spilot_smoke_is_one_node_one_step_without_dynamic_filtering() -> None:

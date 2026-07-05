@@ -329,6 +329,11 @@ export GRPO_STD_NORMALIZATION="${GRPO_STD_NORMALIZATION:-0}"
 # policy lag, but stops batches whose average token probability ratio is
 # already far outside the useful TIS range before any gradient is applied.
 export MAX_TRAIN_ROLLOUT_LOGPROB_ABS_DIFF="${MAX_TRAIN_ROLLOUT_LOGPROB_ABS_DIFF:-1.0}"
+export TMAX_OPTIMIZER_CPU_OFFLOAD="${TMAX_OPTIMIZER_CPU_OFFLOAD:-0}"
+if ! [[ "${TMAX_OPTIMIZER_CPU_OFFLOAD}" =~ ^[01]$ ]]; then
+    echo "ERROR: TMAX_OPTIMIZER_CPU_OFFLOAD must be 0 or 1" >&2
+    return 1 2>/dev/null || exit 1
+fi
 
 _tmax_validate_resource_topology() {
     local name value

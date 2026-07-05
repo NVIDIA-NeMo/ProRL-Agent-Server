@@ -60,6 +60,13 @@ export TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP="${TMAX_ALLOW_SINGLE_SAMPLE_OVER_
 # the primary bound on total activation memory.
 export LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-64}"
 
+# Keep full-precision Adam moments and updates, but place them on host memory.
+# A TP4 Qwen3.5-9B rank can train from a release seed with GPU Adam, yet a
+# numbered checkpoint cannot reconstruct those states without exceeding an
+# 80 GiB H100.  Megatron's HybridDeviceOptimizer makes checkpoint restart and
+# the steady-state learner fit without lowering optimizer precision.
+export TMAX_OPTIMIZER_CPU_OFFLOAD="${TMAX_OPTIMIZER_CPU_OFFLOAD:-1}"
+
 # Slime's boundary is exclusive: iterations 0..199 are 200 optimizer steps.
 export TMAX_NUM_ROLLOUT="${TMAX_NUM_ROLLOUT:-200}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-1}"

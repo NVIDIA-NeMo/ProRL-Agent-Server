@@ -21,6 +21,9 @@ accumulates groups in at most 24,576-token dynamic microbatches. This leaves
 headroom for Adam state and the TP4 FP32 vocabulary loss without changing the
 eight-episode effective batch. A 64-token log-probability chunk further bounds
 individual FP32 allocations.
+Full-precision Adam parameters and moments are CPU-offloaded with Megatron's
+precision-aware hybrid optimizer. This keeps numbered-checkpoint restore below
+the H100 memory ceiling without changing optimizer dtypes.
 
 ## Credential handling
 

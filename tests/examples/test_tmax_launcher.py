@@ -918,6 +918,25 @@ def test_tmax_enables_true_trainer_fp32_lm_head_by_default(tmp_path: Path) -> No
     assert "TMAX_ENABLE_FP32_LM_HEAD" in (TMAX / "run_state.sh").read_text()
 
 
+def test_tmax_cpu_optimizer_offload_is_explicit_opt_in(tmp_path: Path) -> None:
+    env = clean_env(tmp_path)
+    result = run_bash(
+        f"source {TMAX / 'env.cwdfw.sh'} >/dev/null; "
+        'printf \'%s\' "$TMAX_OPTIMIZER_CPU_OFFLOAD"',
+        env=env,
+    )
+
+    assert result.stdout == "0"
+
+    invalid_root = tmp_path / "invalid"
+    invalid_root.mkdir()
+    invalid_env = clean_env(invalid_root)
+    invalid_env["TMAX_OPTIMIZER_CPU_OFFLOAD"] = "true"
+    invalid = run_bash(f"source {TMAX / 'env.cwdfw.sh'}", env=invalid_env, check=False)
+    assert invalid.returncode != 0
+    assert "TMAX_OPTIMIZER_CPU_OFFLOAD must be 0 or 1" in invalid.stderr
+
+
 def test_tmax_context_parallel_rejects_invalid_actor_topology(tmp_path: Path) -> None:
     env = clean_env(tmp_path)
     env.update(CONTEXT_PARALLEL_SIZE="3")

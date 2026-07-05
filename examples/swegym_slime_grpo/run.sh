@@ -1286,6 +1286,23 @@ case "${GRPO_STD_NORMALIZATION:-1}" in
         exit 1
         ;;
 esac
+OPTIMIZER_MEMORY_ARGS=()
+case "${TMAX_OPTIMIZER_CPU_OFFLOAD:-0}" in
+    0) ;;
+    1)
+        OPTIMIZER_MEMORY_ARGS=(
+            --optimizer-cpu-offload
+            --optimizer-offload-fraction 1.0
+            --overlap-cpu-optimizer-d2h-h2d
+            --use-precision-aware-optimizer
+        )
+        echo "Using full-precision CPU-offloaded optimizer state"
+        ;;
+    *)
+        echo "ERROR: TMAX_OPTIMIZER_CPU_OFFLOAD must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
 KL_LOSS_ARGS=()
 if ! "${PYTHON_BIN}" -c \
     'import math,sys; value=float(sys.argv[1]); assert math.isfinite(value) and value >= 0' \
@@ -1824,6 +1841,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     --weight-decay 0.1 \
     --adam-beta1 0.9 \
     --adam-beta2 0.98 \
+    "${OPTIMIZER_MEMORY_ARGS[@]}" \
     --attention-dropout 0.0 \
     --hidden-dropout 0.0 \
     --accumulate-allreduce-grads-in-fp32 \
