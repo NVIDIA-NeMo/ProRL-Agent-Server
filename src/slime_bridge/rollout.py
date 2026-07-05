@@ -49,6 +49,14 @@ from slime_bridge.config import (
 
 logger = logging.getLogger(__name__)
 
+
+def _control_plane_headers() -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    token = os.environ.get("POLAR_CONTROL_PLANE_TOKEN", "").strip()
+    if token:
+        headers["X-Polar-Control-Token"] = token
+    return headers
+
 _POLL_INTERVAL = 2.0  # seconds between task-status polls (eval / no-callback path)
 _CALLBACK_FALLBACK_POLL_SECONDS = 60.0  # defensive backstop for dropped callbacks
 _TASK_STATUS_GET_MAX_ATTEMPTS = 5
@@ -437,7 +445,7 @@ async def _submit_and_wait_for_task(
     resp = await client.post(
         f"{base_url}/rollout/task/submit",
         json=payload,
-        headers={"Content-Type": "application/json"},
+        headers=_control_plane_headers(),
     )
     resp.raise_for_status()
     task_id = resp.json()["task_id"]
@@ -1492,7 +1500,7 @@ class AsyncPolarRolloutWorker:
             resp = await client.post(
                 f"{base_url}/rollout/task/submit",
                 json=payload,
-                headers={"Content-Type": "application/json"},
+                headers=_control_plane_headers(),
             )
             resp.raise_for_status()
             return await self._await_task_result(client, task_id, event)
@@ -3351,6 +3359,176 @@ def _add_distribution_metrics(
     out[f"{prefix}/max"] = max(values)
 
 
+def _spilot_router_metrics(
+    sessions: dict[str, dict[str, Any]],
+    session_rewards: dict[str, float],
+) -> dict[str, float]:
+    """Aggregate bounded Router telemetry with one vote per session.
+
+    Model identities are deliberately absent from metric names.  Slots are the
+    stable action vocabulary, while their per-episode mapping remains available
+    in trajectory metadata for offline analysis.
+    """
+    if not sessions:
+        return {}
+
+    prefix = "polar/spilot_router"
+    action_valid_sessions = 0
+    submitted_sessions = 0
+    route_counts = {"M0": 0, "M1": 0}
+    verify_counts = {"M0": 0, "M1": 0}
+    route_candidate_counts = {"C0": 0, "C1": 0}
+    verify_candidate_counts = {"C0": 0, "C1": 0}
+    direct_submit_sessions = 0
+    pool_call_count = 0
+    pool_status_counts = {"completed": 0, "failed": 0, "timeout": 0}
+    total_cost = 0.0
+    initial_slot_by_session: dict[str, str] = {}
+    initial_candidate_by_session: dict[str, str] = {}
+
+    for session_id, metadata in sessions.items():
+        if metadata.get("action_valid") is True:
+            action_valid_sessions += 1
+        if metadata.get("submitted") is True:
+            submitted_sessions += 1
+
+        parsed_cost = _optional_nonnegative_finite_float(metadata.get("total_cost"))
+        if parsed_cost is not None:
+            total_cost += parsed_cost
+
+        candidate_by_slot: dict[str, str] = {}
+        slot_mapping = metadata.get("slot_mapping")
+        if isinstance(slot_mapping, dict):
+            aliases_by_slot: dict[str, str] = {}
+            for raw_slot, raw_candidate in slot_mapping.items():
+                if not isinstance(raw_candidate, dict):
+                    continue
+                alias = raw_candidate.get("model")
+                if isinstance(alias, str) and alias:
+                    aliases_by_slot[str(raw_slot).upper()] = alias
+            # Candidate labels are stable under the per-episode M0/M1 shuffle:
+            # C0 is the lexicographically first model alias, C1 the second.
+            # Duplicate aliases cannot be disambiguated safely, so omit their
+            # candidate-level attribution while retaining slot diagnostics.
+            sorted_aliases = sorted(set(aliases_by_slot.values()))
+            if len(sorted_aliases) == len(aliases_by_slot):
+                candidate_by_alias = {
+                    alias: f"C{index}" for index, alias in enumerate(sorted_aliases[:2])
+                }
+                candidate_by_slot = {
+                    slot: candidate_by_alias[alias]
+                    for slot, alias in aliases_by_slot.items()
+                    if alias in candidate_by_alias
+                }
+
+        actions = metadata.get("actions")
+        if isinstance(actions, list):
+            initial_route: dict[str, Any] | None = None
+            submit_seen = False
+            verify_action: dict[str, Any] | None = None
+            for action in actions:
+                if not isinstance(action, dict) or action.get("valid") is not True:
+                    continue
+                action_name = str(action.get("action") or "").upper()
+                if action_name == "ROUTE" and initial_route is None:
+                    initial_route = action
+                elif action_name == "VERIFY" and verify_action is None:
+                    verify_action = action
+                elif action_name == "SUBMIT":
+                    submit_seen = True
+
+            if initial_route is not None:
+                slot = str(initial_route.get("model_slot") or "").upper()
+                if slot in route_counts:
+                    route_counts[slot] += 1
+                    initial_slot_by_session[session_id] = slot
+                    candidate = candidate_by_slot.get(slot)
+                    if candidate in route_candidate_counts:
+                        route_candidate_counts[candidate] += 1
+                        initial_candidate_by_session[session_id] = candidate
+            if verify_action is not None:
+                slot = str(verify_action.get("model_slot") or "").upper()
+                if slot in verify_counts:
+                    verify_counts[slot] += 1
+                    candidate = candidate_by_slot.get(slot)
+                    if candidate in verify_candidate_counts:
+                        verify_candidate_counts[candidate] += 1
+            if submit_seen:
+                direct_submit_sessions += 1
+
+        calls = metadata.get("calls")
+        if isinstance(calls, list):
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                pool_call_count += 1
+                status = str(call.get("status") or "").lower()
+                if status in pool_status_counts:
+                    pool_status_counts[status] += 1
+
+    session_count = len(sessions)
+    metrics: dict[str, float] = {
+        f"{prefix}/session_count": float(session_count),
+        f"{prefix}/action_valid_count": float(action_valid_sessions),
+        f"{prefix}/action_valid_fraction": action_valid_sessions / session_count,
+        f"{prefix}/submitted_count": float(submitted_sessions),
+        f"{prefix}/submitted_fraction": submitted_sessions / session_count,
+        f"{prefix}/route_m0_count": float(route_counts["M0"]),
+        f"{prefix}/route_m1_count": float(route_counts["M1"]),
+        f"{prefix}/verify_m0_count": float(verify_counts["M0"]),
+        f"{prefix}/verify_m1_count": float(verify_counts["M1"]),
+        f"{prefix}/route_candidate_c0_count": float(route_candidate_counts["C0"]),
+        f"{prefix}/route_candidate_c1_count": float(route_candidate_counts["C1"]),
+        f"{prefix}/verify_candidate_c0_count": float(verify_candidate_counts["C0"]),
+        f"{prefix}/verify_candidate_c1_count": float(verify_candidate_counts["C1"]),
+        f"{prefix}/direct_submit_count": float(direct_submit_sessions),
+        f"{prefix}/pool_call_count": float(pool_call_count),
+        f"{prefix}/pool_completed_count": float(pool_status_counts["completed"]),
+        f"{prefix}/pool_failed_count": float(pool_status_counts["failed"]),
+        f"{prefix}/pool_timeout_count": float(pool_status_counts["timeout"]),
+        f"{prefix}/total_cost": total_cost,
+    }
+
+    router_rewards = [
+        session_rewards[session_id]
+        for session_id in sessions
+        if session_id in session_rewards
+    ]
+    metrics[f"{prefix}/reward_accounted_session_count"] = float(len(router_rewards))
+    if router_rewards:
+        metrics[f"{prefix}/reward_mean"] = sum(router_rewards) / len(router_rewards)
+
+    for slot in ("M0", "M1"):
+        slot_rewards = [
+            session_rewards[session_id]
+            for session_id, initial_slot in initial_slot_by_session.items()
+            if initial_slot == slot and session_id in session_rewards
+        ]
+        slot_name = slot.lower()
+        metrics[f"{prefix}/reward_{slot_name}_accounted_session_count"] = float(
+            len(slot_rewards)
+        )
+        if slot_rewards:
+            metrics[f"{prefix}/reward_{slot_name}_mean"] = sum(slot_rewards) / len(slot_rewards)
+
+    for candidate in ("C0", "C1"):
+        candidate_rewards = [
+            session_rewards[session_id]
+            for session_id, initial_candidate in initial_candidate_by_session.items()
+            if initial_candidate == candidate and session_id in session_rewards
+        ]
+        candidate_name = candidate.lower()
+        metrics[f"{prefix}/reward_candidate_{candidate_name}_count"] = float(
+            len(candidate_rewards)
+        )
+        if candidate_rewards:
+            metrics[f"{prefix}/reward_candidate_{candidate_name}_mean"] = sum(
+                candidate_rewards
+            ) / len(candidate_rewards)
+
+    return metrics
+
+
 def _polar_extra_metrics(
     flat_samples: list[Any],
     rewards: list[float],
@@ -3409,6 +3587,7 @@ def _polar_extra_metrics(
     session_truncated_trace_counts: dict[str, int] = {}
     session_agent_timeout_trace_counts: dict[str, int] = {}
     session_status_buckets: dict[str, str] = {}
+    spilot_router_sessions: dict[str, dict[str, Any]] = {}
     trainable_traces = 0
     trajectory_rewards_by_group: dict[Any, dict[Any, list[float]]] = {}
     for sample in flat_samples:
@@ -3517,6 +3696,17 @@ def _polar_extra_metrics(
                 terminal_error_sessions.add(session_key)
         if session_key not in seen:
             seen.add(session_key)
+            trajectory_metadata = polar_meta.get("trajectory_metadata")
+            evaluation = (
+                trajectory_metadata.get("evaluation")
+                if isinstance(trajectory_metadata, dict)
+                else None
+            )
+            router_metadata = (
+                evaluation.get("spilot_router") if isinstance(evaluation, dict) else None
+            )
+            if isinstance(router_metadata, dict):
+                spilot_router_sessions[session_key] = router_metadata
             timing = polar_meta.get("timing") or {}
             # Synthetic straggler placeholders contain rollout-server time to
             # cancellation, not completed gateway stage timings. Keep them out
@@ -3626,6 +3816,12 @@ def _polar_extra_metrics(
     accounted_session_rewards_by_key.update(agent_timeout_session_rewards_by_key)
     for session_id in trusted_model_failure_sessions:
         accounted_session_rewards_by_key.setdefault(session_id, 0.0)
+    out.update(
+        _spilot_router_metrics(
+            spilot_router_sessions,
+            accounted_session_rewards_by_key,
+        )
+    )
     completed_session_rewards = list(completed_session_rewards_by_key.values())
     accounted_session_rewards = list(accounted_session_rewards_by_key.values())
     if completed_session_rewards:

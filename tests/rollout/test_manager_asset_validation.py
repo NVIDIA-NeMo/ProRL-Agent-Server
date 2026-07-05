@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -8,7 +9,7 @@ from fastapi import HTTPException
 from polar.agent.models import AgentSpec
 from polar.rollout.balancer import NodeScheduler
 from polar.rollout.manager import RolloutManager
-from polar.rollout.models import TaskRequest
+from polar.rollout.models import NodeRegistrationRequest, TaskRequest
 from polar.rollout import server as rollout_server
 from polar.runtime.assets import RuntimeAssetUnavailableError
 from polar.runtime.models import RuntimeSpec
@@ -82,7 +83,70 @@ async def test_submit_endpoint_reports_asset_outage_as_service_unavailable(
     )
 
     with pytest.raises(HTTPException) as error:
-        await rollout_server.submit_task_async(request)
+        await rollout_server.submit_task_async(SimpleNamespace(headers={}), request)
 
     assert error.value.status_code == 503
     assert "runtime bundle disappeared" in str(error.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_spilot_submit_requires_control_plane_token(monkeypatch) -> None:
+    class _Manager:
+        calls = 0
+
+        @classmethod
+        async def submit_task(cls, request: TaskRequest) -> str:
+            cls.calls += 1
+            return request.task_id
+
+    class _State:
+        manager = _Manager()
+
+    monkeypatch.setenv("POLAR_CONTROL_PLANE_TOKEN", "trusted-control-token")
+    monkeypatch.setattr(rollout_server, "get_state", lambda: _State())
+    request = TaskRequest(
+        task_id="spilot-task",
+        instruction="test",
+        agent=AgentSpec(harness="spilot_router"),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await rollout_server.submit_task_async(SimpleNamespace(headers={}), request)
+    assert error.value.status_code == 401
+    assert _Manager.calls == 0
+
+    response = await rollout_server.submit_task_async(
+        SimpleNamespace(headers={"x-polar-control-token": "trusted-control-token"}),
+        request,
+    )
+    assert response == {"task_id": "spilot-task", "status": "running"}
+    assert _Manager.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fake_node_registration_requires_control_plane_token(monkeypatch) -> None:
+    class _Scheduler:
+        calls = 0
+
+        @classmethod
+        def register_node(cls, request: NodeRegistrationRequest):
+            cls.calls += 1
+            return request
+
+    class _State:
+        scheduler = _Scheduler()
+
+    monkeypatch.setenv("POLAR_CONTROL_PLANE_TOKEN", "trusted-control-token")
+    monkeypatch.setattr(rollout_server, "get_state", lambda: _State())
+    registration = NodeRegistrationRequest(
+        node_id="attacker-node",
+        gateway_url="http://attacker.invalid",
+        max_init_workers=1000,
+        max_run_workers=1000,
+        max_postrun_workers=1000,
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await rollout_server.register_node(SimpleNamespace(headers={}), registration)
+    assert error.value.status_code == 401
+    assert _Scheduler.calls == 0

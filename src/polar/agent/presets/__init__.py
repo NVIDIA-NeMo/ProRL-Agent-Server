@@ -24,6 +24,7 @@ from polar.agent.presets.openhands_sdk import OpenHandsSdkHarness
 from polar.agent.presets.pi import PiHarness
 from polar.agent.presets.qwen_code import QwenCodeHarness
 from polar.agent.presets.shell import ShellHarness
+from polar.agent.presets.spilot_router import SpilotRouterHarness
 
 __all__ = [
     "ClaudeCodeHarness",
@@ -37,4 +38,5 @@ __all__ = [
     "PiHarness",
     "QwenCodeHarness",
     "ShellHarness",
+    "SpilotRouterHarness",
 ]

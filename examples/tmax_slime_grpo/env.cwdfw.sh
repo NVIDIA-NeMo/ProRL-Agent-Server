@@ -597,7 +597,7 @@ if ! [[ "${POLAR_AGENT_MAX_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
     return 1 2>/dev/null || exit 1
 fi
 case "${TMAX_AGENT_HARNESS}" in
-    mini_swe_agent|vanillux2)
+    mini_swe_agent|spilot_router|vanillux2)
         export POLAR_AGENT_PATH="${MINI_SWE_AGENT_CONTAINER_DIR}/bin:/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         printf -v POLAR_AGENT_RUNTIME_VOLUME '        - %s:%s:ro' \
             "${MINI_SWE_AGENT_RUNTIME_DIR}" "${MINI_SWE_AGENT_CONTAINER_DIR}"

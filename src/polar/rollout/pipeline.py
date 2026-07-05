@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -115,8 +116,13 @@ class Pipeline:
         async with self._lifecycle_lock:
             if self._started:
                 return
+            control_token = os.environ.get("POLAR_CONTROL_PLANE_TOKEN", "").strip()
+            control_headers = (
+                {"X-Polar-Control-Token": control_token} if control_token else None
+            )
             self._client = httpx.AsyncClient(
                 timeout=30.0,
+                headers=control_headers,
                 limits=httpx.Limits(
                     max_connections=self.http_max_connections,
                     max_keepalive_connections=self.http_max_keepalive_connections,
@@ -127,6 +133,7 @@ class Pipeline:
             # releasing gateway runtimes and worker slots.
             self._cleanup_client = httpx.AsyncClient(
                 timeout=10.0,
+                headers=control_headers,
                 limits=httpx.Limits(
                     max_connections=self.cleanup_max_concurrency,
                     max_keepalive_connections=min(64, self.cleanup_max_concurrency),

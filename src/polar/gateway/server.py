@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import json
 import logging
 import os
+import secrets
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,6 +20,7 @@ from polar.config import GatewayNodeConfig, TopologyConfig
 from polar.gateway.completion_writer import CompletionWriter
 from polar.gateway.detection import APIType, detect, extract_model
 from polar.gateway.engine import (
+    OpenAICompatibleEngine,
     POLAR_INFERENCE_TIMINGS_KEY,
     get_engine,
     sanitize_inference_timings,
@@ -31,7 +33,10 @@ from polar.gateway.proxy import (
     UpstreamTimeoutError,
 )
 from polar.gateway.session import (
+    extract_api_key,
     InvalidSessionIdError,
+    MODEL_POOL_CAPABILITY_SCOPE,
+    ROUTER_CAPABILITY_SCOPE,
     SessionCreateRequest,
     SessionCreateResponse,
     SessionDeleteResponse,
@@ -57,12 +62,25 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+_ROUTER_POLICY_MODEL_ALIAS = "router/policy"
+_CONTROL_PLANE_TOKEN_ENV = "POLAR_CONTROL_PLANE_TOKEN"
+_CONTROL_PLANE_TOKEN_HEADER = "x-polar-control-token"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelPoolRoute:
+    """Trusted host-side destination for one opaque sandbox model alias."""
+
+    model: str
+    inference: InferenceClient
+
 
 @dataclass(slots=True)
 class GatewayState:
     topology: TopologyConfig
     node: GatewayNodeConfig
     inference: InferenceClient
+    model_pool: dict[str, ModelPoolRoute]
     storage: SessionStore
     transform_manager: TransformManager
     session_registry: SessionRegistry
@@ -86,6 +104,23 @@ def configure_server(topology_path: str = "topology.yaml", *, node_id: str | Non
 def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
     node = topology.select_gateway_node(node_id)
     inference = InferenceClient(node.inference_base_url, get_engine(node.engine))
+    model_pool: dict[str, ModelPoolRoute] = {}
+    for candidate in node.model_pool:
+        api_key = os.environ.get(candidate.api_key_env)
+        if not api_key:
+            raise ValueError(
+                f"Model pool alias {candidate.alias!r} requires non-empty host "
+                f"environment variable {candidate.api_key_env!r}"
+            )
+        model_pool[candidate.alias] = ModelPoolRoute(
+            model=candidate.model,
+            inference=InferenceClient(
+                candidate.base_url,
+                OpenAICompatibleEngine(),
+                default_headers={"Authorization": f"Bearer {api_key}"},
+                max_concurrency=candidate.max_concurrency,
+            ),
+        )
     persistence_config = topology.gateway.completion_persistence
     save_dir = topology.rollout.save_dir
     completion_writer = CompletionWriter(
@@ -124,6 +159,7 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
         topology=topology,
         node=node,
         inference=inference,
+        model_pool=model_pool,
         storage=storage,
         transform_manager=transform_manager,
         session_registry=session_registry,
@@ -197,6 +233,7 @@ async def _lifespan(_: FastAPI):
     finally:
         await state.node_manager.close()
         await state.inference.close()
+        await asyncio.gather(*(route.inference.close() for route in state.model_pool.values()))
         state.storage.close()
         await state.completion_writer.close()
 
@@ -402,6 +439,45 @@ def _resolve_session_id(
     )
 
 
+def _resolve_privileged_session_id(
+    headers: dict[str, str],
+    registry: SessionRegistry,
+    *,
+    scope: str,
+) -> tuple[str | None, JSONResponse | None]:
+    """Authenticate a Router/model-pool request against a live rollout session.
+
+    Ordinary policy proxy calls retain the gateway's legacy implicit-session
+    behavior.  Reserved ``router/*`` and ``pool/*`` aliases can reach training
+    data or paid host credentials, so they require the bearer injected by the
+    rollout dispatcher and must never auto-register an unknown caller.
+    """
+
+    credential = extract_api_key(headers)
+    if credential is None:
+        return None, _privileged_session_error(
+            "A live rollout-session credential is required",
+            status_code=401,
+            code="missing_session_credential",
+        )
+    info = registry.resolve_capability(credential, scope=scope)
+    if info is None:
+        return None, _privileged_session_error(
+            "The rollout-session capability is invalid",
+            status_code=401,
+            code="invalid_session_capability",
+        )
+    if not info.registered or info.status != SessionStatus.RUNNING:
+        return None, _privileged_session_error(
+            "The rollout session is not running",
+            status_code=403,
+            code="inactive_session_credential",
+        )
+
+    registry.update_activity(info.session_id)
+    return info.session_id, None
+
+
 def _coerce_datetime(value: str | None) -> datetime:
     if value:
         return datetime.fromisoformat(value)
@@ -462,6 +538,22 @@ def _completion_metadata(
         timings = sanitize_inference_timings(response.pop(POLAR_INFERENCE_TIMINGS_KEY, None))
         if timings:
             metadata["inference_timings"] = timings
+    return metadata
+
+
+def _policy_completion_metadata(
+    session_info: Any | None,
+    response: dict[str, Any],
+    *,
+    completion_role: str,
+) -> dict[str, Any]:
+    metadata = _completion_metadata(session_info, response)
+    # Stamp this at the gateway persistence boundary and deliberately overwrite
+    # similarly named session metadata supplied by a caller.  Only the reserved
+    # Router request alias is eligible for SPilot training; other local-policy
+    # requests remain persisted for legacy builders but are excluded by the
+    # RouterPolicyBuilder.
+    metadata["completion_role"] = completion_role
     return metadata
 
 
@@ -658,6 +750,23 @@ async def create_session(request: Request):
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
     if "agent" in body and "session_id" in body:
+        expected_control_token = os.environ.get(_CONTROL_PLANE_TOKEN_ENV, "").strip()
+        agent = body.get("agent")
+        is_spilot_dispatch = isinstance(agent, dict) and agent.get("harness") == "spilot_router"
+        if not expected_control_token and is_spilot_dispatch:
+            return _control_plane_error(
+                "SPilot dispatch requires a configured control-plane token",
+                status_code=503,
+                code="control_plane_auth_unconfigured",
+            )
+        if expected_control_token:
+            supplied_control_token = request.headers.get(_CONTROL_PLANE_TOKEN_HEADER, "")
+            if not secrets.compare_digest(supplied_control_token, expected_control_token):
+                return _control_plane_error(
+                    "The control-plane credential is invalid",
+                    status_code=401,
+                    code="invalid_control_plane_credential",
+                )
         dispatch_request = SessionDispatchRequest.model_validate(body)
         try:
             await state.node_manager.dispatch(dispatch_request)
@@ -757,18 +866,61 @@ async def proxy_request(request: Request, path: str):
     headers = {k: v for k, v in request.headers.items()}
     full_path = request.url.path
     api_type = detect(full_path, headers, body)
-    try:
-        session_id = _resolve_session_id(
-            headers,
-            body,
-            query_session_id=(
-                request.query_params.get("session_id") or request.query_params.get("key")
-            ),
-        )
-    except InvalidSessionIdError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
-
     original_model = extract_model(api_type, body)
+    privileged_alias = isinstance(original_model, str) and original_model.startswith(
+        ("router/", "pool/")
+    )
+    if privileged_alias:
+        capability_scope = (
+            ROUTER_CAPABILITY_SCOPE
+            if original_model.startswith("router/")
+            else MODEL_POOL_CAPABILITY_SCOPE
+        )
+        session_id, auth_error = _resolve_privileged_session_id(
+            headers,
+            state.session_registry,
+            scope=capability_scope,
+        )
+        if auth_error is not None:
+            return auth_error
+        assert session_id is not None
+    else:
+        try:
+            session_id = _resolve_session_id(
+                headers,
+                body,
+                query_session_id=(
+                    request.query_params.get("session_id")
+                    or request.query_params.get("key")
+                ),
+            )
+        except InvalidSessionIdError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    pool_route: ModelPoolRoute | None = None
+    if isinstance(original_model, str) and original_model.startswith("router/"):
+        if original_model != _ROUTER_POLICY_MODEL_ALIAS:
+            return _model_pool_error(
+                f"Unknown Router policy alias: {original_model}",
+                code="unknown_router_model",
+            )
+        if api_type != APIType.OPENAI_CHAT or "/v1/chat/completions" not in full_path:
+            return _model_pool_error(
+                "The Router policy alias supports only /v1/chat/completions",
+                code="unsupported_router_api",
+            )
+    if isinstance(original_model, str) and original_model.startswith("pool/"):
+        if api_type != APIType.OPENAI_CHAT or "/v1/chat/completions" not in full_path:
+            return _model_pool_error(
+                "Model-pool aliases support only /v1/chat/completions",
+                code="unsupported_pool_api",
+            )
+        pool_route = state.model_pool.get(original_model)
+        if pool_route is None:
+            return _model_pool_error(
+                f"Unknown model-pool alias: {original_model}",
+                code="unknown_pool_model",
+            )
     transformer = state.transform_manager.get(api_type)
     session_info = state.session_registry.get(session_id)
 
@@ -784,10 +936,17 @@ async def proxy_request(request: Request, path: str):
     if api_type == APIType.GOOGLE and "streamGenerateContent" in full_path:
         body["_streaming"] = True
 
+    served_model = pool_route.model if pool_route is not None else state.node.model_served
+    inference = pool_route.inference if pool_route is not None else state.inference
+    completion_role = (
+        "router_policy"
+        if original_model == _ROUTER_POLICY_MODEL_ALIAS
+        else "policy"
+    )
     transformed_body = body.copy()
-    transformed_body["_polar_model_served"] = state.node.model_served
+    transformed_body["_polar_model_served"] = served_model
     openai_request = transformer.transform_request(transformed_body)
-    openai_request["model"] = state.node.model_served
+    openai_request["model"] = served_model
     is_streaming = openai_request.get("stream", False)
 
     if is_streaming:
@@ -799,6 +958,10 @@ async def proxy_request(request: Request, path: str):
             session_id,
             original_model=original_model,
             session_info=session_info,
+            inference=inference,
+            persist_completion=pool_route is None,
+            response_model_alias=original_model if pool_route is not None else None,
+            completion_role=completion_role,
         )
     return await _handle_non_streaming(
         api_type,
@@ -808,6 +971,60 @@ async def proxy_request(request: Request, path: str):
         session_id,
         original_model=original_model,
         session_info=session_info,
+        inference=inference,
+        persist_completion=pool_route is None,
+        response_model_alias=original_model if pool_route is not None else None,
+        completion_role=completion_role,
+    )
+
+
+def _model_pool_error(message: str, *, code: str) -> JSONResponse:
+    return JSONResponse(
+        {
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": code,
+            }
+        },
+        status_code=400,
+    )
+
+
+def _privileged_session_error(
+    message: str,
+    *,
+    status_code: int,
+    code: str,
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            "error": {
+                "message": message,
+                "type": "authentication_error",
+                "code": code,
+            }
+        },
+        status_code=status_code,
+        headers={"WWW-Authenticate": "Bearer"} if status_code == 401 else None,
+    )
+
+
+def _control_plane_error(
+    message: str,
+    *,
+    status_code: int,
+    code: str,
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            "error": {
+                "message": message,
+                "type": "authentication_error",
+                "code": code,
+            }
+        },
+        status_code=status_code,
     )
 
 
@@ -820,30 +1037,49 @@ async def _handle_non_streaming(
     *,
     original_model: str,
     session_info: Any | None,
+    inference: InferenceClient | None = None,
+    persist_completion: bool = True,
+    response_model_alias: str | None = None,
+    completion_role: str = "policy",
 ) -> Response:
     state = get_state()
+    inference = inference or state.inference
     try:
-        response = await state.inference.completion(openai_request)
+        response = await inference.completion(openai_request)
     except UpstreamError as exc:
-        logger.warning("Non-streaming upstream error for session %s: %s", session_id, exc)
+        if persist_completion:
+            logger.warning("Non-streaming upstream error for session %s: %s", session_id, exc)
+        else:
+            logger.warning(
+                "Model-pool upstream error for session %s: %s",
+                session_id,
+                _error_type_name(exc),
+            )
         return _upstream_error_response(
             api_type,
             exc,
             standardize_openai_context_length=True,
         )
 
-    state.storage.save_message(
-        session_id,
-        openai_request,
-        response,
-        original_request=original_request,
-        model_requested=original_model,
-        model_used=openai_request["model"],
-        api_type=api_type.value,
-        task_id=session_info.task_id if session_info else None,
-        created_at=session_info.created_at.isoformat() if session_info else None,
-        metadata=_completion_metadata(session_info, response),
-    )
+    if response_model_alias is not None:
+        response["model"] = response_model_alias
+    if persist_completion:
+        state.storage.save_message(
+            session_id,
+            openai_request,
+            response,
+            original_request=original_request,
+            model_requested=original_model,
+            model_used=openai_request["model"],
+            api_type=api_type.value,
+            task_id=session_info.task_id if session_info else None,
+            created_at=session_info.created_at.isoformat() if session_info else None,
+            metadata=_policy_completion_metadata(
+                session_info,
+                response,
+                completion_role=completion_role,
+            ),
+        )
     transformed = transformer.transform_response(response, original_request)
     # Non-streaming SGLang responses carry large token/logprob arrays.  Use the
     # optimized encoder so serializing them does not monopolize the gateway's
@@ -860,28 +1096,47 @@ async def _handle_streaming(
     *,
     original_model: str,
     session_info: Any | None,
+    inference: InferenceClient | None = None,
+    persist_completion: bool = True,
+    response_model_alias: str | None = None,
+    completion_role: str = "policy",
 ) -> StreamingResponse | JSONResponse:
     state = get_state()
+    inference = inference or state.inference
     non_stream_request = {k: v for k, v in openai_request.items() if k != "stream_options"}
     non_stream_request["stream"] = False
     try:
-        response = await state.inference.completion(non_stream_request)
+        response = await inference.completion(non_stream_request)
     except UpstreamError as exc:
-        logger.warning("Upstream error for streaming session %s: %s", session_id, exc)
+        if persist_completion:
+            logger.warning("Upstream error for streaming session %s: %s", session_id, exc)
+        else:
+            logger.warning(
+                "Model-pool streaming upstream error for session %s: %s",
+                session_id,
+                _error_type_name(exc),
+            )
         return _upstream_error_response(api_type, exc)
 
-    state.storage.save_message(
-        session_id,
-        openai_request,
-        response,
-        original_request=original_request,
-        model_requested=original_model,
-        model_used=openai_request["model"],
-        api_type=api_type.value,
-        task_id=session_info.task_id if session_info else None,
-        created_at=session_info.created_at.isoformat() if session_info else None,
-        metadata=_completion_metadata(session_info, response),
-    )
+    if response_model_alias is not None:
+        response["model"] = response_model_alias
+    if persist_completion:
+        state.storage.save_message(
+            session_id,
+            openai_request,
+            response,
+            original_request=original_request,
+            model_requested=original_model,
+            model_used=openai_request["model"],
+            api_type=api_type.value,
+            task_id=session_info.task_id if session_info else None,
+            created_at=session_info.created_at.isoformat() if session_info else None,
+            metadata=_policy_completion_metadata(
+                session_info,
+                response,
+                completion_role=completion_role,
+            ),
+        )
 
     synthetic_chunk = _response_to_stream_chunk(response)
     stream_state = transformer.create_stream_state(original_request)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import socket
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -29,6 +30,54 @@ class _InferenceConfig(_StrictModel):
         return _normalize_http_url(value, "gateway.nodes[].inference.base_url")
 
 
+class ModelPoolConfig(_StrictModel):
+    """One frozen OpenAI-compatible model exposed through an opaque alias.
+
+    ``api_key_env`` stores only the name of the host environment variable.  The
+    secret itself is resolved by the gateway process and is never serialized in
+    topology objects or sent to a runtime sandbox.
+    """
+
+    alias: str
+    model: str
+    base_url: str
+    api_key_env: str
+    max_concurrency: int = Field(default=32, gt=0)
+
+    @field_validator("alias")
+    @classmethod
+    def _validate_alias(cls, value: str) -> str:
+        alias = str(value).strip()
+        if not alias.startswith("pool/") or alias == "pool/":
+            raise ValueError("gateway.nodes[].model_pool[].alias must start with 'pool/'")
+        if any(character.isspace() for character in alias):
+            raise ValueError("gateway.nodes[].model_pool[].alias must not contain whitespace")
+        return alias
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model(cls, value: str) -> str:
+        model = str(value).strip()
+        if not model:
+            raise ValueError("gateway.nodes[].model_pool[].model must be a non-empty string")
+        return model
+
+    @field_validator("base_url")
+    @classmethod
+    def _validate_base_url(cls, value: str) -> str:
+        return _normalize_http_url(value, "gateway.nodes[].model_pool[].base_url")
+
+    @field_validator("api_key_env")
+    @classmethod
+    def _validate_api_key_env(cls, value: str) -> str:
+        name = str(value).strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ValueError(
+                "gateway.nodes[].model_pool[].api_key_env must be an environment variable name"
+            )
+        return name
+
+
 class GatewayNodeConfig(_StrictModel):
     id: str = Field(default_factory=socket.gethostname)
     host: str = "0.0.0.0"
@@ -36,6 +85,7 @@ class GatewayNodeConfig(_StrictModel):
     public_url: str
     model_served: str = ""
     inference: _InferenceConfig = Field(default_factory=_InferenceConfig)
+    model_pool: tuple[ModelPoolConfig, ...] = ()
     max_init_workers: int = Field(default=4, gt=0)
     max_run_workers: int = Field(default=2, gt=0)
     max_postrun_workers: int = Field(default=4, gt=0)
@@ -67,6 +117,15 @@ class GatewayNodeConfig(_StrictModel):
     @classmethod
     def _validate_public_url(cls, value: str) -> str:
         return _normalize_http_url(value, "gateway.nodes[].public_url")
+
+    @model_validator(mode="after")
+    def _unique_model_pool_aliases(self) -> "GatewayNodeConfig":
+        seen: set[str] = set()
+        for candidate in self.model_pool:
+            if candidate.alias in seen:
+                raise ValueError(f"Duplicate model pool alias: {candidate.alias}")
+            seen.add(candidate.alias)
+        return self
 
     @property
     def inference_base_url(self) -> str:

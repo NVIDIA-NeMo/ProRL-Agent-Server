@@ -209,8 +209,8 @@ def test_tmax_launch_contract_accepts_vanillux2() -> None:
         ROOT / "examples" / "tmax_slime_grpo" / "submit_slurm.sh"
     ).read_text()
 
-    assert "mini_swe_agent|vanillux2)" in env_script
-    assert "mini_swe_agent|vanillux2)" in submit_script
+    assert "mini_swe_agent|spilot_router|vanillux2)" in env_script
+    assert "mini_swe_agent|spilot_router|vanillux2)" in submit_script
     assert "polar_mini_swe_vanillux" in submit_script
     assert "config/vanillux2.yaml" in submit_script
 

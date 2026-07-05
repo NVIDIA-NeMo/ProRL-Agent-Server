@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
+import secrets
 import threading
 import uuid
 from dataclasses import dataclass
@@ -14,6 +16,10 @@ from pydantic import BaseModel
 from polar.rollout.models import SessionResult, SessionStatus
 
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+ROUTER_CAPABILITY_SCOPE = "router_policy"
+MODEL_POOL_CAPABILITY_SCOPE = "model_pool"
+ROUTER_CAPABILITY_ENV = "POLAR_ROUTER_CAPABILITY"
+MODEL_POOL_CAPABILITY_ENV = "POLAR_MODEL_POOL_CAPABILITY"
 
 
 class InvalidSessionIdError(ValueError):
@@ -63,6 +69,11 @@ class SessionRegistry:
 
     def __init__(self) -> None:
         self._sessions: dict[str, SessionInfo] = {}
+        # Only capability digests are retained in the registry.  The raw
+        # values live in the dispatched ManagedSession long enough to be
+        # injected into its runtime and are never returned by status APIs.
+        self._capabilities: dict[bytes, tuple[str, str]] = {}
+        self._session_capability_digests: dict[str, set[bytes]] = {}
         self._lock = threading.Lock()
 
     def register(
@@ -106,6 +117,40 @@ class SessionRegistry:
         with self._lock:
             return self._sessions.get(session_id)
 
+    def issue_capability(self, session_id: str, *, scope: str) -> str:
+        """Issue an unguessable, scoped credential for a dispatched session."""
+
+        if not scope:
+            raise ValueError("capability scope cannot be empty")
+        with self._lock:
+            info = self._sessions.get(session_id)
+            if info is None or not info.registered:
+                raise ValueError("capabilities require a registered session")
+            while True:
+                token = secrets.token_urlsafe(32)
+                digest = hashlib.sha256(token.encode("utf-8")).digest()
+                if digest not in self._capabilities:
+                    break
+            self._capabilities[digest] = (session_id, scope)
+            self._session_capability_digests.setdefault(session_id, set()).add(digest)
+            return token
+
+    def resolve_capability(self, token: str, *, scope: str) -> SessionInfo | None:
+        """Resolve a raw credential only when it carries the requested scope."""
+
+        digest = hashlib.sha256(token.encode("utf-8")).digest()
+        with self._lock:
+            record = self._capabilities.get(digest)
+            if record is None or record[1] != scope:
+                return None
+            return self._sessions.get(record[0])
+
+    def revoke_capabilities(self, session_id: str) -> None:
+        with self._lock:
+            digests = self._session_capability_digests.pop(session_id, set())
+            for digest in digests:
+                self._capabilities.pop(digest, None)
+
     def update_activity(self, session_id: str) -> None:
         with self._lock:
             info = self._sessions.get(session_id)
@@ -146,6 +191,9 @@ class SessionRegistry:
     def remove(self, session_id: str) -> None:
         with self._lock:
             self._sessions.pop(session_id, None)
+            digests = self._session_capability_digests.pop(session_id, set())
+            for digest in digests:
+                self._capabilities.pop(digest, None)
 
     def active_count(self) -> int:
         terminal = SessionStatus.terminal()

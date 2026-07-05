@@ -361,7 +361,10 @@ def test_tmax_delegation_routes_the_container_back_to_tmax() -> None:
     container_entrypoint = (SHARED / "run_in_container.sh").read_text()
     tmax_run = (TMAX / "run.sh").read_text()
 
-    assert 'export POLAR_TRAIN_RUN_SCRIPT="${SCRIPT_DIR}/run.sh"' in tmax_submit
+    assert (
+        'export POLAR_TRAIN_RUN_SCRIPT="${POLAR_TRAIN_RUN_SCRIPT:-${SCRIPT_DIR}/run.sh}"'
+        in tmax_submit
+    )
     assert 'TRAIN_RUN_SCRIPT="${POLAR_TRAIN_RUN_SCRIPT:-${SCRIPT_DIR}/run.sh}"' in shared_submit
     assert (
         'TRAIN_RUN_SCRIPT="${POLAR_TRAIN_RUN_SCRIPT:?set POLAR_TRAIN_RUN_SCRIPT}"'

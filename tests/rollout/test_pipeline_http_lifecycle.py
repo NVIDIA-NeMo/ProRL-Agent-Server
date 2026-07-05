@@ -44,6 +44,7 @@ async def test_start_sizes_http_pool_for_fully_async_sessions(monkeypatch) -> No
     cleanup_client = SimpleNamespace(aclose=AsyncMock())
     constructor = Mock(side_effect=[client, cleanup_client])
     monkeypatch.setattr(httpx, "AsyncClient", constructor)
+    monkeypatch.setenv("POLAR_CONTROL_PLANE_TOKEN", "trusted-control-token")
     pipeline = _pipeline(
         http_max_connections=640,
         http_max_keepalive_connections=192,
@@ -57,6 +58,9 @@ async def test_start_sizes_http_pool_for_fully_async_sessions(monkeypatch) -> No
     cleanup_limits = constructor.call_args_list[1].kwargs["limits"]
     assert cleanup_limits.max_connections == 64
     assert cleanup_limits.max_keepalive_connections == 64
+    expected_headers = {"X-Polar-Control-Token": "trusted-control-token"}
+    assert constructor.call_args_list[0].kwargs["headers"] == expected_headers
+    assert constructor.call_args_list[1].kwargs["headers"] == expected_headers
 
     await pipeline.close()
     client.aclose.assert_awaited_once()

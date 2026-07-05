@@ -127,6 +127,29 @@ class InferenceEngine(ABC):
                 entry.setdefault("token_id", token_id)
 
 
+class OpenAICompatibleEngine(InferenceEngine):
+    """Plain OpenAI-compatible inference used by frozen model-pool entries.
+
+    Unlike the trainable SGLang/vLLM engines, this strategy intentionally does
+    not request token IDs, logprobs, or backend metadata.  Pool responses are
+    observations for the router rather than policy samples and therefore must
+    never acquire Polar's training-only request extensions.
+    """
+
+    name = "openai_compatible"
+
+    def prepare_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        for training_field in (
+            "logprobs",
+            "top_logprobs",
+            "return_prompt_token_ids",
+            "return_meta_info",
+            "return_token_ids",
+        ):
+            request.pop(training_field, None)
+        return request
+
+
 class SGLangEngine(InferenceEngine):
     """SGLang via its source-supported OpenAI-compatible extensions."""
 

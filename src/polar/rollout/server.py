@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -33,6 +34,27 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+_CONTROL_PLANE_TOKEN_ENV = "POLAR_CONTROL_PLANE_TOKEN"
+_CONTROL_PLANE_TOKEN_HEADER = "x-polar-control-token"
+
+
+def _require_control_plane_request(
+    request: Request,
+    *,
+    required: bool = False,
+) -> None:
+    expected = os.environ.get(_CONTROL_PLANE_TOKEN_ENV, "").strip()
+    if not expected:
+        if required:
+            raise HTTPException(
+                status_code=503,
+                detail="SPilot submission requires a configured control-plane token",
+            )
+        return
+    supplied = request.headers.get(_CONTROL_PLANE_TOKEN_HEADER, "")
+    if not secrets.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="Invalid control-plane credential")
 
 
 @dataclass(slots=True)
@@ -115,11 +137,14 @@ async def health():
 
 
 @app.post("/rollout/task/submit")
-async def submit_task_async(request: TaskRequest):
+async def submit_task_async(http_request: Request, request: TaskRequest):
     """Non-blocking task submission. Returns immediately with task_id.
 
     Poll ``GET /rollout/task/{task_id}`` until status becomes terminal.
     """
+    if request.agent.harness == "spilot_router":
+        _require_control_plane_request(http_request, required=True)
+
     state = get_state()
     try:
         task_id = await state.manager.submit_task(request)
@@ -160,12 +185,18 @@ async def rollout_status():
 
 
 @app.post("/nodes/register", response_model=GatewayNodeInfo)
-async def register_node(request: NodeRegistrationRequest):
+async def register_node(http_request: Request, request: NodeRegistrationRequest):
+    _require_control_plane_request(http_request)
     return get_state().scheduler.register_node(request)
 
 
 @app.post("/nodes/{node_id}/heartbeat", response_model=GatewayNodeInfo)
-async def node_heartbeat(node_id: str, request: NodeHeartbeatRequest):
+async def node_heartbeat(
+    node_id: str,
+    http_request: Request,
+    request: NodeHeartbeatRequest,
+):
+    _require_control_plane_request(http_request)
     try:
         return get_state().scheduler.heartbeat(node_id, metrics=request.metrics)
     except KeyError as exc:
@@ -194,7 +225,8 @@ async def drain_node(node_id: str):
 
 
 @app.post("/callbacks/session_result")
-async def session_result_callback(result: SessionResult):
+async def session_result_callback(http_request: Request, result: SessionResult):
+    _require_control_plane_request(http_request)
     await get_state().pipeline.accept_callback_result(result)
     return {"status": "accepted"}
 

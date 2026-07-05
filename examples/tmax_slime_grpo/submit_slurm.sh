@@ -151,7 +151,7 @@ if [ "${TMAX_EVAL_ENABLED}" = "1" ]; then
         --check-paths-only
 fi
 case "${TMAX_AGENT_HARNESS}" in
-    mini_swe_agent|vanillux2)
+    mini_swe_agent|spilot_router|vanillux2)
         _mini_swe_python="${MINI_SWE_AGENT_RUNTIME_DIR}/venv/bin/python"
         _mini_swe_timing_source="${PROJECT_ROOT}/src/polar/agent/presets/mini_swe_timing.py"
         _mini_swe_runner_source="${PROJECT_ROOT}/src/polar/agent/presets/mini_swe_runner.py"
@@ -414,7 +414,7 @@ fi
 export PROMPT_DATA="${TMAX_TRAIN_DATA}"
 export TMAX_PREPARE_DATA=0
 export TMAX_PREPARE_EVAL_DATA=0
-export POLAR_TRAIN_RUN_SCRIPT="${SCRIPT_DIR}/run.sh"
+export POLAR_TRAIN_RUN_SCRIPT="${POLAR_TRAIN_RUN_SCRIPT:-${SCRIPT_DIR}/run.sh}"
 export POLAR_LAUNCHER_LABEL="Polar TMax Slime-GRPO"
 export JOB_NAME="${JOB_NAME:-polar-tmax-${RUN_ID}}"
 export POLAR_SUBMIT_RECEIPT_FILE="${TMAX_SUBMIT_RECEIPT_FILE}"

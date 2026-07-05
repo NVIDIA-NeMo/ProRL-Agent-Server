@@ -12,7 +12,13 @@ import pytest
 from polar.agent.models import AgentRunResult, AgentSpec
 from polar.gateway.dispatcher import ManagedSession, SessionStage
 from polar.gateway.node import GatewayExecutionTimeout, GatewayNodeManager
-from polar.gateway.session import SessionRegistry
+from polar.gateway.session import (
+    MODEL_POOL_CAPABILITY_ENV,
+    MODEL_POOL_CAPABILITY_SCOPE,
+    ROUTER_CAPABILITY_ENV,
+    ROUTER_CAPABILITY_SCOPE,
+    SessionRegistry,
+)
 from polar.gateway.storage import SessionStore
 from polar.rollout.models import SessionDispatchRequest, SessionStatus
 from polar.rollout.timer import StageTimer
@@ -79,6 +85,77 @@ def test_exec_log_write_recreates_directory_after_concurrent_cleanup(tmp_path) -
 
     assert (log_dir / "step.00.stdout.log").read_text() == "stdout"
     assert (log_dir / "step.00.stderr.log").read_text() == "stderr"
+
+
+@pytest.mark.asyncio
+async def test_spilot_dispatch_issues_and_injects_scoped_capabilities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POLAR_CONTROL_PLANE_TOKEN", "host-only-control-token")
+    registry = SessionRegistry()
+    storage = SessionStore()
+    manager = GatewayNodeManager(
+        node_id="node-test",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=storage,
+        session_registry=registry,
+        builders=SimpleNamespace(),  # type: ignore[arg-type]
+        evaluators=SimpleNamespace(),  # type: ignore[arg-type]
+        session_base_dir=str(tmp_path),
+    )
+    enqueue = AsyncMock()
+    manager._dispatcher.enqueue = enqueue
+    request = SessionDispatchRequest(
+        session_id="public-session-id",
+        task_id="task-id",
+        instruction="Fix it",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(image="task.sif"),
+        agent=AgentSpec(harness="spilot_router"),
+    )
+    try:
+        await manager.dispatch(request)
+        managed = enqueue.await_args.args[0]
+        assert managed.router_capability not in (None, request.session_id)
+        assert managed.model_pool_capability not in (None, request.session_id)
+        assert (
+            registry.resolve_capability(
+                managed.router_capability,
+                scope=ROUTER_CAPABILITY_SCOPE,
+            ).session_id
+            == request.session_id
+        )
+        assert (
+            registry.resolve_capability(
+                managed.model_pool_capability,
+                scope=MODEL_POOL_CAPABILITY_SCOPE,
+            ).session_id
+            == request.session_id
+        )
+
+        init_environment = manager._runtime_env(request, managed, include_agent_env=True)
+        assert ROUTER_CAPABILITY_ENV not in init_environment
+        assert MODEL_POOL_CAPABILITY_ENV not in init_environment
+
+        managed.stage = SessionStage.RUNNING
+        registry.set_status(request.session_id, SessionStatus.RUNNING)
+        environment = manager._runtime_env(request, managed, include_agent_env=True)
+        assert environment["OPENAI_API_KEY"] == request.session_id
+        assert "POLAR_CONTROL_PLANE_TOKEN" not in environment
+        assert environment[ROUTER_CAPABILITY_ENV] == managed.router_capability
+        assert environment[MODEL_POOL_CAPABILITY_ENV] == managed.model_pool_capability
+
+        managed.stage = SessionStage.POSTRUN
+        postrun_environment = manager._runtime_env(request, managed, include_agent_env=True)
+        assert ROUTER_CAPABILITY_ENV not in postrun_environment
+        assert MODEL_POOL_CAPABILITY_ENV not in postrun_environment
+    finally:
+        await manager._client.aclose()
+        storage.close()
 
 
 def test_runtime_prepare_retries_configured_transient_exec_failure(tmp_path) -> None:

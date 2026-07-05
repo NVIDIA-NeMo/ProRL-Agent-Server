@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import shutil
 from contextlib import suppress
 from pathlib import Path
@@ -19,7 +20,13 @@ from polar.gateway.dispatcher import (
     SessionDispatcher,
     SessionStage,
 )
-from polar.gateway.session import SessionRegistry
+from polar.gateway.session import (
+    MODEL_POOL_CAPABILITY_ENV,
+    MODEL_POOL_CAPABILITY_SCOPE,
+    ROUTER_CAPABILITY_ENV,
+    ROUTER_CAPABILITY_SCOPE,
+    SessionRegistry,
+)
 from polar.gateway.storage import SessionStore
 from polar.agent.base import BaseHarness
 from polar.agent.factory import create_harness
@@ -90,7 +97,12 @@ class GatewayNodeManager:
         self.evaluators = evaluators
         self.default_runtime = default_runtime
         self._session_base_dir = session_base_dir
-        self._client = httpx.AsyncClient(timeout=30.0)
+        control_token = os.environ.get("POLAR_CONTROL_PLANE_TOKEN", "").strip()
+        control_headers = (
+            {"X-Polar-Control-Token": control_token} if control_token else None
+        )
+        self._control_headers = control_headers
+        self._client = httpx.AsyncClient(timeout=30.0, headers=control_headers)
         self._dispatcher = SessionDispatcher(
             max_init_workers=max_init_workers,
             max_run_workers=max_run_workers,
@@ -112,7 +124,9 @@ class GatewayNodeManager:
         await self._dispatcher.start()
         if self._rollout_server_url is not None:
             self._control_client = httpx.AsyncClient(
-                base_url=self._rollout_server_url, timeout=15.0
+                base_url=self._rollout_server_url,
+                timeout=15.0,
+                headers=self._control_headers,
             )
             await self._register_with_rollout_server()
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -205,12 +219,25 @@ class GatewayNodeManager:
             artifacts_dir = session_dir / "artifacts"
             artifacts_dir.mkdir()
             (session_dir / "logs" / "agent").mkdir(parents=True, exist_ok=True)
+            router_capability: str | None = None
+            model_pool_capability: str | None = None
+            if request.agent.harness == "spilot_router":
+                router_capability = self.session_registry.issue_capability(
+                    session_id,
+                    scope=ROUTER_CAPABILITY_SCOPE,
+                )
+                model_pool_capability = self.session_registry.issue_capability(
+                    session_id,
+                    scope=MODEL_POOL_CAPABILITY_SCOPE,
+                )
             await self._dispatcher.enqueue(
                 ManagedSession(
                     request=request,
                     timer=timer,
                     session_dir=session_dir,
                     artifacts_dir=artifacts_dir,
+                    router_capability=router_capability,
+                    model_pool_capability=model_pool_capability,
                 )
             )
         except Exception:
@@ -1121,6 +1148,16 @@ class GatewayNodeManager:
             **{key: str(value) for key, value in runtime_env.items()},
             **{key: str(value) for key, value in agent_env.items()},
         }
+        # These host-generated capabilities are deliberately added after
+        # caller-controlled runtime/agent env.  They exist only for the SPilot
+        # harness and never reuse the externally visible session id.
+        router_capability = getattr(managed, "router_capability", None)
+        model_pool_capability = getattr(managed, "model_pool_capability", None)
+        if getattr(managed, "stage", None) == SessionStage.RUNNING:
+            if router_capability:
+                environment[ROUTER_CAPABILITY_ENV] = router_capability
+            if model_pool_capability:
+                environment[MODEL_POOL_CAPABILITY_ENV] = model_pool_capability
         if runtime is not None:
             # Keep RuntimeSpec.env strictly string-valued while still exposing
             # the authoritative policy to an injected network helper. Put this

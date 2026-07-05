@@ -6,6 +6,7 @@ import math
 from types import SimpleNamespace
 
 from slime_bridge.rollout import (
+    _control_plane_headers,
     _log_trajectory_examples_to_wandb,
     _polar_extra_metrics,
     _prefix_eval_metrics,
@@ -13,6 +14,17 @@ from slime_bridge.rollout import (
     _trajectory_example_records,
     log_rollout_trajectory_examples,
 )
+
+
+def test_control_plane_header_is_attached_without_exposing_token_in_payload(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("POLAR_CONTROL_PLANE_TOKEN", "trusted-control-token")
+
+    assert _control_plane_headers() == {
+        "Content-Type": "application/json",
+        "X-Polar-Control-Token": "trusted-control-token",
+    }
 
 
 def _sample(
@@ -34,6 +46,7 @@ def _sample(
     loss_mask: list[int] | None = None,
     missing_loss_mask: bool = False,
     truncated: bool | None = None,
+    spilot_router: dict | None = None,
 ) -> SimpleNamespace:
     polar = {
         "session_id": session_id,
@@ -95,6 +108,10 @@ def _sample(
             "trainable": True,
             "reason": "agent_timeout",
         }
+    if spilot_router is not None:
+        polar["trajectory_metadata"] = {
+            "evaluation": {"spilot_router": spilot_router}
+        }
     sample_is_truncated = agent_timeout if truncated is None else truncated
     return SimpleNamespace(
         reward={"score": reward},
@@ -154,6 +171,195 @@ def test_polar_reward_mean_averages_traces_within_session_first() -> None:
     assert metrics["polar/reward_mean"] == 0.25
     assert metrics["polar/reward_mean_completed"] == 0.25
     assert metrics["polar/reward_mean_all_samples"] == 0.25
+
+
+def test_spilot_router_metrics_count_each_session_once_with_fixed_slot_keys() -> None:
+    route_submit = {
+        "action_valid": True,
+        "submitted": True,
+        "actions": [
+            {"step": 0, "valid": True, "action": "ROUTE", "model_slot": "M0"},
+            {"step": 1, "valid": True, "action": "SUBMIT"},
+        ],
+        "calls": [{"slot": "M0", "model": "vendor/model-a", "status": "completed"}],
+        "total_cost": 1.0,
+        "termination_reason": "router_submit",
+        "slot_mapping": {"M0": {"model": "vendor/model-a"}},
+    }
+    route_verify = {
+        "action_valid": True,
+        "submitted": True,
+        "actions": [
+            {"step": 0, "valid": True, "action": "ROUTE", "model_slot": "M1"},
+            {"step": 1, "valid": True, "action": "VERIFY", "model_slot": "M0"},
+        ],
+        "calls": [
+            {"slot": "M1", "model": "vendor/model-b", "status": "failed"},
+            {"slot": "M0", "model": "vendor/model-a", "status": "timeout"},
+        ],
+        "total_cost": 3.0,
+        "termination_reason": "verify_auto_submit",
+        "slot_mapping": {
+            "M0": {"model": "vendor/model-a"},
+            "M1": {"model": "vendor/model-b"},
+        },
+    }
+    invalid = {
+        "action_valid": False,
+        "submitted": False,
+        "actions": [{"step": 0, "valid": False}],
+        "calls": [],
+        "total_cost": 0.0,
+        "termination_reason": "invalid_action_step_0",
+        "slot_mapping": {},
+    }
+    samples = [
+        _sample("submit", 1.0, spilot_router=route_submit, trace_index=0),
+        # A second trace from the same trajectory must not duplicate Router metrics.
+        _sample("submit", 1.0, spilot_router=route_submit, trace_index=1),
+        _sample("verify", 0.0, spilot_router=route_verify),
+        _sample("invalid", 0.0, spilot_router=invalid),
+    ]
+
+    metrics = _polar_extra_metrics(samples, rewards=[1.0, 1.0, 0.0, 0.0], reward_key="score")
+    prefix = "polar/spilot_router"
+
+    assert metrics[f"{prefix}/session_count"] == 3.0
+    assert metrics[f"{prefix}/action_valid_count"] == 2.0
+    assert metrics[f"{prefix}/action_valid_fraction"] == 2 / 3
+    assert metrics[f"{prefix}/submitted_count"] == 2.0
+    assert metrics[f"{prefix}/submitted_fraction"] == 2 / 3
+    assert metrics[f"{prefix}/route_m0_count"] == 1.0
+    assert metrics[f"{prefix}/route_m1_count"] == 1.0
+    assert metrics[f"{prefix}/verify_m0_count"] == 1.0
+    assert metrics[f"{prefix}/verify_m1_count"] == 0.0
+    assert metrics[f"{prefix}/route_candidate_c0_count"] == 1.0
+    assert metrics[f"{prefix}/route_candidate_c1_count"] == 1.0
+    assert metrics[f"{prefix}/verify_candidate_c0_count"] == 1.0
+    assert metrics[f"{prefix}/verify_candidate_c1_count"] == 0.0
+    assert metrics[f"{prefix}/direct_submit_count"] == 1.0
+    assert metrics[f"{prefix}/pool_call_count"] == 3.0
+    assert metrics[f"{prefix}/pool_completed_count"] == 1.0
+    assert metrics[f"{prefix}/pool_failed_count"] == 1.0
+    assert metrics[f"{prefix}/pool_timeout_count"] == 1.0
+    assert metrics[f"{prefix}/total_cost"] == 4.0
+    assert metrics[f"{prefix}/reward_accounted_session_count"] == 3.0
+    assert metrics[f"{prefix}/reward_mean"] == 1 / 3
+    assert metrics[f"{prefix}/reward_m0_mean"] == 1.0
+    assert metrics[f"{prefix}/reward_m1_mean"] == 0.0
+    assert metrics[f"{prefix}/reward_candidate_c0_mean"] == 1.0
+    assert metrics[f"{prefix}/reward_candidate_c1_mean"] == 0.0
+    assert not any("vendor/model" in key for key in metrics)
+
+
+def test_spilot_router_candidate_metrics_are_stable_when_slots_shuffle() -> None:
+    def metadata(
+        *,
+        route_slot: str,
+        verify_slot: str,
+        slot_mapping: dict[str, dict[str, str]],
+    ) -> dict:
+        return {
+            "action_valid": True,
+            "submitted": True,
+            "actions": [
+                {
+                    "step": 0,
+                    "valid": True,
+                    "action": "ROUTE",
+                    "model_slot": route_slot,
+                },
+                {
+                    "step": 1,
+                    "valid": True,
+                    "action": "VERIFY",
+                    "model_slot": verify_slot,
+                },
+            ],
+            "calls": [],
+            "total_cost": 0.0,
+            "termination_reason": "verify_auto_submit",
+            "slot_mapping": slot_mapping,
+        }
+
+    # In both sessions the initial candidate is model-z (stable C1), and the
+    # verifier is model-a (stable C0), despite opposite M0/M1 assignments.
+    samples = [
+        _sample(
+            "shuffle-a",
+            1.0,
+            spilot_router=metadata(
+                route_slot="M0",
+                verify_slot="M1",
+                slot_mapping={
+                    "M0": {"model": "pool/model-z"},
+                    "M1": {"model": "pool/model-a"},
+                },
+            ),
+        ),
+        _sample(
+            "shuffle-b",
+            0.0,
+            spilot_router=metadata(
+                route_slot="M1",
+                verify_slot="M0",
+                slot_mapping={
+                    "M0": {"model": "pool/model-a"},
+                    "M1": {"model": "pool/model-z"},
+                },
+            ),
+        ),
+    ]
+
+    metrics = _polar_extra_metrics(samples, rewards=[1.0, 0.0], reward_key="score")
+    prefix = "polar/spilot_router"
+
+    assert metrics[f"{prefix}/route_m0_count"] == 1.0
+    assert metrics[f"{prefix}/route_m1_count"] == 1.0
+    assert metrics[f"{prefix}/verify_m0_count"] == 1.0
+    assert metrics[f"{prefix}/verify_m1_count"] == 1.0
+    assert metrics[f"{prefix}/route_candidate_c0_count"] == 0.0
+    assert metrics[f"{prefix}/route_candidate_c1_count"] == 2.0
+    assert metrics[f"{prefix}/verify_candidate_c0_count"] == 2.0
+    assert metrics[f"{prefix}/verify_candidate_c1_count"] == 0.0
+    assert metrics[f"{prefix}/reward_candidate_c0_count"] == 0.0
+    assert metrics[f"{prefix}/reward_candidate_c1_count"] == 2.0
+    assert f"{prefix}/reward_candidate_c0_mean" not in metrics
+    assert metrics[f"{prefix}/reward_candidate_c1_mean"] == 0.5
+    assert not any("model-a" in key or "model-z" in key for key in metrics)
+
+
+def test_spilot_router_reward_metrics_omit_unsafe_unaccounted_session() -> None:
+    router_metadata = {
+        "action_valid": True,
+        "submitted": True,
+        "actions": [
+            {"step": 0, "valid": True, "action": "ROUTE", "model_slot": "M0"}
+        ],
+        "calls": [],
+        # Invalid legacy telemetry must neither poison W&B with NaN nor count as cost.
+        "total_cost": float("nan"),
+        "termination_reason": "infrastructure_error",
+        "slot_mapping": {"M0": {"model": "arbitrary/dynamic-model-id"}},
+    }
+    unaccounted = _sample(
+        "unaccounted",
+        1.0,
+        status="ERROR",
+        placeholder=True,
+        trainable=False,
+        spilot_router=router_metadata,
+    )
+
+    metrics = _polar_extra_metrics([unaccounted], rewards=[1.0], reward_key="score")
+    prefix = "polar/spilot_router"
+
+    assert metrics[f"{prefix}/session_count"] == 1.0
+    assert metrics[f"{prefix}/total_cost"] == 0.0
+    assert metrics[f"{prefix}/reward_accounted_session_count"] == 0.0
+    assert f"{prefix}/reward_mean" not in metrics
+    assert f"{prefix}/reward_m0_mean" not in metrics
+    assert not any("dynamic-model-id" in key for key in metrics)
 
 
 def test_polar_reward_mean_counts_trusted_model_failure_but_not_early_stop() -> None:

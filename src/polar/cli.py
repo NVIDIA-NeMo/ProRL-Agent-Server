@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 import sys
@@ -152,7 +153,9 @@ def _handle_submit(args: argparse.Namespace) -> int:
     rollout_url = _resolve_rollout_url(args.config, args.rollout_url)
     payload = _load_structured_file(args.task_file)
     timeout = httpx.Timeout(None, connect=30.0)
-    with httpx.Client(base_url=rollout_url, timeout=timeout) as client:
+    control_token = os.environ.get("POLAR_CONTROL_PLANE_TOKEN", "").strip()
+    headers = {"X-Polar-Control-Token": control_token} if control_token else None
+    with httpx.Client(base_url=rollout_url, timeout=timeout, headers=headers) as client:
         submit_resp = client.post("/rollout/task/submit", json=payload)
         submit_resp.raise_for_status()
         task_id = submit_resp.json()["task_id"]

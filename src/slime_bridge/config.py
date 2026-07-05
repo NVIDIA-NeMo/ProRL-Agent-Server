@@ -30,6 +30,7 @@ class PolarSlimeConfig:
     request_timeout: float | None
     task_timeout_floor: float | None
     train_agent_timeout: float | None
+    eval_agent_timeout: float | None
     callback_host: str
     scoring_mode: str
     min_complete_accept_fraction: float
@@ -104,6 +105,13 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
             field="polar_train_agent_timeout",
         )
 
+    eval_agent_timeout = getattr(args, "polar_eval_agent_timeout", None)
+    if eval_agent_timeout is not None:
+        eval_agent_timeout = _positive_finite_number(
+            eval_agent_timeout,
+            field="polar_eval_agent_timeout",
+        )
+
     callback_host = str(getattr(args, "polar_callback_host", "127.0.0.1")).strip()
     if not callback_host:
         raise ValueError("polar_callback_host must be a non-empty host or IP")
@@ -145,6 +153,7 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
         request_timeout=request_timeout,
         task_timeout_floor=task_timeout_floor,
         train_agent_timeout=train_agent_timeout,
+        eval_agent_timeout=eval_agent_timeout,
         callback_host=callback_host,
         scoring_mode=scoring_mode,
         min_complete_accept_fraction=min_complete_accept_fraction,
@@ -199,6 +208,11 @@ def render_task_payload(
         if not isinstance(task_metadata, dict):
             raise ValueError("rendered task payload metadata must be a mapping")
         task_metadata["agent_timeout"] = config.train_agent_timeout
+    if config.eval_agent_timeout is not None and is_eval:
+        task_metadata = payload.setdefault("metadata", {})
+        if not isinstance(task_metadata, dict):
+            raise ValueError("rendered task payload metadata must be a mapping")
+        task_metadata["agent_timeout"] = config.eval_agent_timeout
     if isinstance(metadata, dict) and metadata.get("agent_step_limit") is not None:
         try:
             step_limit = int(metadata["agent_step_limit"])
@@ -375,6 +389,10 @@ def render_topology_template(topology_path: str | Path, args: Any) -> dict[str, 
                         "engine": "sglang",
                         "base_url": router_url,
                     },
+                    "model_pool": [
+                        candidate.model_dump(mode="python")
+                        for candidate in node.model_pool
+                    ],
                     "max_init_workers": node.max_init_workers,
                     "max_run_workers": node.max_run_workers,
                     "max_postrun_workers": node.max_postrun_workers,

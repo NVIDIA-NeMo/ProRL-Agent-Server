@@ -20,6 +20,7 @@ def _builtin_harness_map() -> dict[str, type[BaseHarness]]:
     from polar.agent.presets.pi import PiHarness
     from polar.agent.presets.qwen_code import QwenCodeHarness
     from polar.agent.presets.shell import ShellHarness
+    from polar.agent.presets.spilot_router import SpilotRouterHarness
     from polar.agent.presets.vanillux2 import Vanillux2Harness
 
     return {
@@ -34,6 +35,7 @@ def _builtin_harness_map() -> dict[str, type[BaseHarness]]:
         "pi": PiHarness,
         "qwen_code": QwenCodeHarness,
         "shell": ShellHarness,
+        "spilot_router": SpilotRouterHarness,
         "vanillux2": Vanillux2Harness,
     }
 

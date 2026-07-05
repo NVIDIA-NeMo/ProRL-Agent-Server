@@ -65,6 +65,8 @@ class ManagedSession:
     timer: StageTimer
     session_dir: Path
     artifacts_dir: Path
+    router_capability: str | None = None
+    model_pool_capability: str | None = None
     runtime: BaseRuntime | None = None
     agent_result: AgentRunResult | None = None
     final_result: SessionResult | None = None

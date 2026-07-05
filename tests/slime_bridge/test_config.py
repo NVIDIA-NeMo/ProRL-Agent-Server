@@ -34,6 +34,7 @@ def _args(**overrides):
         "polar_request_timeout": 60,
         "polar_task_timeout_floor": None,
         "polar_train_agent_timeout": None,
+        "polar_eval_agent_timeout": None,
         "polar_callback_host": "127.0.0.1",
         "polar_scoring_mode": "group",
         "polar_min_complete_accept_fraction": 0.0,
@@ -59,6 +60,7 @@ def test_resolve_polar_slime_config_computes_concurrency_and_normalizes_url() ->
     assert config.request_timeout == 60.0
     assert config.task_timeout_floor is None
     assert config.train_agent_timeout is None
+    assert config.eval_agent_timeout is None
     assert config.min_complete_accept_fraction == 0.0
     assert config.early_stop_grace_sessions == 2
 
@@ -94,6 +96,12 @@ def test_resolve_polar_slime_config_rejects_invalid_task_timeout_floor(value) ->
 def test_resolve_polar_slime_config_rejects_invalid_train_agent_timeout(value) -> None:
     with pytest.raises(ValueError, match="polar_train_agent_timeout"):
         resolve_polar_slime_config(_args(polar_train_agent_timeout=value))
+
+
+@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan"), True, "slow"])
+def test_resolve_polar_slime_config_rejects_invalid_eval_agent_timeout(value) -> None:
+    with pytest.raises(ValueError, match="polar_eval_agent_timeout"):
+        resolve_polar_slime_config(_args(polar_eval_agent_timeout=value))
 
 
 @pytest.mark.parametrize("value", [-0.1, 1.1])
@@ -245,6 +253,46 @@ def test_render_task_payload_applies_agent_timeout_override_only_to_training() -
 
     assert training_payload["metadata"]["agent_timeout"] == 1200.0
     assert eval_payload["metadata"]["agent_timeout"] == 600.0
+
+
+def test_render_task_payload_can_override_eval_agent_timeout_independently() -> None:
+    args = _args(
+        polar_train_agent_timeout=1200,
+        polar_eval_agent_timeout=3300,
+        polar_task_template={
+            "timeout_seconds": "{sample.metadata.timeout_seconds}",
+            "agent": {"harness": "spilot_router", "model_name": "model"},
+        },
+    )
+    config = resolve_polar_slime_config(args)
+    sample = SimpleNamespace(
+        prompt="prompt",
+        metadata={"timeout_seconds": 4500.0, "agent_timeout": 600.0},
+        group_index=0,
+    )
+
+    training_payload = render_task_payload(
+        args=args,
+        config=config,
+        sample=sample,
+        instruction="task",
+        rollout_id=1,
+        task_position=0,
+        num_rollouts=1,
+    )
+    eval_payload = render_task_payload(
+        args=args,
+        config=config,
+        sample=sample,
+        instruction="task",
+        rollout_id=1,
+        task_position=0,
+        num_rollouts=1,
+        is_eval=True,
+    )
+
+    assert training_payload["metadata"]["agent_timeout"] == 1200.0
+    assert eval_payload["metadata"]["agent_timeout"] == 3300.0
 
 
 @pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan"), True, "slow"])
@@ -518,9 +566,25 @@ gateway:
       public_url: http://127.0.0.1:8100
       model_served: Qwen/Qwen3.5-4B
       inference: {engine: sglang, base_url: http://127.0.0.1:8000}
+      model_pool:
+        - alias: pool/qwen3.6-27b
+          model: nvidia/qwen/qwen3.6-27b
+          base_url: https://integrate.api.nvidia.com/v1
+          api_key_env: POLAR_NVIDIA_API_KEY
+        - alias: pool/gpt-5.5
+          model: openai/openai/gpt-5.5
+          base_url: https://integrate.api.nvidia.com/v1
+          api_key_env: POLAR_NVIDIA_API_KEY
 """.strip()
     )
     rendered = render_topology_template(str(topology_path), _args())
     node = rendered["gateway"]["nodes"][0]
     assert node["inference"] == {"engine": "sglang", "base_url": "http://127.0.0.1:30000"}
+    assert [(item["alias"], item["model"]) for item in node["model_pool"]] == [
+        ("pool/qwen3.6-27b", "nvidia/qwen/qwen3.6-27b"),
+        ("pool/gpt-5.5", "openai/openai/gpt-5.5"),
+    ]
+    assert {item["api_key_env"] for item in node["model_pool"]} == {
+        "POLAR_NVIDIA_API_KEY"
+    }
     assert "sglang" not in node
