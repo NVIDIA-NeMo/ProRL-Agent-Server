@@ -37,6 +37,9 @@ _TASK_ENV = "SPILOT_TASK_B64"
 _ROUTER_CAPABILITY_ENV = "POLAR_ROUTER_CAPABILITY"
 _MODEL_POOL_CAPABILITY_ENV = "POLAR_MODEL_POOL_CAPABILITY"
 _MINI_SWE_TASK_B64_ENV = "POLAR_MINI_SWE_TASK_B64"
+_VANILLUX2_CONFIG_PATH = "/opt/polar-mini-swe-agent/config/vanillux2.yaml"
+_VANILLUX2_MODEL_CLASS = "polar_mini_swe_vanillux.Vanillux2LitellmModel"
+_VANILLUX2_ENVIRONMENT_CLASS = "polar_mini_swe_timing.Vanillux2TimedLocalEnvironment"
 _SLOT_RE = re.compile(r"^M(?:0|[1-9][0-9]*)$")
 _MAX_ERROR_CHARS = 500
 _MAX_CARD_CHARS = 4_000
@@ -301,12 +304,17 @@ class MiniSwePoolExecutor:
     ) -> PoolCallResult:
         log_path = self.log_dir / f"spilot-pool-{call_index:02d}-{role}.txt"
         timing_path = self.log_dir / f"spilot-pool-{call_index:02d}-timing.jsonl"
+        # Vanillux2 persists cwd and exported variables between turns.  A
+        # verifier is a fresh agent sharing only the mutable task workspace,
+        # so every pool call needs an isolated protocol-state directory.
+        state_dir = self.log_dir / f"spilot-pool-{call_index:02d}-state"
         instruction = task if role == "solve" else _verification_instruction(task)
         model_kwargs = dict(self.config.get("pool_model_kwargs", {}))
         model_kwargs.update(candidate.model_kwargs)
         args = self._command(
             model=candidate.model,
             timing_path=str(timing_path),
+            state_dir=str(state_dir),
             model_kwargs=model_kwargs,
         )
         child_env = dict(os.environ)
@@ -437,6 +445,7 @@ class MiniSwePoolExecutor:
         *,
         model: str,
         timing_path: str,
+        state_dir: str,
         model_kwargs: dict[str, Any],
     ) -> list[str]:
         model_id = model if model.startswith("openai/") else f"openai/{model}"
@@ -444,15 +453,27 @@ class MiniSwePoolExecutor:
             str(self.config["mini_swe_bin"]),
             "--yolo",
             "--environment-class",
-            "polar_mini_swe_timing.TimedLocalEnvironment",
+            _VANILLUX2_ENVIRONMENT_CLASS,
+            "--model-class",
+            _VANILLUX2_MODEL_CLASS,
             f"--model={model_id}",
             "--cost-limit",
             str(self.config["pool_cost_limit"]),
             "--exit-immediately",
             "-c",
-            "mini",
+            _VANILLUX2_CONFIG_PATH,
             "-c",
             f"agent.step_limit={self.config['pool_step_limit']}",
+            "-c",
+            f"agent.max_consecutive_format_errors={self.config['pool_max_format_errors']}",
+            "-c",
+            f"environment.timeout={self.config['pool_command_timeout']}",
+            "-c",
+            f"environment.max_output_chars={self.config['observation_max_chars']}",
+            "-c",
+            f"environment.state_dir={state_dir}",
+            "-c",
+            f"model.response_token_budget={self.config['pool_response_token_budget']}",
             "-c",
             "environment.env.PYTHONPATH=",
             "-c",
@@ -864,6 +885,9 @@ def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
         "deadline_margin_seconds",
         "pool_step_limit",
         "pool_cost_limit",
+        "pool_command_timeout",
+        "pool_max_format_errors",
+        "pool_response_token_budget",
         "pool_model_retry_attempts",
         "observation_max_chars",
         "log_tail_chars",

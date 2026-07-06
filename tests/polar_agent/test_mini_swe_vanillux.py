@@ -27,13 +27,16 @@ class _FakeLimitsExceeded(Exception):
 
 class _FakeLitellmModel:
     def __init__(self, **kwargs) -> None:
-        self.config = SimpleNamespace(
-            model_name="openai/Qwen3.5-9B",
-            model_kwargs={
+        model_kwargs = kwargs.get("model_kwargs")
+        if model_kwargs is None:
+            model_kwargs = {
                 "temperature": 0.7,
                 "max_tokens": 100,
                 "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
-            },
+            }
+        self.config = SimpleNamespace(
+            model_name=kwargs.get("model_name", "openai/Qwen3.5-9B"),
+            model_kwargs=dict(model_kwargs),
             format_error_template="{{ error }} (finish={{ finish_reason }})",
         )
 
@@ -151,6 +154,51 @@ def test_vanillux_cumulative_budget_uses_exact_prompt_growth_and_clamps_turn(
     assert payload["chat_template_kwargs"] == {"enable_thinking": True}
     assert headers["Authorization"] == "Bearer session-1"
     assert tokenize_requests[1][1]["messages"] == second_messages
+
+
+def test_vanillux_budget_uses_only_max_completion_tokens_when_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_vanillux_module(monkeypatch)
+    tokenize_counts = iter((100, 150))
+    completion_requests: list[dict] = []
+
+    class TokenizeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"count": next(tokenize_counts)}
+
+    class TokenizeClient:
+        def post(self, *_args, **_kwargs):
+            return TokenizeResponse()
+
+    def fake_completion(**kwargs):
+        completion_requests.append(kwargs)
+        return "response"
+
+    monkeypatch.setattr(module.litellm, "client_session", TokenizeClient(), raising=False)
+    monkeypatch.setattr(module.litellm, "completion", fake_completion)
+    monkeypatch.setenv("OPENAI_API_BASE", "http://polar.invalid/v1")
+    model = module.Vanillux2LitellmModel(
+        response_token_budget=64,
+        model_name="openai/pool/gpt-5.5",
+        # Recursive mini-SWE config merging supplies both fields.  The modern
+        # field must win and remain the field clamped on every turn.
+        model_kwargs={
+            "max_tokens": 16_384,
+            "max_completion_tokens": 40,
+            "temperature": 0.7,
+        },
+    )
+
+    assert model.query([{"role": "user", "content": "task"}]) == "response"
+    assert model.query([{"role": "user", "content": "larger task"}]) == "response"
+
+    assert "max_tokens" not in model.config.model_kwargs
+    assert [request["max_completion_tokens"] for request in completion_requests] == [40, 14]
+    assert all("max_tokens" not in request for request in completion_requests)
 
 
 def test_vanillux_budget_fails_closed_when_gateway_count_is_invalid(

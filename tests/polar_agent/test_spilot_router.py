@@ -40,7 +40,9 @@ def _runner_config(**updates: object) -> dict[str, object]:
                 "cost_weight": 1.0,
                 "model_kwargs": {
                     "max_tokens": 16384,
-                    "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
                 },
             },
             "M1": {
@@ -59,10 +61,13 @@ def _runner_config(**updates: object) -> dict[str, object]:
         "total_timeout_seconds": 300.0,
         "reserve_evaluator_seconds": 30.0,
         "deadline_margin_seconds": 1.0,
-        "pool_step_limit": 30,
+        "pool_step_limit": 64,
         "pool_cost_limit": 0.0,
-        "pool_model_retry_attempts": 3,
-        "observation_max_chars": 12_000,
+        "pool_command_timeout": 120,
+        "pool_max_format_errors": 64,
+        "pool_response_token_budget": 65_536,
+        "pool_model_retry_attempts": 5,
+        "observation_max_chars": 10_000,
         "log_tail_chars": 6_000,
         "router_model_kwargs": {},
         "pool_model_kwargs": {},
@@ -282,6 +287,7 @@ def test_pool_command_merges_global_and_per_candidate_request_kwargs(tmp_path: P
     command = executor._command(
         model=candidate.model,
         timing_path="/tmp/timing.jsonl",
+        state_dir="/tmp/pool-state",
         model_kwargs={**config["pool_model_kwargs"], **candidate.model_kwargs},
     )
     kwargs_arg = next(
@@ -291,6 +297,16 @@ def test_pool_command_merges_global_and_per_candidate_request_kwargs(tmp_path: P
     )
 
     assert "--model=openai/pool/gpt-5.5" in command
+    assert "--model-class" in command
+    assert "polar_mini_swe_vanillux.Vanillux2LitellmModel" in command
+    assert "polar_mini_swe_timing.Vanillux2TimedLocalEnvironment" in command
+    assert "/opt/polar-mini-swe-agent/config/vanillux2.yaml" in command
+    assert "agent.step_limit=64" in command
+    assert "agent.max_consecutive_format_errors=64" in command
+    assert "environment.timeout=120" in command
+    assert "environment.max_output_chars=10000" in command
+    assert "environment.state_dir=/tmp/pool-state" in command
+    assert "model.response_token_budget=65536" in command
     assert not any(arg == "--task" or arg.startswith("--task=") for arg in command)
     assert json.loads(kwargs_arg) == {
         "max_completion_tokens": 8192,
@@ -351,6 +367,7 @@ def test_pool_child_does_not_inherit_outer_router_protocol_env(
     assert "POLAR_ROUTER_CAPABILITY" not in captured_env
     assert "POLAR_MODEL_POOL_CAPABILITY" not in captured_env
     assert captured_env["OPENAI_API_KEY"] == "pool-only-capability"
+    assert captured_env["MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT"] == "5"
     assert (
         base64.b64decode(captured_env["POLAR_MINI_SWE_TASK_B64"], validate=True).decode("utf-8")
         == "Task"
@@ -410,6 +427,15 @@ def test_pool_task_round_trips_for_solve_and_verify_without_entering_argv(
         os_argv = "\0".join(args)
         assert "polar-danger-marker-9f27" not in os_argv
         assert not any(arg == "--task" or arg.startswith("--task=") for arg in args)
+    state_dirs = [
+        next(arg for arg in args if arg.startswith("environment.state_dir="))
+        for args, _ in captured
+    ]
+    assert state_dirs == [
+        f"environment.state_dir={tmp_path}/spilot-pool-00-state",
+        f"environment.state_dir={tmp_path}/spilot-pool-01-state",
+    ]
+    assert state_dirs[0] != state_dirs[1]
 
 
 @pytest.mark.parametrize(
@@ -502,6 +528,12 @@ def test_harness_is_builtin_and_uploads_portable_runner() -> None:
     )
     assert isinstance(harness, SpilotRouterHarness)
     assert harness._runner_config["router_model"] == "router/policy"
+    assert harness._runner_config["pool_step_limit"] == 64
+    assert harness._runner_config["pool_command_timeout"] == 120
+    assert harness._runner_config["pool_max_format_errors"] == 64
+    assert harness._runner_config["pool_response_token_budget"] == 65_536
+    assert harness._runner_config["pool_model_retry_attempts"] == 5
+    assert harness._runner_config["observation_max_chars"] == 10_000
 
     step = harness.run_steps("Fix quoted 'bug'")[0]
     assert "/opt/polar-mini-swe-agent/venv/bin/python" in step.command

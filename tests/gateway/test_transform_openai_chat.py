@@ -100,6 +100,45 @@ def test_openai_chat_request_aliases_max_completion_tokens() -> None:
     assert transformed["response_format"] == {"type": "json_object"}
 
 
+def test_openai_reasoning_request_uses_only_modern_token_limit() -> None:
+    transformer = OpenAIChatTransformer()
+
+    transformed = transformer.transform_request(
+        {
+            "_polar_model_served": "openai/openai/gpt-5.5",
+            "messages": [{"role": "user", "content": "fix the repository"}],
+            # Recursive protocol config can supply both.  The explicit modern
+            # field is authoritative for GPT-5-family endpoints.
+            "max_tokens": 65_536,
+            "max_completion_tokens": 16_384,
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "stop": ["DONE"],
+        }
+    )
+
+    assert transformed["max_completion_tokens"] == 16_384
+    assert "max_tokens" not in transformed
+    assert "temperature" not in transformed
+    assert "stop" not in transformed
+    assert transformed["top_p"] == 0.95
+
+
+def test_openai_reasoning_request_renames_legacy_token_limit() -> None:
+    transformer = OpenAIChatTransformer()
+
+    transformed = transformer.transform_request(
+        {
+            "_polar_model_served": "gpt-5.5",
+            "messages": [{"role": "user", "content": "fix it"}],
+            "max_tokens": 4_096,
+        }
+    )
+
+    assert transformed["max_completion_tokens"] == 4_096
+    assert "max_tokens" not in transformed
+
+
 def test_openai_chat_merges_developer_role_for_non_qwen_models() -> None:
     transformer = OpenAIChatTransformer()
 

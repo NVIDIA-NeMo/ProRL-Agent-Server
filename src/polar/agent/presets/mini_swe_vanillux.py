@@ -42,6 +42,8 @@ _TOKENIZE_MAX_ATTEMPTS = 5
 _TOKENIZE_RETRY_BACKOFF_SECONDS = 0.1
 _TOKENIZE_RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _TOKENIZE_ERROR_DETAIL_LIMIT = 240
+_MAX_TOKENS_FIELD = "max_tokens"
+_MAX_COMPLETION_TOKENS_FIELD = "max_completion_tokens"
 
 
 def _bounded_error_detail(detail: object) -> str:
@@ -81,6 +83,17 @@ class Vanillux2LitellmModel(LitellmModel):
             raise ValueError("response_token_budget must be a non-negative integer")
 
         super().__init__(**kwargs)
+        # mini-SWE recursively merges the protocol YAML with per-candidate
+        # model kwargs.  GPT-5-family candidates therefore inherit the YAML's
+        # ``max_tokens`` unless it is removed here, leaving both OpenAI token
+        # limit fields on one request.  Treat an explicit
+        # ``max_completion_tokens`` as authoritative and use the same field
+        # for the cumulative-budget clamp.
+        if _MAX_COMPLETION_TOKENS_FIELD in self.config.model_kwargs:
+            self.config.model_kwargs.pop(_MAX_TOKENS_FIELD, None)
+            self.completion_token_limit_field = _MAX_COMPLETION_TOKENS_FIELD
+        else:
+            self.completion_token_limit_field = _MAX_TOKENS_FIELD
         self.response_token_budget = parsed_budget
         self.initial_prompt_tokens: int | None = None
         self.current_prompt_tokens: int | None = None
@@ -118,7 +131,13 @@ class Vanillux2LitellmModel(LitellmModel):
                         },
                     }
                 )
-            kwargs["max_tokens"] = min(
+            other_limit_field = (
+                _MAX_TOKENS_FIELD
+                if self.completion_token_limit_field == _MAX_COMPLETION_TOKENS_FIELD
+                else _MAX_COMPLETION_TOKENS_FIELD
+            )
+            kwargs.pop(other_limit_field, None)
+            kwargs[self.completion_token_limit_field] = min(
                 remaining,
                 self._requested_max_tokens(kwargs),
             )
@@ -126,17 +145,22 @@ class Vanillux2LitellmModel(LitellmModel):
 
     def _requested_max_tokens(self, query_kwargs: dict[str, Any]) -> int:
         raw_value = query_kwargs.get(
-            "max_tokens",
-            self.config.model_kwargs.get("max_tokens", self.response_token_budget),
+            self.completion_token_limit_field,
+            self.config.model_kwargs.get(
+                self.completion_token_limit_field,
+                self.response_token_budget,
+            ),
         )
         if isinstance(raw_value, bool):
-            raise ValueError("max_tokens must be a positive integer")
+            raise ValueError(f"{self.completion_token_limit_field} must be a positive integer")
         try:
             value = int(raw_value)
         except (TypeError, ValueError) as exc:
-            raise ValueError("max_tokens must be a positive integer") from exc
+            raise ValueError(
+                f"{self.completion_token_limit_field} must be a positive integer"
+            ) from exc
         if value <= 0 or value != raw_value:
-            raise ValueError("max_tokens must be a positive integer")
+            raise ValueError(f"{self.completion_token_limit_field} must be a positive integer")
         return value
 
     def _tokenize_prompt(self, messages: list[dict[str, Any]]) -> int:

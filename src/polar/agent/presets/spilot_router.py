@@ -143,7 +143,7 @@ def _build_runner_config(agent_spec: AgentSpec) -> dict[str, Any]:
         )
     )
     eval_step_limit = settings.pop("step_limit", None)
-    configured_pool_step_limit = settings.pop("pool_step_limit", 30)
+    configured_pool_step_limit = settings.pop("pool_step_limit", 64)
 
     router_model_kwargs = _request_mapping(
         settings.pop("router_model_kwargs", {}), "router_model_kwargs"
@@ -211,14 +211,32 @@ def _build_runner_config(agent_spec: AgentSpec) -> dict[str, Any]:
         "pool_cost_limit": _nonnegative_number(
             settings.pop("pool_cost_limit", 0), "pool_cost_limit"
         ),
+        "pool_command_timeout": _bounded_int(
+            settings.pop("pool_command_timeout", 120),
+            name="pool_command_timeout",
+            minimum=1,
+            maximum=86_400,
+        ),
+        "pool_max_format_errors": _bounded_int(
+            settings.pop("pool_max_format_errors", 64),
+            name="pool_max_format_errors",
+            minimum=1,
+            maximum=10_000,
+        ),
+        "pool_response_token_budget": _bounded_int(
+            settings.pop("pool_response_token_budget", 65_536),
+            name="pool_response_token_budget",
+            minimum=1,
+            maximum=10_000_000,
+        ),
         "pool_model_retry_attempts": _bounded_int(
-            settings.pop("pool_model_retry_attempts", 3),
+            settings.pop("pool_model_retry_attempts", 5),
             name="pool_model_retry_attempts",
             minimum=1,
             maximum=20,
         ),
         "observation_max_chars": _bounded_int(
-            settings.pop("observation_max_chars", 12_000),
+            settings.pop("observation_max_chars", 10_000),
             name="observation_max_chars",
             minimum=256,
             maximum=100_000,

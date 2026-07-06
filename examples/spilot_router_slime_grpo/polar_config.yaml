@@ -76,9 +76,11 @@ ${POLAR_INTERNET_RUNTIME_VOLUME}
           cost_weight: 1.0
           model_kwargs:
             max_tokens: 16384
+            temperature: 1.0
+            top_p: 1.0
             extra_body:
               chat_template_kwargs:
-                enable_thinking: false
+                enable_thinking: true
         M1:
           model: pool/gpt-5.5
           card:
@@ -98,10 +100,13 @@ ${POLAR_INTERNET_RUNTIME_VOLUME}
       total_timeout_seconds: 3000
       reserve_evaluator_seconds: 300
       deadline_margin_seconds: 5
-      pool_step_limit: 30
+      pool_step_limit: 64
       pool_cost_limit: 0
-      pool_model_retry_attempts: 3
-      observation_max_chars: 12000
+      pool_command_timeout: 120
+      pool_max_format_errors: 64
+      pool_response_token_budget: 65536
+      pool_model_retry_attempts: 5
+      observation_max_chars: 10000
       log_tail_chars: 6000
       router_model_kwargs:
         temperature: ${POLAR_AGENT_TEMPERATURE}

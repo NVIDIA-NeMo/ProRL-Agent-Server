@@ -20,6 +20,11 @@ optimizer, `1e-6` learning rate, DPPO/TV settings, token ceilings, GPU Adam,
 sample-level loss reduction, and checkpoint interval are pinned unchanged.
 Only the Router-specific harness, action builder, evaluator, model-pool calls,
 and the longer wall-clock budget required for up to two remote calls differ.
+Each frozen pool call uses the same Vanillux2 coding protocol as the direct
+Qwen reference: 64 agent steps, a 65,536-token cumulative response budget,
+120-second shell commands, 64 consecutive format errors, 10,000-character
+head/tail observations, and five transient model attempts. Solve and verify
+calls share task files but receive separate persistent-shell state directories.
 Baseline and final evaluation run synchronously before step 0 and after step
 199 on the same 100 held-out tasks, so evaluation cannot overlap or perturb
 the reference-compatible optimizer schedule. Terminal-Bench remains a separate

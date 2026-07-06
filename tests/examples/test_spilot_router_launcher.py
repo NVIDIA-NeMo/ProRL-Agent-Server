@@ -103,6 +103,21 @@ def test_spilot_agent_template_builds_registered_harness() -> None:
     assert config["max_pool_calls"] == 2
     assert config["model_pool"]["M0"]["model"] == "pool/qwen3.6-27b"
     assert config["model_pool"]["M1"]["model"] == "pool/gpt-5.5"
+    assert config["model_pool"]["M0"]["model_kwargs"] == {
+        "max_tokens": 16_384,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
+    }
+    assert config["model_pool"]["M1"]["model_kwargs"] == {
+        "max_completion_tokens": 16_384,
+    }
+    assert config["pool_step_limit"] == 64
+    assert config["pool_command_timeout"] == 120
+    assert config["pool_max_format_errors"] == 64
+    assert config["pool_response_token_budget"] == 65_536
+    assert config["pool_model_retry_attempts"] == 5
+    assert config["observation_max_chars"] == 10_000
     assert template["builder"]["strategy"] == "router_policy"
     assert template["evaluator"]["strategy"] == "spilot_harbor"
     assert template["evaluator"]["config"]["cost_penalty_lambda"] == 0.0
