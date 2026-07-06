@@ -73,3 +73,47 @@ contains the NVIDIA key.
 `cost_penalty_lambda` is deliberately `0.0`; pool usage is logged but does not
 shape reward in this first experiment. Invalid Router actions receive reward
 zero, and only gateway-provenanced `router_policy` completions are trainable.
+
+## Paired forced-route evaluation
+
+`forced_route_eval.py` measures the frozen candidates on an identical fixed
+task slice without loading, calling, or training the Router. It submits one
+Qwen and one GPT task for every selected JSONL row, auto-submits after the
+single mini-SWE call, and reuses the normal `spilot_harbor` evaluator. The
+evaluation-only builder emits no traces even if a pool completion were ever
+persisted accidentally.
+
+Run it against a dedicated Polar allocation built from the commit containing
+this evaluator. Pass the allocation's already-rendered `polar_config.yaml`,
+not the `${...}` template. A required acknowledgement, required finite task
+count, guarded harness config, guarded portable runner, and guarded zero-trace
+builder keep this path out of formal training by default:
+
+```bash
+python examples/spilot_router_slime_grpo/forced_route_eval.py \
+  --i-understand-eval-only \
+  --run-id qwen-vs-gpt-holdout-v1 \
+  --data /abs/path/tmax_holdout-eval.jsonl \
+  --polar-config /abs/path/job-123/polar_config.yaml \
+  --rollout-url http://rollout-host:18080 \
+  --start-index 0 \
+  --max-tasks 32 \
+  --seed 20260706 \
+  --max-concurrency 4 \
+  --output-dir /abs/path/forced-route-qwen-vs-gpt
+```
+
+The submission shell must already contain `POLAR_CONTROL_PLANE_TOKEN`; model
+credentials remain in the running Polar service. The output directory is
+created exclusively and contains:
+
+- `manifest.json`: immutable data/config hashes, range, seed, candidates, and
+  the no-actor contract;
+- `results.jsonl`: one row per task/candidate/replicate with fixed-denominator
+  reward, lifecycle status, pool status, and run/eval/end-to-end latency;
+- `summary.json`: per-candidate accuracy/validity/latency plus paired wins,
+  losses, ties, and GPT-minus-Qwen reward delta.
+
+Use `--forward-seed-to-pool` only after confirming that every endpoint accepts
+an OpenAI-compatible `seed` field. Without it, the seed still fixes task order,
+candidate interleaving, slot assignment, pair identity, and the audit manifest.

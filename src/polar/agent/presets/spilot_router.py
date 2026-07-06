@@ -33,21 +33,33 @@ from polar.runtime.models import ExecInput
 
 
 SPILOT_RUNNER_PATH = f"{RUNTIME_SESSION_DIR}/spilot_router_runner.py"
+SPILOT_FORCED_EVAL_RUNNER_PATH = (
+    f"{RUNTIME_SESSION_DIR}/spilot_forced_route_eval_runner.py"
+)
 SPILOT_RESULT_PATH = f"{RUNTIME_ARTIFACTS_DIR}/router_result.json"
 SPILOT_LOG_PATH = f"{RUNTIME_AGENT_LOG_DIR}/spilot-router.txt"
 _DEFAULT_PORTABLE_PYTHON = "/opt/polar-mini-swe-agent/venv/bin/python"
 _DEFAULT_MINI_SWE_BIN = "/opt/polar-mini-swe-agent/bin/mini-swe-agent"
 _DEFAULT_ROUTER_REQUEST_MODEL = "router/policy"
+_FORCED_EVAL_ACK = "SPILOT_FORCED_ROUTE_EVAL_ONLY_V1"
+_FORCED_EVAL_AGENT_ACK_ENV = "SPILOT_FORCED_ROUTE_EVAL_ACK"
+_FORCED_EVAL_RUNTIME_ACK_ENV = "SPILOT_FORCED_ROUTE_EVAL_RUNTIME_ACK"
 
 
 class SpilotRouterHarness(BaseHarness):
     """Launch the bounded SPilot router state machine in one mutable runtime."""
 
     def __init__(self, agent_spec: AgentSpec) -> None:
-        super().__init__(agent_spec)
+        forced_eval, normalized_spec = _extract_forced_eval_config(agent_spec)
+        super().__init__(normalized_spec)
         if not self.model_name:
             raise ValueError("spilot_router requires agent.model_name for the router")
-        self._runner_config = _build_runner_config(agent_spec)
+        self._runner_config = _build_runner_config(normalized_spec)
+        self._forced_eval = forced_eval
+        if forced_eval is not None:
+            if self._runner_config["max_pool_calls"] != 1:
+                raise ValueError("forced-route eval requires max_pool_calls=1")
+            self._runner_config["forced_route_eval"] = forced_eval
 
     async def setup(self, runtime: BaseRuntime) -> None:
         """Upload the portable orchestrator without modifying the task image."""
@@ -56,12 +68,27 @@ class SpilotRouterHarness(BaseHarness):
         if not source.is_file():
             raise RuntimeError(f"SPilot router runner is missing: {source}")
         await runtime.upload_file(str(source), SPILOT_RUNNER_PATH)
+        if self._forced_eval is not None:
+            forced_source = Path(__file__).with_name("spilot_forced_route_eval_runner.py")
+            if not forced_source.is_file():
+                raise RuntimeError(
+                    f"SPilot forced-route eval runner is missing: {forced_source}"
+                )
+            await runtime.upload_file(
+                str(forced_source),
+                SPILOT_FORCED_EVAL_RUNNER_PATH,
+            )
 
     def run_steps(self, instruction: str) -> list[ExecInput]:
         config_b64 = _encode_json_b64(self._runner_config)
         task_b64 = base64.b64encode(instruction.encode("utf-8")).decode("ascii")
         python = shlex.quote(str(self._runner_config["runner_python"]))
-        runner = shlex.quote(SPILOT_RUNNER_PATH)
+        runner_path = (
+            SPILOT_FORCED_EVAL_RUNNER_PATH
+            if self._forced_eval is not None
+            else SPILOT_RUNNER_PATH
+        )
+        runner = shlex.quote(runner_path)
         log_path = shlex.quote(SPILOT_LOG_PATH)
         command = (
             "set -o pipefail; "
@@ -84,6 +111,11 @@ class SpilotRouterHarness(BaseHarness):
                     "MSWEA_CONFIGURED": "true",
                     "MSWEA_COST_TRACKING": "ignore_errors",
                     "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+                    **(
+                        {_FORCED_EVAL_RUNTIME_ACK_ENV: _FORCED_EVAL_ACK}
+                        if self._forced_eval is not None
+                        else {}
+                    ),
                 },
             )
         ]
@@ -273,6 +305,53 @@ def _build_runner_config(agent_spec: AgentSpec) -> dict[str, Any]:
         unknown = ", ".join(sorted(settings))
         raise ValueError(f"unknown spilot_router settings: {unknown}")
     return config
+
+
+def _extract_forced_eval_config(
+    agent_spec: AgentSpec,
+) -> tuple[dict[str, str] | None, AgentSpec]:
+    """Remove and validate the deliberately hard-to-enable eval-only mode."""
+
+    settings = dict(agent_spec.settings)
+    raw = settings.pop("forced_route_eval", None)
+    if raw is None:
+        return None, agent_spec
+    if not isinstance(raw, dict):
+        raise ValueError("spilot_router forced_route_eval must be a mapping")
+    allowed = {"enabled", "acknowledgement", "candidate_model"}
+    unknown = set(raw).difference(allowed)
+    if unknown:
+        raise ValueError(
+            "unknown forced_route_eval settings: " + ", ".join(sorted(unknown))
+        )
+    if raw.get("enabled") is not True:
+        raise ValueError("forced_route_eval.enabled must be true")
+    if raw.get("acknowledgement") != _FORCED_EVAL_ACK:
+        raise ValueError("forced_route_eval acknowledgement is missing")
+    if agent_spec.env.get(_FORCED_EVAL_AGENT_ACK_ENV) != _FORCED_EVAL_ACK:
+        raise ValueError("forced_route_eval agent acknowledgement is missing")
+    candidate_model = raw.get("candidate_model")
+    if not isinstance(candidate_model, str) or not candidate_model.strip():
+        raise ValueError("forced_route_eval.candidate_model must be non-empty")
+    candidate_model = candidate_model.strip()
+
+    pool = settings.get("model_pool")
+    values = pool.values() if isinstance(pool, dict) else pool
+    matches = 0
+    if isinstance(values, list) or hasattr(values, "__iter__"):
+        for candidate in values:
+            if isinstance(candidate, dict) and candidate.get("model") == candidate_model:
+                matches += 1
+    if matches != 1:
+        raise ValueError(
+            f"forced_route_eval candidate_model matched {matches} pool entries; expected 1"
+        )
+
+    normalized = agent_spec.model_copy(update={"settings": settings})
+    return {
+        "acknowledgement": _FORCED_EVAL_ACK,
+        "candidate_model": candidate_model,
+    }, normalized
 
 
 def _encode_json_b64(value: object) -> str:
