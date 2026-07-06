@@ -451,6 +451,8 @@ def test_spooled_allocation_script_uses_submitted_project_root(tmp_path: Path) -
     assert completed.returncode == 0, completed.stderr
     arguments = capture.read_text().splitlines()
     assert f"--container-workdir={ROOT}" in arguments
+    assert str(EXAMPLE / "run_forced_route_eval.sh") in arguments
+    assert str(spooled_script) not in arguments
     assert not credential.exists()
 
 

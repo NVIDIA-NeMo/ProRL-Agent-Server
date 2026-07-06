@@ -138,7 +138,7 @@ if [ "${SPILOT_FORCED_EVAL_IN_CONTAINER:-0}" != "1" ]; then
         --container-workdir="${PROJECT_ROOT}" \
         --container-writable \
         --no-container-mount-home \
-        env SPILOT_FORCED_EVAL_IN_CONTAINER=1 bash "${BASH_SOURCE[0]}" "$@"
+        env SPILOT_FORCED_EVAL_IN_CONTAINER=1 bash "${SCRIPT_DIR}/run_forced_route_eval.sh" "$@"
     exit $?
 fi
 
