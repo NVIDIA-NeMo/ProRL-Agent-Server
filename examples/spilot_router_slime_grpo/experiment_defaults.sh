@@ -82,7 +82,9 @@ export TMAX_TRAIN_DATA="${TMAX_TRAIN_DATA:-${_SPILOT_REFERENCE_DATA_DIR}/tmax-tr
 export TMAX_TRAIN_START_INDEX="${TMAX_TRAIN_START_INDEX:-0}"
 export TMAX_MAX_TASKS="${TMAX_MAX_TASKS:--1}"
 export TMAX_TOTAL_TASKS="${TMAX_TOTAL_TASKS:-14601}"
-export TMAX_EXCLUDE_DATA="${TMAX_EXCLUDE_DATA:-${_SPILOT_REFERENCE_DATA_DIR}/tmax_holdout-eval.jsonl}"
+# An explicitly empty value is reserved for targeted smoke runs that select a
+# slice by index; an unset value keeps the formal reference exclusion set.
+export TMAX_EXCLUDE_DATA="${TMAX_EXCLUDE_DATA-${_SPILOT_REFERENCE_DATA_DIR}/tmax_holdout-eval.jsonl}"
 export TMAX_PREPARE_DATA="${TMAX_PREPARE_DATA:-0}"
 export TMAX_VALIDATE_EXISTING_ASSETS="${TMAX_VALIDATE_EXISTING_ASSETS:-0}"
 export TMAX_TRAIN_DATA_SHA256="${TMAX_TRAIN_DATA_SHA256:-96a1c5929de64516eecc8a7b7ae012ccb888a2d575f15e28b8806ae6804826c8}"
