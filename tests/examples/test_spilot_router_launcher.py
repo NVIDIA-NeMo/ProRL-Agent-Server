@@ -193,9 +193,15 @@ def test_spilot_submit_wrapper_pins_8_nodes_and_200_steps() -> None:
     assert 'ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-48}"' in defaults
     assert 'ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"' in defaults
     assert 'N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"' in defaults
+    assert 'GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-256}"' in defaults
+    assert 'EVAL_GLOBAL_BATCH_SIZE="${EVAL_GLOBAL_BATCH_SIZE:-256}"' in defaults
+    assert 'TMAX_OVERRIDE_OPT_PARAM_SCHEDULER="${TMAX_OVERRIDE_OPT_PARAM_SCHEDULER:-1}"' in defaults
     assert 'POLAR_FULLY_ASYNC="${POLAR_FULLY_ASYNC:-true}"' in defaults
+    assert 'POLAR_MULTI_GATEWAY="${POLAR_MULTI_GATEWAY:-1}"' in defaults
     assert 'TMAX_MIN_ASYNC_LEVEL="${TMAX_MIN_ASYNC_LEVEL:-3}"' in defaults
     assert 'POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-3}"' in defaults
+    assert 'POLAR_MIN_COMPLETE_ACCEPT_FRACTION="${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.5}"' in defaults
+    assert 'POLAR_EARLY_STOP_GRACE_SESSIONS="${POLAR_EARLY_STOP_GRACE_SESSIONS:-16}"' in defaults
     assert 'MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-67584}"' in defaults
     assert (
         'TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP="${TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP:-0}"'
@@ -209,6 +215,7 @@ def test_spilot_submit_wrapper_pins_8_nodes_and_200_steps() -> None:
     assert 'SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-}"' in defaults
     assert 'WANDB_GROUP="${WANDB_GROUP:-spilot-router-qwen35-9b-8n64}"' in defaults
     assert 'TMAX_EVAL_MAX_TASKS="${TMAX_EVAL_MAX_TASKS:-100}"' in defaults
+    assert 'TMAX_TRAINING_EVAL_ENABLED="${TMAX_TRAINING_EVAL_ENABLED:-1}"' in defaults
     assert 'TMAX_EXTERNAL_EVAL_ENABLED="${TMAX_EXTERNAL_EVAL_ENABLED:-0}"' in defaults
     assert 'TMAX_CONCURRENT_PRETRAIN_EVAL="${TMAX_CONCURRENT_PRETRAIN_EVAL:-0}"' in defaults
     assert 'TMAX_ONLY_READY="${TMAX_ONLY_READY:-1}"' in defaults
@@ -306,6 +313,8 @@ def test_spilot_smoke_is_one_node_one_step_without_dynamic_filtering() -> None:
     assert 'TMAX_OPTIMIZER_CPU_OFFLOAD="${TMAX_OPTIMIZER_CPU_OFFLOAD:-1}"' in script
     assert 'ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-1}"' in script
     assert 'N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"' in script
+    assert 'GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-8}"' in script
+    assert 'EVAL_GLOBAL_BATCH_SIZE="${EVAL_GLOBAL_BATCH_SIZE:-8}"' in script
     assert 'TMAX_NUM_ROLLOUT="${TMAX_NUM_ROLLOUT:-1}"' in script
     assert 'TMAX_DYNAMIC_SAMPLING_FILTER_PATH=""' in script
     assert 'TMAX_EVAL_ENABLED="${TMAX_EVAL_ENABLED:-0}"' in script

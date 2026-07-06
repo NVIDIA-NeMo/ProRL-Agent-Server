@@ -20,9 +20,10 @@ optimizer, `1e-6` learning rate, DPPO/TV settings, token ceilings, GPU Adam,
 sample-level loss reduction, and checkpoint interval are pinned unchanged.
 Only the Router-specific harness, action builder, evaluator, model-pool calls,
 and the longer wall-clock budget required for up to two remote calls differ.
-Baseline and final evaluation run separately from optimizer training on the
-same 100 held-out tasks, so evaluation cannot perturb the reference-compatible
-train schedule. Terminal-Bench remains a separate experiment.
+Baseline and final evaluation run synchronously before step 0 and after step
+199 on the same 100 held-out tasks, so evaluation cannot overlap or perturb
+the reference-compatible optimizer schedule. Terminal-Bench remains a separate
+experiment.
 
 ## Credential handling
 
