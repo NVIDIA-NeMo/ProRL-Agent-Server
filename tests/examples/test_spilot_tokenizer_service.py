@@ -70,6 +70,34 @@ def test_count_chat_tokens_accepts_batched_input_ids() -> None:
     assert module.count_chat_tokens(tokenizer, {"messages": []}) == 3
 
 
+def test_count_chat_tokens_normalizes_openai_tool_argument_strings() -> None:
+    tokenizer = FakeTokenizer()
+    messages = [
+        {"role": "user", "content": "inspect"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"pwd"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "/workspace"},
+    ]
+
+    assert module.count_chat_tokens(tokenizer, {"messages": messages}) == 4
+    normalized = tokenizer.calls[0][0]
+    assert normalized[1]["content"] == ""
+    assert normalized[1]["tool_calls"][0]["function"]["arguments"] == {
+        "command": "pwd"
+    }
+    assert messages[1]["content"] is None
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == '{"command":"pwd"}'
+
+
 @pytest.mark.parametrize(
     "payload,error",
     [

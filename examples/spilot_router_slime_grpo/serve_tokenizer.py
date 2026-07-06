@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
+import copy
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -70,9 +71,43 @@ def _normalize_token_ids(encoded: object) -> list[int]:
 def count_chat_tokens(tokenizer: Any, payload: object) -> int:
     if not isinstance(payload, dict):
         raise TokenizerRequestError("JSON body must be an object")
-    messages = payload.get("messages")
-    if not isinstance(messages, list):
+    raw_messages = payload.get("messages")
+    if not isinstance(raw_messages, list):
         raise TokenizerRequestError("messages must be a list")
+    messages = copy.deepcopy(raw_messages)
+    for message in messages:
+        if not isinstance(message, dict):
+            raise TokenizerRequestError("each message must be an object")
+        if message.get("content") is None:
+            message["content"] = ""
+        if message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if tool_calls is None:
+            continue
+        if not isinstance(tool_calls, list):
+            raise TokenizerRequestError("assistant tool_calls must be a list")
+        # Mirror SGLang serving_chat before apply_chat_template: OpenAI sends
+        # function arguments as a JSON string, while HF tool templates require
+        # a mapping.  Never mutate the caller's payload.
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict) or not isinstance(
+                function := tool_call.get("function"), dict
+            ):
+                raise TokenizerRequestError("assistant tool call must contain function")
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError as exc:
+                    raise TokenizerRequestError(
+                        "assistant tool call arguments must be valid JSON"
+                    ) from exc
+                function["arguments"] = arguments
+            if not isinstance(arguments, dict):
+                raise TokenizerRequestError(
+                    "assistant tool call arguments must decode to an object"
+                )
     tools = payload.get("tools")
     if tools is not None and not isinstance(tools, list):
         raise TokenizerRequestError("tools must be a list when provided")
