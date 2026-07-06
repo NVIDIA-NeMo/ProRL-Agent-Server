@@ -59,6 +59,65 @@ _APT_LIST_SOURCE_RE = re.compile(
 )
 _APT_DEB822_FIELD_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*\s*:")
 _APT_HTTP_TOKEN_RE = re.compile(r"(?<!\S)http://")
+_CLI_LONG_OPTIONS_WITH_VALUES = frozenset(
+    {
+        "--agent-class",
+        "--config",
+        "--cost-limit",
+        "--environment-class",
+        "--model",
+        "--model-class",
+        "--output",
+    }
+)
+_CLI_SHORT_FLAGS = frozenset({"y"})
+_CLI_SHORT_OPTIONS_WITH_VALUES = frozenset({"c", "l", "m", "o"})
+
+
+def _argv_has_task_option(args: list[str]) -> bool:
+    """Return whether mini-SWE's Click parser would interpret a task option.
+
+    Click permits a value-taking short option to be joined to its value and
+    permits boolean flags to be clustered before it (for example ``-tfix`` and
+    ``-ytfix``).  Conversely, a ``t`` inside another option's joined value is
+    not a task option (for example ``-mtask`` sets the model to ``task``).
+    Keep this small parser aligned with the portable mini-SWE CLI aliases while
+    avoiding an import of mini-SWE/Click before the private task env is popped.
+    """
+
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            return False
+        if arg == "--task" or arg.startswith("--task="):
+            return True
+        if arg.startswith("--"):
+            name, separator, _value = arg.partition("=")
+            if not separator and name in _CLI_LONG_OPTIONS_WITH_VALUES:
+                index += 2
+            else:
+                index += 1
+            continue
+        if not arg.startswith("-") or arg == "-":
+            index += 1
+            continue
+
+        short_options = arg[1:]
+        consumes_next = False
+        for position, option in enumerate(short_options):
+            if option == "t":
+                return True
+            if option in _CLI_SHORT_FLAGS:
+                continue
+            if option in _CLI_SHORT_OPTIONS_WITH_VALUES:
+                consumes_next = position == len(short_options) - 1
+            # A value-taking option consumes the remainder, while an unknown
+            # option makes Click fail at this position. Neither lets a later
+            # character in the same token become ``-t``.
+            break
+        index += 2 if consumes_next else 1
+    return False
 
 
 def _inject_task_from_env() -> None:
@@ -74,9 +133,9 @@ def _inject_task_from_env() -> None:
     encoded_task = os.environ.pop(_TASK_B64_ENV, None)
     if encoded_task is None:
         return
-    if any(arg == "--task" or arg.startswith("--task=") for arg in sys.argv[1:]):
+    if _argv_has_task_option(sys.argv[1:]):
         raise ValueError(
-            f"{_TASK_B64_ENV} cannot be combined with a --task command-line argument"
+            f"{_TASK_B64_ENV} cannot be combined with a task command-line option"
         )
     try:
         task_bytes = base64.b64decode(encoded_task, validate=True)
@@ -88,7 +147,10 @@ def _inject_task_from_env() -> None:
         raise ValueError(f"{_TASK_B64_ENV} must decode to UTF-8 text") from exc
     # Python argument parsing sees the task, but mutating sys.argv does not
     # change the kernel-owned process command line exposed through /proc.
-    sys.argv.append(f"--task={task}")
+    # Put the synthetic option before caller arguments so an incomplete
+    # unrelated value-taking option (or a standalone ``--`` delimiter) cannot
+    # consume or hide it. Existing task options have already been rejected.
+    sys.argv.insert(1, f"--task={task}")
 
 
 def _configure_model_retry_policy() -> None:

@@ -25,7 +25,7 @@ def test_private_task_moves_to_python_argv_but_not_proc_cmdline(
 
     mini_swe_runner._inject_task_from_env()
 
-    assert sys.argv == ["polar_mini_swe_runner", "--yolo", f"--task={task}"]
+    assert sys.argv == ["polar_mini_swe_runner", f"--task={task}", "--yolo"]
     assert "POLAR_MINI_SWE_TASK_B64" not in os.environ
     assert Path("/proc/self/cmdline").read_bytes() == before
     assert b"polar-danger-marker-e81a" not in before
@@ -55,7 +55,17 @@ def test_private_task_rejects_invalid_payload_and_pops_secret_env(
 
 @pytest.mark.parametrize(
     "task_args",
-    [("--task=argv-task",), ("--task", "argv-task")],
+    [
+        ("--task=argv-task",),
+        ("--task", "argv-task"),
+        ("-t", "argv-task"),
+        ("-targv-task",),
+        ("-t=argv-task",),
+        ("-yt", "argv-task"),
+        ("-ytargv-task",),
+        ("-yt=argv-task",),
+        ("-yytargv-task",),
+    ],
 )
 def test_private_task_rejects_ambiguous_env_and_argv(
     monkeypatch: pytest.MonkeyPatch,
@@ -73,6 +83,61 @@ def test_private_task_rejects_ambiguous_env_and_argv(
 
     assert sys.argv == original_argv
     assert "POLAR_MINI_SWE_TASK_B64" not in os.environ
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        [],
+        ["--task-timeout", "5"],
+        ["--model=contains--task"],
+        ["--model", "--task"],
+        ["-m", "-t"],
+        ["-mytask"],
+        ["-ymtask"],
+        ["-ctask"],
+        ["-otask"],
+        ["-ltask"],
+        ["-xtargv-task"],
+        ["-y=targv-task"],
+        ["--", "--task", "positional-text"],
+        ["ordinary-task-text"],
+    ],
+)
+def test_task_argv_checker_does_not_misclassify_other_click_arguments(
+    args: list[str],
+) -> None:
+    assert mini_swe_runner._argv_has_task_option(args) is False
+
+
+@pytest.mark.parametrize(
+    "existing_args",
+    [
+        ["--yolo"],
+        ["--model", "model-id"],
+        ["-mmodel-id"],
+        ["--model"],
+        ["-m"],
+        ["--"],
+    ],
+)
+def test_private_task_is_inserted_before_unrelated_cli_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    existing_args: list[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["polar_mini_swe_runner", *existing_args])
+    monkeypatch.setenv(
+        "POLAR_MINI_SWE_TASK_B64",
+        base64.b64encode(b"env-task").decode("ascii"),
+    )
+
+    mini_swe_runner._inject_task_from_env()
+
+    assert sys.argv == [
+        "polar_mini_swe_runner",
+        "--task=env-task",
+        *existing_args,
+    ]
 
 
 def _serve_unix_echo(path: Path) -> tuple[socket.socket, threading.Thread]:
