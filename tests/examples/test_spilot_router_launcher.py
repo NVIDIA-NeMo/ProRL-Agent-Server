@@ -183,35 +183,38 @@ def test_spilot_submit_wrapper_pins_8_nodes_and_200_steps() -> None:
 
     assert 'source "${SCRIPT_DIR}/experiment_defaults.sh"' in script
     assert 'NUM_NODES="${NUM_NODES:-8}"' in defaults
-    assert 'PARTITION="${PARTITION:-batch}"' in defaults
-    assert 'SLURM_GPUS="${SLURM_GPUS:-1}"' in defaults
-    assert 'RAY_NUM_GPUS_PER_NODE="${RAY_NUM_GPUS_PER_NODE:-1}"' in defaults
-    assert 'ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-4}"' in defaults
-    assert 'ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-1}"' in defaults
+    assert 'PARTITION="${PARTITION:-backfill,batch}"' in defaults
+    assert 'SLURM_GPUS="${SLURM_GPUS:-8}"' in defaults
+    assert 'RAY_NUM_GPUS_PER_NODE="${RAY_NUM_GPUS_PER_NODE:-8}"' in defaults
+    assert 'ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-2}"' in defaults
+    assert 'ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"' in defaults
     assert 'ACTOR_TENSOR_MODEL_PARALLEL_SIZE="${ACTOR_TENSOR_MODEL_PARALLEL_SIZE:-4}"' in defaults
-    assert 'TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL="${TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL:-1}"' in defaults
-    assert 'ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-4}"' in defaults
-    assert 'POLAR_SLURM_MEM_PER_NODE="${POLAR_SLURM_MEM_PER_NODE:-250G}"' in defaults
-    assert 'ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-1}"' in defaults
-    assert 'N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"' in defaults
-    assert 'POLAR_FULLY_ASYNC="${POLAR_FULLY_ASYNC:-false}"' in defaults
-    assert 'POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-4}"' in defaults
-    assert 'MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-24576}"' in defaults
+    assert 'TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL="${TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL:-0}"' in defaults
+    assert 'ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-48}"' in defaults
+    assert 'ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"' in defaults
+    assert 'N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"' in defaults
+    assert 'POLAR_FULLY_ASYNC="${POLAR_FULLY_ASYNC:-true}"' in defaults
+    assert 'TMAX_MIN_ASYNC_LEVEL="${TMAX_MIN_ASYNC_LEVEL:-3}"' in defaults
+    assert 'POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-3}"' in defaults
+    assert 'MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-67584}"' in defaults
     assert (
-        'TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP="${TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP:-1}"'
+        'TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP="${TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP:-0}"'
         in defaults
     )
+    assert 'CALCULATE_PER_TOKEN_LOSS="${CALCULATE_PER_TOKEN_LOSS:-0}"' in defaults
     assert 'LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-64}"' in defaults
-    assert 'TMAX_OPTIMIZER_CPU_OFFLOAD="${TMAX_OPTIMIZER_CPU_OFFLOAD:-1}"' in defaults
+    assert 'TMAX_OPTIMIZER_CPU_OFFLOAD="${TMAX_OPTIMIZER_CPU_OFFLOAD:-0}"' in defaults
     assert 'TMAX_NUM_ROLLOUT="${TMAX_NUM_ROLLOUT:-200}"' in defaults
-    assert 'SAVE_INTERVAL="${SAVE_INTERVAL:-1}"' in defaults
-    assert 'SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-${TMAX_NUM_ROLLOUT}}"' in defaults
-    assert 'WANDB_GROUP="${WANDB_GROUP:-spilot-router-qwen35-9b-8n1g}"' in defaults
-    assert 'TMAX_EVAL_MAX_TASKS="${TMAX_EVAL_MAX_TASKS:-32}"' in defaults
+    assert 'SAVE_INTERVAL="${SAVE_INTERVAL:-5}"' in defaults
+    assert 'SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-}"' in defaults
+    assert 'WANDB_GROUP="${WANDB_GROUP:-spilot-router-qwen35-9b-8n64}"' in defaults
+    assert 'TMAX_EVAL_MAX_TASKS="${TMAX_EVAL_MAX_TASKS:-100}"' in defaults
     assert 'TMAX_EXTERNAL_EVAL_ENABLED="${TMAX_EXTERNAL_EVAL_ENABLED:-0}"' in defaults
     assert 'TMAX_CONCURRENT_PRETRAIN_EVAL="${TMAX_CONCURRENT_PRETRAIN_EVAL:-0}"' in defaults
     assert 'TMAX_ONLY_READY="${TMAX_ONLY_READY:-1}"' in defaults
-    assert 'TMAX_REQUIRE_EXACT_TOTAL_TASKS="${TMAX_REQUIRE_EXACT_TOTAL_TASKS:-0}"' in defaults
+    assert 'TMAX_REQUIRE_EXACT_TOTAL_TASKS="${TMAX_REQUIRE_EXACT_TOTAL_TASKS:-1}"' in defaults
+    assert "tmax-14598r-14498t100h-20260701T011143Z" in defaults
+    assert "96a1c5929de64516eecc8a7b7ae012ccb888a2d575f15e28b8806ae6804826c8" in defaults
     assert "POLAR_NVIDIA_API_KEY" in script
     assert "POLAR_CONTROL_PLANE_TOKEN" in script
     assert "/dev/urandom" in script
@@ -270,15 +273,17 @@ def test_spilot_shared_defaults_bootstrap_watcher_contract() -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout == (
-        "8|1|1|4|1|4|1|4|250G|1|8|false|200|24576|1|64|1|1|200|spilot_router|"
-        "spilot-router-qwen35-9b-8n-200step"
+        "8|8|8|2|8|4|0|48||8|32|true|200|67584|0|64|0|5||spilot_router|"
+        "spilot-router-qwen35-9b-8n64-200step"
     )
 
 
-def test_spilot_uses_restartable_cpu_offloaded_adam() -> None:
+def test_spilot_uses_reference_gpu_adam_by_default() -> None:
     shared_run = (ROOT / "examples" / "swegym_slime_grpo" / "run.sh").read_text()
     run_state = (ROOT / "examples" / "tmax_slime_grpo" / "run_state.sh").read_text()
+    defaults = (EXAMPLE / "experiment_defaults.sh").read_text()
 
+    assert 'TMAX_OPTIMIZER_CPU_OFFLOAD="${TMAX_OPTIMIZER_CPU_OFFLOAD:-0}"' in defaults
     assert "--optimizer-cpu-offload" in shared_run
     assert "--optimizer-offload-fraction 1.0" in shared_run
     assert "--overlap-cpu-optimizer-d2h-h2d" in shared_run
@@ -293,6 +298,12 @@ def test_spilot_smoke_is_one_node_one_step_without_dynamic_filtering() -> None:
     assert 'NUM_NODES="${NUM_NODES:-1}"' in script
     assert 'ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-4}"' in script
     assert 'ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-4}"' in script
+    assert 'MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-24576}"' in script
+    assert (
+        'TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP="${TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP:-1}"'
+        in script
+    )
+    assert 'TMAX_OPTIMIZER_CPU_OFFLOAD="${TMAX_OPTIMIZER_CPU_OFFLOAD:-1}"' in script
     assert 'ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-1}"' in script
     assert 'N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"' in script
     assert 'TMAX_NUM_ROLLOUT="${TMAX_NUM_ROLLOUT:-1}"' in script
