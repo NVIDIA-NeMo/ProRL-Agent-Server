@@ -85,10 +85,13 @@ persisted accidentally.
 
 The safest path is the dedicated services-only Slurm entrypoint. It requests
 one node and no GPU, enters the same proven Pyxis image used by TMax, renders
-fresh allocation-local configs, and starts only rollout, one gateway, and the
-gateway/proxy UDS bridge. The evaluator runs on the same node, after which the
-entrypoint tears all three services down. It never starts Ray, Slime, SGLang,
-or a Router actor.
+fresh allocation-local configs, and starts rollout, one gateway, the
+gateway/proxy UDS bridge, and a loopback tokenizer-only service. The latter
+loads the Qwen3.5 chat template/tokenizer assets but no model weights; it gives
+Vanillux2 the same cumulative-budget token counts normally supplied by the
+training actor. The evaluator runs on the same node, after which the entrypoint
+tears all services down. It never starts Ray, Slime, SGLang, generation, or a
+Router actor.
 
 For example, compare 32 paired holdout tasks on cw-dfw. The output directory
 must not already exist. The submitter loads the NVIDIA credential from the

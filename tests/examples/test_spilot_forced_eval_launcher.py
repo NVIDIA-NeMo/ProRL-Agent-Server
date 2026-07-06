@@ -40,6 +40,10 @@ def _assets(tmp_path: Path) -> tuple[Path, Path]:
     data_root = tmp_path / "data"
     for relative in ("agent_cli/opt_node", "mini_swe_agent_runtime", "tmax-15k-sif"):
         (data_root / relative).mkdir(parents=True)
+    tokenizer_dir = data_root / "checkpoints" / "Qwen3.5-9B"
+    tokenizer_dir.mkdir(parents=True)
+    for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+        (tokenizer_dir / name).write_text("{}" if name.endswith(".json") else "test")
     task_dir = tmp_path / "task"
     tests_dir = task_dir / "tests"
     tests_dir.mkdir(parents=True)
@@ -72,6 +76,7 @@ def test_services_only_topology_is_loopback_zero_actor_and_exact_pool(tmp_path: 
     document = module.build_topology(
         rollout_port=18080,
         gateway_port=18100,
+        tokenizer_port=18200,
         service_dir=tmp_path,
         pool_base_url="https://inference.example/v1",
         max_concurrency=4,
@@ -84,7 +89,7 @@ def test_services_only_topology_is_loopback_zero_actor_and_exact_pool(tmp_path: 
     assert node.host == "127.0.0.1"
     assert node.public_url == "http://127.0.0.1:18100"
     assert node.model_served == "eval-only/forced-route-no-actor"
-    assert node.inference_base_url == "http://127.0.0.1:9"
+    assert node.inference_base_url == "http://127.0.0.1:18200"
     assert topology.gateway.completion_persistence.enabled is False
     assert (node.max_init_workers, node.max_run_workers, node.max_postrun_workers) == (4, 4, 4)
     assert [(candidate.alias, candidate.model) for candidate in node.model_pool] == [
@@ -182,6 +187,8 @@ def test_dry_run_writes_auditable_secret_free_plan(tmp_path: Path, monkeypatch) 
     assert manifest["control_token_persisted"] is False
     assert manifest["model_credential_persisted"] is False
     assert manifest["rollout_url"] == "http://127.0.0.1:18080"
+    assert manifest["gateway_url"] == "http://127.0.0.1:18100"
+    assert manifest["tokenizer_url"] == "http://127.0.0.1:18200"
     TopologyConfig.load(service_dir / "topology.yaml")
     assert isinstance(yaml.safe_load((service_dir / "polar_config.yaml").read_text()), dict)
 
@@ -238,6 +245,7 @@ def test_registration_readiness_accepts_nodes_list(monkeypatch) -> None:
 def test_slurm_entrypoint_is_one_node_and_has_no_training_stack() -> None:
     run_text = RUN_SCRIPT.read_text()
     submit_text = SUBMIT_SCRIPT.read_text()
+    launcher_text = SCRIPT.read_text()
     for script in (RUN_SCRIPT, SUBMIT_SCRIPT):
         completed = subprocess.run(
             ["bash", "-n", str(script)],
@@ -267,6 +275,7 @@ def test_slurm_entrypoint_is_one_node_and_has_no_training_stack() -> None:
     assert "serve_sglang" not in combined
     assert "megatron" not in combined
     assert "checkpoint" not in combined
+    assert 'str(EXAMPLE_DIR / "serve_tokenizer.py")' in launcher_text
 
 
 def test_submit_dry_run_is_secret_free_cpu_default_with_explicit_gpu_fallback(

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Run the paired SPilot pool evaluation in a services-only allocation.
 
-This launcher deliberately starts only Polar rollout, one Polar gateway, and
-the sandbox UDS bridge.  It never starts Ray, Slime, SGLang, or a Router actor.
-The benchmark runs in the same allocation and process tree, so its loopback
-URLs and control-plane credential never need to cross a cluster boundary.
+This launcher starts Polar rollout, one Polar gateway, a tokenizer-only Qwen
+service, and the sandbox UDS bridge.  It never starts Ray, Slime, SGLang, model
+weights, or a Router actor.  The benchmark runs in the same allocation and
+process tree, so its loopback URLs and control-plane credential never need to
+cross a cluster boundary.
 """
 
 from __future__ import annotations
@@ -67,6 +68,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         help="Allocation-local gateway port; otherwise choose a free loopback port",
     )
+    parser.add_argument(
+        "--tokenizer-port",
+        type=int,
+        help="Allocation-local tokenizer port; otherwise choose a free loopback port",
+    )
+    parser.add_argument(
+        "--tokenizer-path",
+        type=Path,
+        help="Local Qwen3.5 tokenizer assets; defaults below the data root",
+    )
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--request-timeout", type=float, default=30.0)
     parser.add_argument("--forward-seed-to-pool", action="store_true")
@@ -109,12 +120,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.poll_seconds <= 0 or args.request_timeout <= 0:
         parser.error("poll and request timeouts must be positive")
-    for name in ("rollout_port", "gateway_port"):
+    for name in ("rollout_port", "gateway_port", "tokenizer_port"):
         value = getattr(args, name)
         if value is not None and not 1 <= value <= 65535:
             parser.error(f"--{name.replace('_', '-')} must be between 1 and 65535")
-    if args.rollout_port is not None and args.rollout_port == args.gateway_port:
-        parser.error("rollout and gateway ports must differ")
+    configured_ports = [
+        value
+        for value in (args.rollout_port, args.gateway_port, args.tokenizer_port)
+        if value is not None
+    ]
+    if len(configured_ports) != len(set(configured_ports)):
+        parser.error("rollout, gateway, and tokenizer ports must differ")
     if not args.dry_run and not os.environ.get("SLURM_JOB_ID"):
         parser.error("run inside a Slurm allocation (or use --dry-run)")
     return args
@@ -207,6 +223,7 @@ def build_topology(
     *,
     rollout_port: int,
     gateway_port: int,
+    tokenizer_port: int,
     service_dir: Path,
     pool_base_url: str,
     max_concurrency: int,
@@ -236,7 +253,7 @@ def build_topology(
                     "model_served": "eval-only/forced-route-no-actor",
                     "inference": {
                         "engine": "sglang",
-                        "base_url": "http://127.0.0.1:9",
+                        "base_url": f"http://127.0.0.1:{tokenizer_port}",
                     },
                     "model_pool": [
                         {
@@ -407,7 +424,7 @@ def scoped_environment(*, control_token: str | None = None, nvidia_key: str | No
     )
     # Rollout, gateway, evaluator, and their heartbeats communicate only over
     # allocation-local loopback.  A cluster-wide HTTP proxy must never capture
-    # those requests (or the intentionally dead 127.0.0.1:9 actor sentinel).
+    # those requests (including the tokenizer-only inference sentinel).
     environment["no_proxy"] = "127.0.0.1,localhost"
     environment["NO_PROXY"] = environment["no_proxy"]
     if control_token is not None:
@@ -454,6 +471,11 @@ def main(argv: list[str] | None = None) -> int:
         raise LauncherError("service directory must be separate from the benchmark output")
 
     data_root = resolve_data_root(args.data_root)
+    tokenizer_path = _absolute(
+        args.tokenizer_path
+        if args.tokenizer_path is not None
+        else data_root / "checkpoints" / "Qwen3.5-9B"
+    )
     for path in (
         data_root / "agent_cli" / "opt_node",
         data_root / "mini_swe_agent_runtime",
@@ -461,6 +483,11 @@ def main(argv: list[str] | None = None) -> int:
     ):
         if not path.is_dir():
             raise LauncherError(f"required runtime directory does not exist: {path}")
+    for tokenizer_asset in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+        if not (tokenizer_path / tokenizer_asset).is_file():
+            raise LauncherError(
+                f"required tokenizer asset does not exist: {tokenizer_path / tokenizer_asset}"
+            )
     needs_internet = preflight_eval_slice(
         data,
         start_index=args.start_index,
@@ -479,21 +506,30 @@ def main(argv: list[str] | None = None) -> int:
 
     service_dir.parent.mkdir(parents=True, exist_ok=True)
     service_dir.mkdir(mode=0o700)
-    if args.rollout_port is None and args.gateway_port is None:
+    if (
+        args.rollout_port is None
+        and args.gateway_port is None
+        and args.tokenizer_port is None
+    ):
         if args.dry_run:
-            rollout_port, gateway_port = 18080, 18100
+            rollout_port, gateway_port, tokenizer_port = 18080, 18100, 18200
         else:
-            rollout_port, gateway_port = reserve_loopback_ports()
-    elif args.rollout_port is None:
-        rollout_port = reserve_loopback_ports(1)[0]
-        gateway_port = args.gateway_port
-    elif args.gateway_port is None:
-        rollout_port = args.rollout_port
-        gateway_port = reserve_loopback_ports(1)[0]
+            rollout_port, gateway_port, tokenizer_port = reserve_loopback_ports(3)
     else:
-        rollout_port, gateway_port = args.rollout_port, args.gateway_port
-    if rollout_port == gateway_port:
-        raise LauncherError("rollout and gateway ports must differ")
+        requested = [args.rollout_port, args.gateway_port, args.tokenizer_port]
+        explicit_ports = {value for value in requested if value is not None}
+        chosen: list[int] = []
+        for value in requested:
+            if value is None:
+                candidate = reserve_loopback_ports(1)[0]
+                while candidate in chosen or candidate in explicit_ports:
+                    candidate = reserve_loopback_ports(1)[0]
+                chosen.append(candidate)
+            else:
+                chosen.append(value)
+        rollout_port, gateway_port, tokenizer_port = chosen
+    if len({rollout_port, gateway_port, tokenizer_port}) != 3:
+        raise LauncherError("rollout, gateway, and tokenizer ports must differ")
     uds_root = Path(
         f"/tmp/polar-forced-eval-{os.environ.get('SLURM_JOB_ID', 'dry')}-{os.getpid()}"
     )
@@ -508,6 +544,7 @@ def main(argv: list[str] | None = None) -> int:
     topology = build_topology(
         rollout_port=rollout_port,
         gateway_port=gateway_port,
+        tokenizer_port=tokenizer_port,
         service_dir=service_dir,
         pool_base_url=args.pool_base_url,
         max_concurrency=args.max_concurrency,
@@ -567,6 +604,8 @@ def main(argv: list[str] | None = None) -> int:
             "hostname": socket.gethostname(),
             "rollout_url": f"http://127.0.0.1:{rollout_port}",
             "gateway_url": f"http://127.0.0.1:{gateway_port}",
+            "tokenizer_url": f"http://127.0.0.1:{tokenizer_port}",
+            "tokenizer_path": str(tokenizer_path),
             "topology_path": str(topology_path),
             "polar_config_path": str(polar_config_path),
             "output_dir": str(output_dir),
@@ -604,9 +643,33 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         with ExitStack() as stack:
+            tokenizer_log = stack.enter_context((service_dir / "tokenizer.log").open("wb"))
             rollout_log = stack.enter_context((service_dir / "rollout.log").open("wb"))
             gateway_log = stack.enter_context((service_dir / "gateway.log").open("wb"))
             tunnel_log = stack.enter_context((service_dir / "uds_tunnel.log").open("wb"))
+            tokenizer = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(EXAMPLE_DIR / "serve_tokenizer.py"),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(tokenizer_port),
+                    "--tokenizer-path",
+                    str(tokenizer_path),
+                ],
+                stdout=tokenizer_log,
+                stderr=subprocess.STDOUT,
+                env=scoped_environment(),
+            )
+            processes.append(tokenizer)
+            wait_http(
+                "tokenizer-only service",
+                f"http://127.0.0.1:{tokenizer_port}/health",
+                tokenizer,
+                timeout=180.0,
+            )
+
             rollout = subprocess.Popen(
                 [sys.executable, "-m", "polar.cli", "serve_rollout", "-c", str(topology_path)],
                 stdout=rollout_log,
@@ -681,7 +744,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             processes.append(evaluator)
             while evaluator.poll() is None:
-                for name, process in (("rollout", rollout), ("gateway", gateway), ("UDS", tunnel)):
+                for name, process in (
+                    ("tokenizer", tokenizer),
+                    ("rollout", rollout),
+                    ("gateway", gateway),
+                    ("UDS", tunnel),
+                ):
                     if process.poll() is not None:
                         raise LauncherError(
                             f"{name} service exited during benchmark (rc={process.returncode})"
