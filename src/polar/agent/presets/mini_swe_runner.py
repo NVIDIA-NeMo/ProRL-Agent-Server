@@ -16,6 +16,8 @@ unit-testable without those optional packages in the Polar control venv.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import os
 from pathlib import Path
 import re
@@ -34,6 +36,7 @@ _PROXY_PORT_ENV = "POLAR_HTTP_PROXY_PORT"
 _PROXY_BROKER_READY_ENV = "POLAR_HTTP_PROXY_BROKER_READY"
 _ALLOW_INTERNET_ENV = "POLAR_ALLOW_INTERNET"
 _TASK_PYTHONPATH_ENV = "POLAR_TASK_PYTHONPATH"
+_TASK_B64_ENV = "POLAR_MINI_SWE_TASK_B64"
 _APT_HTTP_SOURCE_POLICY_ENV = "POLAR_APT_HTTP_SOURCE_POLICY"
 _DEFAULT_PROXY_PORT = 28100
 _PROXY_ENV_NAMES = (
@@ -56,6 +59,36 @@ _APT_LIST_SOURCE_RE = re.compile(
 )
 _APT_DEB822_FIELD_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*\s*:")
 _APT_HTTP_TOKEN_RE = re.compile(r"(?<!\S)http://")
+
+
+def _inject_task_from_env() -> None:
+    """Move the private task payload into Python's argv, never the OS argv.
+
+    Keeping arbitrary task text out of ``/proc/*/cmdline`` prevents task-owned
+    process-management commands such as ``pkill -f`` from matching and killing
+    the mini-SWE parent process.  The variable is popped before validation so
+    it cannot leak into agent-created action subprocesses, including on an
+    invalid launch.
+    """
+
+    encoded_task = os.environ.pop(_TASK_B64_ENV, None)
+    if encoded_task is None:
+        return
+    if any(arg == "--task" or arg.startswith("--task=") for arg in sys.argv[1:]):
+        raise ValueError(
+            f"{_TASK_B64_ENV} cannot be combined with a --task command-line argument"
+        )
+    try:
+        task_bytes = base64.b64decode(encoded_task, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"{_TASK_B64_ENV} must be strict base64") from exc
+    try:
+        task = task_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{_TASK_B64_ENV} must decode to UTF-8 text") from exc
+    # Python argument parsing sees the task, but mutating sys.argv does not
+    # change the kernel-owned process command line exposed through /proc.
+    sys.argv.append(f"--task={task}")
 
 
 def _configure_model_retry_policy() -> None:
@@ -351,6 +384,7 @@ def _configure_litellm_gateway() -> Any | None:
 def main() -> int | None:
     """Configure isolated transports, then invoke mini-SWE-agent's CLI."""
 
+    _inject_task_from_env()
     proxy: LoopbackProxy | None = None
     gateway_client: Any | None = None
     try:

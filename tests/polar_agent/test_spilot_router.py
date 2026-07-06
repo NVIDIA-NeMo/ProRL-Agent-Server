@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+import signal
 import subprocess
 from types import SimpleNamespace
 
@@ -20,7 +21,9 @@ from polar.agent.presets.spilot_router_runner import (
     RouterCompletion,
     RouterProtocolError,
     SpilotOrchestrator,
+    _classify_process_failure,
     _openai_chat_payload,
+    _verification_instruction,
     parse_router_action,
 )
 from polar.agent.presets import spilot_router_runner
@@ -278,7 +281,6 @@ def test_pool_command_merges_global_and_per_candidate_request_kwargs(tmp_path: P
 
     command = executor._command(
         model=candidate.model,
-        instruction="Task",
         timing_path="/tmp/timing.jsonl",
         model_kwargs={**config["pool_model_kwargs"], **candidate.model_kwargs},
     )
@@ -289,6 +291,7 @@ def test_pool_command_merges_global_and_per_candidate_request_kwargs(tmp_path: P
     )
 
     assert "--model=openai/pool/gpt-5.5" in command
+    assert not any(arg == "--task" or arg.startswith("--task=") for arg in command)
     assert json.loads(kwargs_arg) == {
         "max_completion_tokens": 8192,
         "timeout": 60,
@@ -324,6 +327,10 @@ def test_pool_child_does_not_inherit_outer_router_protocol_env(
         "polar.agent.presets.spilot_router_runner.subprocess.Popen",
         fake_popen,
     )
+    monkeypatch.setattr(
+        "polar.agent.presets.spilot_router_runner._workspace_summary",
+        lambda _cwd: ("", "", "fingerprint"),
+    )
     config = _runner_config(
         agent_log_dir=str(tmp_path),
         mini_swe_bin="mini-swe-agent",
@@ -344,6 +351,142 @@ def test_pool_child_does_not_inherit_outer_router_protocol_env(
     assert "POLAR_ROUTER_CAPABILITY" not in captured_env
     assert "POLAR_MODEL_POOL_CAPABILITY" not in captured_env
     assert captured_env["OPENAI_API_KEY"] == "pool-only-capability"
+    assert (
+        base64.b64decode(captured_env["POLAR_MINI_SWE_TASK_B64"], validate=True).decode("utf-8")
+        == "Task"
+    )
+
+
+def test_pool_task_round_trips_for_solve_and_verify_without_entering_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: list[tuple[list[str], dict[str, str]]] = []
+
+    class Process:
+        pid = 123
+
+        def wait(self, timeout: float) -> int:
+            assert timeout > 0
+            return 0
+
+    def fake_popen(args, **kwargs):
+        captured.append((list(args), dict(kwargs["env"])))
+        return Process()
+
+    monkeypatch.setattr(
+        "polar.agent.presets.spilot_router_runner.subprocess.Popen",
+        fake_popen,
+    )
+    monkeypatch.setattr(
+        "polar.agent.presets.spilot_router_runner._workspace_summary",
+        lambda _cwd: ("", "", "fingerprint"),
+    )
+    config = _runner_config(agent_log_dir=str(tmp_path), mini_swe_bin="mini-swe-agent")
+    executor = MiniSwePoolExecutor(config, cwd=tmp_path)
+    candidate = Candidate(slot="M0", model="pool/test", card={})
+    task = "Stop stale helpers with pkill -f polar-danger-marker-9f27\n雪 'quoted'"
+
+    executor.run(
+        candidate=candidate,
+        task=task,
+        role="solve",
+        call_index=0,
+        timeout_seconds=10,
+    )
+    executor.run(
+        candidate=candidate,
+        task=task,
+        role="verify",
+        call_index=1,
+        timeout_seconds=10,
+    )
+
+    decoded_tasks = [
+        base64.b64decode(env["POLAR_MINI_SWE_TASK_B64"], validate=True).decode("utf-8")
+        for _, env in captured
+    ]
+    assert decoded_tasks == [task, _verification_instruction(task)]
+    for args, _ in captured:
+        os_argv = "\0".join(args)
+        assert "polar-danger-marker-9f27" not in os_argv
+        assert not any(arg == "--task" or arg.startswith("--task=") for arg in args)
+
+
+@pytest.mark.parametrize(
+    ("return_code", "timed_out", "expected"),
+    [
+        (-signal.SIGTERM, False, ("signal", signal.SIGTERM, "SIGTERM")),
+        (42, False, ("exit_code", None, None)),
+        (-1, True, ("timeout", None, None)),
+    ],
+)
+def test_pool_process_failure_classification_prioritizes_timeout(
+    return_code: int,
+    timed_out: bool,
+    expected: tuple[str, int | None, str | None],
+) -> None:
+    assert _classify_process_failure(return_code=return_code, timed_out=timed_out) == expected
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_status", "expected_kind", "expected_signal"),
+    [
+        ("sigterm", "failed", "signal", signal.SIGTERM),
+        ("exit42", "failed", "exit_code", None),
+        ("timeout", "timeout", "timeout", None),
+    ],
+)
+def test_pool_result_exposes_signal_exit_and_timeout_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected_status: str,
+    expected_kind: str,
+    expected_signal: int | None,
+) -> None:
+    class Process:
+        pid = 123
+
+        def wait(self, timeout: float) -> int:
+            if mode == "timeout":
+                raise subprocess.TimeoutExpired("mini-swe-agent", timeout)
+            if mode == "sigterm":
+                return -signal.SIGTERM
+            return 42
+
+    monkeypatch.setattr(
+        "polar.agent.presets.spilot_router_runner.subprocess.Popen",
+        lambda *_args, **_kwargs: Process(),
+    )
+    monkeypatch.setattr(
+        "polar.agent.presets.spilot_router_runner._terminate_process_group",
+        lambda _process: None,
+    )
+    monkeypatch.setattr(
+        "polar.agent.presets.spilot_router_runner._workspace_summary",
+        lambda _cwd: ("", "", "fingerprint"),
+    )
+    executor = MiniSwePoolExecutor(
+        _runner_config(agent_log_dir=str(tmp_path), mini_swe_bin="mini-swe-agent"),
+        cwd=tmp_path,
+    )
+
+    result = executor.run(
+        candidate=Candidate(slot="M0", model="pool/test", card={}),
+        task="Task",
+        role="solve",
+        call_index=0,
+        timeout_seconds=0.1,
+    )
+    metadata = result.metadata(index=0, cost=1.0)
+
+    assert result.status == expected_status
+    assert metadata["failure_kind"] == expected_kind
+    assert metadata.get("signal_number") == expected_signal
+    if expected_signal is not None:
+        assert metadata["signal_name"] == "SIGTERM"
+    else:
+        assert "signal_name" not in metadata
 
 
 def test_harness_is_builtin_and_uploads_portable_runner() -> None:

@@ -1,13 +1,78 @@
 from __future__ import annotations
 
+import base64
 import os
 from pathlib import Path
 import socket
+import sys
 import threading
 
 import pytest
 
 from polar.agent.presets import mini_swe_runner
+
+
+def test_private_task_moves_to_python_argv_but_not_proc_cmdline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = "Use pkill -f polar-danger-marker-e81a safely\n雪 'quoted'"
+    monkeypatch.setattr(sys, "argv", ["polar_mini_swe_runner", "--yolo"])
+    monkeypatch.setenv(
+        "POLAR_MINI_SWE_TASK_B64",
+        base64.b64encode(task.encode("utf-8")).decode("ascii"),
+    )
+    before = Path("/proc/self/cmdline").read_bytes()
+
+    mini_swe_runner._inject_task_from_env()
+
+    assert sys.argv == ["polar_mini_swe_runner", "--yolo", f"--task={task}"]
+    assert "POLAR_MINI_SWE_TASK_B64" not in os.environ
+    assert Path("/proc/self/cmdline").read_bytes() == before
+    assert b"polar-danger-marker-e81a" not in before
+
+
+@pytest.mark.parametrize(
+    ("encoded", "message"),
+    [
+        ("not%base64", "strict base64"),
+        (base64.b64encode(b"\xff").decode("ascii"), "UTF-8"),
+    ],
+)
+def test_private_task_rejects_invalid_payload_and_pops_secret_env(
+    monkeypatch: pytest.MonkeyPatch,
+    encoded: str,
+    message: str,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["polar_mini_swe_runner", "--yolo"])
+    monkeypatch.setenv("POLAR_MINI_SWE_TASK_B64", encoded)
+
+    with pytest.raises(ValueError, match=message):
+        mini_swe_runner._inject_task_from_env()
+
+    assert sys.argv == ["polar_mini_swe_runner", "--yolo"]
+    assert "POLAR_MINI_SWE_TASK_B64" not in os.environ
+
+
+@pytest.mark.parametrize(
+    "task_args",
+    [("--task=argv-task",), ("--task", "argv-task")],
+)
+def test_private_task_rejects_ambiguous_env_and_argv(
+    monkeypatch: pytest.MonkeyPatch,
+    task_args: tuple[str, ...],
+) -> None:
+    original_argv = ["polar_mini_swe_runner", *task_args]
+    monkeypatch.setattr(sys, "argv", original_argv.copy())
+    monkeypatch.setenv(
+        "POLAR_MINI_SWE_TASK_B64",
+        base64.b64encode(b"env-task").decode("ascii"),
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        mini_swe_runner._inject_task_from_env()
+
+    assert sys.argv == original_argv
+    assert "POLAR_MINI_SWE_TASK_B64" not in os.environ
 
 
 def _serve_unix_echo(path: Path) -> tuple[socket.socket, threading.Thread]:

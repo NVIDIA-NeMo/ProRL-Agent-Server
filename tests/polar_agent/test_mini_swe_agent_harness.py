@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from pathlib import Path
 import shlex
@@ -25,11 +26,14 @@ def test_mini_swe_agent_uses_gateway_and_bounded_steps() -> None:
         )
     )
 
-    step = harness.run_steps("Fix the quoted 'bug'")[0]
+    instruction = "Fix the quoted 'bug' with pkill -f polar-danger-marker-a91c 雪"
+    step = harness.run_steps(instruction)[0]
 
     assert 'OPENAI_API_BASE="$OPENAI_BASE_URL"' in step.command
     assert "--model=openai/Qwen3.5-4B" in step.command
     assert "--cost-limit 0" in step.command
+    assert "--task" not in step.command
+    assert "polar-danger-marker-a91c" not in step.command
     assert "-c mini -c agent.step_limit=30" in step.command
     assert "-c environment.env.PYTHONPATH=" in step.command
     assert step.command.startswith("set -o pipefail; ")
@@ -39,6 +43,10 @@ def test_mini_swe_agent_uses_gateway_and_bounded_steps() -> None:
     assert step.env["MSWEA_COST_TRACKING"] == "ignore_errors"
     assert step.env["MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT"] == "3"
     assert step.env["LITELLM_LOCAL_MODEL_COST_MAP"] == "True"
+    assert (
+        base64.b64decode(step.env["POLAR_MINI_SWE_TASK_B64"], validate=True).decode("utf-8")
+        == instruction
+    )
 
 
 def test_mini_swe_agent_model_retry_attempts_are_configurable() -> None:
@@ -108,7 +116,8 @@ def test_vanillux2_uses_paper_protocol_defaults() -> None:
     )
 
     assert isinstance(harness, Vanillux2Harness)
-    step = harness.run_steps("Repair the environment")[0]
+    instruction = "Repair the environment with pkill -f polar-danger-marker-f41d"
+    step = harness.run_steps(instruction)[0]
     config_arg = next(
         token.removeprefix("model.model_kwargs=")
         for token in shlex.split(step.command)
@@ -133,6 +142,12 @@ def test_vanillux2_uses_paper_protocol_defaults() -> None:
         "top_p": 0.95,
     }
     assert step.env["MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT"] == "5"
+    assert "--task" not in step.command
+    assert "polar-danger-marker-f41d" not in step.command
+    assert (
+        base64.b64decode(step.env["POLAR_MINI_SWE_TASK_B64"], validate=True).decode("utf-8")
+        == instruction
+    )
 
 
 def test_vanillux2_protocol_limits_remain_configurable() -> None:

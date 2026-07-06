@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import shlex
@@ -16,6 +17,7 @@ from polar.runtime.models import ExecInput
 
 
 MINI_SWE_TIMING_PATH = f"{RUNTIME_AGENT_LOG_DIR}/mini-swe-command-timing.jsonl"
+MINI_SWE_TASK_B64_ENV = "POLAR_MINI_SWE_TASK_B64"
 
 
 class MiniSweAgentHarness(BaseHarness):
@@ -85,7 +87,6 @@ class MiniSweAgentHarness(BaseHarness):
             "--yolo",
             f"--environment-class {shlex.quote(environment_class)}",
             f"--model={shlex.quote(f'openai/{model_id}')}",
-            f"--task={shlex.quote(instruction)}",
             f"--cost-limit {shlex.quote(str(cost_limit))}",
             "--exit-immediately",
         ]
@@ -138,6 +139,9 @@ class MiniSweAgentHarness(BaseHarness):
                 ),
                 env={
                     **self.env,
+                    MINI_SWE_TASK_B64_ENV: base64.b64encode(
+                        instruction.encode("utf-8")
+                    ).decode("ascii"),
                     "MSWEA_CONFIGURED": "true",
                     "MSWEA_COST_TRACKING": "ignore_errors",
                     "MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT": str(model_retry_attempts),

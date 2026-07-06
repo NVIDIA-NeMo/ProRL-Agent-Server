@@ -36,6 +36,7 @@ _CONFIG_ENV = "SPILOT_ROUTER_CONFIG_B64"
 _TASK_ENV = "SPILOT_TASK_B64"
 _ROUTER_CAPABILITY_ENV = "POLAR_ROUTER_CAPABILITY"
 _MODEL_POOL_CAPABILITY_ENV = "POLAR_MODEL_POOL_CAPABILITY"
+_MINI_SWE_TASK_B64_ENV = "POLAR_MINI_SWE_TASK_B64"
 _SLOT_RE = re.compile(r"^M(?:0|[1-9][0-9]*)$")
 _MAX_ERROR_CHARS = 500
 _MAX_CARD_CHARS = 4_000
@@ -60,6 +61,25 @@ class GatewayInfrastructureError(RuntimeError):
 
 class PoolInfrastructureError(RuntimeError):
     """The local pool-agent executable could not be launched."""
+
+
+def _classify_process_failure(
+    *, return_code: int, timed_out: bool
+) -> tuple[str | None, int | None, str | None]:
+    """Classify a child failure without confusing timeout ``-1`` with SIGHUP."""
+
+    if timed_out:
+        return "timeout", None, None
+    if return_code == 0:
+        return None, None, None
+    if return_code < 0:
+        signal_number = -return_code
+        try:
+            signal_name = signal.Signals(signal_number).name
+        except ValueError:
+            signal_name = f"UNKNOWN_SIGNAL_{signal_number}"
+        return "signal", signal_number, signal_name
+    return "exit_code", None, None
 
 
 @dataclass(frozen=True)
@@ -102,6 +122,9 @@ class PoolCallResult:
     git_diff_stat: str
     workspace_fingerprint: str
     error: str | None = None
+    failure_kind: str | None = None
+    signal_number: int | None = None
+    signal_name: str | None = None
 
     def metadata(self, *, index: int, cost: float) -> dict[str, object]:
         result: dict[str, object] = {
@@ -120,6 +143,12 @@ class PoolCallResult:
         }
         if self.error:
             result["error"] = _bounded_text(self.error, _MAX_ERROR_CHARS)
+        if self.failure_kind is not None:
+            result["failure_kind"] = self.failure_kind
+        if self.signal_number is not None:
+            result["signal_number"] = self.signal_number
+        if self.signal_name is not None:
+            result["signal_name"] = self.signal_name
         return result
 
     def observation(self, max_chars: int) -> str:
@@ -130,6 +159,9 @@ class PoolCallResult:
             "return_code": self.return_code,
             "duration_ms": self.duration_ms,
             "timed_out": self.timed_out,
+            "failure_kind": self.failure_kind,
+            "signal_number": self.signal_number,
+            "signal_name": self.signal_name,
             "workspace_fingerprint": self.workspace_fingerprint,
             "git_status": self.git_status,
             "git_diff_stat": self.git_diff_stat,
@@ -274,7 +306,6 @@ class MiniSwePoolExecutor:
         model_kwargs.update(candidate.model_kwargs)
         args = self._command(
             model=candidate.model,
-            instruction=instruction,
             timing_path=str(timing_path),
             model_kwargs=model_kwargs,
         )
@@ -285,6 +316,9 @@ class MiniSwePoolExecutor:
         child_env.pop(_CONFIG_ENV, None)
         child_env.pop(_TASK_ENV, None)
         child_env.pop(_ROUTER_CAPABILITY_ENV, None)
+        child_env[_MINI_SWE_TASK_B64_ENV] = base64.b64encode(
+            instruction.encode("utf-8")
+        ).decode("ascii")
         pool_capability = child_env.pop(_MODEL_POOL_CAPABILITY_ENV, "").strip()
         if pool_capability:
             child_env["OPENAI_API_KEY"] = pool_capability
@@ -337,10 +371,17 @@ class MiniSwePoolExecutor:
             ) from exc
 
         duration_ms = max(0, int((time.monotonic() - started) * 1000))
+        failure_kind, signal_number, signal_name = _classify_process_failure(
+            return_code=return_code,
+            timed_out=timed_out,
+        )
         if timed_out:
             status = "timeout"
         elif return_code == 0:
             status = "completed"
+        elif failure_kind == "signal":
+            status = "failed"
+            error = f"pool agent terminated by signal {signal_name} ({signal_number})"
         else:
             status = "failed"
             error = f"pool agent exited with code {return_code}"
@@ -360,6 +401,9 @@ class MiniSwePoolExecutor:
             git_diff_stat=git_diff_stat,
             workspace_fingerprint=fingerprint,
             error=error,
+            failure_kind=failure_kind,
+            signal_number=signal_number,
+            signal_name=signal_name,
         )
 
     def deadline_result(
@@ -385,13 +429,13 @@ class MiniSwePoolExecutor:
             git_diff_stat=git_diff_stat,
             workspace_fingerprint=fingerprint,
             error="pool call skipped because the episode deadline was exhausted",
+            failure_kind="timeout",
         )
 
     def _command(
         self,
         *,
         model: str,
-        instruction: str,
         timing_path: str,
         model_kwargs: dict[str, Any],
     ) -> list[str]:
@@ -402,7 +446,6 @@ class MiniSwePoolExecutor:
             "--environment-class",
             "polar_mini_swe_timing.TimedLocalEnvironment",
             f"--model={model_id}",
-            f"--task={instruction}",
             "--cost-limit",
             str(self.config["pool_cost_limit"]),
             "--exit-immediately",
@@ -649,6 +692,7 @@ class SpilotOrchestrator:
                 git_diff_stat="",
                 workspace_fingerprint="unavailable",
                 error="pool call skipped because the episode deadline was exhausted",
+                failure_kind="timeout",
             )
         timeout = min(float(self.config["pool_timeout_seconds"]), available)
         return self.pool.run(
