@@ -427,13 +427,13 @@ def test_spooled_allocation_script_uses_submitted_project_root(tmp_path: Path) -
     train_image = tmp_path / "train.sqsh"
     train_image.write_bytes(b"test")
     environment = dict(os.environ)
+    environment.pop("POLAR_DATA_ROOT", None)
     environment.update(
         {
             "SLURM_JOB_ID": "23456",
             "SLURM_JOB_NUM_NODES": "1",
             "SLURM_CPUS_PER_TASK": "2",
             "POLAR_FORCED_EVAL_ENV_FILE": str(credential),
-            "POLAR_DATA_ROOT": str(tmp_path / "data"),
             "POLR_TRAIN_SQSH": str(train_image),
             "TMAX_SIF_PYTHON_BIN": "/bin/true",
             "FAKE_SRUN_ARGS": str(capture),

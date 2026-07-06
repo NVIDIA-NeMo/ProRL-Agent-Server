@@ -85,12 +85,6 @@ if [ -n "${POLAR_CONTROL_PLANE_TOKEN:-}" ]; then
     echo "ERROR: control-plane token must be generated in memory by the allocation launcher" >&2
     exit 2
 fi
-export POLAR_MODEL_POOL_BASE_URL="${POLAR_MODEL_POOL_BASE_URL:-https://integrate.api.nvidia.com/v1}"
-export POLAR_DATA_ROOT="${POLAR_DATA_ROOT:-${SPILOT_ROOT}/data}"
-export http_proxy="${http_proxy:-${HTTP_PROXY:-http://cw-dfw-cs-001-container-cache:3128}}"
-export https_proxy="${https_proxy:-${HTTPS_PROXY:-${http_proxy}}}"
-export HTTP_PROXY="${HTTP_PROXY:-${http_proxy}}"
-export HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy}}"
 
 # A script submitted directly with sbatch is copied below Slurm's spool tree,
 # so BASH_SOURCE[0] is not a stable way to locate this checkout on the worker.
@@ -106,6 +100,13 @@ fi
 SCRIPT_DIR="${PROJECT_ROOT}/examples/spilot_router_slime_grpo"
 SPILOT_ROOT="$(cd -- "${PROJECT_ROOT}/../.." && pwd)"
 USER_ROOT="$(dirname "${SPILOT_ROOT}")"
+
+export POLAR_MODEL_POOL_BASE_URL="${POLAR_MODEL_POOL_BASE_URL:-https://integrate.api.nvidia.com/v1}"
+export POLAR_DATA_ROOT="${POLAR_DATA_ROOT:-${SPILOT_ROOT}/data}"
+export http_proxy="${http_proxy:-${HTTP_PROXY:-http://cw-dfw-cs-001-container-cache:3128}}"
+export https_proxy="${https_proxy:-${HTTPS_PROXY:-${http_proxy}}}"
+export HTTP_PROXY="${HTTP_PROXY:-${http_proxy}}"
+export HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy}}"
 
 TRAIN_SQSH="${POLR_TRAIN_SQSH:-${POLAR_DATA_ROOT}/container/flappydora-ubuntu22.04-cuda13.3.sqsh}"
 TRAIN_MOUNTS="${TRAIN_CONTAINER_MOUNTS:-/lustre/fsw:/lustre/fsw}"
