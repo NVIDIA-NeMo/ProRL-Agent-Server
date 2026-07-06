@@ -116,6 +116,10 @@ trap cleanup_submit EXIT
     printf 'export POLAR_NVIDIA_API_KEY=%q\n' "${POLAR_NVIDIA_API_KEY}"
     printf 'export POLAR_MODEL_POOL_BASE_URL=%q\n' "${POLAR_MODEL_POOL_BASE_URL}"
     printf 'export POLAR_DATA_ROOT=%q\n' "${POLAR_DATA_ROOT}"
+    # Slurm executes a copied batch script from its spool directory.  Pass the
+    # canonical checkout explicitly instead of asking the allocated copy to
+    # infer the repository from BASH_SOURCE[0].
+    printf 'export SPILOT_FORCED_EVAL_PROJECT_ROOT=%q\n' "${PROJECT_ROOT}"
     printf 'export SRUN_BIN=%q\n' "${SRUN_BIN}"
     printf 'export http_proxy=%q\n' "${http_proxy:-${HTTP_PROXY:-http://cw-dfw-cs-001-container-cache:3128}}"
     printf 'export https_proxy=%q\n' "${https_proxy:-${HTTPS_PROXY:-${http_proxy:-${HTTP_PROXY:-http://cw-dfw-cs-001-container-cache:3128}}}}"

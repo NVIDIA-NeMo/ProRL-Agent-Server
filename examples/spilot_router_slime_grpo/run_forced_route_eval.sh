@@ -8,10 +8,8 @@
 set -euo pipefail
 umask 077
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
-SPILOT_ROOT="$(cd -- "${PROJECT_ROOT}/../.." && pwd)"
-USER_ROOT="$(dirname "${SPILOT_ROOT}")"
+SPOOLED_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+FALLBACK_PROJECT_ROOT="$(cd -- "${SPOOLED_SCRIPT_DIR}/../.." && pwd)"
 CHILD_PID=""
 CREDENTIAL_PATH="${POLAR_FORCED_EVAL_ENV_FILE:-}"
 POLAR_JOB_CACHE_ROOT=""
@@ -93,6 +91,21 @@ export http_proxy="${http_proxy:-${HTTP_PROXY:-http://cw-dfw-cs-001-container-ca
 export https_proxy="${https_proxy:-${HTTPS_PROXY:-${http_proxy}}}"
 export HTTP_PROXY="${HTTP_PROXY:-${http_proxy}}"
 export HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy}}"
+
+# A script submitted directly with sbatch is copied below Slurm's spool tree,
+# so BASH_SOURCE[0] is not a stable way to locate this checkout on the worker.
+# The submitter records the canonical path in the private envelope; direct
+# allocation invocations retain the source-relative fallback.
+PROJECT_ROOT="${SPILOT_FORCED_EVAL_PROJECT_ROOT:-${FALLBACK_PROJECT_ROOT}}"
+case "${PROJECT_ROOT}" in /*) ;; *) echo "ERROR: project root must be absolute" >&2; exit 2 ;; esac
+if [ ! -d "${PROJECT_ROOT}/src/polar" ] || \
+   [ ! -f "${PROJECT_ROOT}/examples/spilot_router_slime_grpo/run_forced_route_eval.py" ]; then
+    echo "ERROR: invalid SPilot project root: ${PROJECT_ROOT}" >&2
+    exit 2
+fi
+SCRIPT_DIR="${PROJECT_ROOT}/examples/spilot_router_slime_grpo"
+SPILOT_ROOT="$(cd -- "${PROJECT_ROOT}/../.." && pwd)"
+USER_ROOT="$(dirname "${SPILOT_ROOT}")"
 
 TRAIN_SQSH="${POLR_TRAIN_SQSH:-${POLAR_DATA_ROOT}/container/flappydora-ubuntu22.04-cuda13.3.sqsh}"
 TRAIN_MOUNTS="${TRAIN_CONTAINER_MOUNTS:-/lustre/fsw:/lustre/fsw}"

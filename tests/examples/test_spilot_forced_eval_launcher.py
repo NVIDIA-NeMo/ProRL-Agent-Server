@@ -402,7 +402,56 @@ def test_submitter_persists_only_private_envelope_until_allocation_starts(
     assert secret in credential.read_text()
     assert secret not in args_capture.read_text()
     assert "POLAR_FORCED_EVAL_ENV_FILE=" in args_capture.read_text()
+    assert "SPILOT_FORCED_EVAL_PROJECT_ROOT=" in credential.read_text()
     assert (tmp_path / "submitted.submit" / "job_id").read_text().strip() == "424242"
+
+
+def test_spooled_allocation_script_uses_submitted_project_root(tmp_path: Path) -> None:
+    capture = tmp_path / "srun.args"
+    fake_srun = tmp_path / "srun"
+    fake_srun.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >\"$FAKE_SRUN_ARGS\"\n"
+    )
+    fake_srun.chmod(0o700)
+    spooled_script = tmp_path / "slurm-spool" / "script"
+    spooled_script.parent.mkdir()
+    spooled_script.write_text(RUN_SCRIPT.read_text())
+    spooled_script.chmod(0o700)
+    credential = tmp_path / "credentials.env"
+    credential.write_text(
+        "export POLAR_NVIDIA_API_KEY=nvapi-spool-sentinel\n"
+        f"export SPILOT_FORCED_EVAL_PROJECT_ROOT={ROOT}\n"
+        f"export SRUN_BIN={fake_srun}\n"
+    )
+    credential.chmod(0o600)
+    train_image = tmp_path / "train.sqsh"
+    train_image.write_bytes(b"test")
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "SLURM_JOB_ID": "23456",
+            "SLURM_JOB_NUM_NODES": "1",
+            "SLURM_CPUS_PER_TASK": "2",
+            "POLAR_FORCED_EVAL_ENV_FILE": str(credential),
+            "POLAR_DATA_ROOT": str(tmp_path / "data"),
+            "POLR_TRAIN_SQSH": str(train_image),
+            "TMAX_SIF_PYTHON_BIN": "/bin/true",
+            "FAKE_SRUN_ARGS": str(capture),
+        }
+    )
+
+    completed = subprocess.run(
+        ["bash", str(spooled_script), "--i-understand-eval-only"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    arguments = capture.read_text().splitlines()
+    assert f"--container-workdir={ROOT}" in arguments
+    assert not credential.exists()
 
 
 def test_allocation_reexports_sourced_key_to_pyxis_step_without_control_token(
