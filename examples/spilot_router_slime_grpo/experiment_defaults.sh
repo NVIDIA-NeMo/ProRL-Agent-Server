@@ -95,14 +95,13 @@ export TMAX_PREPARE_DATA="${TMAX_PREPARE_DATA:-0}"
 export TMAX_VALIDATE_EXISTING_ASSETS="${TMAX_VALIDATE_EXISTING_ASSETS:-0}"
 export TMAX_TRAIN_DATA_SHA256="${TMAX_TRAIN_DATA_SHA256:-96a1c5929de64516eecc8a7b7ae012ccb888a2d575f15e28b8806ae6804826c8}"
 
-# Match the reference's 100-task holdout contract.  Baseline/final Router
-# evaluation is launched outside optimizer training, so it cannot perturb the
-# reference-compatible train schedule.
+# Keep holdout metadata available for separate baseline/final evaluation, but
+# match the reference run's no-eval training lifecycle exactly.  Candidate
+# strength and final Router quality are measured by the guarded forced-route
+# evaluator outside optimizer training.
 export TMAX_EVAL_ENABLED="${TMAX_EVAL_ENABLED:-1}"
-# Evaluation is observational and runs before step 0 / after step 199; it is
-# the sole intentional lifecycle difference from the reference's "noeval"
-# launch and does not alter optimizer inputs or scheduling.
-export TMAX_TRAINING_EVAL_ENABLED="${TMAX_TRAINING_EVAL_ENABLED:-1}"
+export TMAX_TRAINING_EVAL_ENABLED="${TMAX_TRAINING_EVAL_ENABLED:-0}"
+export TMAX_EVAL_RESUMED_CHECKPOINT_BEFORE_TRAIN="${TMAX_EVAL_RESUMED_CHECKPOINT_BEFORE_TRAIN:-0}"
 export TMAX_EVAL_SOURCE="${TMAX_EVAL_SOURCE:-tmax}"
 export TMAX_EVAL_DATA="${TMAX_EVAL_DATA:-${_SPILOT_REFERENCE_DATA_DIR}/tmax_holdout-eval.jsonl}"
 export TMAX_EVAL_START_INDEX="${TMAX_EVAL_START_INDEX:-900}"

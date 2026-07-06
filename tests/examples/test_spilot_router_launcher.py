@@ -230,7 +230,11 @@ def test_spilot_submit_wrapper_pins_8_nodes_and_200_steps() -> None:
     assert 'SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-}"' in defaults
     assert 'WANDB_GROUP="${WANDB_GROUP:-spilot-router-qwen35-9b-8n64}"' in defaults
     assert 'TMAX_EVAL_MAX_TASKS="${TMAX_EVAL_MAX_TASKS:-100}"' in defaults
-    assert 'TMAX_TRAINING_EVAL_ENABLED="${TMAX_TRAINING_EVAL_ENABLED:-1}"' in defaults
+    assert 'TMAX_TRAINING_EVAL_ENABLED="${TMAX_TRAINING_EVAL_ENABLED:-0}"' in defaults
+    assert (
+        'TMAX_EVAL_RESUMED_CHECKPOINT_BEFORE_TRAIN="${TMAX_EVAL_RESUMED_CHECKPOINT_BEFORE_TRAIN:-0}"'
+        in defaults
+    )
     assert 'TMAX_EXTERNAL_EVAL_ENABLED="${TMAX_EXTERNAL_EVAL_ENABLED:-0}"' in defaults
     assert 'TMAX_CONCURRENT_PRETRAIN_EVAL="${TMAX_CONCURRENT_PRETRAIN_EVAL:-0}"' in defaults
     assert 'TMAX_ONLY_READY="${TMAX_ONLY_READY:-1}"' in defaults
