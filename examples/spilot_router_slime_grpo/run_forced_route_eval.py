@@ -405,6 +405,11 @@ def scoped_environment(*, control_token: str | None = None, nvidia_key: str | No
     environment["PYTHONPATH"] = str(REPO_ROOT / "src") + (
         f":{current_pythonpath}" if current_pythonpath else ""
     )
+    # Rollout, gateway, evaluator, and their heartbeats communicate only over
+    # allocation-local loopback.  A cluster-wide HTTP proxy must never capture
+    # those requests (or the intentionally dead 127.0.0.1:9 actor sentinel).
+    environment["no_proxy"] = "127.0.0.1,localhost"
+    environment["NO_PROXY"] = environment["no_proxy"]
     if control_token is not None:
         environment[CONTROL_TOKEN_ENV] = control_token
     if nvidia_key is not None:

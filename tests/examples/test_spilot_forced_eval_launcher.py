@@ -552,3 +552,6 @@ def test_child_environments_scope_each_credential(monkeypatch) -> None:
     assert "NVIDIA_API_KEY" not in gateway
     assert "POLAR_CONTROL_PLANE_TOKEN" not in tunnel
     assert "POLAR_NVIDIA_API_KEY" not in tunnel
+    for environment in (rollout, gateway, tunnel):
+        assert environment["no_proxy"] == "127.0.0.1,localhost"
+        assert environment["NO_PROXY"] == "127.0.0.1,localhost"

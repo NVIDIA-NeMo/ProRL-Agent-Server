@@ -107,6 +107,8 @@ export http_proxy="${http_proxy:-${HTTP_PROXY:-http://cw-dfw-cs-001-container-ca
 export https_proxy="${https_proxy:-${HTTPS_PROXY:-${http_proxy}}}"
 export HTTP_PROXY="${HTTP_PROXY:-${http_proxy}}"
 export HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy}}"
+export no_proxy="127.0.0.1,localhost"
+export NO_PROXY="${no_proxy}"
 
 TRAIN_SQSH="${POLR_TRAIN_SQSH:-${POLAR_DATA_ROOT}/container/flappydora-ubuntu22.04-cuda13.3.sqsh}"
 TRAIN_MOUNTS="${TRAIN_CONTAINER_MOUNTS:-/lustre/fsw:/lustre/fsw}"
