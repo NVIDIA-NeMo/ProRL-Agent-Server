@@ -83,11 +83,58 @@ single mini-SWE call, and reuses the normal `spilot_harbor` evaluator. The
 evaluation-only builder emits no traces even if a pool completion were ever
 persisted accidentally.
 
-Run it against a dedicated Polar allocation built from the commit containing
-this evaluator. Pass the allocation's already-rendered `polar_config.yaml`,
-not the `${...}` template. A required acknowledgement, required finite task
-count, guarded harness config, guarded portable runner, and guarded zero-trace
-builder keep this path out of formal training by default:
+The safest path is the dedicated services-only Slurm entrypoint. It requests
+one node and no GPU, enters the same proven Pyxis image used by TMax, renders
+fresh allocation-local configs, and starts only rollout, one gateway, and the
+gateway/proxy UDS bridge. The evaluator runs on the same node, after which the
+entrypoint tears all three services down. It never starts Ray, Slime, SGLang,
+or a Router actor.
+
+For example, compare 32 paired holdout tasks on cw-dfw. The output directory
+must not already exist. The submitter loads the NVIDIA credential from the
+current shell or `~/.zshrc`, writes only a mode-0600 submission envelope, and
+passes its path (not the key) to Slurm. The allocated-node entrypoint sources
+and immediately deletes that file. It generates the control-plane token in
+memory and never persists it:
+
+```bash
+REPO=/lustre/fsw/portfolios/nvr/projects/nvr_lpr_llm/users/jiaruiy/spilot/src/ProRL-Agent-Server
+DATA_ROOT=/lustre/fsw/portfolios/nvr/projects/nvr_lpr_llm/users/jiaruiy/spilot/data
+RUN_ID=qwen-vs-gpt-holdout-$(date -u +%Y%m%dT%H%M%SZ)
+RESULT_ROOT=${DATA_ROOT}/runs/spilot-forced-route-eval
+
+ACCOUNT=nvr_lpr_llm \
+PARTITION=backfill,batch \
+SLURM_CONSTRAINT=H100 \
+CPUS_PER_TASK=32 \
+POLAR_SLURM_MEM_PER_NODE=128G \
+WALL_TIME=12:00:00 \
+FORCED_EVAL_GPUS=0 \
+bash "${REPO}/examples/spilot_router_slime_grpo/submit_forced_route_eval.sh" \
+  --i-understand-eval-only \
+  --run-id "${RUN_ID}" \
+  --data "${DATA_ROOT}/runs/tmax-14598r-14498t100h-20260701T011143Z/tmax_holdout-eval.jsonl" \
+  --data-root "${DATA_ROOT}" \
+  --pool-base-url https://inference-api.nvidia.com/v1 \
+  --start-index 0 --max-tasks 32 \
+  --seed 20260706 --max-concurrency 4 \
+  --output-dir "${RESULT_ROOT}/${RUN_ID}"
+```
+
+There is no software GPU dependency because both candidates are remote. If a
+site partition refuses a zero-GPU Pyxis allocation, resubmit with
+`FORCED_EVAL_GPUS=1`; that GPU remains unused. Do not use an old job's
+rendered config: it contains stale compute-node URLs and job-local `/tmp` UDS
+paths.
+
+Before that paid run, use the same command with `PARTITION=interactive`,
+`WALL_TIME=02:00:00`, `--max-tasks 1`, and `--max-concurrency 2` as the allocation
+smoke. A 32-pair run can require many waves of full coding-agent work, so the
+two-hour interactive limit is not a safe full-benchmark wall time.
+
+For an already running, deliberately managed Polar allocation, the low-level
+evaluator remains available. Pass that allocation's freshly rendered
+`polar_config.yaml`, not the `${...}` template:
 
 ```bash
 python examples/spilot_router_slime_grpo/forced_route_eval.py \
@@ -103,9 +150,9 @@ python examples/spilot_router_slime_grpo/forced_route_eval.py \
   --output-dir /abs/path/forced-route-qwen-vs-gpt
 ```
 
-The submission shell must already contain `POLAR_CONTROL_PLANE_TOKEN`; model
-credentials remain in the running Polar service. The output directory is
-created exclusively and contains:
+In the low-level form, the submission shell must already contain
+`POLAR_CONTROL_PLANE_TOKEN`; model credentials remain in the running Polar
+service. The output directory is created exclusively and contains:
 
 - `manifest.json`: immutable data/config hashes, range, seed, candidates, and
   the no-actor contract;
