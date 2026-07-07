@@ -271,6 +271,7 @@ fi
 HF_CHECKPOINT="${HF_CHECKPOINT:-Qwen/Qwen3.5-4B}"
 REF_LOAD="${REF_LOAD:-${PROJECT_ROOT}/tmp/checkpoints/Qwen3.5-4B_torch_dist}"
 RUN_ID="${RUN_ID:-swegym-slime-grpo-$(date -u +%Y%m%dT%H%M%SZ)}"
+export WANDB_RUN_ID="${WANDB_RUN_ID:-${RUN_ID}}"
 SAVE_ROOT="${SAVE_ROOT:-${PROJECT_ROOT}/tmp/ckpt/swegym_slime_grpo_qwen35_4b}"
 SAVE_DIR="${SAVE_DIR:-${SAVE_ROOT}/${RUN_ID}}"
 mkdir -p "$SAVE_DIR"
@@ -968,7 +969,7 @@ start_gpu_monitor() {
     local wandb_args=("--no-wandb")
     if [ -n "${WANDB_API_KEY:-}" ] && [ "${WANDB_MODE:-offline}" != "disabled" ]; then
         wandb_args=(
-            "--wandb-run-id" "$RUN_ID"
+            "--wandb-run-id" "$WANDB_RUN_ID"
             "--wandb-project" "${WANDB_PROJECT:-polar-swegym-grpo}"
             "--wandb-group" "${WANDB_GROUP:-swegym-qwen35-4b-async-grpo}"
             "--wandb-mode" "${GPU_MONITOR_WANDB_MODE:-shared}"
@@ -1722,7 +1723,7 @@ RUNTIME_ENV_JSON="{
     \"WANDB_MODE\": \"${WANDB_MODE:-offline}\",
     \"WANDB_PROJECT\": \"${WANDB_PROJECT:-polar-swegym-grpo}\",
     \"WANDB_GROUP\": \"${WANDB_GROUP:-swegym-qwen35-4b-async-grpo}\",
-    \"WANDB_RUN_ID\": \"${RUN_ID}\",
+    \"WANDB_RUN_ID\": \"${WANDB_RUN_ID}\",
     \"WANDB_RESUME\": \"${WANDB_RESUME:-allow}\",
     \"HF_TOKEN\": \"${HF_TOKEN:-}\",
     \"HUGGINGFACE_HUB_TOKEN\": \"${HUGGINGFACE_HUB_TOKEN:-${HF_TOKEN:-}}\",
@@ -1860,7 +1861,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     --use-wandb \
     "${WANDB_STEP_ARGS[@]}" \
     --wandb-mode "${WANDB_MODE:-offline}" \
-    --wandb-run-id "$RUN_ID" \
+    --wandb-run-id "$WANDB_RUN_ID" \
     --wandb-project "${WANDB_PROJECT:-polar-swegym-grpo}" \
     --wandb-group "${WANDB_GROUP:-swegym-qwen35-4b-async-grpo}" \
     --disable-wandb-random-suffix \

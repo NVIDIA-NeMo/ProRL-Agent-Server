@@ -76,6 +76,32 @@ def test_launchers_keep_runtime_outputs_under_the_data_root() -> None:
     assert 'log_dir="${TMAX_HF_EXPORT_LOG_DIR:-${DATA_ROOT}/logs/slurm}"' in hf_export
 
 
+def test_shared_launcher_defaults_and_overrides_physical_wandb_run_id() -> None:
+    launcher = (SHARED / "run.sh").read_text()
+    assignment = re.search(
+        r'^export WANDB_RUN_ID="\$\{WANDB_RUN_ID:-\$\{RUN_ID\}\}"$',
+        launcher,
+        re.M,
+    )
+
+    assert assignment is not None
+    default = run_bash(
+        f'RUN_ID=logical-run\nunset WANDB_RUN_ID\n{assignment.group(0)}\nprintf %s "$WANDB_RUN_ID"'
+    )
+    override = run_bash(
+        f'RUN_ID=logical-run\nWANDB_RUN_ID=telemetry-run\n{assignment.group(0)}\nprintf %s "$WANDB_RUN_ID"'
+    )
+
+    assert default.stdout == "logical-run"
+    assert override.stdout == "telemetry-run"
+    assert '"--wandb-run-id" "$WANDB_RUN_ID"' in launcher
+    assert '\\"WANDB_RUN_ID\\": \\"${WANDB_RUN_ID}\\"' in launcher
+    assert '--wandb-run-id "$WANDB_RUN_ID" \\' in launcher
+    assert '"--wandb-run-id" "$RUN_ID"' not in launcher
+    assert '\\"WANDB_RUN_ID\\": \\"${RUN_ID}\\"' not in launcher
+    assert '--wandb-run-id "$RUN_ID" \\' not in launcher
+
+
 def write_command(path: Path, body: str) -> None:
     path.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body)
     path.chmod(0o755)
@@ -217,6 +243,33 @@ def test_tmax_submit_allows_explicit_release_seed_with_fresh_data(
     assert result.returncode == 0, result.stderr
     assert "Dry run only; sbatch wrapper:" in result.stdout
     assert (tmp_path / "data" / "runs" / "fresh-release" / "tmax-train.jsonl").is_file()
+
+
+@pytest.mark.parametrize(
+    ("wandb_run_id", "expected"),
+    [(None, "fresh-release"), ("telemetry-run", "telemetry-run")],
+)
+def test_tmax_submit_snapshots_physical_wandb_run_id_without_changing_lineage(
+    tmp_path: Path, wandb_run_id: str | None, expected: str
+) -> None:
+    env = tmax_submit_env(tmp_path, load_pointer="release")
+    if wandb_run_id is not None:
+        env["WANDB_RUN_ID"] = wandb_run_id
+
+    result = subprocess.run(
+        ["bash", str(TMAX / "submit_slurm.sh")],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    logical_run_dir = tmp_path / "data" / "runs" / "fresh-release"
+    snapshots = list((logical_run_dir / "submit").glob("env-*.sh"))
+    assert len(snapshots) == 1
+    assert f"export WANDB_RUN_ID={expected}\n" in snapshots[0].read_text()
+    assert not (tmp_path / "data" / "runs" / "telemetry-run").exists()
 
 
 def test_sbatch_submission_scrubs_parent_slurm_memory_contract(
@@ -2491,6 +2544,62 @@ printf '%s' "${{SLIME_ROLLOUT_BASE_PORT-unset}}"
     assert "TMAX_DYNAMIC_SAMPLING_FILTER_PATH=" in content
     assert "check_reward_nonzero_std" in content
     assert "SLIME_ROLLOUT_BASE_PORT" not in content
+
+
+def test_run_state_round_trips_physical_wandb_run_id(tmp_path: Path):
+    state = tmp_path / "state.env"
+    env = clean_env(tmp_path)
+    env.update(
+        RUN_ID="logical-run",
+        WANDB_RUN_ID="telemetry-run",
+        SAVE_DIR=str(tmp_path / "save"),
+        STATE=str(state),
+    )
+    script = f"""
+source {TMAX / "run_state.sh"}
+tmax_write_run_state "$STATE"
+unset WANDB_RUN_ID
+tmax_load_run_state "$STATE"
+printf '%s' "$WANDB_RUN_ID"
+"""
+
+    assert run_bash(script, env=env).stdout == "telemetry-run"
+    assert "export WANDB_RUN_ID=telemetry-run" in state.read_text()
+    assert (
+        'export WANDB_RUN_ID="${WANDB_RUN_ID:-${RUN_ID}}"'
+        in (TMAX / "submit_slurm.sh").read_text()
+    )
+
+
+def test_run_state_round_trips_mini_swe_agent_runtime(tmp_path: Path):
+    state = tmp_path / "state.env"
+    runtime_dir = tmp_path / "mini-swe-runtime"
+    agent_bin = runtime_dir / "bin" / "mini-swe-agent"
+    env = clean_env(tmp_path)
+    env.update(
+        RUN_ID="logical-run",
+        SAVE_DIR=str(tmp_path / "save"),
+        MINI_SWE_AGENT_RUNTIME_DIR=str(runtime_dir),
+        MINI_SWE_AGENT_BIN=str(agent_bin),
+        MINI_SWE_AGENT_SPEC="spilot_router",
+        STATE=str(state),
+    )
+    script = f"""
+source {TMAX / "run_state.sh"}
+tmax_write_run_state "$STATE"
+unset MINI_SWE_AGENT_RUNTIME_DIR MINI_SWE_AGENT_BIN MINI_SWE_AGENT_SPEC
+tmax_load_run_state "$STATE"
+printf '%s|%s|%s' \
+    "$MINI_SWE_AGENT_RUNTIME_DIR" "$MINI_SWE_AGENT_BIN" "$MINI_SWE_AGENT_SPEC"
+"""
+
+    assert run_bash(script, env=env).stdout == (
+        f"{runtime_dir}|{agent_bin}|spilot_router"
+    )
+    content = state.read_text()
+    assert f"export MINI_SWE_AGENT_RUNTIME_DIR={runtime_dir}\n" in content
+    assert f"export MINI_SWE_AGENT_BIN={agent_bin}\n" in content
+    assert "export MINI_SWE_AGENT_SPEC=spilot_router\n" in content
 
 
 def test_run_state_detects_fields_present_in_legacy_files(tmp_path: Path):
