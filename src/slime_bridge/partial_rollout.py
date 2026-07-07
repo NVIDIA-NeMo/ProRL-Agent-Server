@@ -22,6 +22,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import stat
 import threading
 import time
 from typing import Any, Iterable
@@ -66,9 +67,12 @@ class PartialRolloutError(RuntimeError):
 class PartialRolloutHeader:
     run_id: str
     rollout_id: int
+    base_checkpoint_kind: str
     base_checkpoint_iteration: int
     base_checkpoint_digest: str
     config_digest: str
+    source_digest: str
+    data_digest: str
     target_groups: int
     replay_start_reservation_id: int
     replay_live_frontier: int
@@ -110,6 +114,46 @@ def _sha256_file(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _regular_file_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
+def _sha256_stable_regular_file(
+    path: Path,
+    *,
+    require_nonempty: bool = True,
+) -> tuple[str, tuple[int, int, int, int, int]]:
+    """Hash one regular file and return the identity proven during hashing."""
+
+    try:
+        before = path.stat()
+    except OSError as exc:
+        raise PartialRolloutError(f"cannot stat identity file {path}: {exc}") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise PartialRolloutError(f"identity path is not a regular file: {path}")
+    if require_nonempty and before.st_size <= 0:
+        raise PartialRolloutError(f"identity file is empty: {path}")
+    try:
+        digest = _sha256_file(path)
+    except OSError as exc:
+        raise PartialRolloutError(f"cannot hash identity file {path}: {exc}") from exc
+    try:
+        after = path.stat()
+    except OSError as exc:
+        raise PartialRolloutError(f"cannot restat identity file {path}: {exc}") from exc
+    before_identity = _regular_file_identity(before)
+    after_identity = _regular_file_identity(after)
+    if before_identity != after_identity:
+        raise PartialRolloutError(f"identity file changed while hashing: {path}")
+    return digest, after_identity
 
 
 def _is_secret_key(key: str) -> bool:
@@ -221,8 +265,98 @@ def _sample_to_dict(sample: Any) -> dict[str, Any]:
     return value
 
 
+def partial_rollout_source_digest(args: Any) -> str:
+    """Fingerprint source code and pinned revisions used to build samples."""
+
+    provenance = {
+        name: os.environ.get(name)
+        for name in (
+            "TMAX_MEGATRON_GIT_COMMIT",
+            "TMAX_PRORL_GIT_COMMIT",
+            "TMAX_SLIME_GIT_COMMIT",
+        )
+    }
+    source_digests = {
+        "partial_rollout": _sha256_file(Path(__file__)),
+        "rollout_bridge": _sha256_file(Path(__file__).with_name("rollout.py")),
+        "adapter": _sha256_file(Path(__file__).with_name("adapter.py")),
+    }
+    for name in (
+        "custom_rm_path",
+        "custom_reward_post_process_path",
+        "dynamic_sampling_filter_path",
+    ):
+        symbol_path = getattr(args, name, None)
+        if symbol_path:
+            source_digests[name] = _symbol_source_digest(str(symbol_path))
+    return _canonical_digest(
+        {
+            "provenance": provenance,
+            "source_digests": source_digests,
+        }
+    )
+
+
+def partial_rollout_data_digest(
+    args: Any,
+    *,
+    require_prompt_file: bool = False,
+) -> str | None:
+    """Fingerprint the prompt bytes and all dataset interpretation settings."""
+
+    prompt_data_raw = getattr(args, "prompt_data", None)
+    prompt_sha256: str | None = None
+    prompt_size: int | None = None
+    if prompt_data_raw:
+        prompt_path = Path(str(prompt_data_raw))
+        try:
+            prompt_sha256, prompt_identity = _sha256_stable_regular_file(prompt_path)
+            prompt_size = prompt_identity[2]
+        except PartialRolloutError:
+            if require_prompt_file:
+                raise
+            return None
+    elif require_prompt_file:
+        raise PartialRolloutError("release-seed rollout 0 requires a prompt-data file")
+
+    pinned_sha256 = str(os.environ.get("TMAX_TRAIN_DATA_SHA256") or "").strip().lower()
+    if pinned_sha256:
+        if len(pinned_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in pinned_sha256
+        ):
+            raise PartialRolloutError("TMAX_TRAIN_DATA_SHA256 is not a valid sha256")
+        if prompt_sha256 is not None and pinned_sha256 != prompt_sha256:
+            raise PartialRolloutError("prompt-data sha256 does not match TMAX_TRAIN_DATA_SHA256")
+
+    dataset_args = {
+        name: getattr(args, name, None)
+        for name in (
+            "apply_chat_template",
+            "apply_chat_template_kwargs",
+            "input_key",
+            "label_key",
+            "metadata_key",
+            "multimodal_keys",
+            "n_samples_per_prompt",
+            "rollout_batch_size",
+            "rollout_max_prompt_len",
+            "rollout_seed",
+            "rollout_shuffle",
+            "tool_key",
+        )
+    }
+    return _canonical_digest(
+        {
+            "prompt_sha256": prompt_sha256,
+            "prompt_size": prompt_size,
+            "pinned_prompt_sha256": pinned_sha256 or None,
+            "dataset_args": dataset_args,
+        }
+    )
+
+
 def partial_rollout_config_digest(args: Any, config: Any) -> str:
-    """Fingerprint every semantic input needed to trust persisted samples."""
+    """Fingerprint semantic runtime inputs needed to trust persisted samples."""
 
     config_payload = dataclasses.asdict(config) if dataclasses.is_dataclass(config) else {}
     # Transport endpoints and callback bindings are expected to change across
@@ -247,38 +381,16 @@ def partial_rollout_config_digest(args: Any, config: Any) -> str:
         "rollout_batch_size",
         "rollout_max_prompt_len",
         "rollout_max_response_len",
+        "rollout_seed",
         "rollout_shuffle",
         "seq_length",
         "update_weights_interval",
     )
     semantic_args = {name: getattr(args, name, None) for name in semantic_arg_names}
-    provenance = {
-        name: os.environ.get(name)
-        for name in (
-            "TMAX_MEGATRON_GIT_COMMIT",
-            "TMAX_PRORL_GIT_COMMIT",
-            "TMAX_SLIME_GIT_COMMIT",
-        )
-    }
-    source_digests = {
-        "partial_rollout": _sha256_file(Path(__file__)),
-        "rollout_bridge": _sha256_file(Path(__file__).with_name("rollout.py")),
-        "adapter": _sha256_file(Path(__file__).with_name("adapter.py")),
-    }
-    for name in (
-        "custom_rm_path",
-        "custom_reward_post_process_path",
-        "dynamic_sampling_filter_path",
-    ):
-        symbol_path = getattr(args, name, None)
-        if symbol_path:
-            source_digests[name] = _symbol_source_digest(str(symbol_path))
     return _canonical_digest(
         {
             "config": config_payload,
             "args": semantic_args,
-            "provenance": provenance,
-            "source_digests": source_digests,
         }
     )
 
@@ -578,6 +690,73 @@ def load_checkpoint_replay_committed_reservation_ids(
     return (replay_start, live_frontier), replay_committed_ids
 
 
+def _release_seed_digest(root: Path) -> str | None:
+    """Validate and hash a canonical Megatron torch-dist release checkpoint."""
+
+    tracker = root / "latest_checkpointed_iteration.txt"
+    release_dir = root / "release"
+    metadata = release_dir / ".metadata"
+    common_state = release_dir / "common.pt"
+    backend_metadata = release_dir / "metadata.json"
+    try:
+        if tracker.read_text(encoding="utf-8").strip() != "release":
+            return None
+    except OSError:
+        return None
+    if not release_dir.is_dir():
+        return None
+
+    required = (tracker, metadata, common_state, backend_metadata)
+    if not all(path.is_file() for path in required):
+        return None
+    shards = sorted(release_dir.glob("*.distcp"), key=lambda path: path.name)
+    if not shards or any(not path.is_file() or path.stat().st_size <= 0 for path in shards):
+        return None
+    try:
+        backend = json.loads(backend_metadata.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(backend, dict) or backend.get("sharded_backend") != "torch_dist":
+        return None
+
+    digest = hashlib.sha256()
+    digest.update(b"polar-release-seed-v1\n")
+    stable_identities: dict[Path, tuple[int, int, int, int, int]] = {}
+    try:
+        for path in (*required, *shards):
+            relative = path.relative_to(root).as_posix()
+            file_digest, identity = _sha256_stable_regular_file(path)
+            stable_identities[path] = identity
+            size = identity[2]
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(size).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(file_digest.encode("ascii"))
+            digest.update(b"\n")
+    except (OSError, PartialRolloutError):
+        return None
+    # Recheck the complete file set after hashing. A concurrent replacement
+    # must disable recovery, never bind a mixed old/new seed into the WAL.
+    try:
+        if tracker.read_text(encoding="utf-8").strip() != "release":
+            return None
+        final_backend = json.loads(backend_metadata.read_text(encoding="utf-8"))
+        final_shards = sorted(release_dir.glob("*.distcp"), key=lambda path: path.name)
+        final_identities = {
+            path: _regular_file_identity(path.stat()) for path in (*required, *shards)
+        }
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if (
+        final_backend != backend
+        or [path.name for path in final_shards] != [path.name for path in shards]
+        or final_identities != stable_identities
+    ):
+        return None
+    return digest.hexdigest()
+
+
 def maybe_open_partial_rollout_store(
     args: Any,
     config: Any,
@@ -589,23 +768,58 @@ def maybe_open_partial_rollout_store(
         return None
     if int(getattr(args, "start_rollout_id", -1) or 0) != int(rollout_id):
         return None
-    if rollout_id <= 0:
+    if rollout_id < 0:
         return None
     save_root_raw = getattr(args, "save", None)
     load_root_raw = getattr(args, "load", None)
     if not save_root_raw or not load_root_raw:
         return None
 
-    base_iteration = int(rollout_id) - 1
-    checkpoint_digest = _checkpoint_digest(Path(load_root_raw), base_iteration)
-    if checkpoint_digest is None:
-        logger.warning(
-            "Partial rollout recovery disabled for rollout %s: exact durable "
-            "checkpoint %s is unavailable",
-            rollout_id,
-            base_iteration,
+    load_root = Path(load_root_raw)
+    target_groups = int(getattr(args, "rollout_batch_size", 1) or 1)
+    if int(rollout_id) == 0:
+        base_checkpoint_kind = "release"
+        base_iteration = -1
+        checkpoint_digest = _release_seed_digest(load_root)
+        if checkpoint_digest is None:
+            logger.warning(
+                "Partial rollout recovery disabled for rollout 0: LOAD is not "
+                "a canonical durable release seed"
+            )
+            return None
+        try:
+            data_digest = partial_rollout_data_digest(args, require_prompt_file=True)
+        except PartialRolloutError as exc:
+            logger.warning(
+                "Partial rollout recovery disabled for rollout 0: %s",
+                exc,
+            )
+            return None
+        assert data_digest is not None
+        replay_start, live_frontier = 0, 0
+        committed_reservation_ids: frozenset[int] = frozenset()
+    else:
+        base_checkpoint_kind = "numeric"
+        base_iteration = int(rollout_id) - 1
+        checkpoint_digest = _checkpoint_digest(load_root, base_iteration)
+        if checkpoint_digest is None:
+            logger.warning(
+                "Partial rollout recovery disabled for rollout %s: exact durable "
+                "checkpoint %s is unavailable",
+                rollout_id,
+                base_iteration,
+            )
+            return None
+        data_digest = partial_rollout_data_digest(args) or _canonical_digest(
+            {"legacy_numeric_checkpoint_data_state": checkpoint_digest}
         )
-        return None
+        (replay_start, live_frontier), committed_reservation_ids = (
+            load_checkpoint_replay_committed_reservation_ids(
+                load_root,
+                base_iteration,
+                expected_group_count=target_groups,
+            )
+        )
 
     run_id = str(
         os.environ.get("RUN_ID")
@@ -617,20 +831,15 @@ def maybe_open_partial_rollout_store(
         logger.warning("Partial rollout recovery disabled: stable run id is unavailable")
         return None
 
-    target_groups = int(getattr(args, "rollout_batch_size", 1) or 1)
-    (replay_start, live_frontier), committed_reservation_ids = (
-        load_checkpoint_replay_committed_reservation_ids(
-            Path(load_root_raw),
-            base_iteration,
-            expected_group_count=target_groups,
-        )
-    )
     header = PartialRolloutHeader(
         run_id=run_id,
         rollout_id=int(rollout_id),
+        base_checkpoint_kind=base_checkpoint_kind,
         base_checkpoint_iteration=base_iteration,
         base_checkpoint_digest=checkpoint_digest,
         config_digest=partial_rollout_config_digest(args, config),
+        source_digest=partial_rollout_source_digest(args),
+        data_digest=data_digest,
         target_groups=target_groups,
         replay_start_reservation_id=replay_start,
         replay_live_frontier=live_frontier,
@@ -697,6 +906,34 @@ class PartialRolloutStore:
     ) -> None:
         self.directory = Path(directory)
         self.header = header
+        if not str(header.run_id).strip():
+            raise PartialRolloutError("partial WAL header has an empty run id")
+        for field_name in (
+            "base_checkpoint_digest",
+            "config_digest",
+            "source_digest",
+            "data_digest",
+            "dedupe_evidence_digest",
+        ):
+            value = str(getattr(header, field_name, ""))
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise PartialRolloutError(f"partial WAL header has invalid {field_name}")
+        if int(header.target_groups) <= 0:
+            raise PartialRolloutError("partial WAL header target_groups must be positive")
+        if header.base_checkpoint_kind == "release":
+            if int(header.rollout_id) != 0 or int(header.base_checkpoint_iteration) != -1:
+                raise PartialRolloutError(
+                    "release partial WAL must be rollout 0 based on iteration -1"
+                )
+        elif header.base_checkpoint_kind == "numeric":
+            if int(header.rollout_id) <= 0 or int(header.base_checkpoint_iteration) != (
+                int(header.rollout_id) - 1
+            ):
+                raise PartialRolloutError(
+                    "numeric partial WAL must follow its exact base checkpoint"
+                )
+        else:
+            raise PartialRolloutError("partial WAL header has invalid checkpoint kind")
         normalized_ids = frozenset(int(item) for item in committed_reservation_ids)
         if any(item < 0 for item in normalized_ids):
             raise ValueError("committed reservation ids must be non-negative")

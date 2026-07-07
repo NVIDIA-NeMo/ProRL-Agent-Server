@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import json
+from pathlib import Path
 import random
 from types import SimpleNamespace
 
@@ -80,7 +82,12 @@ def _args(tmp_path, *, rollout_id: int = 8, target: int = 8) -> SimpleNamespace:
 
 
 def _source(args: SimpleNamespace, prompts: list[str]) -> CeilEpochRolloutDataSourceWithBuffer:
-    source = CeilEpochRolloutDataSourceWithBuffer(args)
+    prompt_data = args.prompt_data
+    args.prompt_data = None
+    try:
+        source = CeilEpochRolloutDataSourceWithBuffer(args)
+    finally:
+        args.prompt_data = prompt_data
     source.dataset = _Dataset(prompts)
     return source
 
@@ -91,6 +98,29 @@ def _write_model_checkpoint_shell(tmp_path, iteration: int) -> None:
     iteration_dir.mkdir(parents=True)
     (iteration_dir / ".metadata").write_bytes(b"dcp-metadata")
     (iteration_dir / "common.pt").write_bytes(b"common-state")
+
+
+def _write_release_seed(tmp_path, *, seed: bytes = b"release-seed") -> None:
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("release\n", encoding="utf-8")
+    release = tmp_path / "release"
+    release.mkdir(parents=True, exist_ok=True)
+    (release / ".metadata").write_bytes(b"dcp-metadata:" + seed)
+    (release / "common.pt").write_bytes(b"common-state:" + seed)
+    (release / "metadata.json").write_text(
+        '{"sharded_backend":"torch_dist","sharded_backend_version":1,'
+        '"common_backend":"torch","common_backend_version":1}\n',
+        encoding="utf-8",
+    )
+    (release / "__0_0.distcp").write_bytes(b"model-shard:" + seed)
+
+
+def _write_prompt_data(tmp_path, prompts: list[str]) -> str:
+    path = tmp_path / "train.jsonl"
+    path.write_text(
+        "".join(json.dumps({"prompt": prompt}) + "\n" for prompt in prompts),
+        encoding="utf-8",
+    )
+    return str(path)
 
 
 def _write_emitted_rollout_journal(
@@ -129,9 +159,12 @@ def _header(
     return PartialRolloutHeader(
         run_id="test-run",
         rollout_id=8,
+        base_checkpoint_kind="numeric",
         base_checkpoint_iteration=7,
         base_checkpoint_digest="a" * 64,
         config_digest="b" * 64,
+        source_digest="c" * 64,
+        data_digest="d" * 64,
         target_groups=target,
         replay_start_reservation_id=0,
         replay_live_frontier=live_frontier,
@@ -167,14 +200,15 @@ def _completed(
     group: list[Sample],
     store: PartialRolloutStore,
 ) -> _CompletedGroup:
+    rollout_id = int(store.header.rollout_id)
     return _CompletedGroup(
         group_id=reservation_id,
         group=group,
         reservation_id=reservation_id,
         samples=[_training_sample(reservation_id)],
         task_id=f"task-{reservation_id}",
-        submitted_rollout_id=8,
-        policy_version=8,
+        submitted_rollout_id=rollout_id,
+        policy_version=rollout_id,
         session_count=1,
         partial_store=store,
     )
@@ -185,11 +219,12 @@ def _record_result(
     reservation_id: int,
     group: list[Sample],
 ) -> _CompletedGroup:
+    rollout_id = int(store.header.rollout_id)
     store.record_prepared(
         reservation_id=reservation_id,
         group=group,
-        submitted_rollout_id=8,
-        policy_version=8,
+        submitted_rollout_id=rollout_id,
+        policy_version=rollout_id,
     )
     completed = _completed(reservation_id, group, store)
     store.record_result_ready(completed)
@@ -733,6 +768,7 @@ class _RecoveredGenerateWorker:
         self.requested: list[int] = []
         self.completions: list[_CompletedGroup] = []
         self.released = False
+        rollout_id = int(plan.store.header.rollout_id)
         for deferred in plan.deferred:
             completed = _completed(
                 int(deferred.reservation_id),
@@ -741,9 +777,9 @@ class _RecoveredGenerateWorker:
             )
             _annotate_accepted_samples(
                 completed.samples,
-                accepted_rollout_id=8,
+                accepted_rollout_id=rollout_id,
                 staleness=0,
-                policy_version=8,
+                policy_version=rollout_id,
                 scheduler_group_id=completed.group_id,
             )
             plan.store.record_result_ready(completed)
@@ -785,19 +821,20 @@ class _InterruptingGenerateWorker:
         self.config = SimpleNamespace(reward_key="score")
         self.source = source
         reservation_id, group = source.get_samples_with_reservation(1)[0]
+        rollout_id = int(plan.store.header.rollout_id)
         plan.store.record_prepared(
             reservation_id=reservation_id,
             group=group,
-            submitted_rollout_id=8,
-            policy_version=8,
+            submitted_rollout_id=rollout_id,
+            policy_version=rollout_id,
         )
         completed = _completed(reservation_id, group, plan.store)
         plan.store.record_result_ready(completed)
         _annotate_accepted_samples(
             completed.samples,
-            accepted_rollout_id=8,
+            accepted_rollout_id=rollout_id,
             staleness=0,
-            policy_version=8,
+            policy_version=rollout_id,
             scheduler_group_id=reservation_id,
         )
         self.completions = [completed]
@@ -934,6 +971,255 @@ def test_kill_after_six_of_eight_recovers_six_and_generates_only_two(
     records = store.load_records()
     assert [record["state"] for record in records] == [STATE_KEEP] * 8
     assert store._ready_path().is_file()
+
+
+def test_release_seed_rollout_zero_kill_after_six_of_eight_recovers_exactly_two(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("RUN_ID", "release-seed-run")
+    monkeypatch.delenv("TMAX_TRAIN_DATA_SHA256", raising=False)
+    args = _args(tmp_path, rollout_id=0, target=8)
+    prompts = [f"p{i}" for i in range(20)]
+    args.prompt_data = _write_prompt_data(tmp_path, prompts)
+    _write_release_seed(tmp_path)
+    writer = _source(args, prompts)
+
+    store = maybe_open_partial_rollout_store(
+        args,
+        resolve_polar_slime_config(args),
+        0,
+    )
+    assert store is not None
+    assert store.header.base_checkpoint_kind == "release"
+    assert store.header.base_checkpoint_iteration == -1
+    assert len(store.header.base_checkpoint_digest) == 64
+    assert len(store.header.config_digest) == 64
+    assert len(store.header.source_digest) == 64
+    assert len(store.header.data_digest) == 64
+    assert store.header.replay_start_reservation_id == 0
+    assert store.header.replay_live_frontier == 0
+    assert store.header.committed_reservation_count == 0
+    assert store.committed_reservation_ids == frozenset()
+    assert store.header.dedupe_evidence_digest == committed_reservation_evidence_digest(0, 0, ())
+
+    reservations = writer.get_samples_with_reservation(8)
+    for reservation_id, group in reservations:
+        store.record_prepared(
+            reservation_id=reservation_id,
+            group=group,
+            submitted_rollout_id=0,
+            policy_version=0,
+        )
+        if reservation_id < 6:
+            completed = _completed(reservation_id, group, store)
+            store.record_result_ready(completed)
+            _annotate_accepted_samples(
+                completed.samples,
+                accepted_rollout_id=0,
+                staleness=0,
+                policy_version=0,
+                scheduler_group_id=reservation_id,
+            )
+            store.record_keep(completed, accepted_rollout_id=0)
+
+    restored = _source(args, prompts)
+    captured = {}
+
+    def fake_get_worker(_args, data_source, plan, rollout_id):
+        assert data_source is restored
+        assert rollout_id == 0
+        captured["plan"] = plan
+        worker = _RecoveredGenerateWorker(plan, restored)
+        captured["worker"] = worker
+        return worker
+
+    monkeypatch.setattr(rollout_module, "get_global_async_worker", fake_get_worker)
+    monkeypatch.setattr(rollout_module, "_current_ray_task_is_canceled", lambda: False)
+    monkeypatch.setattr(
+        rollout_module,
+        "_load_rollout_train_output_type",
+        lambda: RolloutFnTrainOutput,
+    )
+
+    output = generate_rollout_polar_async(args, rollout_id=0, data_source=restored)
+
+    plan = captured["plan"]
+    worker = captured["worker"]
+    assert len(plan.kept) == 6
+    assert len(plan.deferred) == 2
+    assert worker.requested == [2]
+    assert worker.released is True
+    assert len(output.samples) == 8
+    assert {group[0].group_index for group in output.samples} == set(range(8))
+    assert store._ready_path().is_file()
+    # READY only makes optimizer input reconstructable; it never commits a
+    # model update. Until actor checkpoint 0, the model pointer stays release.
+    assert (tmp_path / "latest_checkpointed_iteration.txt").read_text().strip() == ("release")
+
+
+def test_release_seed_change_quarantines_rollout_zero_wal(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("RUN_ID", "release-seed-run")
+    monkeypatch.delenv("TMAX_TRAIN_DATA_SHA256", raising=False)
+    args = _args(tmp_path, rollout_id=0, target=1)
+    prompts = ["p0", "p1"]
+    args.prompt_data = _write_prompt_data(tmp_path, prompts)
+    _write_release_seed(tmp_path, seed=b"seed-a")
+    writer = _source(args, prompts)
+    store = maybe_open_partial_rollout_store(
+        args,
+        resolve_polar_slime_config(args),
+        0,
+    )
+    assert store is not None
+    reservation_id, group = writer.get_samples_with_reservation(1)[0]
+    store.record_prepared(
+        reservation_id=reservation_id,
+        group=group,
+        submitted_rollout_id=0,
+        policy_version=0,
+    )
+
+    _write_release_seed(tmp_path, seed=b"seed-b")
+    restored = _source(args, prompts)
+    plan = rollout_module._prepare_partial_recovery(
+        args,
+        rollout_id=0,
+        data_source=restored,
+    )
+
+    assert plan.store is not None
+    assert plan.kept == [] and plan.result_ready == [] and plan.deferred == []
+    assert not store.directory.exists()
+    assert list(store.directory.parent.glob(f"{store.directory.name}.invalid.*"))
+    assert restored.sample_group_index == 0
+
+
+def test_release_rollout_zero_header_binds_config_source_and_data_identity(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("RUN_ID", "release-seed-run")
+    monkeypatch.delenv("TMAX_TRAIN_DATA_SHA256", raising=False)
+    args = _args(tmp_path, rollout_id=0, target=1)
+    prompt_path = _write_prompt_data(tmp_path, ["p0"])
+    args.prompt_data = prompt_path
+    _write_release_seed(tmp_path)
+
+    baseline = maybe_open_partial_rollout_store(
+        args,
+        resolve_polar_slime_config(args),
+        0,
+    )
+    assert baseline is not None
+
+    args.rollout_max_response_len = 1234
+    config_changed = maybe_open_partial_rollout_store(
+        args,
+        resolve_polar_slime_config(args),
+        0,
+    )
+    assert config_changed is not None
+    assert config_changed.header.config_digest != baseline.header.config_digest
+
+    args.rollout_max_response_len = None
+    monkeypatch.setenv("TMAX_PRORL_GIT_COMMIT", "f" * 40)
+    source_changed = maybe_open_partial_rollout_store(
+        args,
+        resolve_polar_slime_config(args),
+        0,
+    )
+    assert source_changed is not None
+    assert source_changed.header.source_digest != baseline.header.source_digest
+
+    monkeypatch.delenv("TMAX_PRORL_GIT_COMMIT")
+    Path(prompt_path).write_text(json.dumps({"prompt": "changed"}) + "\n")
+    data_changed = maybe_open_partial_rollout_store(
+        args,
+        resolve_polar_slime_config(args),
+        0,
+    )
+    assert data_changed is not None
+    assert data_changed.header.data_digest != baseline.header.data_digest
+
+
+@pytest.mark.parametrize("tracker_value", ["0", "7", "", "not-a-release"])
+def test_nonrelease_rollout_zero_never_opens_partial_wal(
+    monkeypatch,
+    tmp_path,
+    tracker_value,
+) -> None:
+    monkeypatch.setenv("RUN_ID", "not-release-run")
+    monkeypatch.delenv("TMAX_TRAIN_DATA_SHA256", raising=False)
+    args = _args(tmp_path, rollout_id=0, target=1)
+    args.prompt_data = _write_prompt_data(tmp_path, ["p0"])
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text(
+        tracker_value + "\n", encoding="utf-8"
+    )
+
+    store = maybe_open_partial_rollout_store(
+        args,
+        resolve_polar_slime_config(args),
+        0,
+    )
+
+    assert store is None
+    assert not (tmp_path / "rollout" / "partial_rollout_wal").exists()
+
+
+def test_incomplete_release_pointer_disables_rollout_zero_wal(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("RUN_ID", "incomplete-release-run")
+    args = _args(tmp_path, rollout_id=0, target=1)
+    args.prompt_data = _write_prompt_data(tmp_path, ["p0"])
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("release\n")
+    release = tmp_path / "release"
+    release.mkdir()
+    (release / ".metadata").write_bytes(b"metadata")
+    (release / "common.pt").write_bytes(b"common")
+    (release / "metadata.json").write_text('{"sharded_backend":"torch_dist"}')
+
+    assert (
+        maybe_open_partial_rollout_store(
+            args,
+            resolve_polar_slime_config(args),
+            0,
+        )
+        is None
+    )
+
+
+def test_prompt_identity_read_error_disables_rollout_zero_wal(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("RUN_ID", "prompt-read-error-run")
+    args = _args(tmp_path, rollout_id=0, target=1)
+    args.prompt_data = _write_prompt_data(tmp_path, ["p0"])
+    monkeypatch.setattr(
+        partial_rollout_module,
+        "_release_seed_digest",
+        lambda _root: "a" * 64,
+    )
+
+    def fail_hash(_path):
+        raise OSError("injected prompt read error")
+
+    monkeypatch.setattr(partial_rollout_module, "_sha256_file", fail_hash)
+
+    assert (
+        maybe_open_partial_rollout_store(
+            args,
+            resolve_polar_slime_config(args),
+            0,
+        )
+        is None
+    )
 
 
 def test_recovery_replaces_ready_wal_group_already_committed_by_checkpoint(
