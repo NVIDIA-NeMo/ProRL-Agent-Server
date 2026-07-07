@@ -149,6 +149,89 @@ class CeilEpochRolloutDataSourceWithBuffer(RolloutDataSourceWithBuffer):
             )
             return self._reservation_metrics_locked()
 
+    def rebuild_partial_reservations(
+        self,
+        records: list[dict[str, Any]],
+    ) -> list[tuple[dict[str, Any], list[Any]]]:
+        """Recreate one contiguous WAL prefix from the loaded checkpoint cursor.
+
+        This method never seeks the cursor to a reservation id.  It allocates
+        each group through the normal reservation API and verifies both the id
+        and prompt digest.  A mismatch rolls the complete attempt back so the
+        caller can quarantine the WAL and use the existing at-least-once path.
+        """
+
+        if not records:
+            return []
+
+        from slime_bridge.partial_rollout import prompt_group_digest
+
+        ordered = sorted(records, key=lambda record: int(record["reservation_id"]))
+        reservation_ids = [int(record["reservation_id"]) for record in ordered]
+        expected_ids = list(range(reservation_ids[0], reservation_ids[-1] + 1))
+        if reservation_ids != expected_ids:
+            raise RuntimeError(
+                "partial reservation records are not contiguous: "
+                f"actual={reservation_ids}, expected={expected_ids}"
+            )
+
+        with self._state_lock:
+            self._raise_if_buffered_locked("rebuild partial reservations")
+            rollback_cursor = copy.deepcopy(self._cursor_state_locked())
+            rollback_outstanding = copy.deepcopy(self._outstanding_reservations)
+            rollback_reserved_total = self._reservation_reserved_total
+            rollback_consumed_total = self._reservation_consumed_total
+            rollback_consumed_by_outcome = copy.deepcopy(self._reservation_consumed_by_outcome)
+            rollback_mode_started = self._reservation_mode_started
+
+            rebuilt: list[tuple[dict[str, Any], list[Any]]] = []
+            try:
+                if self._outstanding_reservations:
+                    raise RuntimeError(
+                        "partial reservation rebuild requires an empty live reservation set"
+                    )
+                if int(self.sample_group_index) != reservation_ids[0]:
+                    raise RuntimeError(
+                        "partial WAL does not start at the loaded checkpoint frontier: "
+                        f"cursor={self.sample_group_index}, first_record={reservation_ids[0]}"
+                    )
+                for record in ordered:
+                    expected_reservation_id = int(record["reservation_id"])
+                    reservations = self.get_samples_with_reservation(1)
+                    if len(reservations) != 1:
+                        raise RuntimeError(
+                            "data source did not rebuild exactly one partial reservation"
+                        )
+                    actual_reservation_id, group = reservations[0]
+                    if int(actual_reservation_id) != expected_reservation_id:
+                        raise RuntimeError(
+                            "partial reservation id mismatch: "
+                            f"expected={expected_reservation_id}, "
+                            f"actual={actual_reservation_id}"
+                        )
+                    actual_digest = prompt_group_digest(group)
+                    if actual_digest != record.get("prompt_digest"):
+                        raise RuntimeError(
+                            "partial reservation prompt digest mismatch for "
+                            f"reservation {expected_reservation_id}"
+                        )
+                    if len(group) != int(record.get("group_size", -1)):
+                        raise RuntimeError(
+                            "partial reservation group-size mismatch for "
+                            f"reservation {expected_reservation_id}: "
+                            f"expected={record.get('group_size')}, actual={len(group)}"
+                        )
+                    rebuilt.append((record, group))
+            except Exception:
+                super()._restore_checkpoint_state_locked(rollback_cursor)
+                self._outstanding_reservations = rollback_outstanding
+                self._reservation_reserved_total = rollback_reserved_total
+                self._reservation_consumed_total = rollback_consumed_total
+                self._reservation_consumed_by_outcome = rollback_consumed_by_outcome
+                self._reservation_mode_started = rollback_mode_started
+                raise
+            return rebuilt
+
     def reservation_metrics(self) -> dict[str, float]:
         with self._state_lock:
             return self._reservation_metrics_locked()
@@ -174,9 +257,7 @@ class CeilEpochRolloutDataSourceWithBuffer(RolloutDataSourceWithBuffer):
             ),
         }
         for outcome, count in self._reservation_consumed_by_outcome.items():
-            metrics[
-                f"polar/reservations/consumed_{outcome}_since_worker_start"
-            ] = float(count)
+            metrics[f"polar/reservations/consumed_{outcome}_since_worker_start"] = float(count)
         return metrics
 
     def _checkpoint_state_locked(self) -> dict[str, Any]:
@@ -195,8 +276,7 @@ class CeilEpochRolloutDataSourceWithBuffer(RolloutDataSourceWithBuffer):
 
         replay_span = max(
             0,
-            int(live_state["sample_group_index"])
-            - int(state_dict["sample_group_index"]),
+            int(live_state["sample_group_index"]) - int(state_dict["sample_group_index"]),
         )
         potential_duplicates = self._checkpoint_potential_duplicates_locked()
         state_dict[self._FRONTIER_STATE_KEY] = {
@@ -238,8 +318,7 @@ class CeilEpochRolloutDataSourceWithBuffer(RolloutDataSourceWithBuffer):
             return 0
         return max(
             0,
-            int(self.sample_group_index)
-            - int(frontier[1]["sample_group_index"]),
+            int(self.sample_group_index) - int(frontier[1]["sample_group_index"]),
         )
 
     def _checkpoint_potential_duplicates_locked(self) -> int:

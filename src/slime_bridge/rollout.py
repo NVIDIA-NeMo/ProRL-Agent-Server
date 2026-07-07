@@ -46,6 +46,15 @@ from slime_bridge.config import (
     render_task_payload,
     resolve_polar_slime_config,
 )
+from slime_bridge.partial_rollout import (
+    PartialRolloutError,
+    PartialRolloutStore,
+    STATE_DROP,
+    STATE_KEEP,
+    STATE_PREPARED,
+    STATE_RESULT_READY,
+    maybe_open_partial_rollout_store,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +65,7 @@ def _control_plane_headers() -> dict[str, str]:
     if token:
         headers["X-Polar-Control-Token"] = token
     return headers
+
 
 _POLL_INTERVAL = 2.0  # seconds between task-status polls (eval / no-callback path)
 _CALLBACK_FALLBACK_POLL_SECONDS = 60.0  # defensive backstop for dropped callbacks
@@ -162,6 +172,9 @@ class PolarEvalDataIntegrityError(ValueError):
 class _DeferredGroup:
     group: list[Any]
     reservation_id: int | None = None
+    submitted_rollout_id: int | None = None
+    policy_version: int | None = None
+    partial_store: PartialRolloutStore | None = None
 
 
 @dataclass(slots=True)
@@ -172,6 +185,7 @@ class _PendingGroup:
     submitted_rollout_id: int
     policy_version: int
     session_cost: int
+    partial_store: PartialRolloutStore | None = None
     submitted_at: float = field(default_factory=time.monotonic)
 
 
@@ -190,6 +204,19 @@ class _CompletedGroup:
     service_time_seconds: float = 0.0
     sample_conversion_seconds: float = 0.0
     output_queue_wait_seconds: float = 0.0
+    partial_store: PartialRolloutStore | None = None
+
+
+@dataclass(slots=True)
+class _PartialRecoveryPlan:
+    store: PartialRolloutStore | None = None
+    kept: list[_CompletedGroup] = field(default_factory=list)
+    result_ready: list[_CompletedGroup] = field(default_factory=list)
+    deferred: list[_DeferredGroup] = field(default_factory=list)
+    candidate_only: list[_CompletedGroup] = field(default_factory=list)
+    dropped_count: int = 0
+    dynamic_filter_metrics: dict[str, float] = field(default_factory=dict)
+    reservation_metrics: dict[str, float] = field(default_factory=dict)
 
 
 _WASTED_TIMING_FIELDS: tuple[str, ...] = (
@@ -217,12 +244,29 @@ _global_async_worker: "AsyncPolarRolloutWorker | None" = None
 _worker_lock = threading.Lock()
 
 
-def get_global_async_worker(args: Any, data_source: Any) -> "AsyncPolarRolloutWorker":
+def get_global_async_worker(
+    args: Any,
+    data_source: Any,
+    partial_recovery: _PartialRecoveryPlan | None = None,
+    rollout_id: int | None = None,
+) -> "AsyncPolarRolloutWorker":
     global _global_async_worker
     with _worker_lock:
         if _global_async_worker is None or not _global_async_worker.is_alive():
             logger.info("Creating new async Polar rollout worker")
-            _global_async_worker = AsyncPolarRolloutWorker(args, data_source)
+            recovery = partial_recovery or _PartialRecoveryPlan()
+            _global_async_worker = AsyncPolarRolloutWorker(
+                args,
+                data_source,
+                partial_store=recovery.store,
+            )
+            if rollout_id is not None:
+                _global_async_worker.set_rollout_context(rollout_id)
+            _global_async_worker.bootstrap_partial_recovery(
+                deferred=recovery.deferred,
+                completed=recovery.result_ready,
+                held_keep_count=len(recovery.kept),
+            )
             _global_async_worker.start()
         return _global_async_worker
 
@@ -794,7 +838,13 @@ class AsyncPolarRolloutWorker:
     ``drain_completed()`` to collect finished groups.
     """
 
-    def __init__(self, args: Any, data_source: Any) -> None:
+    def __init__(
+        self,
+        args: Any,
+        data_source: Any,
+        *,
+        partial_store: PartialRolloutStore | None = None,
+    ) -> None:
         self.args = args
         self.data_source = data_source
         self.config = resolve_polar_slime_config(args)
@@ -831,6 +881,11 @@ class AsyncPolarRolloutWorker:
         self._task_events: dict[str, asyncio.Event] = {}
         self._task_results: dict[str, TaskResult] = {}
         self._callback_url: str | None = None
+        self._partial_store = partial_store
+        # Recovered KEEP groups live in generate_rollout_polar_async rather
+        # than a worker queue, but they still own reservations and must count
+        # against the bounded async window until the complete batch commits.
+        self._recovered_held_groups = 0
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -854,20 +909,51 @@ class AsyncPolarRolloutWorker:
         with self._state_lock:
             self._current_rollout_id = int(rollout_id)
 
+    def bootstrap_partial_recovery(
+        self,
+        *,
+        deferred: list[_DeferredGroup],
+        completed: list[_CompletedGroup],
+        held_keep_count: int,
+    ) -> None:
+        """Seed reconstructed work before the background thread starts."""
+
+        if self._thread is not None:
+            raise RuntimeError("partial recovery must be bootstrapped before worker start")
+        with self._state_lock:
+            self._recovered_held_groups = int(held_keep_count)
+            for item in deferred:
+                self.deferred_queue.put_nowait(item)
+            for item in completed:
+                self.output_queue.put_nowait(item)
+
+    def release_recovered_holds(self) -> None:
+        with self._state_lock:
+            self._recovered_held_groups = 0
+
     def request_groups(self, count: int) -> None:
-        if count <= 0:
+        count = int(count)
+        if count < 0:
             return
         with self._state_lock:
-            count = int(count)
             self._requested_groups += count
             if self.config.fully_async:
                 if self._fully_async_request_count == 0:
-                    self._fully_async_admission_credit += (
-                        self._batch_size * self.config.max_async_level
+                    max_window = self._batch_size * self.config.max_async_level
+                    reconstructed_owned = (
+                        self._recovered_held_groups
+                        + self.deferred_queue.qsize()
+                        + self.output_queue.qsize()
+                        + self._completed_buffer_size
                     )
-                else:
+                    self._fully_async_admission_credit += max(
+                        0,
+                        max_window - reconstructed_owned,
+                    )
+                    self._fully_async_request_count += 1
+                elif count > 0:
                     self._fully_async_admission_credit += count
-                self._fully_async_request_count += 1
+                    self._fully_async_request_count += 1
 
     def raise_if_failed(self) -> None:
         if self._fatal_error is not None:
@@ -913,6 +999,12 @@ class AsyncPolarRolloutWorker:
                     reason,
                 )
                 self._record_wasted_samples(completed.samples)
+                if completed.partial_store is not None:
+                    completed.partial_store.record_drop(
+                        completed.reservation_id,
+                        outcome="stale",
+                        reason=reason,
+                    )
                 self._consume_reservation(completed.reservation_id, outcome="stale")
                 self._restore_fully_async_admission_credit(1)
                 continue
@@ -958,6 +1050,12 @@ class AsyncPolarRolloutWorker:
             completed.task_id,
             reason or "unspecified",
         )
+        if completed.partial_store is not None:
+            completed.partial_store.record_drop(
+                completed.reservation_id,
+                outcome="dynamic_filter",
+                reason=reason,
+            )
         return self._consume_reservation(
             completed.reservation_id,
             outcome="dynamic_filter",
@@ -972,6 +1070,7 @@ class AsyncPolarRolloutWorker:
             out["polar/scheduler/completed_buffer"] = float(self._completed_buffer_size)
             out["polar/scheduler/output_queue"] = float(self.output_queue.qsize())
             out["polar/scheduler/deferred_queue"] = float(self.deferred_queue.qsize())
+            out["polar/scheduler/recovered_held_groups"] = float(self._recovered_held_groups)
             out["polar/scheduler/requested_groups"] = float(self._requested_groups)
             if self.config.fully_async:
                 out["polar/scheduler/admission_credit"] = float(self._fully_async_admission_credit)
@@ -1071,7 +1170,17 @@ class AsyncPolarRolloutWorker:
 
                         gid = self._group_counter
                         self._group_counter += 1
-                        submitted_rollout_id, policy_version = self._rollout_context()
+                        current_rollout_id, current_policy_version = self._rollout_context()
+                        submitted_rollout_id = (
+                            current_rollout_id
+                            if next_group.submitted_rollout_id is None
+                            else int(next_group.submitted_rollout_id)
+                        )
+                        policy_version = (
+                            current_policy_version
+                            if next_group.policy_version is None
+                            else int(next_group.policy_version)
+                        )
                         pending = _PendingGroup(
                             group_id=gid,
                             group=next_group.group,
@@ -1079,6 +1188,7 @@ class AsyncPolarRolloutWorker:
                             submitted_rollout_id=submitted_rollout_id,
                             policy_version=policy_version,
                             session_cost=session_cost,
+                            partial_store=next_group.partial_store,
                         )
                         task = asyncio.create_task(
                             self._submit_and_collect(client, pending),
@@ -1200,6 +1310,12 @@ class AsyncPolarRolloutWorker:
             last_error,
         )
         if permanently_consumed:
+            if pending.partial_store is not None:
+                pending.partial_store.record_drop(
+                    pending.reservation_id,
+                    outcome="permanent_drop",
+                    reason=reason,
+                )
             self._consume_reservation(pending.reservation_id, outcome="permanent_drop")
             self._restore_fully_async_admission_credit(1)
         else:
@@ -1276,7 +1392,7 @@ class AsyncPolarRolloutWorker:
                 f"Task {task_result.task_id} cannot be accepted: {rejection_reason}"
             )
 
-        return _CompletedGroup(
+        completed = _CompletedGroup(
             group_id=pending.group_id,
             group=pending.group,
             reservation_id=pending.reservation_id,
@@ -1289,7 +1405,11 @@ class AsyncPolarRolloutWorker:
             completed_at=completed_at,
             service_time_seconds=service_time_seconds,
             sample_conversion_seconds=sample_conversion_seconds,
+            partial_store=pending.partial_store,
         )
+        if pending.partial_store is not None:
+            pending.partial_store.record_result_ready(completed)
+        return completed
 
     async def _emit_completed(self, completed: _CompletedGroup) -> None:
         wait_started = time.perf_counter()
@@ -1329,8 +1449,29 @@ class AsyncPolarRolloutWorker:
             group = groups[0]
         if not group:
             raise PolarRolloutSchedulerError("Slime data source returned an empty sample group")
+        submitted_rollout_id, policy_version = self._rollout_context()
+        partial_store = self._partial_store
+        if partial_store is not None and partial_store.sealed:
+            partial_store = None
+        if partial_store is not None:
+            if reservation_id is None:
+                raise PolarRolloutSchedulerError(
+                    "partial rollout WAL requires reservation-aware data source"
+                )
+            partial_store.record_prepared(
+                reservation_id=reservation_id,
+                group=group,
+                submitted_rollout_id=submitted_rollout_id,
+                policy_version=policy_version,
+            )
         self._consume_fully_async_admission_credit()
-        return _DeferredGroup(group=group, reservation_id=reservation_id)
+        return _DeferredGroup(
+            group=group,
+            reservation_id=reservation_id,
+            submitted_rollout_id=submitted_rollout_id,
+            policy_version=policy_version,
+            partial_store=partial_store,
+        )
 
     def _can_admit_group(
         self,
@@ -1352,7 +1493,11 @@ class AsyncPolarRolloutWorker:
 
             max_window = self._batch_size * self.config.max_async_level
             active_or_deferred = len(active) + deferred_groups
-            completed_backlog = self.output_queue.qsize() + self._completed_buffer_size
+            completed_backlog = (
+                self.output_queue.qsize()
+                + self._completed_buffer_size
+                + self._recovered_held_groups
+            )
             owned_groups = active_or_deferred + completed_backlog
             if owned_groups >= max_window:
                 return False
@@ -2603,6 +2748,252 @@ def _decision_window_metrics(scheduler_metrics: dict[str, float]) -> dict[str, f
     }
 
 
+def _can_bootstrap_partial_recovery() -> bool:
+    with _worker_lock:
+        return _global_async_worker is None or not _global_async_worker.is_alive()
+
+
+def _recovered_completed_group(
+    *,
+    record: dict[str, Any],
+    group: list[Any],
+    samples: list[Any],
+    store: PartialRolloutStore,
+) -> _CompletedGroup:
+    return _CompletedGroup(
+        group_id=int(record.get("scheduler_group_id", record["reservation_id"])),
+        group=group,
+        reservation_id=int(record["reservation_id"]),
+        samples=samples,
+        task_id=str(record.get("task_id", f"recovered-{record['reservation_id']}")),
+        submitted_rollout_id=int(record["submitted_rollout_id"]),
+        policy_version=int(record["policy_version"]),
+        session_count=int(record.get("session_count", len(group))),
+        # Monotonic timestamps cannot be compared across processes.  Preserve
+        # correctness by omitting cross-process service-window telemetry.
+        submitted_at=0.0,
+        completed_at=0.0,
+        service_time_seconds=0.0,
+        sample_conversion_seconds=0.0,
+        output_queue_wait_seconds=0.0,
+        partial_store=store,
+    )
+
+
+def _validate_recovered_samples(
+    *,
+    record: dict[str, Any],
+    samples: list[Any],
+    rollout_id: int,
+    max_off_policy_steps: int,
+) -> None:
+    reservation_id = int(record["reservation_id"])
+    policy_version = int(record["policy_version"])
+    staleness = int(rollout_id) - policy_version
+    if staleness < 0 or staleness > int(max_off_policy_steps):
+        raise PartialRolloutError(
+            f"reservation {reservation_id} has unsafe recovered policy staleness {staleness}"
+        )
+    if not samples:
+        raise PartialRolloutError(f"reservation {reservation_id} recovered an empty sample group")
+    for sample in samples:
+        if int(getattr(sample, "group_index", -1)) != reservation_id:
+            raise PartialRolloutError(
+                f"reservation {reservation_id} recovered a sample with group_index="
+                f"{getattr(sample, 'group_index', None)}"
+            )
+    if not _has_trainable_tokens(samples):
+        raise PartialRolloutError(f"reservation {reservation_id} recovered zero trainable tokens")
+
+    if record["state"] != STATE_KEEP:
+        return
+    if int(record.get("accepted_rollout_id", -1)) != int(rollout_id):
+        raise PartialRolloutError(f"reservation {reservation_id} KEEP belongs to another rollout")
+    for sample in samples:
+        polar_meta = (getattr(sample, "metadata", {}) or {}).get("polar", {})
+        train_meta = getattr(sample, "train_metadata", None) or {}
+        if (
+            int(polar_meta.get("accepted_rollout_id", -1)) != int(rollout_id)
+            or int(polar_meta.get("policy_version", -1)) != policy_version
+            or int(train_meta.get("policy_version", -1)) != policy_version
+        ):
+            raise PartialRolloutError(
+                f"reservation {reservation_id} KEEP sample policy metadata mismatch"
+            )
+
+
+def _prepare_partial_recovery(
+    args: Any,
+    *,
+    rollout_id: int,
+    data_source: Any,
+) -> _PartialRecoveryPlan:
+    """Load, validate, and replay a partial WAL before starting the worker."""
+
+    if not _can_bootstrap_partial_recovery():
+        return _PartialRecoveryPlan()
+    if not bool(getattr(args, "rollout_global_dataset", False)):
+        return _PartialRecoveryPlan()
+
+    config = resolve_polar_slime_config(args)
+    store = maybe_open_partial_rollout_store(args, config, rollout_id)
+    if store is None:
+        return _PartialRecoveryPlan()
+    rebuilder = getattr(data_source, "rebuild_partial_reservations", None)
+    if not callable(rebuilder):
+        logger.warning(
+            "Partial rollout recovery disabled: data source does not expose "
+            "rebuild_partial_reservations"
+        )
+        return _PartialRecoveryPlan()
+
+    try:
+        records = store.load_records()
+        recovered_owned = sum(record["state"] != STATE_DROP for record in records)
+        if recovered_owned > config.max_concurrency:
+            raise PartialRolloutError(
+                f"partial WAL owns {recovered_owned} groups, exceeding async window "
+                f"{config.max_concurrency}"
+            )
+        Sample = _load_sample_type()
+        preloaded_samples: dict[int, list[Any]] = {}
+        for record in records:
+            reuse_samples = record["state"] in (STATE_RESULT_READY, STATE_KEEP) or (
+                record["state"] == STATE_DROP
+                and record.get("drop_outcome") == "dynamic_filter"
+                and record.get("sample_blob") is not None
+            )
+            if reuse_samples:
+                samples = [
+                    Sample.from_dict(sample_dict)
+                    for sample_dict in store.load_sample_dicts(record)
+                ]
+                if record["state"] == STATE_KEEP:
+                    reservation_id = int(record["reservation_id"])
+                    policy_version = int(record["policy_version"])
+                    for sample in samples:
+                        polar_meta = (getattr(sample, "metadata", {}) or {}).get("polar", {})
+                        train_meta = getattr(sample, "train_metadata", None) or {}
+                        for metadata, field_name, expected in (
+                            (
+                                polar_meta,
+                                "accepted_rollout_id",
+                                int(record["accepted_rollout_id"]),
+                            ),
+                            (polar_meta, "policy_version", policy_version),
+                            (train_meta, "policy_version", policy_version),
+                        ):
+                            present = metadata.get(field_name)
+                            if present is not None and int(present) != expected:
+                                raise PartialRolloutError(
+                                    f"reservation {reservation_id} KEEP blob has "
+                                    f"conflicting {field_name}={present}"
+                                )
+                    _annotate_accepted_samples(
+                        samples,
+                        accepted_rollout_id=int(record["accepted_rollout_id"]),
+                        staleness=int(rollout_id) - policy_version,
+                        policy_version=policy_version,
+                        scheduler_group_id=int(record.get("scheduler_group_id", reservation_id)),
+                    )
+                _validate_recovered_samples(
+                    record=record,
+                    samples=samples,
+                    rollout_id=rollout_id,
+                    max_off_policy_steps=config.max_off_policy_steps,
+                )
+                preloaded_samples[int(record["reservation_id"])] = samples
+        rebuilt = rebuilder(records)
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        try:
+            store.quarantine(reason)
+        except Exception:
+            logger.exception("Failed to quarantine invalid partial rollout WAL")
+            raise
+        # Continue with the existing at-least-once replay path and a fresh WAL.
+        return _PartialRecoveryPlan(store=PartialRolloutStore(store.directory, store.header))
+
+    plan = _PartialRecoveryPlan(store=store)
+    drop_records: list[dict[str, Any]] = []
+    for record, group in rebuilt:
+        state = record["state"]
+        reservation_id = int(record["reservation_id"])
+        if state == STATE_PREPARED:
+            plan.deferred.append(
+                _DeferredGroup(
+                    group=group,
+                    reservation_id=reservation_id,
+                    submitted_rollout_id=int(record["submitted_rollout_id"]),
+                    policy_version=int(record["policy_version"]),
+                    partial_store=store,
+                )
+            )
+            continue
+
+        reuse_samples = state in (STATE_RESULT_READY, STATE_KEEP) or (
+            state == STATE_DROP
+            and record.get("drop_outcome") == "dynamic_filter"
+            and record.get("sample_blob") is not None
+        )
+        if reuse_samples:
+            completed = _recovered_completed_group(
+                record=record,
+                group=group,
+                samples=preloaded_samples[reservation_id],
+                store=store,
+            )
+        else:
+            completed = None
+
+        if state == STATE_RESULT_READY:
+            assert completed is not None
+            plan.result_ready.append(completed)
+        elif state == STATE_KEEP:
+            assert completed is not None
+            plan.kept.append(completed)
+        elif state == STATE_DROP:
+            drop_records.append(record)
+            if completed is not None:
+                plan.candidate_only.append(completed)
+            if record.get("drop_outcome") == "dynamic_filter":
+                reason = record.get("drop_reason")
+                if reason:
+                    key = f"rollout/dynamic_filter/drop_{reason}"
+                    plan.dynamic_filter_metrics[key] = (
+                        plan.dynamic_filter_metrics.get(key, 0.0) + 1.0
+                    )
+        else:
+            raise PartialRolloutError(f"unsupported recovered state {state}")
+
+    marker_many = getattr(data_source, "mark_consumed_many", None)
+    marker_one = getattr(data_source, "mark_consumed", None)
+    plan.dropped_count = len(drop_records)
+    for record in drop_records:
+        reservation_id = int(record["reservation_id"])
+        outcome = str(record.get("drop_outcome") or "recovered_drop")
+        if callable(marker_one):
+            metrics = marker_one(reservation_id, outcome=outcome)
+        elif callable(marker_many):
+            metrics = marker_many([reservation_id], outcome=outcome)
+        else:
+            raise PartialRolloutError(
+                "data source cannot consume a reconstructed DROP reservation"
+            )
+        if isinstance(metrics, dict):
+            plan.reservation_metrics.update(metrics)
+
+    logger.info(
+        "Recovered partial rollout %s: keep=%d result_ready=%d prepared=%d drop=%d",
+        rollout_id,
+        len(plan.kept),
+        len(plan.result_ready),
+        len(plan.deferred),
+        len(drop_records),
+    )
+    return plan
+
+
 def generate_rollout_polar_async(
     args: Any, rollout_id: int, data_source: Any, evaluation: bool = False
 ) -> Any:
@@ -2617,16 +3008,66 @@ def generate_rollout_polar_async(
         return asyncio.run(_run_eval_rollout(args, rollout_id, data_source))
 
     dynamic_filter = _load_training_dynamic_filter(args)
-    async_worker = get_global_async_worker(args, data_source)
+    partial_recovery = _prepare_partial_recovery(
+        args,
+        rollout_id=rollout_id,
+        data_source=data_source,
+    )
+    if partial_recovery.store is None:
+        async_worker = get_global_async_worker(args, data_source)
+    else:
+        async_worker = get_global_async_worker(
+            args,
+            data_source,
+            partial_recovery,
+            rollout_id,
+        )
     async_worker.set_rollout_context(rollout_id)
-    target = getattr(args, "rollout_batch_size", 1)
-    async_worker.request_groups(int(target))
+    target = int(getattr(args, "rollout_batch_size", 1))
+    if len(partial_recovery.kept) > target:
+        raise PartialRolloutError(
+            f"recovered {len(partial_recovery.kept)} KEEP groups for target {target}"
+        )
+    async_worker.request_groups(target - len(partial_recovery.kept))
 
-    data: list[list[Any]] = []
-    accepted_completions: list[_CompletedGroup] = []
+    data: list[list[Any]] = [completed.samples for completed in partial_recovery.kept]
+    accepted_completions: list[_CompletedGroup] = list(partial_recovery.kept)
     candidate_quality = _CandidateQualityAccumulator()
-    dynamic_filter_metrics: dict[str, float] = {}
-    dynamic_filter_reservation_metrics: dict[str, float] = {}
+    for completed in (*partial_recovery.candidate_only, *partial_recovery.kept):
+        try:
+            candidate_quality.add(completed, reward_key=async_worker.config.reward_key)
+        except Exception:
+            candidate_quality.record_group_error()
+            logger.warning(
+                "Recovered candidate-quality telemetry failed for Polar group %s",
+                completed.group_id,
+                exc_info=True,
+            )
+    dynamic_filter_metrics: dict[str, float] = dict(partial_recovery.dynamic_filter_metrics)
+    dynamic_filter_reservation_metrics: dict[str, float] = dict(
+        partial_recovery.reservation_metrics
+    )
+    partial_recovery_metrics: dict[str, float] = {}
+    recovered_group_count = (
+        len(partial_recovery.kept)
+        + len(partial_recovery.result_ready)
+        + len(partial_recovery.deferred)
+        + partial_recovery.dropped_count
+    )
+    if recovered_group_count:
+        partial_recovery_metrics = {
+            "polar/partial_recovery/replayed_group_count": float(recovered_group_count),
+            "polar/partial_recovery/restored_keep_group_count": float(len(partial_recovery.kept)),
+            "polar/partial_recovery/restored_result_ready_group_count": float(
+                len(partial_recovery.result_ready)
+            ),
+            "polar/partial_recovery/resubmitted_prepared_group_count": float(
+                len(partial_recovery.deferred)
+            ),
+            "polar/partial_recovery/restored_drop_group_count": float(
+                partial_recovery.dropped_count
+            ),
+        }
     start = time.monotonic()
     last_progress = start
 
@@ -2680,6 +3121,15 @@ def generate_rollout_polar_async(
                     replacement_groups += 1
                     made_progress = True
                     continue
+            if partial_recovery.store is not None:
+                if completed.partial_store is not partial_recovery.store:
+                    raise PartialRolloutError(
+                        "completed group is not owned by the active partial WAL"
+                    )
+                partial_recovery.store.record_keep(
+                    completed,
+                    accepted_rollout_id=rollout_id,
+                )
             data.append(completed.samples)
             accepted_completions.append(completed)
             made_progress = True
@@ -2712,12 +3162,17 @@ def generate_rollout_polar_async(
         elapsed,
         async_worker.queue_size(),
     )
+    if partial_recovery.store is not None:
+        partial_recovery.store.mark_ready(
+            completed.reservation_id for completed in accepted_completions
+        )
 
     RolloutFnTrainOutput = _load_rollout_train_output_type()
     flat = [s for g in data for s in g]
     rewards = [_extract_sample_reward(s, async_worker.config.reward_key) for s in flat]
     metrics: dict[str, Any] = dict(dynamic_filter_metrics)
     metrics.update(dynamic_filter_reservation_metrics)
+    metrics.update(partial_recovery_metrics)
     metrics.update(
         _candidate_quality_metrics_fail_open(
             candidate_quality,
@@ -2754,6 +3209,8 @@ def generate_rollout_polar_async(
         [completed.reservation_id for completed in accepted_completions],
         outcome="accepted",
     )
+    if partial_recovery.store is not None:
+        async_worker.release_recovered_holds()
     # Snapshot exactly once per delivered rollout, after reservation commit,
     # so *_delta means "during this rollout" and lifetime counters carry an
     # explicit worker-local scope across Slurm restarts.
@@ -3520,9 +3977,7 @@ def _spilot_router_metrics(
     }
 
     router_rewards = [
-        session_rewards[session_id]
-        for session_id in sessions
-        if session_id in session_rewards
+        session_rewards[session_id] for session_id in sessions if session_id in session_rewards
     ]
     metrics[f"{prefix}/reward_accounted_session_count"] = float(len(router_rewards))
     if router_rewards:
@@ -3535,9 +3990,7 @@ def _spilot_router_metrics(
             if initial_slot == slot and session_id in session_rewards
         ]
         slot_name = slot.lower()
-        metrics[f"{prefix}/reward_{slot_name}_accounted_session_count"] = float(
-            len(slot_rewards)
-        )
+        metrics[f"{prefix}/reward_{slot_name}_accounted_session_count"] = float(len(slot_rewards))
         if slot_rewards:
             metrics[f"{prefix}/reward_{slot_name}_mean"] = sum(slot_rewards) / len(slot_rewards)
 
