@@ -118,6 +118,18 @@ export TMAX_WATCH_FAILURE_SIGNATURE="${TMAX_WATCH_FAILURE_SIGNATURE:-}"
 export TMAX_WATCH_LAST_ACCOUNTED_JOB_ID="${TMAX_WATCH_LAST_ACCOUNTED_JOB_ID:-}"
 TMAX_SUBMIT_SCRIPT="${TMAX_SUBMIT_SCRIPT:-${SCRIPT_DIR}/submit_slurm.sh}"
 
+# SPilot credentials are deliberately absent from run state, so its watcher
+# must relaunch through the wrapper that regenerates the control token and
+# normalizes the NVIDIA key.  Refuse a silent fallback to this generic TMax
+# submitter: that exact fallback previously produced an all-503 resume job.
+if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ]; then
+    tmax_require_spilot_entrypoints "watcher preflight"
+    if [ -z "${POLAR_NVIDIA_API_KEY:-${NVIDIA_API_KEY:-}}" ]; then
+        echo "ERROR: SPilot Router watcher requires NVIDIA_API_KEY before relaunch" >&2
+        exit 1
+    fi
+fi
+
 if [ -n "${TMAX_TARGET_ITER:-}" ] && ! [[ "${TMAX_TARGET_ITER}" =~ ^[0-9]+$ ]]; then
     echo "ERROR: TMAX_TARGET_ITER must be a non-negative integer" >&2
     exit 2

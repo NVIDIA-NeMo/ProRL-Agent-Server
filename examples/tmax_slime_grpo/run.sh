@@ -12,6 +12,11 @@ source "${SCRIPT_DIR}/lifecycle.sh"
 # shellcheck source=./run_state.sh
 source "${SCRIPT_DIR}/run_state.sh"
 
+# Repeat the submit-side guard inside the allocation.  This protects direct or
+# stale environment-file launches that bypassed the current submitter.
+tmax_require_spilot_entrypoints "allocation startup"
+tmax_require_spilot_credentials "allocation startup"
+
 _TMAX_SOURCE_LOCK_COUNT=0
 if [ -n "${TMAX_PRORL_GIT_COMMIT:-}" ]; then
     _TMAX_SOURCE_LOCK_COUNT=$((_TMAX_SOURCE_LOCK_COUNT + 1))

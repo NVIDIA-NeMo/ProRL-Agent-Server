@@ -18,6 +18,16 @@ from polar.config.topology import TopologyConfig
 ROOT = Path(__file__).resolve().parents[2]
 SHARED = ROOT / "examples" / "swegym_slime_grpo"
 TMAX = ROOT / "examples" / "tmax_slime_grpo"
+SPILOT = ROOT / "examples" / "spilot_router_slime_grpo"
+
+
+def spilot_entrypoint_env() -> dict[str, str]:
+    return {
+        "TMAX_SUBMIT_SCRIPT": str(SPILOT / "submit_slurm.sh"),
+        "POLAR_TRAIN_RUN_SCRIPT": str(SPILOT / "run.sh"),
+        "POLAR_CONFIG_TEMPLATE": str(SPILOT / "polar_config.yaml"),
+        "TOPOLOGY_TEMPLATE": str(SPILOT / "topology.yaml"),
+    }
 
 
 def run_bash(script: str, *, env: dict[str, str] | None = None, check: bool = True):
@@ -225,6 +235,105 @@ def test_tmax_submit_fails_closed_on_training_abi_preflight(tmp_path: Path) -> N
     assert result.returncode == 1
     assert "training ABI preflight failed before Slurm submission" in result.stderr
     assert "Dry run only" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("credential_env", "expected_error"),
+    [
+        ({}, "SPilot Router requires POLAR_CONTROL_PLANE_TOKEN"),
+        (
+            {"POLAR_CONTROL_PLANE_TOKEN": "c" * 32},
+            "SPilot Router requires POLAR_NVIDIA_API_KEY",
+        ),
+        (
+            {
+                "POLAR_CONTROL_PLANE_TOKEN": "too-short",
+                "POLAR_NVIDIA_API_KEY": "test-model-pool-key",
+                "POLAR_MODEL_POOL_BASE_URL": "https://model-pool.invalid/v1",
+            },
+            "POLAR_CONTROL_PLANE_TOKEN must be a 32-128 character opaque token",
+        ),
+        (
+            {
+                "POLAR_CONTROL_PLANE_TOKEN": "c" * 32,
+                "POLAR_NVIDIA_API_KEY": "test-model-pool-key",
+            },
+            "SPilot Router requires POLAR_MODEL_POOL_BASE_URL",
+        ),
+    ],
+)
+def test_tmax_submit_fails_before_sbatch_when_spilot_wrapper_was_bypassed(
+    tmp_path: Path,
+    credential_env: dict[str, str],
+    expected_error: str,
+) -> None:
+    env = tmax_submit_env(tmp_path, load_pointer="release")
+    env["TMAX_AGENT_HARNESS"] = "spilot_router"
+    env.update(spilot_entrypoint_env())
+    env.update(credential_env)
+
+    result = subprocess.run(
+        ["bash", str(TMAX / "submit_slurm.sh")],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert expected_error in result.stderr
+    assert "Dry run only" not in result.stdout
+
+
+def test_tmax_submit_rejects_spilot_credentials_with_generic_runtime_entrypoint(
+    tmp_path: Path,
+) -> None:
+    env = tmax_submit_env(tmp_path, load_pointer="release")
+    env.update(
+        spilot_entrypoint_env(),
+        TMAX_AGENT_HARNESS="spilot_router",
+        POLAR_CONTROL_PLANE_TOKEN="c" * 32,
+        POLAR_NVIDIA_API_KEY="test-model-pool-key",
+        POLAR_MODEL_POOL_BASE_URL="https://model-pool.invalid/v1",
+        POLAR_TRAIN_RUN_SCRIPT=str(TMAX / "run.sh"),
+    )
+
+    result = subprocess.run(
+        ["bash", str(TMAX / "submit_slurm.sh")],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert "submission preflight: SPilot Router requires POLAR_TRAIN_RUN_SCRIPT=" in result.stderr
+    assert "Dry run only" not in result.stdout
+
+
+def test_tmax_allocation_rejects_missing_spilot_credentials_before_run_dir(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "must-not-exist"
+    env = clean_env(tmp_path)
+    env.update(
+        spilot_entrypoint_env(),
+        TMAX_AGENT_HARNESS="spilot_router",
+        RUN_ID="router-run",
+        RUN_DIR=str(run_dir),
+    )
+
+    result = subprocess.run(
+        ["bash", str(TMAX / "run.sh")],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert "allocation startup: SPilot Router requires POLAR_CONTROL_PLANE_TOKEN" in result.stderr
+    assert not run_dir.exists()
 
 
 def test_tmax_submit_allows_explicit_release_seed_with_fresh_data(
@@ -2618,6 +2727,38 @@ if tmax_run_state_has_export "$STATE" TMAX_EVAL_SOURCE; then printf bad; else pr
     assert run_bash(script, env=env).stdout == "enabled|source-missing"
 
 
+def test_run_state_persists_resume_entrypoints_but_not_spilot_credentials(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state.env"
+    entrypoints = {
+        "TMAX_SUBMIT_SCRIPT": "/repo/examples/spilot_router_slime_grpo/submit_slurm.sh",
+        "POLAR_TRAIN_RUN_SCRIPT": "/repo/examples/spilot_router_slime_grpo/run.sh",
+        "POLAR_CONFIG_TEMPLATE": "/repo/examples/spilot_router_slime_grpo/polar_config.yaml",
+        "TOPOLOGY_TEMPLATE": "/repo/examples/spilot_router_slime_grpo/topology.yaml",
+    }
+    env = clean_env(tmp_path)
+    env.update(
+        STATE=str(state),
+        RUN_ID="router-run",
+        SAVE_DIR="/tmp/router-save",
+        POLAR_CONTROL_PLANE_TOKEN="c" * 32,
+        POLAR_NVIDIA_API_KEY="private-model-pool-key",
+        **entrypoints,
+    )
+    script = f"""
+source {TMAX / "run_state.sh"}
+tmax_write_run_state "$STATE"
+"""
+
+    run_bash(script, env=env)
+    content = state.read_text()
+    for name, value in entrypoints.items():
+        assert f"export {name}={value}\n" in content
+    assert "POLAR_CONTROL_PLANE_TOKEN" not in content
+    assert "POLAR_NVIDIA_API_KEY" not in content
+
+
 def watcher_env(tmp_path: Path, bin_dir: Path) -> dict[str, str]:
     save = tmp_path / "save"
     save.mkdir()
@@ -2641,6 +2782,87 @@ def watcher_env(tmp_path: Path, bin_dir: Path) -> dict[str, str]:
         TMAX_WATCH_QUICK_FAILURE_SECONDS="900",
     )
     return env
+
+
+@pytest.mark.parametrize(
+    ("submit_script", "nvidia_key", "expected_error"),
+    [
+        (
+            str(TMAX / "submit_slurm.sh"),
+            "test-model-pool-key",
+            "watcher preflight: SPilot Router requires TMAX_SUBMIT_SCRIPT=",
+        ),
+        (
+            str(ROOT / "examples" / "spilot_router_slime_grpo" / "submit_slurm.sh"),
+            None,
+            "SPilot Router watcher requires NVIDIA_API_KEY",
+        ),
+    ],
+)
+def test_generic_watcher_fails_closed_on_incomplete_spilot_resume_environment(
+    tmp_path: Path,
+    submit_script: str,
+    nvidia_key: str | None,
+    expected_error: str,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_command(bin_dir / "squeue", "exit 0\n")
+    write_command(bin_dir / "sacct", "exit 0\n")
+    env = watcher_env(tmp_path, bin_dir)
+    env.update(
+        TMAX_AGENT_HARNESS="spilot_router",
+        TMAX_SUBMIT_SCRIPT=submit_script,
+        POLAR_TRAIN_RUN_SCRIPT=str(SPILOT / "run.sh"),
+        POLAR_CONFIG_TEMPLATE=str(SPILOT / "polar_config.yaml"),
+        TOPOLOGY_TEMPLATE=str(SPILOT / "topology.yaml"),
+    )
+    if nvidia_key is not None:
+        env["POLAR_NVIDIA_API_KEY"] = nvidia_key
+
+    result = subprocess.run(
+        ["bash", str(TMAX / "watch_training.sh"), "--relaunch"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert expected_error in result.stderr
+
+
+def test_watcher_loaded_spilot_state_without_entrypoints_cannot_fall_back(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_command(bin_dir / "squeue", "exit 0\n")
+    write_command(bin_dir / "sacct", "exit 0\n")
+    env = watcher_env(tmp_path, bin_dir)
+    env["POLAR_NVIDIA_API_KEY"] = "test-model-pool-key"
+    state = Path(env["TMAX_RUN_STATE_FILE"])
+    original = (
+        f"export RUN_ID={env['RUN_ID']}\n"
+        f"export SAVE_DIR={env['SAVE_DIR']}\n"
+        f"export TMAX_TRAIN_DATA={env['TMAX_TRAIN_DATA']}\n"
+        f"export TMAX_EVAL_DATA={env['TMAX_EVAL_DATA']}\n"
+        "export TMAX_AGENT_HARNESS=spilot_router\n"
+        "export JOB_NAME=polar-tmax-run-a\n"
+    )
+    state.write_text(original)
+
+    result = subprocess.run(
+        ["bash", str(TMAX / "watch_training.sh"), "--relaunch"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert "watcher preflight: SPilot Router requires TMAX_SUBMIT_SCRIPT=" in result.stderr
+    assert state.read_text() == original
 
 
 def test_watcher_legacy_state_ignores_inherited_new_eval_defaults(tmp_path: Path):

@@ -6,6 +6,13 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # shellcheck source=./experiment_defaults.sh
 source "${SCRIPT_DIR}/experiment_defaults.sh"
 
+# Entrypoint identity is part of the logical-run contract.  Do not inherit a
+# stale generic TMax path from an operator shell or an older watcher.
+export TMAX_SUBMIT_SCRIPT="${SCRIPT_DIR}/submit_slurm.sh"
+export POLAR_TRAIN_RUN_SCRIPT="${SCRIPT_DIR}/run.sh"
+export POLAR_CONFIG_TEMPLATE="${SCRIPT_DIR}/polar_config.yaml"
+export TOPOLOGY_TEMPLATE="${SCRIPT_DIR}/topology.yaml"
+
 # The shared submitter serializes POLAR_* variables into a private mode-0600
 # job environment. Copy the credential under that namespace without writing it
 # into YAML, command lines, logs, or the repository.

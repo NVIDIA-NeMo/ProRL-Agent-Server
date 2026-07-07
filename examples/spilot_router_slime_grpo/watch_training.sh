@@ -8,6 +8,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # shellcheck source=./experiment_defaults.sh
 source "${SCRIPT_DIR}/experiment_defaults.sh"
 export TMAX_SUBMIT_SCRIPT="${SCRIPT_DIR}/submit_slurm.sh"
+export POLAR_TRAIN_RUN_SCRIPT="${SCRIPT_DIR}/run.sh"
+export POLAR_CONFIG_TEMPLATE="${SCRIPT_DIR}/polar_config.yaml"
+export TOPOLOGY_TEMPLATE="${SCRIPT_DIR}/topology.yaml"
 
 # Credentials are intentionally excluded from TMax run state. Every watcher
 # process must receive them afresh and keeps them only in its environment; each

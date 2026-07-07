@@ -23,6 +23,13 @@ source "${SCRIPT_DIR}/env.cwdfw.sh"
 # shellcheck source=./run_state.sh
 source "${SCRIPT_DIR}/run_state.sh"
 
+# The SPilot wrapper creates an allocation-local control token and normalizes
+# the model-pool credential under POLAR_*.  Fail before requesting GPUs if a
+# caller bypasses that wrapper; otherwise the rollout service would start and
+# reject every task with 503 only after the expensive model startup.
+tmax_require_spilot_entrypoints "submission preflight"
+tmax_require_spilot_credentials "submission preflight"
+
 if [ "${TMAX_PERSIST_RUN_STATE:-1}" = "1" ] && \
    [ "${SUBMIT_DRY_RUN:-0}" != "1" ] && \
    [ "${TMAX_RUN_STATE_LOCK_HELD:-0}" != "1" ]; then

@@ -254,6 +254,10 @@ def test_spilot_watcher_relaunches_through_spilot_submitter() -> None:
 
     assert 'source "${SCRIPT_DIR}/experiment_defaults.sh"' in script
     assert 'TMAX_SUBMIT_SCRIPT="${SCRIPT_DIR}/submit_slurm.sh"' in script
+    assert 'POLAR_TRAIN_RUN_SCRIPT="${SCRIPT_DIR}/run.sh"' in script
+    assert 'POLAR_CONFIG_TEMPLATE="${SCRIPT_DIR}/polar_config.yaml"' in script
+    assert 'TOPOLOGY_TEMPLATE="${SCRIPT_DIR}/topology.yaml"' in script
+    assert 'TMAX_SUBMIT_SCRIPT="${TMAX_SUBMIT_SCRIPT:-${_SPILOT_ROUTER_DIR}/submit_slurm.sh}"' in defaults
     assert "runs/spilot_router_slime_grpo/current_run.env" in defaults
     assert "POLAR_NVIDIA_API_KEY" in script
     assert "NVIDIA_API_KEY is not set" in script

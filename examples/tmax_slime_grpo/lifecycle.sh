@@ -2,6 +2,51 @@
 
 TMAX_LIFECYCLE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
+tmax_require_spilot_credentials() {
+    local stage="${1:-operation}"
+    if [ "${TMAX_AGENT_HARNESS:-}" != "spilot_router" ]; then
+        return 0
+    fi
+    if [ -z "${POLAR_CONTROL_PLANE_TOKEN:-}" ]; then
+        echo "ERROR: ${stage}: SPilot Router requires POLAR_CONTROL_PLANE_TOKEN; use the SPilot submit wrapper" >&2
+        return 1
+    fi
+    if ! [[ "${POLAR_CONTROL_PLANE_TOKEN}" =~ ^[0-9A-Za-z_-]{32,128}$ ]]; then
+        echo "ERROR: ${stage}: POLAR_CONTROL_PLANE_TOKEN must be a 32-128 character opaque token" >&2
+        return 1
+    fi
+    if [ -z "${POLAR_NVIDIA_API_KEY:-}" ]; then
+        echo "ERROR: ${stage}: SPilot Router requires POLAR_NVIDIA_API_KEY; use the SPilot submit wrapper" >&2
+        return 1
+    fi
+    if [ -z "${POLAR_MODEL_POOL_BASE_URL:-}" ]; then
+        echo "ERROR: ${stage}: SPilot Router requires POLAR_MODEL_POOL_BASE_URL; use the SPilot submit wrapper" >&2
+        return 1
+    fi
+}
+
+tmax_require_spilot_entrypoints() {
+    local stage="${1:-operation}"
+    local spilot_dir entrypoint name file expected
+    if [ "${TMAX_AGENT_HARNESS:-}" != "spilot_router" ]; then
+        return 0
+    fi
+    spilot_dir="$(cd -- "${TMAX_LIFECYCLE_DIR}/../spilot_router_slime_grpo" &>/dev/null && pwd)"
+    for entrypoint in \
+        "TMAX_SUBMIT_SCRIPT:submit_slurm.sh" \
+        "POLAR_TRAIN_RUN_SCRIPT:run.sh" \
+        "POLAR_CONFIG_TEMPLATE:polar_config.yaml" \
+        "TOPOLOGY_TEMPLATE:topology.yaml"; do
+        name="${entrypoint%%:*}"
+        file="${entrypoint#*:}"
+        expected="${spilot_dir}/${file}"
+        if [ "${!name:-}" != "${expected}" ]; then
+            echo "ERROR: ${stage}: SPilot Router requires ${name}=${expected}; got ${!name:-unset}" >&2
+            return 1
+        fi
+    done
+}
+
 tmax_slurm_duration_seconds() {
     local spec="$1" rest days=0 has_days=0
     local -a fields
