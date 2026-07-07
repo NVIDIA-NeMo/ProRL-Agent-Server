@@ -70,6 +70,10 @@ class PartialRolloutHeader:
     base_checkpoint_digest: str
     config_digest: str
     target_groups: int
+    replay_start_reservation_id: int
+    replay_live_frontier: int
+    committed_reservation_count: int
+    dedupe_evidence_digest: str
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -162,6 +166,23 @@ def _canonical_digest(value: Any) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def committed_reservation_evidence_digest(
+    replay_start: int,
+    live_frontier: int,
+    reservation_ids: Iterable[int],
+) -> str:
+    """Bind a partial WAL to the exact checkpoint replay evidence it used."""
+
+    return _canonical_digest(
+        {
+            "version": 1,
+            "replay_start_reservation_id": int(replay_start),
+            "replay_live_frontier": int(live_frontier),
+            "committed_reservation_ids": sorted(int(item) for item in reservation_ids),
+        }
+    )
 
 
 def prompt_group_digest(group: list[Any]) -> str:
@@ -337,6 +358,226 @@ def _checkpoint_digest(root: Path, iteration: int) -> str | None:
     return digest.hexdigest()
 
 
+def load_emitted_reservation_ids(
+    checkpoint_root: Path,
+    iteration: int,
+    *,
+    expected_group_count: int | None = None,
+) -> frozenset[int]:
+    """Return every monotonic reservation id proven trained by ``iteration``.
+
+    The model checkpoint is the optimizer commit marker, while each emitted
+    rollout journal describes an exact batch included in that cumulative model
+    state.  We must scan *all* emitted journals through ``iteration``: an old
+    outstanding reservation can hold the checkpoint replay frontier behind
+    several later optimizer steps.  Reading only the latest journal would then
+    replay trained groups from those earlier steps.
+
+    Journals after ``iteration`` and pending journals without an emitted marker
+    remain speculative and are ignored.  Older steps with no marker retain the
+    previous at-least-once behavior.  Once an emitted marker exists, however,
+    its missing or malformed payload is unsafe and fails closed.
+    """
+
+    iteration = int(iteration)
+    journal_dir = Path(checkpoint_root) / "rollout" / "rollout_metrics_journal"
+    if not journal_dir.is_dir():
+        return frozenset()
+
+    committed_ids: set[int] = set()
+    for emitted_path in sorted(journal_dir.glob("rollout_*.emitted")):
+        stem = emitted_path.name.removeprefix("rollout_").removesuffix(".emitted")
+        try:
+            emitted_iteration = int(stem)
+        except ValueError as exc:
+            raise PartialRolloutError(
+                f"invalid emitted rollout marker filename: {emitted_path}"
+            ) from exc
+        if emitted_iteration < 0:
+            raise PartialRolloutError(f"negative emitted rollout marker iteration: {emitted_path}")
+        if emitted_iteration > iteration:
+            continue
+        committed_ids.update(
+            _load_one_emitted_reservation_ids(
+                emitted_path,
+                emitted_iteration,
+                expected_group_count=expected_group_count,
+            )
+        )
+    return frozenset(committed_ids)
+
+
+def _load_one_emitted_reservation_ids(
+    emitted_path: Path,
+    iteration: int,
+    *,
+    expected_group_count: int | None,
+) -> frozenset[int]:
+    pending_path = emitted_path.with_suffix(".pending.pt")
+    if not pending_path.is_file():
+        raise PartialRolloutError(
+            f"emitted rollout journal has no payload for iteration {iteration}: {pending_path}"
+        )
+
+    try:
+        marker_fields = {}
+        for line in emitted_path.read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                marker_fields[key] = value
+    except OSError as exc:
+        raise PartialRolloutError(
+            f"cannot read emitted rollout marker {emitted_path}: {exc}"
+        ) from exc
+    if marker_fields.get("version") != "1" or marker_fields.get("rollout_id") != str(iteration):
+        raise PartialRolloutError(f"invalid emitted rollout marker: {emitted_path}")
+
+    try:
+        payload = torch.load(pending_path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        raise PartialRolloutError(
+            f"cannot load emitted rollout journal {pending_path}: {exc}"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != 1
+        or payload.get("rollout_id") != iteration
+    ):
+        raise PartialRolloutError(f"invalid emitted rollout journal: {pending_path}")
+    pending = payload.get("pending")
+    samples = getattr(pending, "samples", None)
+    if samples is None:
+        raise PartialRolloutError(
+            "emitted rollout journal does not retain samples needed for exact "
+            f"reservation dedupe: {pending_path}"
+        )
+
+    reservation_ids: set[int] = set()
+    stack = list(samples) if isinstance(samples, (list, tuple)) else [samples]
+    while stack:
+        sample = stack.pop()
+        if isinstance(sample, (list, tuple)):
+            stack.extend(sample)
+            continue
+        group_index = getattr(sample, "group_index", None)
+        if group_index is None:
+            raise PartialRolloutError(
+                f"emitted rollout sample is missing group_index: {pending_path}"
+            )
+        try:
+            reservation_id = int(group_index)
+        except (TypeError, ValueError) as exc:
+            raise PartialRolloutError(
+                f"invalid emitted rollout group_index={group_index!r}: {pending_path}"
+            ) from exc
+        if reservation_id < 0:
+            raise PartialRolloutError(
+                f"negative emitted rollout group_index={reservation_id}: {pending_path}"
+            )
+        reservation_ids.add(reservation_id)
+
+    if expected_group_count is not None and len(reservation_ids) != int(expected_group_count):
+        raise PartialRolloutError(
+            "emitted rollout journal has an unexpected reservation count: "
+            f"expected={int(expected_group_count)}, actual={len(reservation_ids)}, "
+            f"path={pending_path}"
+        )
+    return frozenset(reservation_ids)
+
+
+def _checkpoint_replay_bounds(checkpoint_root: Path, iteration: int) -> tuple[int, int]:
+    """Return the half-open reservation range replayed by a v1 checkpoint."""
+
+    path = Path(checkpoint_root) / "rollout" / f"global_dataset_state_dict_{int(iteration)}.pt"
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        raise PartialRolloutError(f"cannot load rollout data checkpoint {path}: {exc}") from exc
+    if not isinstance(state, dict):
+        raise PartialRolloutError(f"rollout data checkpoint is not a mapping: {path}")
+    try:
+        replay_start = int(state["sample_group_index"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PartialRolloutError(
+            f"rollout data checkpoint has invalid sample_group_index: {path}"
+        ) from exc
+    if replay_start < 0:
+        raise PartialRolloutError(f"rollout data checkpoint has a negative frontier: {path}")
+
+    frontier = state.get("polar_reservation_frontier")
+    if frontier is None:
+        # Legacy exact-cursor checkpoints do not rewind speculative work and
+        # therefore have no duplicate replay interval.
+        return replay_start, replay_start
+    if not isinstance(frontier, dict):
+        raise PartialRolloutError(f"invalid reservation frontier in checkpoint: {path}")
+    if frontier.get("version") != 1 or frontier.get("mode") != (
+        "earliest_outstanding_at_least_once"
+    ):
+        raise PartialRolloutError(f"unsupported reservation frontier in checkpoint: {path}")
+    try:
+        live_frontier = int(frontier["live_sample_group_index"])
+        replay_span = int(frontier["replay_span_groups"])
+        outstanding_groups = int(frontier["outstanding_groups"])
+        potential_duplicates = int(frontier["potential_duplicate_groups"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PartialRolloutError(
+            f"reservation frontier has invalid integer fields: {path}"
+        ) from exc
+    if (
+        live_frontier < replay_start
+        or replay_span != live_frontier - replay_start
+        or outstanding_groups < 0
+        or outstanding_groups > replay_span
+        or potential_duplicates != replay_span - outstanding_groups
+    ):
+        raise PartialRolloutError(f"inconsistent reservation frontier in checkpoint: {path}")
+    frontier_reservation_id = frontier.get("frontier_reservation_id")
+    if outstanding_groups == 0:
+        if frontier_reservation_id is not None or replay_span != 0:
+            raise PartialRolloutError(f"empty reservation frontier has a replay interval: {path}")
+    else:
+        try:
+            normalized_frontier_id = int(frontier_reservation_id)
+        except (TypeError, ValueError) as exc:
+            raise PartialRolloutError(f"reservation frontier id is invalid: {path}") from exc
+        if normalized_frontier_id != replay_start:
+            raise PartialRolloutError(
+                f"reservation frontier id does not match replay start: {path}"
+            )
+    return replay_start, live_frontier
+
+
+def load_checkpoint_replay_committed_reservation_ids(
+    checkpoint_root: Path,
+    iteration: int,
+    *,
+    expected_group_count: int | None = None,
+) -> tuple[tuple[int, int], frozenset[int]]:
+    """Load exact trained IDs that can reappear from one checkpoint frontier.
+
+    This is intentionally read-only and can be used as a preflight audit before
+    launching a resumed allocation.  Pending journals without `.emitted`
+    markers, including an orphan for ``iteration + 1``, are never admitted.
+    """
+
+    root = Path(checkpoint_root)
+    replay_start, live_frontier = _checkpoint_replay_bounds(root, int(iteration))
+    if replay_start == live_frontier:
+        return (replay_start, live_frontier), frozenset()
+    all_committed_ids = load_emitted_reservation_ids(
+        root,
+        int(iteration),
+        expected_group_count=expected_group_count,
+    )
+    replay_committed_ids = frozenset(
+        reservation_id
+        for reservation_id in all_committed_ids
+        if replay_start <= reservation_id < live_frontier
+    )
+    return (replay_start, live_frontier), replay_committed_ids
+
+
 def maybe_open_partial_rollout_store(
     args: Any,
     config: Any,
@@ -376,13 +617,29 @@ def maybe_open_partial_rollout_store(
         logger.warning("Partial rollout recovery disabled: stable run id is unavailable")
         return None
 
+    target_groups = int(getattr(args, "rollout_batch_size", 1) or 1)
+    (replay_start, live_frontier), committed_reservation_ids = (
+        load_checkpoint_replay_committed_reservation_ids(
+            Path(load_root_raw),
+            base_iteration,
+            expected_group_count=target_groups,
+        )
+    )
     header = PartialRolloutHeader(
         run_id=run_id,
         rollout_id=int(rollout_id),
         base_checkpoint_iteration=base_iteration,
         base_checkpoint_digest=checkpoint_digest,
         config_digest=partial_rollout_config_digest(args, config),
-        target_groups=int(getattr(args, "rollout_batch_size", 1) or 1),
+        target_groups=target_groups,
+        replay_start_reservation_id=replay_start,
+        replay_live_frontier=live_frontier,
+        committed_reservation_count=len(committed_reservation_ids),
+        dedupe_evidence_digest=committed_reservation_evidence_digest(
+            replay_start,
+            live_frontier,
+            committed_reservation_ids,
+        ),
     )
     directory = (
         Path(save_root_raw) / "rollout" / "partial_rollout_wal" / f"rollout_{int(rollout_id):07d}"
@@ -392,7 +649,11 @@ def maybe_open_partial_rollout_store(
         committed_iteration=base_iteration,
         current_rollout_id=int(rollout_id),
     )
-    return PartialRolloutStore(directory, header)
+    return PartialRolloutStore(
+        directory,
+        header,
+        committed_reservation_ids=committed_reservation_ids,
+    )
 
 
 def _gc_committed_partial_rollouts(
@@ -427,9 +688,40 @@ def _gc_committed_partial_rollouts(
 class PartialRolloutStore:
     """Thread-safe, per-rollout reservation decision WAL."""
 
-    def __init__(self, directory: Path, header: PartialRolloutHeader) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        header: PartialRolloutHeader,
+        *,
+        committed_reservation_ids: Iterable[int] = (),
+    ) -> None:
         self.directory = Path(directory)
         self.header = header
+        normalized_ids = frozenset(int(item) for item in committed_reservation_ids)
+        if any(item < 0 for item in normalized_ids):
+            raise ValueError("committed reservation ids must be non-negative")
+        replay_start = int(header.replay_start_reservation_id)
+        live_frontier = int(header.replay_live_frontier)
+        if replay_start < 0 or live_frontier < replay_start:
+            raise PartialRolloutError("partial WAL header has invalid replay bounds")
+        if any(item < replay_start or item >= live_frontier for item in normalized_ids):
+            raise PartialRolloutError(
+                "committed reservation evidence falls outside the checkpoint replay bounds"
+            )
+        if int(header.committed_reservation_count) != len(normalized_ids):
+            raise PartialRolloutError(
+                "partial WAL header committed reservation count does not match evidence"
+            )
+        expected_evidence_digest = committed_reservation_evidence_digest(
+            replay_start,
+            live_frontier,
+            normalized_ids,
+        )
+        if header.dedupe_evidence_digest != expected_evidence_digest:
+            raise PartialRolloutError(
+                "partial WAL header committed reservation evidence digest mismatch"
+            )
+        self.committed_reservation_ids = normalized_ids
         self._lock = threading.RLock()
         self._sealed = False
 
@@ -789,6 +1081,56 @@ class PartialRolloutStore:
                     "state": STATE_DROP,
                     "drop_outcome": str(outcome),
                     "drop_reason": reason,
+                    "updated_unix_ns": time.time_ns(),
+                }
+            )
+            _atomic_torch_save(
+                self._with_record_digest(record),
+                self._record_path(reservation_id),
+            )
+
+    def record_resume_duplicate(
+        self,
+        reservation_id: int,
+        *,
+        reason: str = "reservation was already trained by the base checkpoint",
+    ) -> None:
+        """Durably turn any replayed committed reservation into a DROP.
+
+        This transition intentionally overrides PREPARED, RESULT_READY, and
+        KEEP records.  The emitted base-checkpoint journal is stronger commit
+        evidence than an uncheckpointed partial-rollout decision.  If a crash
+        happened after READY but before optimizer commit, removing READY first
+        makes replacement generation recoverable without ever reusing the
+        duplicate group.
+        """
+
+        reservation_id = int(reservation_id)
+        with self._lock:
+            current = self._load_record(reservation_id)
+            if current is None:
+                raise PartialRolloutError(
+                    f"resume duplicate has no PREPARED record for reservation {reservation_id}"
+                )
+            if (
+                current["state"] == STATE_DROP
+                and current.get("drop_outcome") == "resume_duplicate"
+            ):
+                return
+            if self._ready_path().exists():
+                try:
+                    self._ready_path().unlink()
+                except FileNotFoundError:
+                    pass
+                else:
+                    _fsync_directory(self.directory)
+                self._sealed = False
+            record = dict(current)
+            record.update(
+                {
+                    "state": STATE_DROP,
+                    "drop_outcome": "resume_duplicate",
+                    "drop_reason": str(reason),
                     "updated_unix_ns": time.time_ns(),
                 }
             )

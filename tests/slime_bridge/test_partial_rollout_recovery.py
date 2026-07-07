@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import random
 from types import SimpleNamespace
 
@@ -22,6 +23,9 @@ from slime_bridge.partial_rollout import (
     STATE_PREPARED,
     STATE_RESULT_READY,
     _gc_committed_partial_rollouts,
+    committed_reservation_evidence_digest,
+    load_checkpoint_replay_committed_reservation_ids,
+    load_emitted_reservation_ids,
     maybe_open_partial_rollout_store,
     partial_rollout_config_digest,
 )
@@ -89,7 +93,39 @@ def _write_model_checkpoint_shell(tmp_path, iteration: int) -> None:
     (iteration_dir / "common.pt").write_bytes(b"common-state")
 
 
-def _header(tmp_path, *, target: int = 2) -> PartialRolloutHeader:
+def _write_emitted_rollout_journal(
+    tmp_path,
+    iteration: int,
+    reservation_ids: list[int],
+) -> None:
+    journal_dir = tmp_path / "rollout" / "rollout_metrics_journal"
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    samples = [
+        Sample(group_index=reservation_id, prompt=f"p-{reservation_id}")
+        for reservation_id in reservation_ids
+    ]
+    partial_rollout_module.torch.save(
+        {
+            "version": 1,
+            "rollout_id": iteration,
+            "pending": SimpleNamespace(samples=samples),
+        },
+        journal_dir / f"rollout_{iteration:07d}.pending.pt",
+    )
+    (journal_dir / f"rollout_{iteration:07d}.emitted").write_text(
+        f"version=1\nrollout_id={iteration}\n",
+        encoding="utf-8",
+    )
+
+
+def _header(
+    tmp_path,
+    *,
+    target: int = 2,
+    committed_reservation_ids=(),
+) -> PartialRolloutHeader:
+    committed_reservation_ids = frozenset(committed_reservation_ids)
+    live_frontier = max(committed_reservation_ids, default=-1) + 1
     return PartialRolloutHeader(
         run_id="test-run",
         rollout_id=8,
@@ -97,6 +133,14 @@ def _header(tmp_path, *, target: int = 2) -> PartialRolloutHeader:
         base_checkpoint_digest="a" * 64,
         config_digest="b" * 64,
         target_groups=target,
+        replay_start_reservation_id=0,
+        replay_live_frontier=live_frontier,
+        committed_reservation_count=len(committed_reservation_ids),
+        dedupe_evidence_digest=committed_reservation_evidence_digest(
+            0,
+            live_frontier,
+            committed_reservation_ids,
+        ),
     )
 
 
@@ -191,6 +235,41 @@ def test_wal_rejects_conflicting_terminal_transition(tmp_path) -> None:
 
     with pytest.raises(PartialRolloutError, match="cannot DROP kept"):
         store.record_drop(0, outcome="dynamic_filter", reason="zero_std")
+
+
+def test_wal_rejects_records_from_changed_dedupe_evidence(tmp_path) -> None:
+    committed_ids = frozenset({0})
+    header = _header(
+        tmp_path,
+        target=1,
+        committed_reservation_ids=committed_ids,
+    )
+    store = PartialRolloutStore(
+        tmp_path / "wal",
+        header,
+        committed_reservation_ids=committed_ids,
+    )
+    group = [Sample(group_index=0, index=0, prompt="p0")]
+    store.record_prepared(
+        reservation_id=0,
+        group=group,
+        submitted_rollout_id=8,
+        policy_version=8,
+    )
+    store.record_resume_duplicate(0)
+
+    changed_header = dataclasses.replace(
+        header,
+        committed_reservation_count=0,
+        dedupe_evidence_digest=committed_reservation_evidence_digest(0, 1, ()),
+    )
+    reopened = PartialRolloutStore(
+        store.directory,
+        changed_header,
+        committed_reservation_ids=(),
+    )
+    with pytest.raises(PartialRolloutError, match="header mismatch"):
+        reopened.load_records()
 
 
 def test_duplicate_result_is_idempotent_only_for_identical_payload(tmp_path) -> None:
@@ -356,6 +435,80 @@ def test_committed_wal_gc_never_deletes_current_or_uncommitted_rollout(tmp_path)
     assert (parent / "rollout_0000009").is_dir()
 
 
+def test_emitted_journal_extracts_exact_reservation_ids_and_ignores_speculation(
+    tmp_path,
+) -> None:
+    _write_emitted_rollout_journal(tmp_path, 6, [1, 1, 2, 2])
+    _write_emitted_rollout_journal(tmp_path, 7, [3, 3, 7, 7])
+
+    assert load_emitted_reservation_ids(
+        tmp_path,
+        7,
+        expected_group_count=2,
+    ) == frozenset({1, 2, 3, 7})
+
+    journal_dir = tmp_path / "rollout" / "rollout_metrics_journal"
+    partial_rollout_module.torch.save(
+        {
+            "version": 1,
+            "rollout_id": 8,
+            "pending": SimpleNamespace(samples=[Sample(group_index=101, prompt="speculative")]),
+        },
+        journal_dir / "rollout_0000008.pending.pt",
+    )
+    assert load_emitted_reservation_ids(tmp_path, 8) == frozenset({1, 2, 3, 7})
+
+
+def test_malformed_emitted_journal_fails_closed(tmp_path) -> None:
+    _write_emitted_rollout_journal(tmp_path, 7, [3])
+    pending_path = tmp_path / "rollout" / "rollout_metrics_journal" / "rollout_0000007.pending.pt"
+    partial_rollout_module.torch.save(
+        {
+            "version": 1,
+            "rollout_id": 7,
+            "pending": SimpleNamespace(samples=None),
+        },
+        pending_path,
+    )
+
+    with pytest.raises(PartialRolloutError, match="does not retain samples"):
+        load_emitted_reservation_ids(tmp_path, 7)
+
+
+def test_checkpoint_dedupe_covers_emitted_steps_behind_long_lived_frontier(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("RUN_ID", "test-run")
+    args = _args(tmp_path, rollout_id=8, target=2)
+    source = _source(args, [f"p{i}" for i in range(8)])
+    reservations = source.get_samples_with_reservation(7)
+    source.mark_consumed_many(list(range(1, 7)), outcome="accepted")
+    source.save(7)
+    _write_model_checkpoint_shell(tmp_path, 7)
+    _write_emitted_rollout_journal(tmp_path, 5, [1, 2])
+    _write_emitted_rollout_journal(tmp_path, 6, [3, 4])
+    _write_emitted_rollout_journal(tmp_path, 7, [5, 6])
+
+    bounds, committed_ids = load_checkpoint_replay_committed_reservation_ids(
+        tmp_path,
+        7,
+        expected_group_count=2,
+    )
+
+    store = maybe_open_partial_rollout_store(
+        args,
+        resolve_polar_slime_config(args),
+        8,
+    )
+
+    assert [reservation_id for reservation_id, _group in reservations] == list(range(7))
+    assert bounds == (0, 7)
+    assert committed_ids == frozenset(range(1, 7))
+    assert store is not None
+    assert store.committed_reservation_ids == frozenset(range(1, 7))
+
+
 def test_rebuild_mixed_contiguous_states_without_seeking_or_skipping(tmp_path) -> None:
     args = _args(tmp_path, target=2)
     writer = _source(args, [f"p{i}" for i in range(8)])
@@ -433,6 +586,49 @@ def test_worker_writes_prepared_before_returning_reserved_work(tmp_path) -> None
 
     assert deferred is not None and deferred.reservation_id == 0
     assert store.load_records()[0]["state"] == STATE_PREPARED
+
+
+def test_resume_dedupe_skips_committed_ids_without_credit_or_cross_epoch_skip(
+    tmp_path,
+) -> None:
+    args = _args(tmp_path, target=1)
+    source = _source(args, ["same-prompt-every-epoch"])
+    store = PartialRolloutStore(
+        tmp_path / "wal",
+        _header(tmp_path, target=1, committed_reservation_ids={0, 1}),
+        committed_reservation_ids={0, 1},
+    )
+    worker = AsyncPolarRolloutWorker(args, source, partial_store=store)
+    worker.set_rollout_context(8)
+    worker.request_groups(1)
+
+    deferred = worker._next_group_for_submission()
+
+    assert deferred is not None and deferred.reservation_id == 2
+    assert deferred.group[0].prompt == "same-prompt-every-epoch"
+    records = store.load_records()
+    assert [record["state"] for record in records] == [
+        STATE_DROP,
+        STATE_DROP,
+        STATE_PREPARED,
+    ]
+    assert [record.get("drop_outcome") for record in records[:2]] == [
+        "resume_duplicate",
+        "resume_duplicate",
+    ]
+    reservation_metrics = source.reservation_metrics()
+    assert reservation_metrics["polar/reservations/reserved_since_worker_start"] == 3.0
+    assert (
+        reservation_metrics["polar/reservations/consumed_resume_duplicate_since_worker_start"]
+        == 2.0
+    )
+    assert reservation_metrics["polar/reservations/outstanding_groups"] == 1.0
+
+    metrics = worker.snapshot_metrics()
+    assert metrics["polar/scheduler/admission_credit"] == 2.0
+    assert metrics["polar/resume_duplicate_groups_delta"] == 2.0
+    assert metrics["polar/resume_duplicate_sessions_delta"] == 2.0
+    assert metrics["polar/reservations/consumed_resume_duplicate_delta"] == 2.0
 
 
 def test_full_ready_recovery_initializes_async_credit_without_over_admission(tmp_path) -> None:
@@ -738,6 +934,77 @@ def test_kill_after_six_of_eight_recovers_six_and_generates_only_two(
     records = store.load_records()
     assert [record["state"] for record in records] == [STATE_KEEP] * 8
     assert store._ready_path().is_file()
+
+
+def test_recovery_replaces_ready_wal_group_already_committed_by_checkpoint(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("RUN_ID", "test-run")
+    args = _args(tmp_path, target=1)
+    prompts = ["p0", "p1", "p2"]
+    writer = _source(args, prompts)
+    checkpoint_reservations = writer.get_samples_with_reservation(2)
+    writer.mark_consumed(1, outcome="accepted")
+    writer.save(7)
+    _write_model_checkpoint_shell(tmp_path, 7)
+    _write_emitted_rollout_journal(tmp_path, 7, [1])
+
+    store = maybe_open_partial_rollout_store(
+        args,
+        resolve_polar_slime_config(args),
+        8,
+    )
+    assert store is not None
+    assert store.committed_reservation_ids == frozenset({1})
+
+    replay_writer = _source(args, prompts)
+    replay_writer.load(7)
+    replay_reservations = replay_writer.get_samples_with_reservation(2)
+    assert [item[0] for item in checkpoint_reservations] == [0, 1]
+    assert [item[0] for item in replay_reservations] == [0, 1]
+    dropped = _record_result(store, 0, replay_reservations[0][1])
+    store.record_drop(dropped.reservation_id, outcome="dynamic_filter", reason="test")
+    completed = _record_result(store, 1, replay_reservations[1][1])
+    _annotate_accepted_samples(
+        completed.samples,
+        accepted_rollout_id=8,
+        staleness=0,
+        policy_version=8,
+        scheduler_group_id=1,
+    )
+    store.record_keep(completed, accepted_rollout_id=8)
+    store.mark_ready([1])
+    assert store.sealed is True
+
+    restored = _source(args, prompts)
+    restored.load(7)
+    plan = rollout_module._prepare_partial_recovery(
+        args,
+        rollout_id=8,
+        data_source=restored,
+    )
+
+    assert plan.store is store or plan.store is not None
+    assert plan.kept == [] and plan.result_ready == [] and plan.deferred == []
+    assert plan.dropped_count == 2
+    assert plan.resume_duplicate_count == 1
+    assert not store._ready_path().exists()
+    records = store.load_records()
+    assert [record["state"] for record in records] == [STATE_DROP, STATE_DROP]
+    assert records[1]["drop_outcome"] == "resume_duplicate"
+    assert (
+        restored.reservation_metrics()[
+            "polar/reservations/consumed_resume_duplicate_since_worker_start"
+        ]
+        == 1.0
+    )
+
+    worker = AsyncPolarRolloutWorker(args, restored, partial_store=plan.store)
+    worker.set_rollout_context(8)
+    worker.request_groups(1)
+    replacement = worker._next_group_for_submission()
+    assert replacement is not None and replacement.reservation_id == 2
 
 
 def test_stale_policy_record_is_quarantined_before_reservation_rebuild(

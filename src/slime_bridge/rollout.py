@@ -215,6 +215,7 @@ class _PartialRecoveryPlan:
     deferred: list[_DeferredGroup] = field(default_factory=list)
     candidate_only: list[_CompletedGroup] = field(default_factory=list)
     dropped_count: int = 0
+    resume_duplicate_count: int = 0
     dynamic_filter_metrics: dict[str, float] = field(default_factory=dict)
     reservation_metrics: dict[str, float] = field(default_factory=dict)
 
@@ -882,6 +883,9 @@ class AsyncPolarRolloutWorker:
         self._task_results: dict[str, TaskResult] = {}
         self._callback_url: str | None = None
         self._partial_store = partial_store
+        self._resume_committed_reservation_ids = (
+            partial_store.committed_reservation_ids if partial_store is not None else frozenset()
+        )
         # Recovered KEEP groups live in generate_rollout_polar_async rather
         # than a worker queue, but they still own reservations and must count
         # against the bounded async window until the complete batch commits.
@@ -1431,46 +1435,97 @@ class AsyncPolarRolloutWorker:
         except queue.Empty:
             pass
 
-        reservation_getter = getattr(self.data_source, "get_samples_with_reservation", None)
-        if callable(reservation_getter):
-            reservations = reservation_getter(1)
-            if not reservations:
-                return None
-            if len(reservations) != 1:
+        while True:
+            reservation_getter = getattr(
+                self.data_source,
+                "get_samples_with_reservation",
+                None,
+            )
+            if callable(reservation_getter):
+                reservations = reservation_getter(1)
+                if not reservations:
+                    return None
+                if len(reservations) != 1:
+                    raise PolarRolloutSchedulerError(
+                        "Slime data source returned an invalid reservation batch"
+                    )
+                reservation_id, group = reservations[0]
+            else:
+                groups = self.data_source.get_samples(1)
+                if not groups:
+                    return None
+                reservation_id = None
+                group = groups[0]
+            if not group:
                 raise PolarRolloutSchedulerError(
-                    "Slime data source returned an invalid reservation batch"
+                    "Slime data source returned an empty sample group"
                 )
-            reservation_id, group = reservations[0]
-        else:
-            groups = self.data_source.get_samples(1)
-            if not groups:
-                return None
-            reservation_id = None
-            group = groups[0]
-        if not group:
-            raise PolarRolloutSchedulerError("Slime data source returned an empty sample group")
-        submitted_rollout_id, policy_version = self._rollout_context()
-        partial_store = self._partial_store
-        if partial_store is not None and partial_store.sealed:
-            partial_store = None
+            submitted_rollout_id, policy_version = self._rollout_context()
+            partial_store = self._partial_store
+            if partial_store is not None and partial_store.sealed:
+                partial_store = None
+
+            if (
+                reservation_id is not None
+                and int(reservation_id) in self._resume_committed_reservation_ids
+            ):
+                self._skip_resume_duplicate(
+                    reservation_id=int(reservation_id),
+                    group=group,
+                    submitted_rollout_id=submitted_rollout_id,
+                    policy_version=policy_version,
+                    partial_store=partial_store,
+                )
+                # A replay skip never owned remote work and therefore consumes
+                # no fully-async admission credit. Continue synchronously until
+                # the first genuinely admissible reservation is found.
+                continue
+
+            if partial_store is not None:
+                if reservation_id is None:
+                    raise PolarRolloutSchedulerError(
+                        "partial rollout WAL requires reservation-aware data source"
+                    )
+                partial_store.record_prepared(
+                    reservation_id=reservation_id,
+                    group=group,
+                    submitted_rollout_id=submitted_rollout_id,
+                    policy_version=policy_version,
+                )
+            self._consume_fully_async_admission_credit()
+            return _DeferredGroup(
+                group=group,
+                reservation_id=reservation_id,
+                submitted_rollout_id=submitted_rollout_id,
+                policy_version=policy_version,
+                partial_store=partial_store,
+            )
+
+    def _skip_resume_duplicate(
+        self,
+        *,
+        reservation_id: int,
+        group: list[Any],
+        submitted_rollout_id: int,
+        policy_version: int,
+        partial_store: PartialRolloutStore | None,
+    ) -> None:
+        """Consume a base-checkpoint duplicate before any remote submission."""
+
         if partial_store is not None:
-            if reservation_id is None:
-                raise PolarRolloutSchedulerError(
-                    "partial rollout WAL requires reservation-aware data source"
-                )
             partial_store.record_prepared(
                 reservation_id=reservation_id,
                 group=group,
                 submitted_rollout_id=submitted_rollout_id,
                 policy_version=policy_version,
             )
-        self._consume_fully_async_admission_credit()
-        return _DeferredGroup(
-            group=group,
-            reservation_id=reservation_id,
-            submitted_rollout_id=submitted_rollout_id,
-            policy_version=policy_version,
-            partial_store=partial_store,
+            partial_store.record_resume_duplicate(reservation_id)
+        self._consume_reservation(reservation_id, outcome="resume_duplicate")
+        self._inc_metric("polar/resume_duplicate_groups")
+        self._inc_metric("polar/resume_duplicate_sessions", len(group))
+        logger.info(
+            "Skipping reservation %s already committed by the base checkpoint",
+            reservation_id,
         )
 
     def _can_admit_group(
@@ -2849,6 +2904,15 @@ def _prepare_partial_recovery(
 
     try:
         records = store.load_records()
+        committed_record_ids = {
+            int(record["reservation_id"])
+            for record in records
+            if int(record["reservation_id"]) in store.committed_reservation_ids
+        }
+        for reservation_id in sorted(committed_record_ids):
+            store.record_resume_duplicate(reservation_id)
+        if committed_record_ids:
+            records = store.load_records()
         recovered_owned = sum(record["state"] != STATE_DROP for record in records)
         if recovered_owned > config.max_concurrency:
             raise PartialRolloutError(
@@ -2912,7 +2976,13 @@ def _prepare_partial_recovery(
             logger.exception("Failed to quarantine invalid partial rollout WAL")
             raise
         # Continue with the existing at-least-once replay path and a fresh WAL.
-        return _PartialRecoveryPlan(store=PartialRolloutStore(store.directory, store.header))
+        return _PartialRecoveryPlan(
+            store=PartialRolloutStore(
+                store.directory,
+                store.header,
+                committed_reservation_ids=store.committed_reservation_ids,
+            )
+        )
 
     plan = _PartialRecoveryPlan(store=store)
     drop_records: list[dict[str, Any]] = []
@@ -2969,6 +3039,9 @@ def _prepare_partial_recovery(
     marker_many = getattr(data_source, "mark_consumed_many", None)
     marker_one = getattr(data_source, "mark_consumed", None)
     plan.dropped_count = len(drop_records)
+    plan.resume_duplicate_count = sum(
+        record.get("drop_outcome") == "resume_duplicate" for record in drop_records
+    )
     for record in drop_records:
         reservation_id = int(record["reservation_id"])
         outcome = str(record.get("drop_outcome") or "recovered_drop")
@@ -2984,12 +3057,14 @@ def _prepare_partial_recovery(
             plan.reservation_metrics.update(metrics)
 
     logger.info(
-        "Recovered partial rollout %s: keep=%d result_ready=%d prepared=%d drop=%d",
+        "Recovered partial rollout %s: keep=%d result_ready=%d prepared=%d "
+        "drop=%d resume_duplicate=%d",
         rollout_id,
         len(plan.kept),
         len(plan.result_ready),
         len(plan.deferred),
         len(drop_records),
+        plan.resume_duplicate_count,
     )
     return plan
 
@@ -3066,6 +3141,9 @@ def generate_rollout_polar_async(
             ),
             "polar/partial_recovery/restored_drop_group_count": float(
                 partial_recovery.dropped_count
+            ),
+            "polar/partial_recovery/resume_duplicate_group_count": float(
+                partial_recovery.resume_duplicate_count
             ),
         }
     start = time.monotonic()
