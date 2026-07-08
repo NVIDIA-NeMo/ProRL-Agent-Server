@@ -43,6 +43,10 @@ class ModelPoolConfig(_StrictModel):
     base_url: str
     api_key_env: str
     max_concurrency: int = Field(default=32, gt=0)
+    # A request slot spans one HTTP completion.  SPilot candidates issue many
+    # sequential completions, so optionally keep a second, coarser bound for
+    # the complete candidate-agent process on this gateway.
+    max_active_episodes: int | None = Field(default=None, gt=0)
 
     @field_validator("alias")
     @classmethod
@@ -76,6 +80,18 @@ class ModelPoolConfig(_StrictModel):
                 "gateway.nodes[].model_pool[].api_key_env must be an environment variable name"
             )
         return name
+
+    @model_validator(mode="after")
+    def _episode_cap_fits_request_cap(self) -> "ModelPoolConfig":
+        if (
+            self.max_active_episodes is not None
+            and self.max_active_episodes > self.max_concurrency
+        ):
+            raise ValueError(
+                "gateway.nodes[].model_pool[].max_active_episodes cannot exceed "
+                "max_concurrency"
+            )
+        return self
 
 
 class GatewayNodeConfig(_StrictModel):

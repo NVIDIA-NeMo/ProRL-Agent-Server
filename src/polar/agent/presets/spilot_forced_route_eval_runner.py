@@ -14,6 +14,7 @@ fail-closed boundary; ordinary training never sets it.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -71,6 +72,34 @@ def run_forced_eval(config: dict[str, object], task: str) -> dict[str, object]:
         raise ValueError("forced-route eval config acknowledgement is missing")
     if config.get("max_pool_calls") != 1:
         raise ValueError("forced-route eval requires max_pool_calls=1")
+    timeout_names = (
+        "pool_timeout_seconds",
+        "router_timeout_seconds",
+        "total_timeout_seconds",
+        "reserve_evaluator_seconds",
+        "deadline_margin_seconds",
+    )
+    timeouts: dict[str, float] = {}
+    for name in timeout_names:
+        value = config.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"forced-route eval {name} must be numeric")
+        parsed = float(value)
+        if not math.isfinite(parsed) or parsed < 0:
+            raise ValueError(f"forced-route eval {name} must be finite and non-negative")
+        timeouts[name] = parsed
+    minimum_total = (
+        timeouts["pool_timeout_seconds"]
+        + timeouts["router_timeout_seconds"]
+        + timeouts["reserve_evaluator_seconds"]
+        + timeouts["deadline_margin_seconds"]
+    )
+    if timeouts["total_timeout_seconds"] < minimum_total:
+        raise ValueError(
+            "forced-route eval total_timeout_seconds must cover pool + Router + "
+            f"evaluator reserve + deadline margin ({timeouts['total_timeout_seconds']:g} "
+            f"< {minimum_total:g})"
+        )
     candidate_model = forced.get("candidate_model")
     if not isinstance(candidate_model, str) or not candidate_model:
         raise ValueError("forced-route eval candidate_model must be non-empty")
@@ -79,36 +108,50 @@ def run_forced_eval(config: dict[str, object], task: str) -> dict[str, object]:
     core_config.pop("forced_route_eval", None)
     router = ForcedRouteClient()
     pool = core.MiniSwePoolExecutor(core_config)
-    orchestrator = core.SpilotOrchestrator(
-        config=core_config,
-        task=task,
-        router=router,
-        pool=pool,
+    admission = (
+        core.GatewayEpisodeAdmissionClient()
+        if core_config.get("pool_episode_admission_enabled") is True
+        else None
     )
-    matching = [
-        candidate
-        for candidate in orchestrator.candidates
-        if candidate.model == candidate_model
-    ]
-    if len(matching) != 1:
-        raise ValueError(
-            f"forced candidate {candidate_model!r} matched {len(matching)} pool entries; expected 1"
+    try:
+        orchestrator = core.SpilotOrchestrator(
+            config=core_config,
+            task=task,
+            router=router,
+            pool=pool,
+            admission=admission,
         )
-    router.slot = matching[0].slot
-    result = orchestrator.run()
-    if router.call_count != 1:
-        raise ValueError("forced-route eval did not execute exactly one deterministic decision")
-    if len(result.get("calls", [])) != 1 or not result.get("submitted"):
-        raise ValueError("forced-route eval did not execute one pool call followed by submit")
-    result.update(
-        {
-            "eval_only": True,
-            "actor_invoked": False,
-            "forced_candidate_model": candidate_model,
-            "forced_route_acknowledgement": EVAL_ONLY_ACK,
-        }
-    )
-    return result
+        matching = [
+            candidate
+            for candidate in orchestrator.candidates
+            if candidate.model == candidate_model
+        ]
+        if len(matching) != 1:
+            raise ValueError(
+                f"forced candidate {candidate_model!r} matched {len(matching)} pool entries; expected 1"
+            )
+        router.slot = matching[0].slot
+        result = orchestrator.run()
+        if router.call_count != 1:
+            raise ValueError(
+                "forced-route eval did not execute exactly one deterministic decision"
+            )
+        if len(result.get("calls", [])) != 1 or not result.get("submitted"):
+            raise ValueError(
+                "forced-route eval did not execute one pool call followed by submit"
+            )
+        result.update(
+            {
+                "eval_only": True,
+                "actor_invoked": False,
+                "forced_candidate_model": candidate_model,
+                "forced_route_acknowledgement": EVAL_ONLY_ACK,
+            }
+        )
+        return result
+    finally:
+        if admission is not None:
+            admission.close()
 
 
 def main() -> int:

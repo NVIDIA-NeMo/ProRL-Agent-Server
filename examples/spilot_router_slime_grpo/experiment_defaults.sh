@@ -9,14 +9,17 @@ export POLAR_DATA_ROOT="${POLAR_DATA_ROOT:-${_SPILOT_ROOT}/data}"
 export TMAX_RUN_STATE_FILE="${TMAX_RUN_STATE_FILE:-${POLAR_DATA_ROOT}/runs/spilot_router_slime_grpo/current_run.env}"
 _SPILOT_REFERENCE_DATA_DIR="${POLAR_DATA_ROOT}/runs/tmax-14598r-14498t100h-20260701T011143Z"
 
-# Controlled-comparison contract: keep the learner, rollout topology, and
-# effective GRPO batch identical to the validated Qwen3.5-9B TMax reference
-# run (tmax-8n64-qwen35-9b-lr1e6-b8n32-noeval-fresh-20260702T074934Z).
-# Only the agent harness/builder/evaluator and remote candidate-model calls are
-# Router-specific.  This prevents a topology or batch-size change from being
-# mistaken for a routing gain.
+# Controlled-comparison contract: keep the learner, GPU allocation, gateway
+# worker pools, and effective GRPO batch identical to the validated Qwen3.5-9B
+# TMax reference run
+# (tmax-8n64-qwen35-9b-lr1e6-b8n32-noeval-fresh-20260702T074934Z).
+# Candidate-provider pressure is bounded separately by full-episode admission;
+# changing the gateway pools would otherwise confound Router quality with a
+# rollout-throughput change.
 export NUM_NODES="${NUM_NODES:-8}"
-export PARTITION="${PARTITION:-backfill,batch}"
+export PARTITION="${PARTITION:-backfill}"
+export WALL_TIME="${WALL_TIME:-2-00:00:00}"
+export TMAX_MIN_WALL_TIME="${TMAX_MIN_WALL_TIME:-2-00:00:00}"
 export SLURM_GPUS="${SLURM_GPUS:-8}"
 export RAY_NUM_GPUS_PER_NODE="${RAY_NUM_GPUS_PER_NODE:-8}"
 export ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-2}"
@@ -53,6 +56,87 @@ export POLAR_MAX_RUN_WORKERS="${POLAR_MAX_RUN_WORKERS:-576}"
 export POLAR_MAX_POSTRUN_WORKERS="${POLAR_MAX_POSTRUN_WORKERS:-384}"
 export POLAR_APPTAINER_BROKER_START_CONCURRENCY="${POLAR_APPTAINER_BROKER_START_CONCURRENCY:-8}"
 
+# The protected broker and host-supplied read-only mini-SWE runtime are only a
+# security boundary when task images cannot inherit host mounts/environment or
+# share the host PID/IPC namespaces.  Default missing values, but never repair
+# an explicit/inherited opt-out: a formal SPilot run must fail closed instead.
+for _spilot_isolation_name in \
+    POLAR_APPTAINER_NO_MOUNT_HOSTFS \
+    POLAR_APPTAINER_NO_MOUNT_TMP \
+    POLAR_APPTAINER_ISOLATE_PID \
+    POLAR_APPTAINER_ISOLATE_IPC \
+    POLAR_APPTAINER_CLEANENV; do
+    _spilot_isolation_value="${!_spilot_isolation_name:-1}"
+    export "${_spilot_isolation_name}=${_spilot_isolation_value}"
+    if [ "${_spilot_isolation_value}" != 1 ]; then
+        echo "ERROR: formal SPilot requires ${_spilot_isolation_name}=1 (got ${_spilot_isolation_value})" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+done
+unset _spilot_isolation_name _spilot_isolation_value
+
+# Full candidate episodes, rather than individual HTTP requests, are the scarce
+# resource.  These totals are aggregate across the eight gateway processes and
+# are divided exactly below.  Persist both configured totals and effective
+# local/effective totals so a resumed run cannot silently change its provider
+# pressure.
+export SPILOT_EPISODE_ADMISSION_ENABLED="${SPILOT_EPISODE_ADMISSION_ENABLED:-true}"
+export TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT="${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT:-0}"
+if ! [[ "${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT must be a non-negative integer" >&2
+    return 1 2>/dev/null || exit 1
+fi
+export SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT="${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT:-${NUM_NODES}}"
+if ! [[ "${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT must be a positive integer" >&2
+    return 1 2>/dev/null || exit 1
+fi
+case "${SPILOT_EPISODE_ADMISSION_ENABLED}" in
+    true)
+        export SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS="${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS:-14400}"
+        export SPILOT_QWEN_MAX_ACTIVE_EPISODES="${SPILOT_QWEN_MAX_ACTIVE_EPISODES:-8}"
+        export SPILOT_GPT_MAX_ACTIVE_EPISODES="${SPILOT_GPT_MAX_ACTIVE_EPISODES:-32}"
+        if ! [[ "${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS}" =~ ^[1-9][0-9]*$ ]] || \
+           [ "${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS}" -gt 86400 ]; then
+            echo "ERROR: SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS must be in [1, 86400]" >&2
+            return 1 2>/dev/null || exit 1
+        fi
+        for _spilot_total_name in \
+            SPILOT_QWEN_MAX_ACTIVE_EPISODES SPILOT_GPT_MAX_ACTIVE_EPISODES; do
+            _spilot_total_value="${!_spilot_total_name}"
+            if ! [[ "${_spilot_total_value}" =~ ^[1-9][0-9]*$ ]] || \
+               [ $((_spilot_total_value % SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT)) -ne 0 ]; then
+                echo "ERROR: ${_spilot_total_name} must be positive and divisible by SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT=${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT}" >&2
+                return 1 2>/dev/null || exit 1
+            fi
+        done
+        _spilot_qwen_local="$((SPILOT_QWEN_MAX_ACTIVE_EPISODES / SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT))"
+        _spilot_gpt_local="$((SPILOT_GPT_MAX_ACTIVE_EPISODES / SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT))"
+        export SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES="${SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES:-${_spilot_qwen_local}}"
+        export SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES="${SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES:-${_spilot_gpt_local}}"
+        export SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY="${SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY:-${_spilot_qwen_local}}"
+        export SPILOT_GPT_GATEWAY_MAX_CONCURRENCY="${SPILOT_GPT_GATEWAY_MAX_CONCURRENCY:-${_spilot_gpt_local}}"
+        export SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES="${SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES:-$((_spilot_qwen_local * SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT))}"
+        export SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES="${SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES:-$((_spilot_gpt_local * SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT))}"
+        ;;
+    false)
+        export SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS="${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS:-0}"
+        export SPILOT_QWEN_MAX_ACTIVE_EPISODES="${SPILOT_QWEN_MAX_ACTIVE_EPISODES:-0}"
+        export SPILOT_GPT_MAX_ACTIVE_EPISODES="${SPILOT_GPT_MAX_ACTIVE_EPISODES:-0}"
+        export SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES="${SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES:-null}"
+        export SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES="${SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES:-null}"
+        export SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY="${SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY:-32}"
+        export SPILOT_GPT_GATEWAY_MAX_CONCURRENCY="${SPILOT_GPT_GATEWAY_MAX_CONCURRENCY:-32}"
+        export SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES="${SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES:-0}"
+        export SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES="${SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES:-0}"
+        ;;
+    *)
+        echo "ERROR: SPILOT_EPISODE_ADMISSION_ENABLED must be true or false" >&2
+        return 1 2>/dev/null || exit 1
+        ;;
+esac
+unset _spilot_total_name _spilot_total_value _spilot_qwen_local _spilot_gpt_local
+
 # Match the reference trainer's token capacity and loss reduction.  Router
 # actions are shorter, but changing either value would change optimizer-scale
 # semantics independently of the action space.
@@ -70,16 +154,42 @@ export TMAX_OPTIMIZER_CPU_OFFLOAD="${TMAX_OPTIMIZER_CPU_OFFLOAD:-0}"
 # Slime's boundary is exclusive: iterations 0..199 are 200 optimizer steps.
 export TMAX_NUM_ROLLOUT="${TMAX_NUM_ROLLOUT:-200}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
-export SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-}"
+# Preserve the baseline's every-five-step synchronous recovery cadence, but
+# retain only the latest periodic checkpoint by default.  Slime passes the
+# zero-based completed iteration to Megatron, so this cadence writes 4, 9, 14,
+# ..., 199; each previous non-multiple of five is pruned on the next save.  The
+# current user quota has less free space than the reference run's 9.2-TiB
+# checkpoint set; retention changes storage history only, not rollout or
+# optimizer semantics.
+export SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-5}"
 export TMAX_AGENT_HARNESS="${TMAX_AGENT_HARNESS:-spilot_router}"
 export POLAR_AGENT_HARNESS="${TMAX_AGENT_HARNESS}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-spilot-router-qwen35-9b-8n64-200step}"
 export WANDB_GROUP="${WANDB_GROUP:-spilot-router-qwen35-9b-8n64}"
 
-export TMAX_TRAIN_AGENT_TIMEOUT_SECONDS="${TMAX_TRAIN_AGENT_TIMEOUT_SECONDS:-3300}"
-export POLAR_TASK_TIMEOUT_FLOOR_SECONDS="${POLAR_TASK_TIMEOUT_FLOOR_SECONDS:-4500}"
-export POLAR_REQUEST_TIMEOUT="${POLAR_REQUEST_TIMEOUT:-5100}"
-export TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS:-4500}"
+if [ "${SPILOT_EPISODE_ADMISSION_ENABLED}" = "true" ]; then
+    # Q=14,400 seconds is shared by both candidate calls. The portable runner
+    # keeps total_timeout_seconds=3,000 and credits only measured admission
+    # wait. The outer agent envelope is base 3,300 + Q. Task/request retain a
+    # second full agent envelope as infrastructure headroom. These bounds are
+    # deliberately independent of gateway worker counts and provider caps:
+    #   agent   = 3,300 + Q                 = 17,700
+    #   task    = 4,500 + Q + agent envelope = 36,600
+    #   request = 5,100 + Q + agent envelope = 37,200
+    _spilot_agent_timeout="$((3300 + SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS))"
+    _spilot_task_timeout="$((4500 + SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS + _spilot_agent_timeout))"
+    _spilot_request_timeout="$((5100 + SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS + _spilot_agent_timeout))"
+else
+    _spilot_agent_timeout=3300
+    _spilot_task_timeout=4500
+    _spilot_request_timeout=5100
+fi
+export TMAX_TRAIN_AGENT_TIMEOUT_SECONDS="${TMAX_TRAIN_AGENT_TIMEOUT_SECONDS:-${_spilot_agent_timeout}}"
+export POLAR_TASK_TIMEOUT_FLOOR_SECONDS="${POLAR_TASK_TIMEOUT_FLOOR_SECONDS:-${_spilot_task_timeout}}"
+export POLAR_REQUEST_TIMEOUT="${POLAR_REQUEST_TIMEOUT:-${_spilot_request_timeout}}"
+export TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS:-43200}"
+export TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS:-43200}"
+unset _spilot_agent_timeout _spilot_task_timeout _spilot_request_timeout
 
 # Reuse the exact reference train ordering and held-out task set.  Router cards
 # and action instructions are injected by the harness, so the underlying TMax

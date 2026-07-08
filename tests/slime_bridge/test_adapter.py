@@ -122,6 +122,38 @@ def test_session_result_to_samples_converts_trace_to_slime_like_sample(monkeypat
 
 
 @pytest.mark.parametrize(
+    "malformed_reward",
+    [float("nan"), float("inf"), float("-inf"), True, False],
+)
+def test_adapter_fail_closes_nonfinite_or_boolean_trace_reward(
+    monkeypatch,
+    malformed_reward,
+) -> None:
+    monkeypatch.setattr(adapter, "_load_sample_type", lambda: FakeSample)
+    # Bypass the current schema to model replay of a legacy artifact written
+    # before reward validation existed; the adapter remains a second boundary.
+    trace = Trace.model_construct(
+        prompt_ids=[1],
+        response_ids=[2],
+        loss_mask=[1],
+        prompt_messages=[],
+        response_messages=[],
+        response_logprobs=[-0.1],
+        reward=malformed_reward,
+        metadata={},
+    )
+
+    sample = session_result_to_samples(
+        _session_result(trace=trace),
+        group_index=11,
+        trajectory_index=2,
+        reward_key="score",
+    )[0]
+
+    assert sample.reward == {"score": 0.0}
+
+
+@pytest.mark.parametrize(
     ("session_status", "sample_status", "filter_reason", "error"),
     [
         (

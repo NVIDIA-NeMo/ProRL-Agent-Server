@@ -40,10 +40,15 @@ export TMAX_EXTERNAL_EVAL_ENABLED="${TMAX_EXTERNAL_EVAL_ENABLED:-0}"
 export TMAX_MAX_TASKS="${TMAX_MAX_TASKS:-8}"
 export TMAX_TOTAL_TASKS="${TMAX_TOTAL_TASKS:-8}"
 export TMAX_REQUIRE_EXACT_TOTAL_TASKS="${TMAX_REQUIRE_EXACT_TOTAL_TASKS:-0}"
+# A smoke deliberately selects the first small slice instead of rebuilding the
+# complete formal train set.  The full-run holdout exclusion contract only
+# supports the complete start=0/max=-1 dataset, so do not inherit it here.
+export TMAX_EXCLUDE_DATA=""
 
-export WALL_TIME="${WALL_TIME:-3:00:00}"
-export TMAX_MIN_WALL_TIME="${TMAX_MIN_WALL_TIME:-3:00:00}"
-export TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS:-1800}"
+export WALL_TIME="${WALL_TIME:-1-00:00:00}"
+export TMAX_MIN_WALL_TIME="${TMAX_MIN_WALL_TIME:-1-00:00:00}"
+export TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS:-43200}"
+export TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS:-43200}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-spilot-router-qwen35-9b-1n-smoke}"
 
 exec bash "${SCRIPT_DIR}/submit_slurm.sh" "$@"

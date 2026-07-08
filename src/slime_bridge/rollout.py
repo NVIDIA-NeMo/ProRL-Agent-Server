@@ -3268,6 +3268,16 @@ def generate_rollout_polar_async(
     ):
         if source in accepted_quality:
             metrics[f"polar/accepted/{suffix}"] = accepted_quality[source]
+    # Slime's built-in rollout/raw_reward is intentionally trace/sample
+    # weighted and includes zero-gradient placeholders. Publish the
+    # exchangeable one-session-one-vote quality next to it so dashboards do
+    # not mistake a diagnostic transport field for Router outcome quality.
+    if "polar/reward_mean" in accepted_quality:
+        metrics["rollout/session_reward_mean"] = accepted_quality["polar/reward_mean"]
+    if "polar/reward_accounted_sessions" in accepted_quality:
+        metrics["rollout/session_reward_accounted_sessions"] = accepted_quality[
+            "polar/reward_accounted_sessions"
+        ]
     metrics.update(_completed_service_metrics(accepted_completions))
     metrics["timing/pipeline_ms/rollout_collect"] = elapsed * 1000.0
     output = RolloutFnTrainOutput(samples=data, metrics=metrics)
@@ -3318,11 +3328,7 @@ def _sample_reward_for_example(sample: Any) -> float:
         value = reward.get("score", next(iter(reward.values()), 0.0))
     else:
         value = reward
-    try:
-        parsed = float(value or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-    return parsed if math.isfinite(parsed) else 0.0
+    return _finite_float_or_zero(value)
 
 
 def _trajectory_example_payload(session_id: str, samples: list[Any]) -> dict[str, Any]:
@@ -3850,12 +3856,22 @@ def _extract_sample_reward(sample: Any, reward_key: str) -> float:
     reward = getattr(sample, "reward", None)
     if isinstance(reward, dict):
         if reward_key in reward:
-            return float(reward[reward_key])
+            return _finite_float_or_zero(reward[reward_key])
         if "score" in reward:
-            return float(reward["score"])
+            return _finite_float_or_zero(reward["score"])
     if isinstance(reward, (int, float)):
-        return float(reward)
+        return _finite_float_or_zero(reward)
     return 0.0
+
+
+def _finite_float_or_zero(value: Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
 
 
 def _is_trainable_agent_timeout_sample(sample: Any) -> bool:
@@ -3946,12 +3962,58 @@ def _spilot_router_metrics(
     verify_candidate_counts = {"C0": 0, "C1": 0}
     direct_submit_sessions = 0
     pool_call_count = 0
+    pool_unattributed_call_count = 0
     pool_status_counts = {"completed": 0, "failed": 0, "timeout": 0}
+    pool_status_candidate_counts = {
+        candidate: {"completed": 0, "failed": 0, "timeout": 0} for candidate in ("C0", "C1")
+    }
+    pool_duration_ms_by_candidate: dict[str, list[float]] = {
+        "C0": [],
+        "C1": [],
+    }
+    admission_wait_ms_by_candidate: dict[str, list[float]] = {
+        "C0": [],
+        "C1": [],
+    }
     total_cost = 0.0
+    admission_session_count = 0
+    admission_waits_ms: list[float] = []
+    admission_waited_session_count = 0
+    admission_local_caps: list[float] = []
+    admission_failure_count = 0
+    admission_failure_candidate_counts = {"C0": 0, "C1": 0}
+    admission_failure_wait_ms_by_candidate: dict[str, list[float]] = {
+        "C0": [],
+        "C1": [],
+    }
+    admission_fatal_retained_session_count = 0
+    admission_node_health_accounted_session_count = 0
+    admission_node_healthy_session_count = 0
     initial_slot_by_session: dict[str, str] = {}
     initial_candidate_by_session: dict[str, str] = {}
 
     for session_id, metadata in sessions.items():
+        admission_enabled = metadata.get("admission_enabled") is True
+        if admission_enabled:
+            admission_session_count += 1
+            admission_wait_ms = _optional_nonnegative_finite_float(
+                metadata.get("admission_wait_ms")
+            )
+            if admission_wait_ms is not None:
+                admission_waits_ms.append(admission_wait_ms)
+                if admission_wait_ms > 0:
+                    admission_waited_session_count += 1
+            fatal_retained = metadata.get("admission_fatal_retained") is True
+            if fatal_retained:
+                admission_fatal_retained_session_count += 1
+            node_healthy = metadata.get("admission_node_healthy")
+            if node_healthy is True or node_healthy is False:
+                admission_node_health_accounted_session_count += 1
+            # Missing health telemetry is unknown, never an implicit healthy
+            # vote. This keeps partially written/legacy metadata fail closed.
+            if node_healthy is True:
+                admission_node_healthy_session_count += 1
+
         if metadata.get("action_valid") is True:
             action_valid_sessions += 1
         if metadata.get("submitted") is True:
@@ -3962,6 +4024,7 @@ def _spilot_router_metrics(
             total_cost += parsed_cost
 
         candidate_by_slot: dict[str, str] = {}
+        candidate_by_alias: dict[str, str] = {}
         slot_mapping = metadata.get("slot_mapping")
         if isinstance(slot_mapping, dict):
             aliases_by_slot: dict[str, str] = {}
@@ -3976,7 +4039,7 @@ def _spilot_router_metrics(
             # Duplicate aliases cannot be disambiguated safely, so omit their
             # candidate-level attribution while retaining slot diagnostics.
             sorted_aliases = sorted(set(aliases_by_slot.values()))
-            if len(sorted_aliases) == len(aliases_by_slot):
+            if len(sorted_aliases) == 2 and len(aliases_by_slot) == 2:
                 candidate_by_alias = {
                     alias: f"C{index}" for index, alias in enumerate(sorted_aliases[:2])
                 }
@@ -3985,6 +4048,23 @@ def _spilot_router_metrics(
                     for slot, alias in aliases_by_slot.items()
                     if alias in candidate_by_alias
                 }
+
+        admission_failure = metadata.get("admission_failure")
+        if admission_enabled and isinstance(admission_failure, dict):
+            admission_failure_count += 1
+            failure_model = admission_failure.get("model")
+            failure_candidate = (
+                candidate_by_alias.get(failure_model) if isinstance(failure_model, str) else None
+            )
+            if failure_candidate in admission_failure_candidate_counts:
+                admission_failure_candidate_counts[failure_candidate] += 1
+                failure_wait_ms = _optional_nonnegative_finite_float(
+                    admission_failure.get("wait_ms")
+                )
+                if failure_wait_ms is not None:
+                    admission_failure_wait_ms_by_candidate[failure_candidate].append(
+                        failure_wait_ms
+                    )
 
         actions = metadata.get("actions")
         if isinstance(actions, list):
@@ -4030,6 +4110,36 @@ def _spilot_router_metrics(
                 status = str(call.get("status") or "").lower()
                 if status in pool_status_counts:
                     pool_status_counts[status] += 1
+                call_model = call.get("model")
+                call_slot = str(call.get("slot") or "").upper()
+                model_candidate = (
+                    candidate_by_alias.get(call_model) if isinstance(call_model, str) else None
+                )
+                slot_candidate = candidate_by_slot.get(call_slot)
+                call_candidate = (
+                    model_candidate
+                    if model_candidate is not None and model_candidate == slot_candidate
+                    else None
+                )
+                if call_candidate in pool_status_candidate_counts:
+                    if status in pool_status_counts:
+                        pool_status_candidate_counts[call_candidate][status] += 1
+                    duration_ms = _optional_nonnegative_finite_float(call.get("duration_ms"))
+                    if duration_ms is not None:
+                        pool_duration_ms_by_candidate[call_candidate].append(duration_ms)
+                    call_admission_wait_ms = _optional_nonnegative_finite_float(
+                        call.get("admission_wait_ms")
+                    )
+                    if call_admission_wait_ms is not None:
+                        admission_wait_ms_by_candidate[call_candidate].append(
+                            call_admission_wait_ms
+                        )
+                else:
+                    pool_unattributed_call_count += 1
+                if admission_enabled:
+                    local_cap = _optional_nonnegative_finite_float(call.get("admission_local_cap"))
+                    if local_cap is not None and local_cap > 0:
+                        admission_local_caps.append(local_cap)
 
     session_count = len(sessions)
     metrics: dict[str, float] = {
@@ -4048,11 +4158,96 @@ def _spilot_router_metrics(
         f"{prefix}/verify_candidate_c1_count": float(verify_candidate_counts["C1"]),
         f"{prefix}/direct_submit_count": float(direct_submit_sessions),
         f"{prefix}/pool_call_count": float(pool_call_count),
+        f"{prefix}/pool_unattributed_call_count": float(pool_unattributed_call_count),
         f"{prefix}/pool_completed_count": float(pool_status_counts["completed"]),
         f"{prefix}/pool_failed_count": float(pool_status_counts["failed"]),
         f"{prefix}/pool_timeout_count": float(pool_status_counts["timeout"]),
         f"{prefix}/total_cost": total_cost,
+        f"{prefix}/admission_session_count": float(admission_session_count),
+        f"{prefix}/admission_wait_ms_total": sum(admission_waits_ms),
+        f"{prefix}/admission_wait_accounted_session_count": float(len(admission_waits_ms)),
+        f"{prefix}/admission_waited_session_count": float(admission_waited_session_count),
+        f"{prefix}/admission_fatal_retained_session_count": float(
+            admission_fatal_retained_session_count
+        ),
+        f"{prefix}/admission_failure_count": float(admission_failure_count),
+        f"{prefix}/admission_node_health_accounted_session_count": float(
+            admission_node_health_accounted_session_count
+        ),
+        f"{prefix}/admission_node_healthy_session_count": float(
+            admission_node_healthy_session_count
+        ),
     }
+    if admission_waits_ms:
+        metrics[f"{prefix}/admission_wait_ms_mean"] = sum(admission_waits_ms) / len(
+            admission_waits_ms
+        )
+        metrics[f"{prefix}/admission_wait_ms_max"] = max(admission_waits_ms)
+    if admission_session_count:
+        metrics[f"{prefix}/admission_waited_session_fraction"] = (
+            admission_waited_session_count / admission_session_count
+        )
+        metrics[f"{prefix}/admission_fatal_retained_session_fraction"] = (
+            admission_fatal_retained_session_count / admission_session_count
+        )
+        metrics[f"{prefix}/admission_node_healthy_session_fraction"] = (
+            admission_node_healthy_session_count / admission_session_count
+        )
+        metrics[f"{prefix}/admission_node_health_accounted_session_fraction"] = (
+            admission_node_health_accounted_session_count / admission_session_count
+        )
+    if admission_local_caps:
+        metrics[f"{prefix}/admission_local_cap_observation_count"] = float(
+            len(admission_local_caps)
+        )
+        metrics[f"{prefix}/admission_local_cap_mean"] = sum(admission_local_caps) / len(
+            admission_local_caps
+        )
+        metrics[f"{prefix}/admission_local_cap_min"] = min(admission_local_caps)
+        metrics[f"{prefix}/admission_local_cap_max"] = max(admission_local_caps)
+
+    for candidate in ("C0", "C1"):
+        candidate_name = candidate.lower()
+        metrics[f"{prefix}/admission_failure_candidate_{candidate_name}_count"] = float(
+            admission_failure_candidate_counts[candidate]
+        )
+        failure_waits = admission_failure_wait_ms_by_candidate[candidate]
+        metrics[f"{prefix}/admission_failure_wait_candidate_{candidate_name}_accounted_count"] = (
+            float(len(failure_waits))
+        )
+        if failure_waits:
+            metrics[f"{prefix}/admission_failure_wait_candidate_{candidate_name}_mean_ms"] = sum(
+                failure_waits
+            ) / len(failure_waits)
+            metrics[f"{prefix}/admission_failure_wait_candidate_{candidate_name}_max_ms"] = max(
+                failure_waits
+            )
+        for status in ("completed", "failed", "timeout"):
+            metrics[f"{prefix}/pool_{status}_candidate_{candidate_name}_count"] = float(
+                pool_status_candidate_counts[candidate][status]
+            )
+        candidate_durations = pool_duration_ms_by_candidate[candidate]
+        metrics[f"{prefix}/pool_duration_candidate_{candidate_name}_count"] = float(
+            len(candidate_durations)
+        )
+        if candidate_durations:
+            metrics[f"{prefix}/pool_duration_candidate_{candidate_name}_mean_ms"] = sum(
+                candidate_durations
+            ) / len(candidate_durations)
+            metrics[f"{prefix}/pool_duration_candidate_{candidate_name}_max_ms"] = max(
+                candidate_durations
+            )
+        candidate_admission_waits = admission_wait_ms_by_candidate[candidate]
+        metrics[f"{prefix}/admission_wait_candidate_{candidate_name}_accounted_count"] = float(
+            len(candidate_admission_waits)
+        )
+        if candidate_admission_waits:
+            metrics[f"{prefix}/admission_wait_candidate_{candidate_name}_mean_ms"] = sum(
+                candidate_admission_waits
+            ) / len(candidate_admission_waits)
+            metrics[f"{prefix}/admission_wait_candidate_{candidate_name}_max_ms"] = max(
+                candidate_admission_waits
+            )
 
     router_rewards = [
         session_rewards[session_id] for session_id in sessions if session_id in session_rewards
@@ -4362,7 +4557,8 @@ def _polar_extra_metrics(
         # diagnostic name. It is not an exchangeable GRPO outcome: a session
         # can emit multiple traces, while an early-stop cancellation emits a
         # synthetic zero-gradient placeholder.
-        out["polar/reward_mean_all_samples"] = sum(rewards) / len(rewards)
+        safe_rewards = [_finite_float_or_zero(reward) for reward in rewards]
+        out["polar/reward_mean_all_samples"] = sum(safe_rewards) / len(safe_rewards)
     completed_session_rewards_by_key = {
         session_id: sum(trace_rewards) / len(trace_rewards)
         for session_id, trace_rewards in completed_session_trace_rewards.items()

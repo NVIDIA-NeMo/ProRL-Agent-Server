@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
@@ -18,13 +19,23 @@ def _extract_reward(sample: Any, reward_key: str) -> float:
     reward = getattr(sample, "reward", None)
     if isinstance(reward, dict):
         if reward_key in reward:
-            return float(reward[reward_key])
+            return _finite_reward_or_zero(reward[reward_key])
         if "score" in reward:
-            return float(reward["score"])
+            return _finite_reward_or_zero(reward["score"])
         for value in reward.values():
-            if isinstance(value, (int, float)):
-                return float(value)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return _finite_reward_or_zero(value)
         return 0.0
     if isinstance(reward, (int, float)):
-        return float(reward)
+        return _finite_reward_or_zero(reward)
     return 0.0
+
+
+def _finite_reward_or_zero(value: Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0

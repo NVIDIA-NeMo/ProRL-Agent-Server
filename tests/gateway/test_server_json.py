@@ -5,9 +5,39 @@ from types import SimpleNamespace
 from fastapi.responses import Response
 import orjson
 import pytest
+import uvicorn
 
 from polar.gateway.detection import APIType
 from polar.gateway import server
+
+
+def test_serve_exits_nonzero_when_lifespan_shutdown_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_kwargs: dict = {}
+    fake_server = SimpleNamespace(
+        started=True,
+        lifespan=SimpleNamespace(shutdown_failed=True),
+        run=lambda: None,
+    )
+    monkeypatch.setattr(server, "configure_server", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "get_state",
+        lambda: SimpleNamespace(node=SimpleNamespace(host="127.0.0.1", port=8081)),
+    )
+    def fake_config(*_args, **kwargs):
+        config_kwargs.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(uvicorn, "Config", fake_config)
+    monkeypatch.setattr(uvicorn, "Server", lambda *, config: fake_server)
+
+    with pytest.raises(SystemExit) as error:
+        server.serve("topology.yaml")
+
+    assert error.value.code == 1
+    assert config_kwargs["timeout_graceful_shutdown"] == 60
 
 
 @pytest.mark.asyncio

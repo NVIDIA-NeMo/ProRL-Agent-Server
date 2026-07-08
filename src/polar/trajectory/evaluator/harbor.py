@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
@@ -79,9 +80,7 @@ class HarborEvaluator(BaseTrajectoryEvaluator):
             raise ValueError("upload_attempts must be between 1 and 10")
         self.upload_retry_backoff_seconds = float(upload_retry_backoff_seconds)
         if not 0.0 <= self.upload_retry_backoff_seconds <= 60.0:
-            raise ValueError(
-                "upload_retry_backoff_seconds must be between 0 and 60"
-            )
+            raise ValueError("upload_retry_backoff_seconds must be between 0 and 60")
 
     async def evaluate(self, trajectory: Trajectory, **runtime: Any) -> EvalResult:
         rt = runtime.get("runtime")
@@ -96,7 +95,9 @@ class HarborEvaluator(BaseTrajectoryEvaluator):
         env = runtime.get("env")
         eval_env = env if isinstance(env, dict) else {}
         cap = runtime.get("timeout_seconds")
-        test_timeout = self.verifier_timeout if cap is None else min(self.verifier_timeout, float(cap))
+        test_timeout = (
+            self.verifier_timeout if cap is None else min(self.verifier_timeout, float(cap))
+        )
 
         # 1. Inject the verifier into the container the agent just used.
         await rt.exec(
@@ -168,22 +169,33 @@ class HarborEvaluator(BaseTrajectoryEvaluator):
         text = await rt.exec(f"cat {self.verifier_dir}/reward.txt 2>/dev/null", env=env)
         if text.return_code == 0 and (text.stdout or "").strip():
             try:
-                return _clamp(float(text.stdout.strip()))
-            except ValueError:
+                return _clamp(text.stdout.strip())
+            except (TypeError, ValueError):
                 pass
         # Fallback: Harbor also accepts a reward.json (scalar or {name: reward}).
         blob = await rt.exec(f"cat {self.verifier_dir}/reward.json 2>/dev/null", env=env)
         if blob.return_code == 0 and (blob.stdout or "").strip():
             try:
                 data = json.loads(blob.stdout)
-                if isinstance(data, (int, float)):
-                    return _clamp(float(data))
+                if isinstance(data, (int, float)) and not isinstance(data, bool):
+                    return _clamp(data)
                 if isinstance(data, dict) and data:
-                    return _clamp(sum(float(v) for v in data.values()) / len(data))
+                    values = [_finite_float(value) for value in data.values()]
+                    return _clamp(sum(values) / len(values))
             except (ValueError, TypeError):
                 pass
         return 0.0
 
 
-def _clamp(value: float) -> float:
-    return max(0.0, min(1.0, value))
+def _finite_float(value: Any) -> float:
+    if isinstance(value, bool):
+        raise TypeError("boolean is not a Harbor reward")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("Harbor reward must be finite")
+    return parsed
+
+
+def _clamp(value: Any) -> float:
+    parsed = _finite_float(value)
+    return max(0.0, min(1.0, parsed))

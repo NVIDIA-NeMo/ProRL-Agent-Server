@@ -610,6 +610,20 @@ unset -f _tmax_validate_async_capacity
 
 export TMAX_AGENT_HARNESS="${TMAX_AGENT_HARNESS:-${POLAR_AGENT_HARNESS:-mini_swe_agent}}"
 export POLAR_AGENT_HARNESS="${TMAX_AGENT_HARNESS}"
+if [ "${TMAX_AGENT_HARNESS}" = "spilot_router" ]; then
+    for _tmax_spilot_isolation_name in \
+        POLAR_APPTAINER_NO_MOUNT_HOSTFS \
+        POLAR_APPTAINER_NO_MOUNT_TMP \
+        POLAR_APPTAINER_ISOLATE_PID \
+        POLAR_APPTAINER_ISOLATE_IPC \
+        POLAR_APPTAINER_CLEANENV; do
+        if [ "${!_tmax_spilot_isolation_name:-}" != 1 ]; then
+            echo "ERROR: formal SPilot requires ${_tmax_spilot_isolation_name}=1 at allocation startup" >&2
+            return 1 2>/dev/null || exit 1
+        fi
+    done
+    unset _tmax_spilot_isolation_name
+fi
 export POLAR_AGENT_MODEL_NAME="${POLAR_AGENT_MODEL_NAME:-Qwen/Qwen3.5-9B}"
 # Qwen3.5's tokenizer supports interleaved reasoning natively. Explicit model
 # kwargs keep that behavior through LiteLLM and the gateway; the qwen3 parser
@@ -649,6 +663,142 @@ case "${TMAX_AGENT_HARNESS}" in
         return 1 2>/dev/null || exit 1
         ;;
 esac
+
+_tmax_validate_spilot_episode_admission() {
+    local name value expected_qwen expected_gpt expected_agent expected_task
+    local expected_request wall_seconds required_buffer_seconds required_wall_seconds
+    if [ "${TMAX_AGENT_HARNESS}" != "spilot_router" ]; then
+        return 0
+    fi
+
+    # Generic/legacy SPilot entrypoints fail safe to the pre-admission
+    # behavior. The canonical SPilot wrapper opts in explicitly and persists
+    # the complete contract in run state.
+    export SPILOT_EPISODE_ADMISSION_ENABLED="${SPILOT_EPISODE_ADMISSION_ENABLED:-false}"
+    export SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT="${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT:-${NUM_NODES}}"
+    if ! [[ "${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT must be a positive integer" >&2
+        return 1
+    fi
+    case "${SPILOT_EPISODE_ADMISSION_ENABLED}" in
+        true)
+            for name in \
+                SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS \
+                SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT \
+                SPILOT_QWEN_MAX_ACTIVE_EPISODES \
+                SPILOT_GPT_MAX_ACTIVE_EPISODES \
+                SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES \
+                SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES \
+                SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY \
+                SPILOT_GPT_GATEWAY_MAX_CONCURRENCY \
+                SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES \
+                SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES; do
+                value="${!name:-}"
+                if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "ERROR: ${name} must be a positive integer when SPilot episode admission is enabled" >&2
+                    return 1
+                fi
+            done
+            if [ "${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS}" -gt 86400 ]; then
+                echo "ERROR: SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS must be at most 86400" >&2
+                return 1
+            fi
+            if [ "${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT}" -ne "${NUM_NODES}" ]; then
+                echo "ERROR: SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT must equal NUM_NODES=${NUM_NODES}" >&2
+                return 1
+            fi
+            if [ $((SPILOT_QWEN_MAX_ACTIVE_EPISODES % SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT)) -ne 0 ] || \
+               [ $((SPILOT_GPT_MAX_ACTIVE_EPISODES % SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT)) -ne 0 ]; then
+                echo "ERROR: both SPilot aggregate model-pool caps must be divisible by all ${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT} gateways" >&2
+                return 1
+            fi
+            expected_qwen="$((SPILOT_QWEN_MAX_ACTIVE_EPISODES / SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT))"
+            expected_gpt="$((SPILOT_GPT_MAX_ACTIVE_EPISODES / SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT))"
+            if [ "${SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES}" -ne "${expected_qwen}" ] || \
+               [ "${SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES}" -ne "${expected_gpt}" ]; then
+                echo "ERROR: SPilot per-gateway active-episode caps do not match the exact aggregate split" >&2
+                return 1
+            fi
+            if [ "${SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY}" -ne "${expected_qwen}" ] || \
+               [ "${SPILOT_GPT_GATEWAY_MAX_CONCURRENCY}" -ne "${expected_gpt}" ]; then
+                echo "ERROR: each SPilot pool HTTP max_concurrency must equal its local episode cap" >&2
+                return 1
+            fi
+            if [ "${SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES}" -ne "${SPILOT_QWEN_MAX_ACTIVE_EPISODES}" ] || \
+               [ "${SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES}" -ne "${SPILOT_GPT_MAX_ACTIVE_EPISODES}" ]; then
+                echo "ERROR: persisted SPilot effective caps must equal the configured aggregate caps" >&2
+                return 1
+            fi
+            # The runner's internal total remains 3,000 seconds and credits
+            # measured queue time. Provider admission has its own explicit wait
+            # budget and therefore must not depend on the gateway worker-pool
+            # shape used by the controlled Qwen3.5 training comparison. A
+            # saturated provider queue may exceed Q; that admission expiry is
+            # an infrastructure-masked outcome, not a synthetic reward sample.
+            expected_agent="$((3300 + SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS))"
+            expected_task="$((4500 + SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS + expected_agent))"
+            expected_request="$((5100 + SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS + expected_agent))"
+            if [ "${TMAX_TRAIN_AGENT_TIMEOUT_SECONDS}" -ne "${expected_agent}" ] || \
+               [ "${POLAR_TASK_TIMEOUT_FLOOR_SECONDS}" -ne "${expected_task}" ] || \
+               [ "${POLAR_REQUEST_TIMEOUT}" -ne "${expected_request}" ]; then
+                echo "ERROR: SPilot admission timeout formula requires agent/task/request=${expected_agent}/${expected_task}/${expected_request}" >&2
+                return 1
+            fi
+            if [ "${PARTITION}" != backfill ]; then
+                echo "ERROR: canonical SPilot admission requires PARTITION=backfill because batch is limited to four hours" >&2
+                return 1
+            fi
+            # Once Slime enters its graceful window it must have enough time
+            # for the longest in-flight request plus one hour reserved for the
+            # final checkpoint and process teardown.  The allocation itself
+            # must also have room for one complete request before that window.
+            required_buffer_seconds="$((POLAR_REQUEST_TIMEOUT + 3600))"
+            if [ "${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS}" -lt "${required_buffer_seconds}" ]; then
+                echo "ERROR: SPilot TMAX_GRACEFUL_EXIT_BUFFER_SECONDS must cover POLAR_REQUEST_TIMEOUT + 3600 (${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS} < ${required_buffer_seconds})" >&2
+                return 1
+            fi
+            if ! wall_seconds="$(tmax_slurm_duration_seconds "${WALL_TIME}")"; then
+                echo "ERROR: unsupported SPilot WALL_TIME=${WALL_TIME}" >&2
+                return 1
+            fi
+            required_wall_seconds="$((TMAX_GRACEFUL_EXIT_BUFFER_SECONDS + POLAR_REQUEST_TIMEOUT))"
+            if [ "${wall_seconds}" -lt "${required_wall_seconds}" ]; then
+                echo "ERROR: SPilot WALL_TIME must cover POLAR_REQUEST_TIMEOUT + TMAX_GRACEFUL_EXIT_BUFFER_SECONDS (${wall_seconds} < ${required_wall_seconds})" >&2
+                return 1
+            fi
+            ;;
+        false)
+            export SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS="${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS:-0}"
+            export SPILOT_QWEN_MAX_ACTIVE_EPISODES="${SPILOT_QWEN_MAX_ACTIVE_EPISODES:-0}"
+            export SPILOT_GPT_MAX_ACTIVE_EPISODES="${SPILOT_GPT_MAX_ACTIVE_EPISODES:-0}"
+            export SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES="${SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES:-null}"
+            export SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES="${SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES:-null}"
+            export SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY="${SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY:-32}"
+            export SPILOT_GPT_GATEWAY_MAX_CONCURRENCY="${SPILOT_GPT_GATEWAY_MAX_CONCURRENCY:-32}"
+            export SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES="${SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES:-0}"
+            export SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES="${SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES:-0}"
+            if ! [[ "${SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] || \
+               ! [[ "${SPILOT_GPT_GATEWAY_MAX_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
+                echo "ERROR: disabled SPilot HTTP max_concurrency values must remain positive integers" >&2
+                return 1
+            fi
+            if [ "${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS}" != 0 ] || \
+               [ "${SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES}" != null ] || \
+               [ "${SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES}" != null ]; then
+                echo "ERROR: disabled SPilot episode admission requires zero wait and null caps for both aliases" >&2
+                return 1
+            fi
+            ;;
+        *)
+            echo "ERROR: SPILOT_EPISODE_ADMISSION_ENABLED must be true or false" >&2
+            return 1
+            ;;
+    esac
+}
+if ! _tmax_validate_spilot_episode_admission; then
+    return 1 2>/dev/null || exit 1
+fi
+unset -f _tmax_validate_spilot_episode_admission
 
 # Missing SIFs are fatal by default. The dual-eval contract rejects partial
 # mode: every task in the deterministic train+holdout population must have a

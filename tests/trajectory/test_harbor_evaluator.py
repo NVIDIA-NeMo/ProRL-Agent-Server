@@ -18,7 +18,8 @@ class HarborRuntime(BaseRuntime):
         artifacts_dir: Path,
         *,
         verifier_return_code: int = 0,
-        reported_reward: str = "1",
+        reported_reward: str | None = "1",
+        reported_reward_json: str | None = None,
         upload_failures: int = 0,
         destroy_on_upload_failure: bool = False,
     ) -> None:
@@ -26,6 +27,7 @@ class HarborRuntime(BaseRuntime):
         self._test_artifacts_dir = artifacts_dir
         self._verifier_return_code = verifier_return_code
         self._reported_reward = reported_reward
+        self._reported_reward_json = reported_reward_json
         self._upload_failures = upload_failures
         self._destroy_on_upload_failure = destroy_on_upload_failure
         self.upload_attempts = 0
@@ -56,7 +58,13 @@ class HarborRuntime(BaseRuntime):
                 return_code=self._verifier_return_code,
             )
         if "reward.txt" in command:
+            if self._reported_reward is None:
+                return ExecResult(return_code=1)
             return ExecResult(stdout=self._reported_reward, return_code=0)
+        if "reward.json" in command:
+            if self._reported_reward_json is None:
+                return ExecResult(return_code=1)
+            return ExecResult(stdout=self._reported_reward_json, return_code=0)
         return ExecResult(return_code=0)
 
     async def upload_file(self, local_path: str, remote_path: str) -> None:
@@ -121,6 +129,64 @@ async def test_harbor_rejects_positive_reward_when_verifier_exits_nonzero(tmp_pa
     assert result.metadata["verifier_reported_reward"] == 1.0
     assert result.metadata["verifier_reward_accepted"] is False
     assert result.metadata["verifier_exit_code"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reported_reward", ["nan", "NaN", "inf", "+Infinity", "-inf"])
+async def test_harbor_rejects_nonfinite_text_reward(
+    tmp_path,
+    reported_reward: str,
+) -> None:
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    artifacts_dir = tmp_path / "session" / "artifacts"
+    runtime = HarborRuntime(
+        tmp_path / "session",
+        artifacts_dir,
+        reported_reward=reported_reward,
+    )
+    evaluator = HarborEvaluator(tests_dir=str(tests_dir))
+
+    result = await evaluator.evaluate(
+        Trajectory(status="COMPLETED"),
+        runtime=runtime,
+        artifacts_dir=artifacts_dir,
+    )
+
+    assert result.outcome_reward == 0.0
+    assert result.metadata["resolved"] is False
+    assert result.metadata["verifier_reported_reward"] == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reported_reward_json",
+    ["NaN", "Infinity", "-Infinity", "true", '{"score": NaN}', '{"score": true}'],
+)
+async def test_harbor_rejects_nonfinite_or_boolean_json_reward(
+    tmp_path,
+    reported_reward_json: str,
+) -> None:
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    artifacts_dir = tmp_path / "session" / "artifacts"
+    runtime = HarborRuntime(
+        tmp_path / "session",
+        artifacts_dir,
+        reported_reward=None,
+        reported_reward_json=reported_reward_json,
+    )
+    evaluator = HarborEvaluator(tests_dir=str(tests_dir))
+
+    result = await evaluator.evaluate(
+        Trajectory(status="COMPLETED"),
+        runtime=runtime,
+        artifacts_dir=artifacts_dir,
+    )
+
+    assert result.outcome_reward == 0.0
+    assert result.metadata["resolved"] is False
+    assert result.metadata["verifier_reported_reward"] == 0.0
 
 
 @pytest.mark.asyncio

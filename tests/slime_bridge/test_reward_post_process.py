@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import statistics
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -14,7 +15,7 @@ class FakeSample:
         *,
         group_index: int = 0,
         group_id: int,
-        reward: float,
+        reward: Any,
         status: str = "COMPLETED",
         loss_mask: list[int] | None = None,
         remove_sample: bool = False,
@@ -32,8 +33,8 @@ class FakeSample:
             "polar": {"training_filter": training_filter} if training_filter is not None else {}
         }
 
-    def get_reward_value(self, args) -> float:
-        return float(self.reward[args.reward_key])
+    def get_reward_value(self, args) -> Any:
+        return self.reward[args.reward_key]
 
 
 def _args(**overrides):
@@ -183,6 +184,24 @@ def test_agent_timeout_fail_closes_stale_reward_but_keeps_negative_advantage() -
                 "reason": "agent_timeout",
             },
         ),
+        FakeSample(group_id=2, reward=1.0),
+    ]
+
+    raw, rewards = post_process_rewards(_args(), samples)
+
+    assert raw == [0.0, 1.0]
+    assert rewards == [-1.0, 1.0]
+
+
+@pytest.mark.parametrize(
+    "malformed_reward",
+    [float("nan"), float("inf"), float("-inf"), True, False, "not-a-number"],
+)
+def test_training_boundary_fail_closes_nonfinite_or_boolean_reward(
+    malformed_reward: Any,
+) -> None:
+    samples = [
+        FakeSample(group_id=1, reward=malformed_reward),
         FakeSample(group_id=2, reward=1.0),
     ]
 

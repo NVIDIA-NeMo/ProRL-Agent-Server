@@ -97,6 +97,8 @@ ${POLAR_INTERNET_RUNTIME_VOLUME}
       router_max_tokens: 192
       router_timeout_seconds: 180
       pool_timeout_seconds: 1200
+      pool_episode_admission_enabled: ${SPILOT_EPISODE_ADMISSION_ENABLED}
+      pool_episode_admission_wait_budget_seconds: ${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS}
       total_timeout_seconds: 3000
       reserve_evaluator_seconds: 300
       deadline_margin_seconds: 5

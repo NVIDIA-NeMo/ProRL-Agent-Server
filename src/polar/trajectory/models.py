@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -39,6 +40,20 @@ class EvalResult(BaseModel):
     outcome_reward: float | None = None
     trace_rewards: list[float | None] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("outcome_reward", mode="before")
+    @classmethod
+    def _validate_outcome_reward(cls, value: Any) -> float | None:
+        return _finite_reward_or_none(value)
+
+    @field_validator("trace_rewards", mode="before")
+    @classmethod
+    def _validate_trace_rewards(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if not isinstance(value, (list, tuple)):
+            return value
+        return [_finite_reward_or_none(item) for item in value]
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +115,11 @@ class Trace(BaseModel):
     reward: float | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("reward", mode="before")
+    @classmethod
+    def _validate_reward(cls, value: Any) -> float | None:
+        return _finite_reward_or_none(value)
+
     @field_validator("loss_mask")
     @classmethod
     def _validate_loss_mask_values(cls, value: list[int]) -> list[int]:
@@ -115,12 +135,25 @@ class Trace(BaseModel):
     def _validate_response_lengths(self) -> "Trace":
         if self.loss_mask and len(self.loss_mask) != len(self.response_ids):
             raise ValueError("loss_mask length must match response_ids length")
-        if (
-            self.response_logprobs is not None
-            and len(self.response_logprobs) != len(self.response_ids)
+        if self.response_logprobs is not None and len(self.response_logprobs) != len(
+            self.response_ids
         ):
             raise ValueError("response_logprobs length must match response_ids length")
         return self
+
+
+def _finite_reward_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("reward must be numeric, not boolean")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("reward must be numeric") from exc
+    if not math.isfinite(parsed):
+        raise ValueError("reward must be finite")
+    return parsed
 
 
 class Trajectory(BaseModel):

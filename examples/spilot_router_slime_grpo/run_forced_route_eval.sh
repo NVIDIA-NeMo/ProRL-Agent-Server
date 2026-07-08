@@ -47,6 +47,26 @@ run_child() {
 trap cleanup EXIT
 trap on_signal INT TERM
 
+REQUIRED_ISOLATION_VARIABLES=(
+    POLAR_APPTAINER_NO_INSTANCE
+    POLAR_APPTAINER_NO_MOUNT_HOSTFS
+    POLAR_APPTAINER_NO_MOUNT_TMP
+    POLAR_APPTAINER_ISOLATE_PID
+    POLAR_APPTAINER_ISOLATE_IPC
+)
+for isolation_name in "${REQUIRED_ISOLATION_VARIABLES[@]}"; do
+    if [[ -v "${isolation_name}" ]]; then
+        isolation_value="${!isolation_name}"
+    else
+        isolation_value=1
+    fi
+    if [ "${isolation_value}" != "1" ]; then
+        echo "ERROR: ${isolation_name} must be exactly 1 for forced evaluation" >&2
+        exit 2
+    fi
+    export "${isolation_name}=1"
+done
+
 if [ -z "${SLURM_JOB_ID:-}" ]; then
     echo "ERROR: submit this entrypoint with sbatch or run it inside an allocation" >&2
     exit 2

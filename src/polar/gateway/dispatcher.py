@@ -19,7 +19,7 @@ from typing import Awaitable, Callable
 from polar.agent.models import AgentRunResult
 from polar.rollout.models import SessionDispatchRequest, SessionResult
 from polar.rollout.timer import StageTimer
-from polar.runtime.base import BaseRuntime
+from polar.runtime.base import BaseRuntime, RuntimeContainmentError
 from polar.runtime.models import ExecInput
 
 logger = logging.getLogger(__name__)
@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 StageCallback = Callable[["ManagedSession"], Awaitable[None]]
 StageTransitionCallback = Callable[["ManagedSession"], None]
 _STOP = object()
+_SHUTDOWN_RUNTIME_TIMEOUT_SECONDS = 60.0
 
 
 class SessionStage(str, Enum):
@@ -67,12 +68,15 @@ class ManagedSession:
     artifacts_dir: Path
     router_capability: str | None = None
     model_pool_capability: str | None = None
+    model_pool_admission_capability: str | None = None
     runtime: BaseRuntime | None = None
     agent_result: AgentRunResult | None = None
     final_result: SessionResult | None = None
     postrun_steps: list[ExecInput] = field(default_factory=list)
     eval_prewarm_task: asyncio.Task | None = None
+    eval_runtime: BaseRuntime | None = None
     runtime_cancel_task: asyncio.Task[None] | None = None
+    runtime_cancel_error: BaseException | None = None
     done_event: asyncio.Event = field(default_factory=asyncio.Event)
     cancel_requested: bool = False
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -122,10 +126,12 @@ class SessionDispatcher:
         self._workers: list[asyncio.Task[None]] = []
         self._runtime_cancel_tasks: set[asyncio.Task[None]] = set()
         self._started = False
+        self._stopping = False
 
     async def start(self) -> None:
         if self._started:
             return
+        self._stopping = False
         self._workers = [
             *(asyncio.create_task(self._init_worker()) for _ in range(self.max_init_workers)),
             *(asyncio.create_task(self._run_worker()) for _ in range(self.max_run_workers)),
@@ -139,33 +145,150 @@ class SessionDispatcher:
     async def stop(self) -> None:
         if not self._started:
             return
+        loop = asyncio.get_running_loop()
+        shutdown_deadline = loop.time() + _SHUTDOWN_RUNTIME_TIMEOUT_SECONDS
         async with self._lock:
-            sessions = list(self._sessions.values())
+            self._stopping = True
+            self._started = False
+            sessions_by_id = dict(self._sessions)
+            for managed in sessions_by_id.values():
+                managed.cancel_requested = True
+                managed.cancel_event.set()
+
+        async def drain_tasks(tasks: list[asyncio.Task], *, label: str) -> bool:
+            if not tasks:
+                return True
+            remaining = shutdown_deadline - loop.time()
+            if remaining <= 0:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                return False
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=remaining,
+                )
+                return True
+            except TimeoutError:
+                logger.error("Dispatcher shutdown timed out draining %s", label)
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                done, _pending = await asyncio.wait(tasks, timeout=0.5)
+                for task in done:
+                    if not task.cancelled():
+                        task.exception()
+                return False
+
+        # Stop stage callbacks before taking the final runtime snapshot. INIT
+        # publishes managed.runtime immediately before awaiting start(), so a
+        # worker cannot create a runtime after this handoff unnoticed.
+        workers = list(self._workers)
+        for task in workers:
+            task.cancel()
+        workers_drained = await drain_tasks(workers, label="stage workers")
+        self._workers.clear()
+
+        async with self._lock:
+            sessions_by_id.update(self._sessions)
             self._sessions.clear()
+            sessions = list(sessions_by_id.values())
             for managed in sessions:
                 managed.cancel_requested = True
                 managed.cancel_event.set()
                 self._schedule_runtime_cancel_locked(managed)
-            cancel_tasks = [
-                managed.runtime_cancel_task
-                for managed in sessions
-                if managed.runtime_cancel_task is not None
-            ]
-        if cancel_tasks:
-            await asyncio.gather(*cancel_tasks, return_exceptions=True)
-        for task in self._workers:
+
+        # Eval prewarm is not a dispatcher worker. Cancel and join it before
+        # enumerating its published runtime for the final destruction proof.
+        eval_tasks = [
+            managed.eval_prewarm_task
+            for managed in sessions
+            if managed.eval_prewarm_task is not None
+            and not managed.eval_prewarm_task.done()
+        ]
+        for task in eval_tasks:
             task.cancel()
-        if self._workers:
-            await asyncio.gather(*self._workers, return_exceptions=True)
-        self._workers.clear()
+        eval_tasks_drained = await drain_tasks(eval_tasks, label="eval prewarm tasks")
+
+        cancel_tasks = [
+            managed.runtime_cancel_task
+            for managed in sessions
+            if managed.runtime_cancel_task is not None
+        ]
+        cancel_tasks_drained = await drain_tasks(
+            cancel_tasks,
+            label="runtime cancellation tasks",
+        )
+
+        runtime_owners: list[tuple[ManagedSession, BaseRuntime]] = []
+        seen_runtimes: set[int] = set()
+        for managed in sessions:
+            for runtime in (managed.runtime, managed.eval_runtime):
+                if not isinstance(runtime, BaseRuntime) or id(runtime) in seen_runtimes:
+                    continue
+                seen_runtimes.add(id(runtime))
+                runtime_owners.append((managed, runtime))
+
+        async def retry_stop(managed: ManagedSession, runtime: BaseRuntime) -> None:
+            try:
+                await runtime.stop()
+                if not runtime.destroyed:
+                    raise RuntimeContainmentError(
+                        "runtime stop returned without destruction proof"
+                    )
+                managed.runtime_cancel_error = None
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                managed.runtime_cancel_error = exc
+
+        retry_tasks = [
+            asyncio.create_task(retry_stop(managed, runtime))
+            for managed, runtime in runtime_owners
+            if not runtime.destroyed
+        ]
+        retry_tasks_drained = await drain_tasks(retry_tasks, label="runtime stop retries")
+
+        teardown_failures: list[tuple[str, BaseException]] = []
+        if not workers_drained:
+            teardown_failures.append(
+                ("stage-workers", RuntimeContainmentError("stage workers did not stop"))
+            )
+        if not eval_tasks_drained:
+            teardown_failures.append(
+                ("eval-prewarm", RuntimeContainmentError("eval prewarm did not stop"))
+            )
+        if not cancel_tasks_drained or not retry_tasks_drained:
+            teardown_failures.append(
+                (
+                    "runtime-teardown",
+                    RuntimeContainmentError("runtime teardown exceeded shutdown deadline"),
+                )
+            )
+        for managed, runtime in runtime_owners:
+            if runtime.destroyed:
+                continue
+            error = managed.runtime_cancel_error or RuntimeContainmentError(
+                "runtime teardown exceeded the dispatcher shutdown deadline"
+            )
+            teardown_failures.append((managed.session_id, error))
         for managed in sessions:
             managed.done_event.set()
-        self._started = False
+        self._stopping = False
+        if teardown_failures:
+            session_ids = ", ".join(session_id for session_id, _ in teardown_failures)
+            raise RuntimeContainmentError(
+                "dispatcher shutdown could not prove runtime destruction for: "
+                f"{session_ids}"
+            ) from teardown_failures[0][1]
 
     async def enqueue(self, managed: ManagedSession) -> None:
-        if not self._started:
+        if not self._started or self._stopping:
             raise RuntimeError("dispatcher has not been started")
         async with self._lock:
+            if not self._started or self._stopping:
+                raise RuntimeError("dispatcher is shutting down")
             if managed.session_id in self._sessions:
                 raise ValueError(f"session {managed.session_id} is already enqueued")
             self._sessions[managed.session_id] = managed
@@ -236,9 +359,15 @@ class SessionDispatcher:
             return
         try:
             await runtime.cancel()
+            if isinstance(runtime, BaseRuntime) and not runtime.destroyed:
+                raise RuntimeContainmentError(
+                    "runtime cancel returned without destruction proof"
+                )
+            managed.runtime_cancel_error = None
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            managed.runtime_cancel_error = exc
             logger.exception(
                 "Failed to cancel runtime for session %s",
                 managed.session_id,

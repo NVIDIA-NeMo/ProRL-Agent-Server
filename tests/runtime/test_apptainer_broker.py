@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 from pathlib import Path
 import signal
@@ -49,6 +50,8 @@ def _local_broker_runtime(
             "env",
             *(f"{key}={value}" for key, value in environment.items()),
             f"POLAR_APPTAINER_BROKER_RUNTIME_DIR={runtime._broker_dir}",  # noqa: SLF001
+            "POLAR_APPTAINER_PROTECTED_SOCKET_NAME="
+            f"{runtime._protected_broker_socket_name}",  # noqa: SLF001
             f"POLAR_APPTAINER_BROKER_SCRIPT={broker_source}",
             f"POLAR_APPTAINER_BROKER_PYTHON={sys.executable}",
             "bash",
@@ -127,6 +130,137 @@ def test_proxy_close_keeps_unreaped_pid_for_supervisor(monkeypatch, tmp_path: Pa
     assert pid_path.read_text() == "123\n"
 
 
+def test_protected_runner_is_digest_checked_and_copied_to_sealed_memfd(
+    tmp_path: Path,
+) -> None:
+    runner = tmp_path / "runner.py"
+    trusted_bytes = b"print('trusted runner')\n"
+    runner.write_bytes(trusted_bytes)
+    descriptor = apptainer_broker._sealed_verified_file(  # noqa: SLF001
+        str(runner),
+        hashlib.sha256(trusted_bytes).hexdigest(),
+    )
+    try:
+        runner.write_bytes(b"print('attacker replacement')\n")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        assert os.read(descriptor, 4096) == trusted_bytes
+        with pytest.raises(OSError):
+            os.write(descriptor, b"tamper")
+    finally:
+        os.close(descriptor)
+
+
+def test_protected_runner_rejects_replacement_digest_and_symlink(tmp_path: Path) -> None:
+    runner = tmp_path / "runner.py"
+    runner.write_text("print('replacement')\n")
+    with pytest.raises(PermissionError, match="digest mismatch"):
+        apptainer_broker._sealed_verified_file(  # noqa: SLF001
+            str(runner),
+            hashlib.sha256(b"print('trusted')\n").hexdigest(),
+        )
+
+    symlink = tmp_path / "runner-link.py"
+    symlink.symlink_to(runner)
+    with pytest.raises(OSError):
+        apptainer_broker._sealed_verified_file(  # noqa: SLF001
+            str(symlink),
+            hashlib.sha256(runner.read_bytes()).hexdigest(),
+        )
+
+
+def test_protected_broker_executes_sealed_runner_and_delivers_after_child_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = tmp_path / "runner.py"
+    runner.write_text(
+        """
+import ctypes
+import hashlib
+import json
+import os
+import socket
+import struct
+
+assert "TEST_SECRET" not in os.environ
+libc = ctypes.CDLL(None, use_errno=True)
+assert libc.prctl(4, 0, 0, 0, 0) == 0
+assert libc.prctl(3, 0, 0, 0, 0) == 0
+ready_fd = int(os.environ.pop("POLAR_PROTECTED_EXEC_READY_FD"))
+assert os.read(ready_fd, 1) == b"1"
+os.close(ready_fd)
+connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+connection.connect(os.environ.pop("POLAR_PROTECTED_EXEC_SOCKET"))
+peer_pid, _, _ = struct.unpack(
+    "3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+)
+assert peer_pid == int(os.environ.pop("POLAR_PROTECTED_EXEC_BROKER_PID"))
+request_id = os.environ.pop("POLAR_PROTECTED_EXEC_REQUEST_ID")
+connection.sendall(
+    json.dumps({"operation": "protected_child_ready", "id": request_id}).encode()
+    + b"\\n"
+)
+response = json.loads(connection.makefile("rb").readline())
+connection.close()
+secret = response["protected_env"]["TEST_SECRET"]
+print(hashlib.sha256(secret.encode()).hexdigest())
+""".lstrip()
+    )
+    socket_path = tmp_path / "protected.sock"
+    result_dir = tmp_path / "results"
+    monkeypatch.setattr(apptainer_broker, "_PROTECTED_PYTHON", sys.executable)
+    monkeypatch.setattr(apptainer_broker, "_SPILOT_RUNNER", str(runner))
+    server = apptainer_broker._BrokerServer(  # noqa: SLF001
+        str(socket_path),
+        result_dir,
+        base_environment={},
+        proxy=None,
+        proxy_url=None,
+        allow_internet=False,
+        protected_only=True,
+        runtime_socket_path=str(socket_path),
+    )
+    real_write = os.write
+    gate_released_after_publish: list[bool] = []
+
+    def checked_write(descriptor: int, payload: bytes) -> int:
+        if payload == b"1":
+            with server._process_lock:  # noqa: SLF001
+                gate_released_after_publish.append(
+                    request_id in server._protected_pending  # noqa: SLF001
+                )
+        return real_write(descriptor, payload)
+
+    monkeypatch.setattr(apptainer_broker.os, "write", checked_write)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    request_id = "sealed-runner-test"
+    secret = "secret-delivered-after-ready"
+    try:
+        result = server.execute_protected(
+            {
+                "id": request_id,
+                "argv": [sys.executable, str(runner)],
+                "env": {},
+                "protected_env": {"TEST_SECRET": secret},
+                "file_digests": {
+                    str(runner): hashlib.sha256(runner.read_bytes()).hexdigest()
+                },
+                "timeout_sec": 5,
+            }
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result == {"return_code": 0}
+    assert gate_released_after_publish == [True]
+    assert (result_dir / f"{request_id}.stdout").read_text().strip() == hashlib.sha256(
+        secret.encode()
+    ).hexdigest()
+
+
 def test_supervisor_cleans_residual_proxy_after_clean_broker_exit(tmp_path: Path) -> None:
     broker_source = tmp_path / "fake_broker.py"
     broker_source.write_text(
@@ -152,6 +286,7 @@ proxy = subprocess.Popen(
     environment = {
         **os.environ,
         "POLAR_APPTAINER_BROKER_RUNTIME_DIR": str(tmp_path),
+        "POLAR_APPTAINER_PROTECTED_SOCKET_NAME": "p-deadbeef.sock",
         "POLAR_APPTAINER_BROKER_SCRIPT": str(broker_source),
         "POLAR_APPTAINER_BROKER_PYTHON": sys.executable,
     }
@@ -227,11 +362,11 @@ def test_direct_broker_preserves_background_processes_and_recovers_after_timeout
     asyncio.run(scenario())
 
 
-def test_broker_identity_survives_python_pkill_matching_and_preexec_recovers(
+def test_pinned_broker_identity_survives_python_pkill_and_rejects_recovery(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Simulate pkill selection, then an unexpected between-command exit."""
+    """A pinned secret broker is hidden from pkill and never replaced."""
 
     runtime = _local_broker_runtime(monkeypatch, tmp_path)
 
@@ -249,27 +384,13 @@ def test_broker_identity_survives_python_pkill_matching_and_preexec_recovers(
             assert process_name == "polar-broker"
 
             os.kill(original_pid, signal.SIGKILL)
-            results = await asyncio.gather(
-                *(runtime.exec(f"echo recovered-{index}") for index in range(8))
-            )
-            assert [result.return_code for result in results] == [0] * 8
-            assert [result.stdout for result in results] == [
-                f"recovered-{index}\n" for index in range(8)
-            ]
-
-            replacement_pid = int(broker_pid_path.read_text())
-            assert replacement_pid != original_pid
-            command_line, process_name = _process_identity(replacement_pid)
-            assert "python" not in command_line.lower()
-            assert "python" not in process_name.lower()
+            with pytest.raises(RuntimeError, match="identity changed.*forbidden"):
+                await runtime.exec("echo must-not-recover")
 
             summary = runtime.exec_timing_summary()
-            assert summary["broker_recovery_count"] == 1
-            assert summary["broker_recovery_failure_count"] == 0
+            assert summary["broker_recovery_count"] == 0
+            assert summary["broker_recovery_failure_count"] == 1
             assert summary["broker_preflight_failure_count"] >= 1
-            assert summary["broker_supervisor_restart_count"] == 1
-            assert summary["broker_generation"] == 2
-            assert summary["broker_recovery_ms"] >= 0.0
         finally:
             await runtime.stop()
 
@@ -363,7 +484,7 @@ def test_proxy_listener_kill_does_not_kill_control_broker(
     asyncio.run(scenario())
 
 
-def test_supervisor_recovers_when_command_kills_control_broker(
+def test_command_that_kills_pinned_control_broker_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -373,16 +494,12 @@ def test_supervisor_recovers_when_command_kills_control_broker(
         await runtime.start()
         try:
             broker_pid = runtime._broker_dir / "broker.pid"  # noqa: SLF001
-            result = await runtime.exec(
-                f'kill -9 "$(cat {shlex.quote(str(broker_pid))})"'
-            )
-            assert result.return_code == 125
-            assert result.stderr is not None
-            assert "broker recovered" in result.stderr
-
-            ready = await runtime.exec("echo recovered-control-broker")
-            assert ready.return_code == 0
-            assert ready.stdout == "recovered-control-broker\n"
+            with pytest.raises(RuntimeError, match="identity changed.*forbidden"):
+                await runtime.exec(
+                    f'kill -9 "$(cat {shlex.quote(str(broker_pid))})"'
+                )
+            with pytest.raises(RuntimeError, match="identity changed.*forbidden"):
+                await runtime.exec("echo must-not-recover")
         finally:
             await runtime.stop()
 

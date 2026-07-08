@@ -43,6 +43,10 @@ def _render_topology() -> str:
         "POLAR_AGENT_MODEL_NAME": "Qwen/Qwen3.5-9B",
         "SGLANG_ROUTER_BASE_URL": "http://head:30000",
         "POLAR_MODEL_POOL_BASE_URL": "https://integrate.api.nvidia.com/v1",
+        "SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY": "1",
+        "SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES": "1",
+        "SPILOT_GPT_GATEWAY_MAX_CONCURRENCY": "4",
+        "SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES": "4",
     }
     text = (EXAMPLE / "topology.yaml").read_text()
     for name, value in values.items():
@@ -61,6 +65,10 @@ def test_spilot_topology_has_exact_fixed_pool_and_no_secret() -> None:
         ("pool/gpt-5.5", "openai/openai/gpt-5.5"),
     ]
     assert {item.api_key_env for item in pool} == {"POLAR_NVIDIA_API_KEY"}
+    assert [(item.max_concurrency, item.max_active_episodes) for item in pool] == [
+        (1, 1),
+        (4, 4),
+    ]
     assert "POLAR_NVIDIA_API_KEY" not in {
         item.base_url for item in pool
     }
@@ -94,6 +102,10 @@ def test_spilot_agent_template_builds_registered_harness() -> None:
     text = (EXAMPLE / "polar_config.yaml").read_text()
     text = text.replace("${POLAR_AGENT_RUNTIME_VOLUME}", "")
     text = text.replace("${POLAR_INTERNET_RUNTIME_VOLUME}", "")
+    text = text.replace("${SPILOT_EPISODE_ADMISSION_ENABLED}", "true")
+    text = text.replace(
+        "${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS}", "14400"
+    )
     document = yaml.safe_load(text)
     template = document["polar_task_template"]
     harness = create_harness(AgentSpec.model_validate(template["agent"]))
@@ -118,6 +130,8 @@ def test_spilot_agent_template_builds_registered_harness() -> None:
     assert config["pool_response_token_budget"] == 65_536
     assert config["pool_model_retry_attempts"] == 5
     assert config["observation_max_chars"] == 10_000
+    assert config["pool_episode_admission_enabled"] is True
+    assert config["pool_episode_admission_wait_budget_seconds"] == 14_400
     assert template["builder"]["strategy"] == "router_policy"
     assert template["evaluator"]["strategy"] == "spilot_harbor"
     assert template["evaluator"]["config"]["cost_penalty_lambda"] == 0.0
@@ -127,6 +141,10 @@ def test_spilot_fixed_eval_payload_normalizes_generic_overrides() -> None:
     text = (EXAMPLE / "polar_config.yaml").read_text()
     text = text.replace("${POLAR_AGENT_RUNTIME_VOLUME}", "")
     text = text.replace("${POLAR_INTERNET_RUNTIME_VOLUME}", "")
+    text = text.replace("${SPILOT_EPISODE_ADMISSION_ENABLED}", "true")
+    text = text.replace(
+        "${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS}", "14400"
+    )
     document = yaml.safe_load(text)
     agent = deepcopy(document["polar_task_template"]["agent"])
     agent["model_name"] = "Qwen/Qwen3.5-9B"
@@ -198,7 +216,9 @@ def test_spilot_submit_wrapper_pins_8_nodes_and_200_steps() -> None:
 
     assert 'source "${SCRIPT_DIR}/experiment_defaults.sh"' in script
     assert 'NUM_NODES="${NUM_NODES:-8}"' in defaults
-    assert 'PARTITION="${PARTITION:-backfill,batch}"' in defaults
+    assert 'PARTITION="${PARTITION:-backfill}"' in defaults
+    assert 'WALL_TIME="${WALL_TIME:-2-00:00:00}"' in defaults
+    assert 'TMAX_MIN_WALL_TIME="${TMAX_MIN_WALL_TIME:-2-00:00:00}"' in defaults
     assert 'SLURM_GPUS="${SLURM_GPUS:-8}"' in defaults
     assert 'RAY_NUM_GPUS_PER_NODE="${RAY_NUM_GPUS_PER_NODE:-8}"' in defaults
     assert 'ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-2}"' in defaults
@@ -217,6 +237,9 @@ def test_spilot_submit_wrapper_pins_8_nodes_and_200_steps() -> None:
     assert 'POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-3}"' in defaults
     assert 'POLAR_MIN_COMPLETE_ACCEPT_FRACTION="${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.5}"' in defaults
     assert 'POLAR_EARLY_STOP_GRACE_SESSIONS="${POLAR_EARLY_STOP_GRACE_SESSIONS:-16}"' in defaults
+    assert 'TMAX_MIN_RUN_WORKERS_PER_ROLLOUT_GPU="${TMAX_MIN_RUN_WORKERS_PER_ROLLOUT_GPU:-12}"' in defaults
+    assert 'POLAR_MAX_INIT_WORKERS="${POLAR_MAX_INIT_WORKERS:-96}"' in defaults
+    assert 'POLAR_MAX_RUN_WORKERS="${POLAR_MAX_RUN_WORKERS:-576}"' in defaults
     assert 'MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-67584}"' in defaults
     assert (
         'TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP="${TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP:-0}"'
@@ -227,8 +250,18 @@ def test_spilot_submit_wrapper_pins_8_nodes_and_200_steps() -> None:
     assert 'TMAX_OPTIMIZER_CPU_OFFLOAD="${TMAX_OPTIMIZER_CPU_OFFLOAD:-0}"' in defaults
     assert 'TMAX_NUM_ROLLOUT="${TMAX_NUM_ROLLOUT:-200}"' in defaults
     assert 'SAVE_INTERVAL="${SAVE_INTERVAL:-5}"' in defaults
-    assert 'SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-}"' in defaults
+    assert (
+        'TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS:-43200}"'
+        in defaults
+    )
+    assert (
+        'TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS:-43200}"'
+        in defaults
+    )
+    assert 'SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-5}"' in defaults
     assert 'WANDB_GROUP="${WANDB_GROUP:-spilot-router-qwen35-9b-8n64}"' in defaults
+    assert 'SPILOT_EPISODE_ADMISSION_ENABLED="${SPILOT_EPISODE_ADMISSION_ENABLED:-true}"' in defaults
+    assert 'SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS="${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS:-14400}"' in defaults
     assert 'TMAX_EVAL_MAX_TASKS="${TMAX_EVAL_MAX_TASKS:-100}"' in defaults
     assert 'TMAX_TRAINING_EVAL_ENABLED="${TMAX_TRAINING_EVAL_ENABLED:-0}"' in defaults
     assert (
@@ -261,6 +294,19 @@ def test_spilot_watcher_relaunches_through_spilot_submitter() -> None:
     assert "runs/spilot_router_slime_grpo/current_run.env" in defaults
     assert "POLAR_NVIDIA_API_KEY" in script
     assert "NVIDIA_API_KEY is not set" in script
+    assert script.index("tmax_load_selected_run_state") < script.index(
+        'source "${SCRIPT_DIR}/experiment_defaults.sh"'
+    )
+
+
+def test_spilot_submit_loads_locked_state_before_current_defaults() -> None:
+    script = (EXAMPLE / "submit_slurm.sh").read_text()
+
+    load = script.index("tmax_load_selected_run_state")
+    migrate = script.index("tmax_restore_spilot_admission_resume_contract")
+    defaults = script.index('source "${SCRIPT_DIR}/experiment_defaults.sh"')
+    assert load < defaults
+    assert migrate < defaults
 
 
 def test_spilot_shared_defaults_bootstrap_watcher_contract() -> None:
@@ -303,7 +349,7 @@ def test_spilot_shared_defaults_bootstrap_watcher_contract() -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout == (
-        "8|8|8|2|8|4|0|48||8|32|true|200|67584|0|64|0|5||spilot_router|"
+        "8|8|8|2|8|4|0|48||8|32|true|200|67584|0|64|0|5|5|spilot_router|"
         "spilot-router-qwen35-9b-8n64-200step"
     )
 
@@ -340,7 +386,15 @@ def test_spilot_smoke_is_one_node_one_step_without_dynamic_filtering() -> None:
     assert 'EVAL_GLOBAL_BATCH_SIZE="${EVAL_GLOBAL_BATCH_SIZE:-8}"' in script
     assert 'TMAX_NUM_ROLLOUT="${TMAX_NUM_ROLLOUT:-1}"' in script
     assert 'TMAX_DYNAMIC_SAMPLING_FILTER_PATH=""' in script
+    assert 'TMAX_EXCLUDE_DATA=""' in script
     assert 'TMAX_EVAL_ENABLED="${TMAX_EVAL_ENABLED:-0}"' in script
+    assert 'WALL_TIME="${WALL_TIME:-1-00:00:00}"' in script
+    assert 'TMAX_MIN_WALL_TIME="${TMAX_MIN_WALL_TIME:-1-00:00:00}"' in script
+    assert 'TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS:-43200}"' in script
+    assert (
+        'TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS:-43200}"'
+        in script
+    )
     run_state = (ROOT / "examples" / "tmax_slime_grpo" / "run_state.sh").read_text()
     assert "NVIDIA_API_KEY" not in run_state
     assert "POLAR_NVIDIA_API_KEY" not in run_state

@@ -25,10 +25,10 @@ Qwen reference: 64 agent steps, a 65,536-token cumulative response budget,
 120-second shell commands, 64 consecutive format errors, 10,000-character
 head/tail observations, and five transient model attempts. Solve and verify
 calls share task files but receive separate persistent-shell state directories.
-Baseline and final evaluation run synchronously before step 0 and after step
-199 on the same 100 held-out tasks, so evaluation cannot overlap or perturb
-the reference-compatible optimizer schedule. Terminal-Bench remains a separate
-experiment.
+In-training holdout evaluation is disabled (`TMAX_TRAINING_EVAL_ENABLED=0`) to
+match the no-eval reference run. Frozen-candidate calibration and any final
+holdout evaluation are separate experiments and cannot perturb the optimizer
+schedule. Terminal-Bench also remains separate.
 
 ## Credential handling
 
@@ -53,8 +53,10 @@ bash examples/spilot_router_slime_grpo/submit_smoke.sh
 ```
 
 After the smoke run produces one trainable Router trajectory and checkpoint,
-start the checkpoint-aware watcher for the default 200-step experiment. A
-single allocation is only four hours, so the watcher is the normal launch path:
+start the checkpoint-aware watcher for the default 200-step experiment. The
+canonical allocation requests two days on `backfill`; the watcher remains the
+normal launch path so a requeue or infrastructure interruption can resume from
+the last validated checkpoint:
 
 ```bash
 bash examples/spilot_router_slime_grpo/watch_training.sh --relaunch --loop
@@ -74,6 +76,15 @@ contains the NVIDIA key.
 shape reward in this first experiment. Invalid Router actions receive reward
 zero, and only gateway-provenanced `router_policy` completions are trainable.
 
+For training diagnostics, `rollout/raw_reward` is Slime's legacy
+trace/sample-weighted series and can include masked or early-stop placeholder
+samples. Treat the one-session-one-vote `polar/reward_mean` as the aggregate
+quality signal and use `polar/spilot_router/reward_candidate_c0_mean` and
+`polar/spilot_router/reward_candidate_c1_mean` for the frozen candidates. The
+C-index is the lexical alias order: for this pool C0 is GPT-5.5 and C1 is
+Qwen3.6-27B. Interpret those rewards together with each candidate's timeout and
+admission-failure metrics.
+
 ## Paired forced-route evaluation
 
 `forced_route_eval.py` measures the frozen candidates on an identical fixed
@@ -82,6 +93,12 @@ Qwen and one GPT task for every selected JSONL row, auto-submits after the
 single mini-SWE call, and reuses the normal `spilot_harbor` evaluator. The
 evaluation-only builder emits no traces even if a pool completion were ever
 persisted accidentally.
+
+`--include-qwen35-baseline` optionally adds a third, evaluation-only route:
+`pool/qwen3.5-9b-baseline` -> `nvidia/qwen/qwen3.5-9b`. The `pool/` alias keeps
+the baseline inside the same strict lease and one-shot call-capability boundary
+as the two primary candidates. This switch does not modify the two-candidate
+training topology or any training action space.
 
 The safest path is the dedicated services-only Slurm entrypoint. It requests
 one node and no GPU, enters the same proven Pyxis image used by TMax, renders
@@ -93,9 +110,20 @@ training actor. The evaluator runs on the same node, after which the entrypoint
 tears all services down. It never starts Ray, Slime, SGLang, generation, or a
 Router actor.
 
-For example, compare 32 paired holdout tasks on cw-dfw. The output directory
-must not already exist. The submitter loads the NVIDIA credential from the
-current shell or `~/.zshrc`, writes only a mode-0600 submission envelope, and
+Before starting any service, the launcher hashes the live implementation,
+copies `src/` and this complete example into a read-only allocation snapshot,
+and verifies the copy byte-for-byte. Every child command and `PYTHONPATH` then
+uses that snapshot. A secret-free semantic identity additionally binds the
+candidate alias/model/base URL and admission caps, tokenizer content,
+mini-SWE and `agent_cli` runtimes, container/executable identities, and Python
+dependency versions. It is verified before evaluation, before formal metrics,
+and after clean service teardown.
+
+For example, compare 32 paired holdout tasks on cw-dfw. A new benchmark requires
+a fresh run id and output/service/submit paths; an explicit `--resume` keeps the
+same immutable run/output but always creates fresh service and submit paths.
+The submitter loads the NVIDIA credential from the current shell or `~/.zshrc`,
+writes only a mode-0600 submission envelope, and
 passes its path (not the key) to Slurm. The allocated-node entrypoint sources
 and immediately deletes that file. It generates the control-plane token in
 memory and never persists it:
@@ -107,11 +135,10 @@ RUN_ID=qwen-vs-gpt-holdout-$(date -u +%Y%m%dT%H%M%SZ)
 RESULT_ROOT=${DATA_ROOT}/runs/spilot-forced-route-eval
 
 ACCOUNT=nvr_lpr_llm \
-PARTITION=backfill,batch \
+PARTITION=backfill \
 SLURM_CONSTRAINT=H100 \
 CPUS_PER_TASK=32 \
 POLAR_SLURM_MEM_PER_NODE=128G \
-WALL_TIME=12:00:00 \
 FORCED_EVAL_GPUS=0 \
 bash "${REPO}/examples/spilot_router_slime_grpo/submit_forced_route_eval.sh" \
   --i-understand-eval-only \
@@ -121,8 +148,30 @@ bash "${REPO}/examples/spilot_router_slime_grpo/submit_forced_route_eval.sh" \
   --pool-base-url https://inference-api.nvidia.com/v1 \
   --start-index 0 --max-tasks 32 \
   --seed 20260706 --max-concurrency 4 \
+  --pool-timeout-seconds 1200 \
   --output-dir "${RESULT_ROOT}/${RUN_ID}"
 ```
+
+Add `--include-qwen35-baseline` to that command for the three-candidate matrix.
+The immutable plan, source/asset identity, spend ledger, and walltime bound all
+record the switch and exact endpoint mapping.
+
+If `WALL_TIME` is omitted, the submitter preflights the exact selected JSONL
+slice. It computes the outer task envelope as the larger of the selected rows'
+maximum `timeout_seconds` and configured agent timeout plus their maximum
+`verifier_timeout`, then applies
+`ceil(max_tasks * candidate_count * replicates * max_paid_attempts / max_concurrency)`
+waves and a
+30-minute service/scheduling margin. An explicitly set walltime is rejected
+before `sbatch` if it cannot cover that bound. For the documented holdout
+slice (`timeout_seconds=840`, `verifier_timeout=120`) at concurrency 4, the
+32-task minimum is 56,520 seconds (`15:42:00`). The default global cap is one
+paid attempt per task/candidate work item; `--max-paid-attempts-per-work N`
+with `N > 1` is an explicit opt-in to full paid retries and increases the
+walltime bound accordingly. Override the margin with
+`FORCED_EVAL_SLURM_MARGIN_SECONDS` only when the site overhead is understood.
+With the optional baseline and the same documented settings, the minimum is
+83,880 seconds (`23:18:00`).
 
 There is no software GPU dependency because both candidates are remote. If a
 site partition refuses a zero-GPU Pyxis allocation, resubmit with
@@ -131,7 +180,7 @@ rendered config: it contains stale compute-node URLs and job-local `/tmp` UDS
 paths.
 
 Before that paid run, use the same command with `PARTITION=interactive`,
-`WALL_TIME=02:00:00`, `--max-tasks 1`, and `--max-concurrency 2` as the allocation
+`--max-tasks 1`, and `--max-concurrency 2` as the allocation
 smoke. A 32-pair run can require many waves of full coding-agent work, so the
 two-hour interactive limit is not a safe full-benchmark wall time.
 
@@ -145,6 +194,7 @@ python examples/spilot_router_slime_grpo/forced_route_eval.py \
   --run-id qwen-vs-gpt-holdout-v1 \
   --data /abs/path/tmax_holdout-eval.jsonl \
   --polar-config /abs/path/job-123/polar_config.yaml \
+  --semantic-identity /abs/path/job-123/semantic_identity.json \
   --rollout-url http://rollout-host:18080 \
   --start-index 0 \
   --max-tasks 32 \
@@ -155,15 +205,62 @@ python examples/spilot_router_slime_grpo/forced_route_eval.py \
 
 In the low-level form, the submission shell must already contain
 `POLAR_CONTROL_PLANE_TOKEN`; model credentials remain in the running Polar
-service. The output directory is created exclusively and contains:
+service. The semantic identity must be the one produced before those services
+started; hand-written identity files are unsupported. A new output directory
+starts a run. Repeating the exact command
+with `--resume` against the same live allocation resumes an interrupted run:
+the evaluator
+validates the immutable plan, keeps already persisted task ids, reattaches to
+any task accepted remotely just before the interruption, verifies its echoed
+plan/work/row fingerprints, and submits only missing work. Session
+`ERROR`/`TIMEOUT`, missing forced acknowledgements or candidate calls,
+failed/ambiguous calls, local transport failures, and evaluator-induced
+cancellations remain pending rather than becoming zero-reward benchmark rows.
+Only a complete attributable candidate call, including an explicit matching
+candidate timeout, is benchmark data. The default paid-attempt cap is one; a
+larger cap is an explicit retry-spend opt-in. An allocation-wide owner lease
+and per-pass output lock prevent concurrent resumers from overwriting one
+another. Changing the run id, data/config hash,
+implementation, prompt/row identity, range, seed, candidate
+mapping, or concurrency requires a fresh output directory. The directory
+contains:
 
-- `manifest.json`: immutable data/config hashes, range, seed, candidates, and
-  the no-actor contract;
-- `results.jsonl`: one row per task/candidate/replicate with fixed-denominator
+- `manifest.json`: immutable data/semantic-config/code/SIF/verifier hashes,
+  range, seed, candidates, the no-actor contract, separate allocation-attempt
+  metadata, and an explicit `collection.status` of `partial` or `complete`;
+- `results.jsonl`: a sorted, duplicate-free snapshot replaced and `fsync`ed
+  after every authoritative `completed` task/candidate/replicate, with fixed-denominator
   reward, lifecycle status, pool status, and run/eval/end-to-end latency;
-- `summary.json`: per-candidate accuracy/validity/latency plus paired wins,
-  losses, ties, and GPT-minus-Qwen reward delta.
+- `summary.json`: current collection counts and explicitly labeled
+  `collected_only` diagnostics while partial. Formal candidate means and
+  paired deltas appear under `final_metrics` only after the complete expected
+  matrix and all content/teardown integrity checks pass; otherwise it is null
+  with a `withheld_*` status. `paired` remains the backward-compatible
+  GPT-minus-Qwen3.6 comparison; `paired_comparisons` additionally reports GPT
+  minus Qwen3.5 baseline and Qwen3.6 minus Qwen3.5 baseline when enabled.
 
 Use `--forward-seed-to-pool` only after confirming that every endpoint accepts
 an OpenAI-compatible `seed` field. Without it, the seed still fixes task order,
 candidate interleaving, slot assignment, pair identity, and the audit manifest.
+
+The immutable plan also records a declared content manifest for the forced and
+shared runners, trajectory builder/evaluators, gateway, rollout and runtime
+implementation, every selected task SIF, and every verifier tests tree. Missing
+or changed content changes the plan and task IDs, so old rows cannot be mixed
+into a resumed benchmark. Allocation-local ports, UDS roots, raw rendered
+config paths, and hostnames are recorded separately as attempt metadata and do
+not change the semantic plan. If an evaluator pass exits with code 3 (pending
+work), the services-only launcher performs a bounded number of `--resume`
+passes against the same live services; it stops rather than restart unless the
+remaining Slurm walltime can cover all missing waves plus shutdown margin.
+Paid calls use gateway episode admission with each candidate capped by the
+requested evaluation concurrency and a bounded positive wait budget. The
+launcher continuously checks structured gateway health; a retained unreaped
+episode, repeated health failure, premature service exit, forced kill, or
+non-clean gateway/rollout/UDS teardown invalidates and withholds final metrics.
+
+To resume in a fresh allocation, rerun the submit command with the same run id,
+dataset slice, seed, candidates, concurrency and output directory, adding
+`--resume`. The wrapper generates a fresh service directory automatically; any
+semantic config, implementation, SIF, verifier, or row-content change fails
+closed before a result can be reused.

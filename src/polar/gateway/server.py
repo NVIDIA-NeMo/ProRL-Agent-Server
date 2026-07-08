@@ -10,11 +10,13 @@ import logging
 import os
 import secrets
 from datetime import datetime, timezone
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 import orjson
+from pydantic import BaseModel, ConfigDict, Field
 
 from polar.config import GatewayNodeConfig, TopologyConfig
 from polar.gateway.completion_writer import CompletionWriter
@@ -24,6 +26,18 @@ from polar.gateway.engine import (
     POLAR_INFERENCE_TIMINGS_KEY,
     get_engine,
     sanitize_inference_timings,
+)
+from polar.gateway.episode_admission import (
+    EpisodeAcquireCancelled,
+    EpisodeAcquireTimeout,
+    EpisodeAdmissionPoisoned,
+    EpisodeCallUnauthorized,
+    EpisodeLeaseClosing,
+    EpisodeLeaseConflict,
+    EpisodeLeaseNotOwned,
+    EpisodeReleaseDraining,
+    ModelPoolEpisodeAdmission,
+    UnknownEpisodeAlias,
 )
 from polar.gateway.node import GatewayNodeManager
 from polar.gateway.proxy import (
@@ -35,6 +49,7 @@ from polar.gateway.proxy import (
 from polar.gateway.session import (
     extract_api_key,
     InvalidSessionIdError,
+    MODEL_POOL_ADMISSION_CAPABILITY_SCOPE,
     MODEL_POOL_CAPABILITY_SCOPE,
     ROUTER_CAPABILITY_SCOPE,
     SessionCreateRequest,
@@ -65,6 +80,30 @@ logger = logging.getLogger(__name__)
 _ROUTER_POLICY_MODEL_ALIAS = "router/policy"
 _CONTROL_PLANE_TOKEN_ENV = "POLAR_CONTROL_PLANE_TOKEN"
 _CONTROL_PLANE_TOKEN_HEADER = "x-polar-control-token"
+_MAX_EPISODE_ADMISSION_WAIT_SECONDS = 86_400.0
+_GATEWAY_HTTP_DRAIN_TIMEOUT_SECONDS = 60
+
+
+class _StrictRequestModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class EpisodeLeaseAcquireRequest(_StrictRequestModel):
+    model: str = Field(min_length=1, max_length=256, pattern=r"^pool/\S+$")
+    attempt_id: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    )
+    wait_timeout_seconds: float = Field(
+        gt=0,
+        le=_MAX_EPISODE_ADMISSION_WAIT_SECONDS,
+    )
+
+
+class EpisodeLeaseReleaseRequest(_StrictRequestModel):
+    lease_id: str = Field(min_length=16, max_length=256)
+    wait_timeout_seconds: float = Field(default=2.0, gt=0, le=10.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +112,7 @@ class ModelPoolRoute:
 
     model: str
     inference: InferenceClient
+    max_active_episodes: int | None = None
 
 
 @dataclass(slots=True)
@@ -81,12 +121,88 @@ class GatewayState:
     node: GatewayNodeConfig
     inference: InferenceClient
     model_pool: dict[str, ModelPoolRoute]
+    episode_admission: ModelPoolEpisodeAdmission
     storage: SessionStore
     transform_manager: TransformManager
     session_registry: SessionRegistry
     node_manager: GatewayNodeManager
     completion_writer: CompletionWriter
     event_bus: EventBus
+
+
+class _AsyncOnce:
+    """Run one async cleanup exactly once, shielding it from disconnect cancellation."""
+
+    def __init__(self, callback: Callable[[], Awaitable[None]]) -> None:
+        self._callback = callback
+        self._lock = asyncio.Lock()
+        self._task: asyncio.Task[None] | None = None
+
+    async def __call__(self) -> None:
+        async with self._lock:
+            if self._task is None:
+
+                async def invoke() -> None:
+                    await self._callback()
+
+                self._task = asyncio.create_task(invoke())
+            task = self._task
+        await _await_task_despite_cancellation(task)
+
+
+async def _await_task_despite_cancellation(task: asyncio.Task[None]) -> None:
+    """Finish security cleanup before propagating any caller cancellation."""
+
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+            if task.done():
+                break
+    # Retrieve/propagate cleanup failure before an unrelated caller cancel.
+    task.result()
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _end_request_despite_cancellation(
+    admission: ModelPoolEpisodeAdmission,
+    handle: Any,
+) -> None:
+    async def finish() -> None:
+        await admission.end_request(handle)
+
+    await _await_task_despite_cancellation(asyncio.create_task(finish()))
+
+
+class _FinalizingStreamingResponse(StreamingResponse):
+    """Own a lease/request finalizer across every ASGI send/disconnect path."""
+
+    def __init__(self, *args: Any, finalizer: _AsyncOnce, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._request_finalizer = finalizer
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Starlette does not guarantee aclose() when response-start/body
+            # send fails or the response task is cancelled. Close best-effort
+            # for generator-local cleanup, then unconditionally release the
+            # admission handle from this response ownership boundary.
+            aclose = getattr(self.body_iterator, "aclose", None)
+            if callable(aclose):
+                try:
+                    await asyncio.shield(aclose())
+                except (Exception, asyncio.CancelledError) as exc:
+                    logger.debug("Could not close streaming body during disconnect: %s", exc)
+            await self._request_finalizer()
 
 
 _state: GatewayState | None = None
@@ -120,7 +236,15 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
                 default_headers={"Authorization": f"Bearer {api_key}"},
                 max_concurrency=candidate.max_concurrency,
             ),
+            max_active_episodes=candidate.max_active_episodes,
         )
+    episode_admission = ModelPoolEpisodeAdmission(
+        {
+            candidate.alias: candidate.max_active_episodes
+            for candidate in node.model_pool
+            if candidate.max_active_episodes is not None
+        }
+    )
     persistence_config = topology.gateway.completion_persistence
     save_dir = topology.rollout.save_dir
     completion_writer = CompletionWriter(
@@ -154,12 +278,14 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
         default_runtime=node.default_runtime,
         rollout_server_url=topology.gateway.rollout_server_url or None,
         heartbeat_interval_seconds=topology.gateway.heartbeat_interval_seconds,
+        episode_admission=episode_admission,
     )
     return GatewayState(
         topology=topology,
         node=node,
         inference=inference,
         model_pool=model_pool,
+        episode_admission=episode_admission,
         storage=storage,
         transform_manager=transform_manager,
         session_registry=session_registry,
@@ -478,6 +604,80 @@ def _resolve_privileged_session_id(
     return info.session_id, None
 
 
+def _resolve_legacy_proxy_session_id(
+    headers: dict[str, str],
+    registry: SessionRegistry,
+) -> tuple[str | None, JSONResponse | None]:
+    """Resolve an ordinary model call without implicit session creation."""
+
+    credential = extract_api_key(headers)
+    if credential is None:
+        return None, _privileged_session_error(
+            "A live rollout-session credential is required",
+            status_code=401,
+            code="missing_session_credential",
+        )
+    info = registry.get(credential)
+    if info is None or not info.registered:
+        return None, _privileged_session_error(
+            "The rollout-session credential is invalid",
+            status_code=401,
+            code="invalid_session_credential",
+        )
+    if info.status != SessionStatus.RUNNING:
+        return None, _privileged_session_error(
+            "The rollout session is not running",
+            status_code=403,
+            code="inactive_session_credential",
+        )
+    if info.metadata.get("_polar_agent_harness") == "spilot_router":
+        return None, _privileged_session_error(
+            "SPilot sessions may call only scoped Router and model-pool aliases",
+            status_code=403,
+            code="spilot_unscoped_model_forbidden",
+        )
+    registry.update_activity(info.session_id)
+    return info.session_id, None
+
+
+def _require_control_plane_request(
+    request: Request,
+    *,
+    state: GatewayState | Any | None = None,
+) -> JSONResponse | None:
+    """Protect gateway control/diagnostic routes from task sandboxes.
+
+    SPilot task containers intentionally share the gateway's UDS transport so
+    they can reach the scoped Router/model-pool APIs.  Transport reachability
+    is therefore not authority to inspect or mutate gateway state.  Preserve
+    legacy deployments that have neither a control token nor a model pool,
+    while failing closed whenever model-pool credentials are configured.
+    """
+
+    current_state = state if state is not None else get_state()
+    expected = os.environ.get(_CONTROL_PLANE_TOKEN_ENV, "").strip()
+    requires_protection = bool(expected) or bool(
+        getattr(getattr(current_state, "node", None), "model_pool", None)
+        or getattr(current_state, "model_pool", None)
+    )
+    if not requires_protection:
+        return None
+    if not expected:
+        return _control_plane_error(
+            "Gateway control-plane authentication is not configured",
+            status_code=503,
+            code="control_plane_auth_unconfigured",
+        )
+    supplied = request.headers.get(_CONTROL_PLANE_TOKEN_HEADER, "")
+    if not secrets.compare_digest(supplied, expected):
+        return _control_plane_error(
+            "This gateway route is restricted to the control plane",
+            status_code=403,
+            code="control_plane_forbidden",
+        )
+    return None
+
+
 def _coerce_datetime(value: str | None) -> datetime:
     if value:
         return datetime.fromisoformat(value)
@@ -577,8 +777,10 @@ def format_stream_output(
 
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models(request: Request):
     state = get_state()
+    if auth_error := _require_control_plane_request(request, state=state):
+        return auth_error
     try:
         return await state.inference.list_models()
     except Exception as exc:
@@ -604,13 +806,79 @@ async def tokenize_request(request: Request) -> Response:
     if not isinstance(body, dict):
         return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
 
+    pool_request_handle = None
+    # A formal Router gateway exposes its UDS to untrusted task sandboxes.
+    # Tokenization still consumes local serving capacity, so bind it to the
+    # same active alias-specific episode lease as the candidate completion.
+    if getattr(state, "model_pool", None):
+        requested_model = body.get("model")
+        pool_route = (
+            state.model_pool.get(requested_model)
+            if isinstance(requested_model, str)
+            else None
+        )
+        if pool_route is None or pool_route.max_active_episodes is None:
+            return _privileged_session_error(
+                "Tokenization requires an active capped model-pool lease",
+                status_code=403,
+                code="tokenize_model_forbidden",
+            )
+        credential = extract_api_key({key: value for key, value in request.headers.items()})
+        if credential is None:
+            return _privileged_session_error(
+                "A lease-scoped pool-call credential is required",
+                status_code=401,
+                code="missing_pool_call_capability",
+            )
+        try:
+            pool_request_handle = await state.episode_admission.begin_request(
+                call_capability=credential,
+                alias=requested_model,
+            )
+        except EpisodeCallUnauthorized:
+            return _privileged_session_error(
+                "The pool-call capability is invalid",
+                status_code=401,
+                code="invalid_pool_call_capability",
+            )
+        except EpisodeLeaseClosing:
+            return _episode_admission_error(
+                "The episode lease is closing",
+                status_code=409,
+                code="episode_lease_closing",
+            )
+        except EpisodeAdmissionPoisoned:
+            return _episode_admission_error(
+                "Model-pool episode admission is poisoned",
+                status_code=503,
+                code="episode_admission_poisoned",
+            )
+        info = state.session_registry.get(pool_request_handle.session_id)
+        if info is None or info.status != SessionStatus.RUNNING:
+            await _end_request_despite_cancellation(
+                state.episode_admission,
+                pool_request_handle,
+            )
+            return _privileged_session_error(
+                "The rollout session is not running",
+                status_code=403,
+                code="inactive_pool_call_capability",
+            )
+
     tokenize_body = dict(body)
     tokenize_body["model"] = state.node.model_served
     try:
-        response = await state.inference.tokenize(tokenize_body)
-    except UpstreamError as exc:
-        logger.warning("Upstream tokenization error: %s", exc)
-        return _upstream_error_response(APIType.OPENAI_CHAT, exc)
+        try:
+            response = await state.inference.tokenize(tokenize_body)
+        except UpstreamError as exc:
+            logger.warning("Upstream tokenization error: %s", exc)
+            return _upstream_error_response(APIType.OPENAI_CHAT, exc)
+    finally:
+        if pool_request_handle is not None:
+            await _end_request_despite_cancellation(
+                state.episode_admission,
+                pool_request_handle,
+            )
     # SGLang also returns every token id.  The budget client only needs the
     # scalar count; dropping the potentially 262k-element list avoids copying
     # it over the sandbox UDS and serializing it a second time.
@@ -629,33 +897,44 @@ async def tokenize_request(request: Request) -> Response:
 async def health():
     state = get_state()
     metrics = await state.node_manager.stage_metrics()
+    episode_admission = await state.episode_admission.snapshot()
+    admission_health = state.node_manager.episode_admission_health()
     try:
         upstream = await state.inference.health()
     except Exception as exc:
         upstream = {"status": "error", "error": str(exc)}
-    return {
-        "status": "ok",
+    payload = {
+        "status": "ok" if admission_health["healthy"] else "error",
         "node_id": state.node.id,
         "gateway_url": state.node.public_url,
         "inference": upstream,
         "metrics": metrics.model_dump(mode="json"),
         "completion_persistence": state.completion_writer.stats(),
         "active_status_counts": state.session_registry.active_status_counts(),
-        "active_sessions": state.session_registry.active_sessions(),
+        "model_pool_episode_admission": episode_admission,
+        "model_pool_episode_admission_health": admission_health,
         "available_init": max(0, state.node.max_init_workers - metrics.init_inflight),
         "available_run": max(0, state.node.max_run_workers - metrics.run_inflight),
         "available_postrun": max(0, state.node.max_postrun_workers - metrics.postrun_inflight),
     }
+    if not admission_health["healthy"]:
+        return JSONResponse(payload, status_code=503)
+    return payload
 
 
 @app.get("/admin/inference/status")
-async def inference_generation_status():
-    return get_state().inference.generation_status()
+async def inference_generation_status(request: Request):
+    state = get_state()
+    if auth_error := _require_control_plane_request(request, state=state):
+        return auth_error
+    return state.inference.generation_status()
 
 
 @app.post("/admin/inference/pause")
-async def pause_inference_generation(timeout_seconds: float = 300.0):
+async def pause_inference_generation(request: Request, timeout_seconds: float = 300.0):
     state = get_state()
+    if auth_error := _require_control_plane_request(request, state=state):
+        return auth_error
     try:
         status = await state.inference.pause_generation(timeout_seconds=timeout_seconds)
     except TimeoutError as exc:
@@ -671,20 +950,26 @@ async def pause_inference_generation(timeout_seconds: float = 300.0):
 
 
 @app.post("/admin/inference/resume")
-async def resume_inference_generation():
-    status = await get_state().inference.resume_generation()
+async def resume_inference_generation(request: Request):
+    state = get_state()
+    if auth_error := _require_control_plane_request(request, state=state):
+        return auth_error
+    status = await state.inference.resume_generation()
     logger.info("Resumed inference generation proxy")
     return status
 
 
 @app.get("/sessions")
 async def list_sessions(
+    request: Request,
     status: str | None = Query(default=None),
     task_id: str | None = Query(default=None),
     limit: int = Query(default=200, ge=1, le=1000),
 ) -> dict[str, Any]:
     """List sessions on this gateway (active + recently terminal)."""
     state = get_state()
+    if auth_error := _require_control_plane_request(request, state=state):
+        return auth_error
     active = state.session_registry.active_sessions()
     rows: list[dict[str, Any]] = []
     for entry in active:
@@ -708,9 +993,11 @@ async def list_sessions(
 
 
 @app.get("/sessions/{session_id}/completions")
-async def list_session_completions(session_id: str) -> dict[str, Any]:
+async def list_session_completions(request: Request, session_id: str) -> dict[str, Any]:
     """In-memory completions for an active or recently-completed session."""
     state = get_state()
+    if auth_error := _require_control_plane_request(request, state=state):
+        return auth_error
     try:
         safe = clean_session_id(session_id)
     except InvalidSessionIdError as exc:
@@ -728,6 +1015,8 @@ async def list_session_completions(session_id: str) -> dict[str, Any]:
 @app.get("/events")
 async def stream_events(request: Request):
     state = get_state()
+    if auth_error := _require_control_plane_request(request, state=state):
+        return auth_error
 
     async def iterator():
         async for chunk in state.event_bus.stream_events(heartbeat_seconds=15.0):
@@ -749,6 +1038,8 @@ async def create_session(request: Request):
         body = await request.json()
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    if auth_error := _require_control_plane_request(request, state=state):
+        return auth_error
     if "agent" in body and "session_id" in body:
         expected_control_token = os.environ.get(_CONTROL_PLANE_TOKEN_ENV, "").strip()
         agent = body.get("agent")
@@ -811,7 +1102,9 @@ async def create_session(request: Request):
 
 
 @app.get("/sessions/{session_id}", response_model=SessionStatusResponse)
-async def get_session(session_id: str):
+async def get_session(request: Request, session_id: str):
+    if auth_error := _require_control_plane_request(request):
+        return auth_error
     try:
         safe_session_id = clean_session_id(session_id)
     except InvalidSessionIdError as exc:
@@ -822,8 +1115,10 @@ async def get_session(session_id: str):
 
 
 @app.delete("/sessions/{session_id}", response_model=SessionDeleteResponse)
-async def delete_session(session_id: str):
+async def delete_session(request: Request, session_id: str):
     state = get_state()
+    if auth_error := _require_control_plane_request(request, state=state):
+        return auth_error
     try:
         safe_session_id = clean_session_id(session_id)
     except InvalidSessionIdError as exc:
@@ -855,6 +1150,111 @@ async def delete_session(session_id: str):
     )
 
 
+def _episode_admission_error(
+    message: str,
+    *,
+    status_code: int,
+    code: str,
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            "error": {
+                "message": message,
+                "type": "episode_admission_error",
+                "code": code,
+            }
+        },
+        status_code=status_code,
+    )
+
+
+@app.post("/internal/model-pool/episode-leases/acquire")
+async def acquire_model_pool_episode_lease(
+    request: Request,
+    payload: EpisodeLeaseAcquireRequest,
+):
+    state = get_state()
+    session_id, auth_error = _resolve_privileged_session_id(
+        {key: value for key, value in request.headers.items()},
+        state.session_registry,
+        scope=MODEL_POOL_ADMISSION_CAPABILITY_SCOPE,
+    )
+    if auth_error is not None:
+        return auth_error
+    assert session_id is not None
+    try:
+        grant = await state.episode_admission.acquire(
+            session_id=session_id,
+            alias=payload.model,
+            attempt_id=payload.attempt_id,
+            timeout_seconds=payload.wait_timeout_seconds,
+        )
+    except UnknownEpisodeAlias as exc:
+        return _episode_admission_error(
+            str(exc), status_code=400, code="unknown_episode_model"
+        )
+    except EpisodeLeaseConflict as exc:
+        return _episode_admission_error(
+            str(exc), status_code=409, code="episode_lease_conflict"
+        )
+    except EpisodeAcquireTimeout as exc:
+        return _episode_admission_error(
+            str(exc), status_code=503, code="episode_admission_timeout"
+        )
+    except EpisodeAcquireCancelled as exc:
+        return _episode_admission_error(
+            str(exc), status_code=409, code="episode_admission_cancelled"
+        )
+    except EpisodeAdmissionPoisoned as exc:
+        return _episode_admission_error(
+            str(exc), status_code=503, code="episode_admission_poisoned"
+        )
+    return {
+        "lease_id": grant.lease_id,
+        "model": grant.alias,
+        "attempt_id": grant.attempt_id,
+        "wait_ms": grant.wait_ms,
+        "local_cap": grant.local_cap,
+        "call_capability": grant.call_capability,
+    }
+
+
+@app.post("/internal/model-pool/episode-leases/release")
+async def release_model_pool_episode_lease(
+    request: Request,
+    payload: EpisodeLeaseReleaseRequest,
+):
+    state = get_state()
+    session_id, auth_error = _resolve_privileged_session_id(
+        {key: value for key, value in request.headers.items()},
+        state.session_registry,
+        scope=MODEL_POOL_ADMISSION_CAPABILITY_SCOPE,
+    )
+    if auth_error is not None:
+        return auth_error
+    assert session_id is not None
+    try:
+        released = await state.episode_admission.release(
+            session_id=session_id,
+            lease_id=payload.lease_id,
+            wait_timeout_seconds=payload.wait_timeout_seconds,
+        )
+    except EpisodeReleaseDraining:
+        return JSONResponse(
+            {"released": False, "draining": True},
+            status_code=202,
+        )
+    except EpisodeAdmissionPoisoned as exc:
+        return _episode_admission_error(
+            str(exc), status_code=503, code="episode_admission_poisoned"
+        )
+    except EpisodeLeaseNotOwned as exc:
+        return _episode_admission_error(
+            str(exc), status_code=404, code="episode_lease_not_owned"
+        )
+    return {"released": released}
+
+
 @app.api_route("/{path:path}", methods=["POST"])
 async def proxy_request(request: Request, path: str):
     state = get_state()
@@ -867,37 +1267,45 @@ async def proxy_request(request: Request, path: str):
     full_path = request.url.path
     api_type = detect(full_path, headers, body)
     original_model = extract_model(api_type, body)
-    privileged_alias = isinstance(original_model, str) and original_model.startswith(
-        ("router/", "pool/")
+    is_router_alias = isinstance(original_model, str) and original_model.startswith(
+        "router/"
     )
-    if privileged_alias:
-        capability_scope = (
-            ROUTER_CAPABILITY_SCOPE
-            if original_model.startswith("router/")
-            else MODEL_POOL_CAPABILITY_SCOPE
-        )
+    is_pool_alias = isinstance(original_model, str) and original_model.startswith(
+        "pool/"
+    )
+    if is_router_alias:
         session_id, auth_error = _resolve_privileged_session_id(
             headers,
             state.session_registry,
-            scope=capability_scope,
+            scope=ROUTER_CAPABILITY_SCOPE,
+        )
+        if auth_error is not None:
+            return auth_error
+        assert session_id is not None
+    elif not is_pool_alias:
+        session_id, auth_error = _resolve_legacy_proxy_session_id(
+            headers,
+            state.session_registry,
         )
         if auth_error is not None:
             return auth_error
         assert session_id is not None
     else:
-        try:
-            session_id = _resolve_session_id(
+        # A capped pool alias authenticates below with the lease-scoped call
+        # token. Keep the legacy session capability only for uncapped routes.
+        session_id = ""
+        if original_model not in state.model_pool:
+            session_id, auth_error = _resolve_privileged_session_id(
                 headers,
-                body,
-                query_session_id=(
-                    request.query_params.get("session_id")
-                    or request.query_params.get("key")
-                ),
+                state.session_registry,
+                scope=MODEL_POOL_CAPABILITY_SCOPE,
             )
-        except InvalidSessionIdError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
+            if auth_error is not None:
+                return auth_error
+            assert session_id is not None
 
     pool_route: ModelPoolRoute | None = None
+    pool_request_handle = None
     if isinstance(original_model, str) and original_model.startswith("router/"):
         if original_model != _ROUTER_POLICY_MODEL_ALIAS:
             return _model_pool_error(
@@ -921,36 +1329,124 @@ async def proxy_request(request: Request, path: str):
                 f"Unknown model-pool alias: {original_model}",
                 code="unknown_pool_model",
             )
-    transformer = state.transform_manager.get(api_type)
-    session_info = state.session_registry.get(session_id)
+        if pool_route.max_active_episodes is not None:
+            admission = getattr(state, "episode_admission", None)
+            if admission is None:
+                return _episode_admission_error(
+                    "Model-pool episode admission is not initialized",
+                    status_code=503,
+                    code="episode_admission_unavailable",
+                )
+            credential = extract_api_key(headers)
+            if credential is None:
+                return _privileged_session_error(
+                    "A lease-scoped pool-call credential is required",
+                    status_code=401,
+                    code="missing_pool_call_capability",
+                )
+            try:
+                pool_request_handle = await admission.begin_request(
+                    call_capability=credential,
+                    alias=original_model,
+                )
+            except EpisodeCallUnauthorized:
+                return _privileged_session_error(
+                    "The pool-call capability is invalid",
+                    status_code=401,
+                    code="invalid_pool_call_capability",
+                )
+            except EpisodeLeaseClosing:
+                return _episode_admission_error(
+                    "The episode lease is closing",
+                    status_code=409,
+                    code="episode_lease_closing",
+                )
+            except EpisodeAdmissionPoisoned:
+                return _episode_admission_error(
+                    "Model-pool episode admission is poisoned",
+                    status_code=503,
+                    code="episode_admission_poisoned",
+                )
+            session_id = pool_request_handle.session_id
+            info = state.session_registry.get(session_id)
+            if info is None or info.status != SessionStatus.RUNNING:
+                await _end_request_despite_cancellation(
+                    admission,
+                    pool_request_handle,
+                )
+                pool_request_handle = None
+                return _privileged_session_error(
+                    "The rollout session is not running",
+                    status_code=403,
+                    code="inactive_pool_call_capability",
+                )
+            state.session_registry.update_activity(session_id)
+        else:
+            session_id, auth_error = _resolve_privileged_session_id(
+                headers,
+                state.session_registry,
+                scope=MODEL_POOL_CAPABILITY_SCOPE,
+            )
+            if auth_error is not None:
+                return auth_error
+            assert session_id is not None
+    try:
+        transformer = state.transform_manager.get(api_type)
+        session_info = state.session_registry.get(session_id)
 
-    logger.debug(
-        "← %s %s | api=%s model=%s session=%s",
-        request.method,
-        full_path,
-        api_type.value,
-        original_model,
-        session_id,
-    )
+        logger.debug(
+            "← %s %s | api=%s model=%s session=%s",
+            request.method,
+            full_path,
+            api_type.value,
+            original_model,
+            session_id,
+        )
 
-    if api_type == APIType.GOOGLE and "streamGenerateContent" in full_path:
-        body["_streaming"] = True
+        if api_type == APIType.GOOGLE and "streamGenerateContent" in full_path:
+            body["_streaming"] = True
 
-    served_model = pool_route.model if pool_route is not None else state.node.model_served
-    inference = pool_route.inference if pool_route is not None else state.inference
-    completion_role = (
-        "router_policy"
-        if original_model == _ROUTER_POLICY_MODEL_ALIAS
-        else "policy"
-    )
-    transformed_body = body.copy()
-    transformed_body["_polar_model_served"] = served_model
-    openai_request = transformer.transform_request(transformed_body)
-    openai_request["model"] = served_model
-    is_streaming = openai_request.get("stream", False)
+        served_model = pool_route.model if pool_route is not None else state.node.model_served
+        inference = pool_route.inference if pool_route is not None else state.inference
+        completion_role = (
+            "router_policy"
+            if original_model == _ROUTER_POLICY_MODEL_ALIAS
+            else "policy"
+        )
+        transformed_body = body.copy()
+        transformed_body["_polar_model_served"] = served_model
+        openai_request = transformer.transform_request(transformed_body)
+        openai_request["model"] = served_model
+        is_streaming = openai_request.get("stream", False)
 
-    if is_streaming:
-        return await _handle_streaming(
+        if is_streaming:
+            stream_finalizer: Callable[[], Awaitable[None]] | None = None
+            if pool_request_handle is not None:
+                request_handle = pool_request_handle
+
+                async def stream_finalizer() -> None:
+                    await state.episode_admission.end_request(request_handle)
+
+            response = await _handle_streaming(
+                api_type,
+                transformer,
+                openai_request,
+                body,
+                session_id,
+                original_model=original_model,
+                session_info=session_info,
+                inference=inference,
+                persist_completion=pool_route is None,
+                response_model_alias=original_model if pool_route is not None else None,
+                completion_role=completion_role,
+                request_finalizer=stream_finalizer,
+            )
+            if isinstance(response, StreamingResponse) and pool_request_handle is not None:
+                # The response body's async-generator now owns the lease
+                # request handle through normal exhaustion or disconnect.
+                pool_request_handle = None
+            return response
+        return await _handle_non_streaming(
             api_type,
             transformer,
             openai_request,
@@ -963,19 +1459,12 @@ async def proxy_request(request: Request, path: str):
             response_model_alias=original_model if pool_route is not None else None,
             completion_role=completion_role,
         )
-    return await _handle_non_streaming(
-        api_type,
-        transformer,
-        openai_request,
-        body,
-        session_id,
-        original_model=original_model,
-        session_info=session_info,
-        inference=inference,
-        persist_completion=pool_route is None,
-        response_model_alias=original_model if pool_route is not None else None,
-        completion_role=completion_role,
-    )
+    finally:
+        if pool_request_handle is not None:
+            await _end_request_despite_cancellation(
+                state.episode_admission,
+                pool_request_handle,
+            )
 
 
 def _model_pool_error(message: str, *, code: str) -> JSONResponse:
@@ -1100,6 +1589,7 @@ async def _handle_streaming(
     persist_completion: bool = True,
     response_model_alias: str | None = None,
     completion_role: str = "policy",
+    request_finalizer: Callable[[], Awaitable[None]] | None = None,
 ) -> StreamingResponse | JSONResponse:
     state = get_state()
     inference = inference or state.inference
@@ -1140,6 +1630,7 @@ async def _handle_streaming(
 
     synthetic_chunk = _response_to_stream_chunk(response)
     stream_state = transformer.create_stream_state(original_request)
+    finalizer_once = _AsyncOnce(request_finalizer) if request_finalizer is not None else None
 
     async def generate():
         try:
@@ -1165,16 +1656,25 @@ async def _handle_streaming(
         except Exception as exc:
             logger.error("Synthetic stream error: %s", exc)
             yield _stream_error_output(api_type, exc)
+        finally:
+            if finalizer_once is not None:
+                await finalizer_once()
 
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={
+    response_kwargs = {
+        "media_type": "text/event-stream",
+        "headers": {
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
-    )
+    }
+    if finalizer_once is not None:
+        return _FinalizingStreamingResponse(
+            generate(),
+            finalizer=finalizer_once,
+            **response_kwargs,
+        )
+    return StreamingResponse(generate(), **response_kwargs)
 
 
 def _response_to_stream_chunk(response: dict[str, Any]) -> dict[str, Any]:
@@ -1233,13 +1733,26 @@ def serve(
 
     configure_server(topology_path, node_id=node_id)
     state = get_state()
-    uvicorn.run(
+    config = uvicorn.Config(
         app,
         host=state.node.host,
         port=state.node.port,
         log_level=log_level,
         access_log=uvicorn_access_log_enabled(),
+        # Bound active HTTP/provider streams before ASGI lifespan shutdown.
+        # Node.close then gets its separate dispatcher/runtime proof budget;
+        # launcher teardown covers both phases plus a margin.
+        timeout_graceful_shutdown=_GATEWAY_HTTP_DRAIN_TIMEOUT_SECONDS,
     )
+    server = uvicorn.Server(config=config)
+    server.run()
+    lifespan = getattr(server, "lifespan", None)
+    if not server.started or bool(getattr(lifespan, "shutdown_failed", False)):
+        # uvicorn.run() reports startup failures nonzero but silently returns
+        # zero when ASGI lifespan shutdown fails. A gateway teardown failure
+        # means runtime containment is unproven, so surface it to Slurm and the
+        # launcher instead of publishing a successful experiment exit.
+        raise SystemExit(1)
 
 
 def main() -> None:

@@ -11,18 +11,24 @@ import pytest
 
 from polar.agent.models import AgentRunResult, AgentSpec
 from polar.gateway.dispatcher import ManagedSession, SessionStage
-from polar.gateway.node import GatewayExecutionTimeout, GatewayNodeManager
+from polar.gateway.episode_admission import ModelPoolEpisodeAdmission
+from polar.gateway.node import (
+    GatewayExecutionTimeout,
+    GatewayNodeManager,
+    GatewayNodeUnhealthyError,
+)
 from polar.gateway.session import (
+    MODEL_POOL_ADMISSION_CAPABILITY_ENV,
+    MODEL_POOL_ADMISSION_CAPABILITY_SCOPE,
     MODEL_POOL_CAPABILITY_ENV,
-    MODEL_POOL_CAPABILITY_SCOPE,
     ROUTER_CAPABILITY_ENV,
     ROUTER_CAPABILITY_SCOPE,
     SessionRegistry,
 )
 from polar.gateway.storage import SessionStore
-from polar.rollout.models import SessionDispatchRequest, SessionStatus
+from polar.rollout.models import SessionDispatchRequest, SessionResult, SessionStatus
 from polar.rollout.timer import StageTimer
-from polar.runtime.base import BaseRuntime
+from polar.runtime.base import BaseRuntime, RuntimeContainmentError
 from polar.runtime.models import ExecResult, PrepareAction, RuntimeSpec
 from polar.trajectory.models import EvalResult, EvaluatorSpec, Trace, Trajectory
 
@@ -75,6 +81,65 @@ class _BlockingEvaluator:
             raise
 
 
+@pytest.mark.asyncio
+async def test_node_close_propagates_dispatcher_containment_failure() -> None:
+    manager = object.__new__(GatewayNodeManager)
+    manager.episode_admission = SimpleNamespace(
+        poison=AsyncMock(),
+        close=AsyncMock(),
+    )
+    manager._heartbeat_task = None
+    manager._control_client = None
+    manager._dispatcher = SimpleNamespace(
+        stop=AsyncMock(
+            side_effect=RuntimeContainmentError("unproven runtime destruction")
+        )
+    )
+    manager._cancel_finalizers = {}
+    manager._client = SimpleNamespace(aclose=AsyncMock())
+
+    with pytest.raises(RuntimeContainmentError, match="unproven runtime destruction"):
+        await manager.close()
+
+    manager.episode_admission.poison.assert_awaited_once()
+    manager.episode_admission.close.assert_awaited_once()
+    manager._client.aclose.assert_awaited_once()
+
+
+def test_fatal_containment_result_is_error_and_fully_masked() -> None:
+    result = SessionResult(
+        session_id="session-fatal-mask",
+        task_id="task-fatal-mask",
+        status=SessionStatus.COMPLETED,
+        trajectory=Trajectory(
+            status="COMPLETED",
+            traces=[
+                Trace(
+                    prompt_ids=[1],
+                    response_ids=[2, 3],
+                    loss_mask=[1, 1],
+                    response_logprobs=[-0.1, -0.2],
+                    reward=1.0,
+                )
+            ],
+        ),
+    )
+
+    masked = GatewayNodeManager._attach_fatal_retained_episode_metadata(result)
+
+    assert masked.status == SessionStatus.ERROR
+    assert masked.trajectory.status == "ERROR"
+    assert masked.trajectory.traces[0].reward == 0.0
+    assert masked.trajectory.traces[0].loss_mask == [0, 0]
+    assert masked.trajectory.traces[0].metadata["training_filter"] == {
+        "masked": True,
+        "trainable": False,
+        "reason": "runtime_containment_unproven",
+        "detail": "runtime destruction could not be proven",
+        "original_reward": 1.0,
+    }
+
+
 def test_exec_log_write_recreates_directory_after_concurrent_cleanup(tmp_path) -> None:
     session_dir = tmp_path / "session"
     log_dir = session_dir / "logs" / "agent"
@@ -121,7 +186,13 @@ async def test_spilot_dispatch_issues_and_injects_scoped_capabilities(
         await manager.dispatch(request)
         managed = enqueue.await_args.args[0]
         assert managed.router_capability not in (None, request.session_id)
-        assert managed.model_pool_capability not in (None, request.session_id)
+        # Capped pool calls no longer receive a session-wide capability. Each
+        # episode lease mints an alias-bound call credential instead.
+        assert managed.model_pool_capability is None
+        assert managed.model_pool_admission_capability not in (
+            None,
+            request.session_id,
+        )
         assert (
             registry.resolve_capability(
                 managed.router_capability,
@@ -131,8 +202,8 @@ async def test_spilot_dispatch_issues_and_injects_scoped_capabilities(
         )
         assert (
             registry.resolve_capability(
-                managed.model_pool_capability,
-                scope=MODEL_POOL_CAPABILITY_SCOPE,
+                managed.model_pool_admission_capability,
+                scope=MODEL_POOL_ADMISSION_CAPABILITY_SCOPE,
             ).session_id
             == request.session_id
         )
@@ -140,6 +211,7 @@ async def test_spilot_dispatch_issues_and_injects_scoped_capabilities(
         init_environment = manager._runtime_env(request, managed, include_agent_env=True)
         assert ROUTER_CAPABILITY_ENV not in init_environment
         assert MODEL_POOL_CAPABILITY_ENV not in init_environment
+        assert MODEL_POOL_ADMISSION_CAPABILITY_ENV not in init_environment
 
         managed.stage = SessionStage.RUNNING
         registry.set_status(request.session_id, SessionStatus.RUNNING)
@@ -147,12 +219,17 @@ async def test_spilot_dispatch_issues_and_injects_scoped_capabilities(
         assert environment["OPENAI_API_KEY"] == request.session_id
         assert "POLAR_CONTROL_PLANE_TOKEN" not in environment
         assert environment[ROUTER_CAPABILITY_ENV] == managed.router_capability
-        assert environment[MODEL_POOL_CAPABILITY_ENV] == managed.model_pool_capability
+        assert MODEL_POOL_CAPABILITY_ENV not in environment
+        assert (
+            environment[MODEL_POOL_ADMISSION_CAPABILITY_ENV]
+            == managed.model_pool_admission_capability
+        )
 
         managed.stage = SessionStage.POSTRUN
         postrun_environment = manager._runtime_env(request, managed, include_agent_env=True)
         assert ROUTER_CAPABILITY_ENV not in postrun_environment
         assert MODEL_POOL_CAPABILITY_ENV not in postrun_environment
+        assert MODEL_POOL_ADMISSION_CAPABILITY_ENV not in postrun_environment
     finally:
         await manager._client.aclose()
         storage.close()
@@ -576,6 +653,223 @@ async def test_eval_budget_timeout_masks_preexisting_agent_timeout(tmp_path: Pat
     assert trace.loss_mask == [0, 0]
     assert trace.metadata["training_filter"]["reason"] == "session_timeout"
     assert trace.metadata["training_filter"]["masked"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "release_before_teardown",
+    [False, True],
+    ids=["active-lease", "lease-already-released"],
+)
+async def test_failed_runtime_destruction_retains_lease_and_marks_node_unhealthy(
+    tmp_path: Path,
+    release_before_teardown: bool,
+) -> None:
+    session_id = f"session-episode-cleanup-{int(release_before_teardown)}"
+    admission = ModelPoolEpisodeAdmission({"pool/qwen": 1})
+
+    class Runtime(_PostrunRuntime):
+        async def stop(self) -> None:
+            assert await admission.has_active(
+                session_id=session_id,
+                alias="pool/qwen",
+            ) is not release_before_teardown
+            raise RuntimeContainmentError("synthetic residual runtime process")
+
+    registry = SessionRegistry()
+    storage = SessionStore()
+    manager = GatewayNodeManager(
+        node_id="node-test",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=storage,
+        session_registry=registry,
+        builders=SimpleNamespace(),  # type: ignore[arg-type]
+        evaluators=SimpleNamespace(),  # type: ignore[arg-type]
+        episode_admission=admission,
+    )
+    manager._remove_session_dir_best_effort = AsyncMock()  # type: ignore[method-assign]
+    session_dir = tmp_path / session_id
+    artifacts_dir = session_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    runtime_spec = RuntimeSpec(image="task.sif")
+    runtime = Runtime(runtime_spec, session_id, session_dir)
+    request = SessionDispatchRequest(
+        session_id=session_id,
+        task_id="task-episode-cleanup",
+        instruction="test",
+        remaining_timeout_seconds=60,
+        runtime=runtime_spec,
+        agent=AgentSpec(harness="spilot_router"),
+    )
+    timer = StageTimer()
+    timer.mark("dispatch", "started")
+    managed = ManagedSession(
+        request=request,
+        timer=timer,
+        session_dir=session_dir,
+        artifacts_dir=artifacts_dir,
+        runtime=runtime,
+        execution_deadline=asyncio.get_running_loop().time() + 60,
+        stage=SessionStage.POSTRUN,
+    )
+    managed.final_result = manager._cancelled_result(request, timer)
+    registry.register(
+        session_id,
+        task_id=request.task_id,
+        registered=True,
+        status=SessionStatus.POST_RUN,
+    )
+    storage.ensure_session(
+        session_id,
+        model_requested=None,
+        model_used=None,
+        api_type=None,
+        task_id=request.task_id,
+    )
+    grant = await admission.acquire(
+        session_id=session_id,
+        alias="pool/qwen",
+        attempt_id="0:solve",
+        timeout_seconds=1,
+    )
+    if release_before_teardown:
+        assert await admission.release(
+            session_id=session_id,
+            lease_id=grant.lease_id,
+        )
+    try:
+        await manager._handle_postrun(managed)
+        assert runtime.destroyed is False
+        assert (await admission.snapshot())["pool/qwen"]["active"] == (
+            0 if release_before_teardown else 1
+        )
+        assert manager.episode_admission_health() == {
+            "healthy": False,
+            "fatal_retained": True,
+            "retained_session_ids": [session_id],
+        }
+        stored_result = registry.get(session_id).result
+        assert stored_result is not None
+        assert stored_result.status == "ERROR"
+        assert stored_result.trajectory.status == "ERROR"
+        assert stored_result.metadata["runtime_containment_proven"] is False
+        router_health = stored_result.trajectory.metadata["evaluation"][
+            "spilot_router"
+        ]
+        assert router_health["admission_enabled"] is True
+        assert router_health["admission_fatal_retained"] is True
+        assert router_health["admission_node_healthy"] is False
+        assert (
+            stored_result.metadata[
+                "model_pool_episode_admission_fatal_retained"
+            ]
+            is True
+        )
+        assert manager._remove_session_dir_best_effort.await_count == 0
+        blocked_request = request.model_copy(
+            update={
+                "session_id": "session-after-retained-lease",
+                "task_id": "task-after-retained-lease",
+            }
+        )
+        with pytest.raises(GatewayNodeUnhealthyError, match="gateway node is unhealthy"):
+            await manager.dispatch(blocked_request)
+
+        control_client = SimpleNamespace(post=AsyncMock())
+        manager._control_client = control_client
+        assert await manager._send_heartbeat_once() is False
+        control_client.post.assert_not_awaited()
+    finally:
+        await admission.close()
+        await manager._client.aclose()
+        storage.close()
+
+
+@pytest.mark.asyncio
+async def test_postrun_after_explicit_runner_release_stays_healthy(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-episode-cleanup-released"
+    admission = ModelPoolEpisodeAdmission({"pool/qwen": 1})
+
+    registry = SessionRegistry()
+    storage = SessionStore()
+    manager = GatewayNodeManager(
+        node_id="node-test",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=storage,
+        session_registry=registry,
+        builders=SimpleNamespace(),  # type: ignore[arg-type]
+        evaluators=SimpleNamespace(),  # type: ignore[arg-type]
+        episode_admission=admission,
+    )
+    manager._remove_session_dir_best_effort = AsyncMock()  # type: ignore[method-assign]
+    session_dir = tmp_path / session_id
+    artifacts_dir = session_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    runtime_spec = RuntimeSpec(image="task.sif")
+    runtime = _PostrunRuntime(runtime_spec, session_id, session_dir)
+    request = SessionDispatchRequest(
+        session_id=session_id,
+        task_id="task-episode-cleanup-released",
+        instruction="test",
+        remaining_timeout_seconds=60,
+        runtime=runtime_spec,
+        agent=AgentSpec(harness="spilot_router"),
+    )
+    timer = StageTimer()
+    timer.mark("dispatch", "started")
+    managed = ManagedSession(
+        request=request,
+        timer=timer,
+        session_dir=session_dir,
+        artifacts_dir=artifacts_dir,
+        runtime=runtime,
+        execution_deadline=asyncio.get_running_loop().time() + 60,
+        stage=SessionStage.POSTRUN,
+    )
+    managed.final_result = manager._cancelled_result(request, timer)
+    registry.register(
+        session_id,
+        task_id=request.task_id,
+        registered=True,
+        status=SessionStatus.POST_RUN,
+    )
+    storage.ensure_session(
+        session_id,
+        model_requested=None,
+        model_used=None,
+        api_type=None,
+        task_id=request.task_id,
+    )
+    grant = await admission.acquire(
+        session_id=session_id,
+        alias="pool/qwen",
+        attempt_id="0:solve",
+        timeout_seconds=1,
+    )
+    assert await admission.release(
+        session_id=session_id,
+        lease_id=grant.lease_id,
+    )
+    try:
+        await manager._handle_postrun(managed)
+        assert runtime._destroyed
+        assert (await admission.snapshot())["pool/qwen"]["active"] == 0
+        assert manager.episode_admission_health() == {
+            "healthy": True,
+            "fatal_retained": False,
+            "retained_session_ids": [],
+        }
+    finally:
+        await manager._client.aclose()
+        storage.close()
 
 
 @pytest.mark.asyncio

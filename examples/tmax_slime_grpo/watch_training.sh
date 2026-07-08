@@ -75,6 +75,15 @@ if [ "$LOADED_RUN_STATE" = true ] && \
    ! tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_DYNAMIC_SAMPLING_FILTER_PATH; then
     export TMAX_DYNAMIC_SAMPLING_FILTER_PATH=""
 fi
+# Episode admission changes both provider pressure and timeout semantics. A run
+# state that contains none of the contract fields predates admission and must
+# resume with the old disabled behavior and 3,300/4,500/5,100 envelopes. A
+# partially written contract is ambiguous and therefore rejected.
+if [ "$LOADED_RUN_STATE" = true ] && \
+   [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ]; then
+    tmax_restore_spilot_admission_resume_contract \
+        "${TMAX_RUN_STATE_FILE}" "[tmax watch]"
+fi
 # Model identity is part of checkpoint compatibility. Run states created before
 # it was persisted belong to the historical Qwen3.5-4B launcher; preserve that
 # lineage instead of combining a 4B SAVE_DIR with the new 9B architecture.
@@ -116,6 +125,7 @@ export TMAX_WATCH_QUICK_FAILURE_SECONDS="${TMAX_WATCH_QUICK_FAILURE_SECONDS:-900
 export TMAX_WATCH_FAILURE_COUNT="${TMAX_WATCH_FAILURE_COUNT:-0}"
 export TMAX_WATCH_FAILURE_SIGNATURE="${TMAX_WATCH_FAILURE_SIGNATURE:-}"
 export TMAX_WATCH_LAST_ACCOUNTED_JOB_ID="${TMAX_WATCH_LAST_ACCOUNTED_JOB_ID:-}"
+export TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT="${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT:-0}"
 TMAX_SUBMIT_SCRIPT="${TMAX_SUBMIT_SCRIPT:-${SCRIPT_DIR}/submit_slurm.sh}"
 
 # SPilot credentials are deliberately absent from run state, so its watcher
@@ -152,7 +162,8 @@ if ! [[ "${ROLLOUT_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] || ! [[ "${NUM_EPOCH}" =~ ^[
 fi
 if ! [[ "${TMAX_WATCH_MAX_QUICK_FAILURES}" =~ ^[1-9][0-9]*$ ]] || \
    ! [[ "${TMAX_WATCH_QUICK_FAILURE_SECONDS}" =~ ^[1-9][0-9]*$ ]] || \
-   ! [[ "${TMAX_WATCH_FAILURE_COUNT}" =~ ^[0-9]+$ ]]; then
+   ! [[ "${TMAX_WATCH_FAILURE_COUNT}" =~ ^[0-9]+$ ]] || \
+   ! [[ "${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT}" =~ ^[0-9]+$ ]]; then
     echo "ERROR: invalid watcher failure-policy setting" >&2
     exit 2
 fi
@@ -322,6 +333,48 @@ slurm_job_record() {
         awk -F '|' -v wanted="$id" '$1 == wanted { print $2 "|" $3 "|" $4; exit }'
 }
 
+spilot_admission_fatal_marker_status() {
+    local id="$1"
+    python3 - "${TMAX_RUN_STATE_FILE}" "${id}" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+state_path = pathlib.Path(sys.argv[1])
+job_id = sys.argv[2]
+prefix = f"{state_path.name}.job-{job_id}.admission-fatal.rank-"
+paths = sorted(state_path.parent.glob(f"{prefix}*.json"))
+if not paths:
+    raise SystemExit(1)
+retained_total = 0
+for path in paths:
+    match = re.fullmatch(re.escape(prefix) + r"([0-9]+)\.json", path.name)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise SystemExit(2)
+    if (
+        match is None
+        or not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("kind") != "model_pool_episode_admission_fatal_retained"
+        or payload.get("job_id") != job_id
+        or type(payload.get("rank")) is not int
+        or payload["rank"] != int(match.group(1))
+        or not isinstance(payload.get("node_id"), str)
+        or not payload["node_id"]
+        or not isinstance(payload.get("observed_at"), str)
+        or not payload["observed_at"]
+        or type(payload.get("retained_count")) is not int
+        or payload["retained_count"] <= 0
+    ):
+        raise SystemExit(2)
+    retained_total += payload["retained_count"]
+print(f"{len(paths)}|{retained_total}")
+PY
+}
+
 normalize_slurm_state() {
     local state="${1%% *}"
     printf '%s\n' "${state%+}"
@@ -369,10 +422,67 @@ record_failure_signature() {
     export TMAX_WATCH_FAILURE_COUNT="$((TMAX_WATCH_FAILURE_COUNT + 1))"
 }
 
+publish_spilot_admission_fatal_metric() {
+    local publish_python publish_script publish_timeout wandb_dir
+    local -a publish_args
+    [ -n "${WANDB_API_KEY:-}" ] || {
+        echo "[tmax watch] W&B fatal metric publish skipped: WANDB_API_KEY is unavailable" >&2
+        return 0
+    }
+    case "${WANDB_MODE:-offline}" in
+        online|shared) ;;
+        *)
+            echo "[tmax watch] W&B fatal metric publish skipped: WANDB_MODE=${WANDB_MODE:-offline}" >&2
+            return 0
+            ;;
+    esac
+    command -v timeout >/dev/null || {
+        echo "[tmax watch] WARNING: cannot publish final W&B fatal metric without timeout(1)" >&2
+        return 0
+    }
+    publish_python="${TMAX_SPILOT_FATAL_WANDB_PYTHON_BIN:-${POLR_TRAIN_VENV}/bin/python3}"
+    publish_script="${PROJECT_ROOT}/scripts/monitor_wandb_gpu.py"
+    publish_timeout="${TMAX_SPILOT_FATAL_WANDB_PUBLISH_TIMEOUT_SECONDS:-45}"
+    if ! [[ "$publish_timeout" =~ ^[1-9][0-9]*$ ]]; then
+        echo "[tmax watch] WARNING: invalid TMAX_SPILOT_FATAL_WANDB_PUBLISH_TIMEOUT_SECONDS=${publish_timeout}" >&2
+        return 0
+    fi
+    if [ ! -x "$publish_python" ] || [ ! -f "$publish_script" ]; then
+        echo "[tmax watch] WARNING: final W&B fatal metric publisher is unavailable" >&2
+        return 0
+    fi
+    wandb_dir="${POLAR_DATA_ROOT}/runs/${RUN_ID}/watcher-wandb"
+    mkdir -p "$wandb_dir"
+    publish_args=(
+        "$publish_python" "$publish_script"
+        --one-shot-static
+        --metric-prefix "${GPU_MONITOR_PREFIX:-polar_tmax_system}"
+        --train-progress-file "${SAVE_DIR}/train_progress.step"
+        --wandb-run-id "${WANDB_RUN_ID:-${RUN_ID}}"
+        --wandb-project "${WANDB_PROJECT:-polar-tmax-grpo}"
+        --wandb-group "${WANDB_GROUP:-spilot-router-qwen35-9b-8n64}"
+        --wandb-dir "$wandb_dir"
+        --wandb-label spilot-fatal-watcher
+        --wandb-mode shared
+        --wandb-finish-timeout-s 15
+        --static-metric
+        "polar/spilot_router/admission_fatal_job_count_total=${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT}"
+    )
+    if [ -n "${WANDB_ENTITY:-}" ]; then
+        publish_args+=(--wandb-entity "${WANDB_ENTITY}")
+    fi
+    if timeout --signal=TERM --kill-after=5 "$publish_timeout" "${publish_args[@]}"; then
+        echo "[tmax watch] published final SPilot admission fatal count=${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT} to W&B" >&2
+    else
+        echo "[tmax watch] WARNING: bounded final W&B fatal metric publish failed; count remains authoritative in ${TMAX_RUN_STATE_FILE}" >&2
+    fi
+}
+
 account_terminal_job() {
     local id="$1" state="$2" elapsed="$3" exit_code="$4" iter="$5"
     local submitted_iter="${TMAX_LAST_JOB_CHECKPOINT_ITER:--1}"
     local progressed=false fail_closed_quick=false signature
+    local admission_fatal=false marker_status=0 marker_summary=""
 
     if [ "${TMAX_WATCH_LAST_ACCOUNTED_JOB_ID}" = "$id" ]; then
         if is_fail_closed_failure_signature "${TMAX_WATCH_FAILURE_SIGNATURE}"; then
@@ -391,12 +501,28 @@ account_terminal_job() {
         progressed=true
     fi
 
+    if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ] && \
+       [ "${SPILOT_EPISODE_ADMISSION_ENABLED:-false}" = "true" ]; then
+        marker_summary="$(spilot_admission_fatal_marker_status "$id")" || marker_status=$?
+    else
+        marker_status=1
+    fi
+    if [ "$marker_status" -eq 0 ]; then
+        admission_fatal=true
+        export TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT="$((TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT + 1))"
+        echo "[tmax watch] SPilot admission fatal job metric: count_total=${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT} job=${id} markers_retained=${marker_summary}" >&2
+    elif [ "$marker_status" -eq 2 ]; then
+        echo "[tmax watch] malformed SPilot admission fatal marker for job=${id}; retaining normal fail-closed policy" >&2
+    fi
+
     # Completion without either the final marker (handled before this function)
     # or a newer atomic checkpoint is still a failed continuation, regardless
     # of elapsed time or Slurm's terminal-state spelling.
     if [ "$progressed" = false ]; then
         signature="${state}/exit=${exit_code}/checkpoint=${iter}"
-        if [[ "$elapsed" =~ ^[0-9]+$ ]] && \
+        if [ "$admission_fatal" = true ]; then
+            signature="recoverable/model-pool-episode-admission-retained/${signature}"
+        elif [[ "$elapsed" =~ ^[0-9]+$ ]] && \
            [ "$elapsed" -lt "$TMAX_WATCH_QUICK_FAILURE_SECONDS" ] && \
            is_fail_closed_quick_failure_state "$state"; then
             fail_closed_quick=true
@@ -409,6 +535,12 @@ account_terminal_job() {
     fi
     export TMAX_WATCH_LAST_ACCOUNTED_JOB_ID="$id"
     tmax_write_run_state "${TMAX_RUN_STATE_FILE}"
+    if [ "$admission_fatal" = true ]; then
+        # The allocation-side GPU monitor exited before this watcher could
+        # increment the run-level count. Publish this event now so the terminal
+        # third fatal is not lost when no subsequent allocation is launched.
+        publish_spilot_admission_fatal_metric
+    fi
 
     if [ "$fail_closed_quick" = true ]; then
         echo "[tmax watch] fail-closed quick failure: job=${id} state=${state} elapsed=${elapsed}s is below ${TMAX_WATCH_QUICK_FAILURE_SECONDS}s with no checkpoint progress; refusing automatic resubmission" >&2

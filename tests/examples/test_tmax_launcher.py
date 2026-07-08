@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 from polar.config.topology import TopologyConfig
 
@@ -1395,6 +1396,9 @@ def test_shared_launcher_cleanup_never_waits_unbounded() -> None:
     assert "polar_terminate_process_groups_bounded" in cleanup
     assert "POLAR_RAY_STOP_TIMEOUT_SECONDS" in shared_run
     assert "POLAR_BACKGROUND_SHUTDOWN_GRACE_SECONDS" in shared_run
+    assert "POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS" in shared_run
+    assert "polar_shutdown_gateway_bounded" in cleanup
+    assert 'exit "${final_status}"' in cleanup
 
 
 def test_shared_launcher_bounded_cleanup_kills_stuck_child() -> None:
@@ -1430,6 +1434,59 @@ done
     result = run_bash(script)
 
     assert result.returncode == 0
+
+
+@pytest.mark.parametrize(
+    ("term_action", "expected"),
+    [
+        ("exit 0", "clean"),
+        ("exit 7", "failed"),
+        ("", "killed"),
+    ],
+)
+def test_shared_launcher_gateway_shutdown_propagates_failure(
+    term_action: str,
+    expected: str,
+) -> None:
+    shared_run = (SHARED / "run.sh").read_text()
+    helpers_start = shared_run.index("polar_pid_is_active() {")
+    helpers_end = shared_run.index("\ncleanup() {", helpers_start)
+    helpers = shared_run[helpers_start:helpers_end]
+    if term_action:
+        grace = 2
+    else:
+        grace = 0
+    script = f"""
+set -euo pipefail
+{helpers}
+ready=$(mktemp)
+action={json.dumps(term_action)}
+bash -c 'trap "$2" TERM; touch "$1"; while true; do read -r -t 1 _ || true; done' _ "$ready" "$action" &
+pid=$!
+for _ in $(seq 1 100); do
+    [ -s "$ready" ] && break
+    sleep 0.01
+done
+[ -s "$ready" ]
+if POLAR_BACKGROUND_KILL_GRACE_SECONDS=1 \
+    polar_shutdown_gateway_bounded "$pid" {grace}; then
+    printf clean
+else
+    if [ {grace} -eq 0 ]; then printf killed; else printf failed; fi
+fi
+"""
+
+    result = run_bash(script)
+
+    assert result.stdout == expected
+
+
+def test_spilot_gateway_shutdown_budget_covers_http_and_runtime_teardown() -> None:
+    launcher = (SHARED / "run.sh").read_text()
+
+    assert 'POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS:-150' in launcher
+    assert 'POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS}" -lt 150' in launcher
+    assert "60s HTTP drain + 60s runtime proof + 30s margin" in launcher
 
 
 def test_shared_launcher_bounded_cleanup_kills_stuck_process_group() -> None:
@@ -2088,6 +2145,394 @@ printf '%s\n' \
     assert lines[-3:] == ["4", "12/96/48", "8192/4"]
 
 
+def test_spilot_canonical_episode_admission_defaults_and_timeout_formula(
+    tmp_path: Path,
+) -> None:
+    env = clean_env(tmp_path)
+    script = f"""
+source {SPILOT / "experiment_defaults.sh"}
+printf '%s\n' \
+  "$NUM_NODES|$POLAR_MAX_INIT_WORKERS|$POLAR_MAX_RUN_WORKERS|$TMAX_MIN_RUN_WORKERS_PER_ROLLOUT_GPU" \
+  "$SPILOT_EPISODE_ADMISSION_ENABLED|$SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS|$SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT" \
+  "$SPILOT_QWEN_MAX_ACTIVE_EPISODES|$SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES|$SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY|$SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES" \
+  "$SPILOT_GPT_MAX_ACTIVE_EPISODES|$SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES|$SPILOT_GPT_GATEWAY_MAX_CONCURRENCY|$SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES" \
+  "$TMAX_TRAIN_AGENT_TIMEOUT_SECONDS|$POLAR_TASK_TIMEOUT_FLOOR_SECONDS|$POLAR_REQUEST_TIMEOUT" \
+  "$PARTITION|$WALL_TIME|$TMAX_MIN_WALL_TIME|$TMAX_GRACEFUL_EXIT_BUFFER_SECONDS|$TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS|$SAVE_INTERVAL"
+"""
+
+    assert run_bash(script, env=env).stdout.splitlines() == [
+        "8|96|576|12",
+        "true|14400|8",
+        "8|1|1|8",
+        "32|4|4|32",
+        "17700|36600|37200",
+        "backfill|2-00:00:00|2-00:00:00|43200|43200|5",
+    ]
+
+
+def test_spilot_defaults_reject_nondivisible_aggregate_episode_cap(
+    tmp_path: Path,
+) -> None:
+    env = clean_env(tmp_path)
+    env["SPILOT_QWEN_MAX_ACTIVE_EPISODES"] = "9"
+
+    result = run_bash(
+        f"source {SPILOT / 'experiment_defaults.sh'}",
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "must be positive and divisible" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "POLAR_APPTAINER_NO_MOUNT_HOSTFS",
+        "POLAR_APPTAINER_NO_MOUNT_TMP",
+        "POLAR_APPTAINER_ISOLATE_PID",
+        "POLAR_APPTAINER_ISOLATE_IPC",
+        "POLAR_APPTAINER_CLEANENV",
+    ],
+)
+def test_spilot_defaults_reject_isolation_opt_out(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    env = clean_env(tmp_path)
+    env[name] = "0"
+
+    result = run_bash(
+        f"source {SPILOT / 'experiment_defaults.sh'}",
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert f"formal SPilot requires {name}=1" in result.stderr
+
+
+def test_spilot_launcher_rejects_timeout_without_ready_wave_reserve(
+    tmp_path: Path,
+) -> None:
+    env = clean_env(tmp_path)
+    env["POLAR_TASK_TIMEOUT_FLOOR_SECONDS"] = "36599"
+    result = run_bash(
+        f"source {SPILOT / 'experiment_defaults.sh'}; "
+        f"source {TMAX / 'env.cwdfw.sh'}",
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert (
+        "SPilot admission timeout formula requires "
+        "agent/task/request=17700/36600/37200"
+    ) in result.stderr
+
+
+def test_spilot_launcher_rejects_wall_time_shorter_than_request_and_grace(
+    tmp_path: Path,
+) -> None:
+    env = clean_env(tmp_path)
+    env.update(WALL_TIME="4:00:00", TMAX_MIN_WALL_TIME="4:00:00")
+    result = run_bash(
+        f"source {SPILOT / 'experiment_defaults.sh'}; "
+        f"source {TMAX / 'env.cwdfw.sh'}",
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert (
+        "SPilot WALL_TIME must cover POLAR_REQUEST_TIMEOUT + "
+        "TMAX_GRACEFUL_EXIT_BUFFER_SECONDS (14400 < 80400)"
+    ) in result.stderr
+
+
+def test_spilot_launcher_rejects_grace_buffer_without_checkpoint_reserve(
+    tmp_path: Path,
+) -> None:
+    env = clean_env(tmp_path)
+    env.update(
+        TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="40799",
+        TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS="40799",
+    )
+    result = run_bash(
+        f"source {SPILOT / 'experiment_defaults.sh'}; "
+        f"source {TMAX / 'env.cwdfw.sh'}",
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert (
+        "SPilot TMAX_GRACEFUL_EXIT_BUFFER_SECONDS must cover "
+        "POLAR_REQUEST_TIMEOUT + 3600 (40799 < 40800)"
+    ) in result.stderr
+
+
+def test_shared_launcher_preserves_spilot_effective_caps_across_eight_gateways():
+    launcher = (SHARED / "run.sh").read_text()
+    start = launcher.index('case "${POLAR_MULTI_GATEWAY:-0}"')
+    end = launcher.index("\nPOLAR_ROLLOUT_LOCAL_URL=", start)
+    capacity_block = launcher[start:end]
+    script = f"""
+set -euo pipefail
+TMAX_AGENT_HARNESS=spilot_router
+POLAR_MULTI_GATEWAY=1
+RAY_NUM_NODES=8
+POLAR_MAX_INIT_WORKERS=96
+POLAR_MAX_RUN_WORKERS=576
+POLAR_MAX_POSTRUN_WORKERS=384
+POLAR_COMPLETION_QUEUE_SIZE=32768
+POLAR_COMPLETION_WRITE_WORKERS=16
+SPILOT_EPISODE_ADMISSION_ENABLED=true
+SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS=14400
+SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT=8
+SPILOT_QWEN_MAX_ACTIVE_EPISODES=8
+SPILOT_GPT_MAX_ACTIVE_EPISODES=32
+SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES=1
+SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES=4
+SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY=1
+SPILOT_GPT_GATEWAY_MAX_CONCURRENCY=4
+SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES=8
+SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES=32
+{capacity_block}
+printf '%s\n' \
+  "$POLAR_GATEWAY_COUNT" \
+  "$POLAR_GATEWAY_MAX_INIT_WORKERS/$POLAR_GATEWAY_MAX_RUN_WORKERS" \
+  "$SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES/$SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES"
+"""
+
+    lines = run_bash(script).stdout.splitlines()
+
+    assert lines[-3:] == ["8", "12/72", "1/4"]
+
+
+def test_legacy_disabled_spilot_resume_keeps_single_gateway_topology():
+    launcher = (SHARED / "run.sh").read_text()
+    start = launcher.index('case "${POLAR_MULTI_GATEWAY:-0}"')
+    end = launcher.index("\nPOLAR_ROLLOUT_LOCAL_URL=", start)
+    capacity_block = launcher[start:end]
+    script = f"""
+set -euo pipefail
+TMAX_AGENT_HARNESS=spilot_router
+POLAR_MULTI_GATEWAY=0
+RAY_NUM_NODES=8
+POLAR_MAX_INIT_WORKERS=96
+POLAR_MAX_RUN_WORKERS=576
+POLAR_MAX_POSTRUN_WORKERS=384
+POLAR_COMPLETION_QUEUE_SIZE=32768
+POLAR_COMPLETION_WRITE_WORKERS=16
+SPILOT_EPISODE_ADMISSION_ENABLED=false
+# Legacy migration records the historical node count, but disabled admission
+# has no per-gateway lease split and must not force multi-gateway execution.
+SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT=8
+{capacity_block}
+printf '%s|%s/%s/%s\n' \
+  "$POLAR_GATEWAY_COUNT" \
+  "$POLAR_GATEWAY_MAX_INIT_WORKERS" \
+  "$POLAR_GATEWAY_MAX_RUN_WORKERS" \
+  "$POLAR_GATEWAY_MAX_POSTRUN_WORKERS"
+"""
+
+    assert run_bash(script).stdout.splitlines()[-1] == "1|96/576/384"
+
+
+def test_spilot_gateway_health_monitor_writes_sanitized_job_marker(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_command(
+        bin_dir / "curl",
+        """
+output=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o) output="$2"; shift 2 ;;
+        -w) shift 2 ;;
+        *) shift ;;
+    esac
+done
+printf '%s' "$FAKE_HEALTH_PAYLOAD" > "$output"
+printf '%s' "$FAKE_HEALTH_STATUS"
+""",
+    )
+    state = tmp_path / "current_run.env"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    payload = {
+        "status": "error",
+        "node_id": "slurm-rank-2",
+        "model_pool_episode_admission_health": {
+            "healthy": False,
+            "fatal_retained": True,
+            "retained_session_ids": ["secret-session-a", "secret-session-b"],
+        },
+    }
+    env = clean_env(tmp_path)
+    env.update(
+        PATH=f"{bin_dir}:{env['PATH']}",
+        TMAX_AGENT_HARNESS="spilot_router",
+        SPILOT_EPISODE_ADMISSION_ENABLED="true",
+        POLAR_GATEWAY_LOCAL_URL="http://127.0.0.1:18100",
+        RUN_DIR=str(run_dir),
+        PYTHON_BIN=sys.executable,
+        TMAX_RUN_STATE_FILE=str(state),
+        SLURM_JOB_ID="123",
+        RAY_NODE_RANK="2",
+        FAKE_HEALTH_STATUS="503",
+        FAKE_HEALTH_PAYLOAD=json.dumps(payload),
+    )
+    script = f"""
+source {SHARED / 'launcher_utils.sh'}
+if polar_check_spilot_admission_health; then
+    printf healthy
+else
+    printf 'fatal:%s' "$?"
+fi
+"""
+
+    result = run_bash(script, env=env)
+
+    assert result.stdout == "fatal:70"
+    assert "[spilot admission fatal] job=123 rank=2 retained_count=2" in result.stderr
+    marker = Path(f"{state}.job-123.admission-fatal.rank-2.json")
+    marker_payload = json.loads(marker.read_text())
+    assert marker_payload == {
+        "schema_version": 1,
+        "kind": "model_pool_episode_admission_fatal_retained",
+        "job_id": "123",
+        "rank": 2,
+        "node_id": "slurm-rank-2",
+        "observed_at": marker_payload["observed_at"],
+        "retained_count": 2,
+    }
+    assert "secret-session" not in marker.read_text()
+
+    env.update(FAKE_HEALTH_STATUS="200", FAKE_HEALTH_PAYLOAD='{"status":"ok"}')
+    env["SLURM_JOB_ID"] = "124"
+    healthy = run_bash(script, env=env)
+    assert healthy.stdout == "healthy"
+    assert not Path(f"{state}.job-124.admission-fatal.rank-2.json").exists()
+
+
+def test_shared_launcher_checks_spilot_gateway_health_in_head_and_worker_loops() -> None:
+    launcher = (SHARED / "run.sh").read_text()
+
+    assert launcher.count("if ! polar_check_spilot_admission_health; then") == 2
+    assert "polar/spilot_router/admission_fatal_job_count_total=" in launcher
+
+
+def test_spilot_templates_render_both_alias_caps_and_runner_admission(
+    tmp_path: Path,
+) -> None:
+    topology_values = {
+        "POLAR_ROLLOUT_HOST": "0.0.0.0",
+        "POLAR_ROLLOUT_PORT": "18080",
+        "POLAR_ROLLOUT_URL": "http://rollout.test:18080",
+        "POLAR_ROLLOUT_SAVE_DIR": "/tmp/rollout",
+        "POLAR_GATEWAY_COMPLETION_QUEUE_SIZE": "4096",
+        "POLAR_GATEWAY_COMPLETION_WRITE_WORKERS": "2",
+        "POLAR_COMPLETION_BATCH_SIZE": "16",
+        "POLAR_COMPLETION_WRITE_MAX_ATTEMPTS": "3",
+        "POLAR_COMPLETION_RETRY_BACKOFF_SECONDS": "0.1",
+        "POLAR_GATEWAY_HOST": "0.0.0.0",
+        "POLAR_GATEWAY_PORT": "18100",
+        "POLAR_GATEWAY_URL": "http://gateway.test:18100",
+        "POLAR_GATEWAY_MAX_INIT_WORKERS": "6",
+        "POLAR_GATEWAY_MAX_RUN_WORKERS": "6",
+        "POLAR_GATEWAY_MAX_POSTRUN_WORKERS": "48",
+        "POLAR_AGENT_MODEL_NAME": "Qwen/Qwen3.5-9B",
+        "SGLANG_ROUTER_BASE_URL": "http://router.test:30000",
+        "POLAR_MODEL_POOL_BASE_URL": "https://integrate.api.nvidia.com/v1",
+        "SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY": "1",
+        "SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES": "1",
+        "SPILOT_GPT_GATEWAY_MAX_CONCURRENCY": "4",
+        "SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES": "4",
+    }
+    topology_text = (SPILOT / "topology.yaml").read_text()
+    for name, value in topology_values.items():
+        topology_text = topology_text.replace("${" + name + "}", value)
+    topology_path = tmp_path / "topology.yaml"
+    topology_path.write_text(topology_text)
+
+    topology = TopologyConfig.load(topology_path)
+    candidates = topology.gateway.nodes[0].model_pool
+    assert [
+        (candidate.max_concurrency, candidate.max_active_episodes)
+        for candidate in candidates
+    ] == [(1, 1), (4, 4)]
+
+    config_text = (SPILOT / "polar_config.yaml").read_text()
+    config_names = set(
+        re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", config_text)
+    )
+    config_values = {name: "1" for name in config_names}
+    config_values.update(
+        {
+            "POLAR_FULLY_ASYNC": "true",
+            "POLAR_SANDBOX_NETWORK": "none",
+            "POLAR_AGENT_ENABLE_THINKING": "true",
+            "SPILOT_EPISODE_ADMISSION_ENABLED": "true",
+            "SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS": "14400",
+            "POLAR_AGENT_RUNTIME_VOLUME": "",
+            "POLAR_INTERNET_RUNTIME_VOLUME": "",
+        }
+    )
+    for name, value in config_values.items():
+        config_text = config_text.replace("${" + name + "}", value)
+    config = yaml.safe_load(config_text)
+    settings = config["polar_task_template"]["agent"]["settings"]
+    assert settings["pool_episode_admission_enabled"] is True
+    assert settings["pool_episode_admission_wait_budget_seconds"] == 14400
+    assert settings["total_timeout_seconds"] == 3000
+
+    disabled_topology_values = dict(topology_values)
+    disabled_topology_values.update(
+        {
+            "SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY": "32",
+            "SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES": "null",
+            "SPILOT_GPT_GATEWAY_MAX_CONCURRENCY": "32",
+            "SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES": "null",
+        }
+    )
+    disabled_topology_text = (SPILOT / "topology.yaml").read_text()
+    for name, value in disabled_topology_values.items():
+        disabled_topology_text = disabled_topology_text.replace(
+            "${" + name + "}", value
+        )
+    disabled_topology_path = tmp_path / "topology-disabled.yaml"
+    disabled_topology_path.write_text(disabled_topology_text)
+    disabled_candidates = TopologyConfig.load(
+        disabled_topology_path
+    ).gateway.nodes[0].model_pool
+    assert [
+        (candidate.max_concurrency, candidate.max_active_episodes)
+        for candidate in disabled_candidates
+    ] == [(32, None), (32, None)]
+
+    disabled_config_text = (SPILOT / "polar_config.yaml").read_text()
+    disabled_config_values = dict(config_values)
+    disabled_config_values.update(
+        {
+            "SPILOT_EPISODE_ADMISSION_ENABLED": "false",
+            "SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS": "0",
+        }
+    )
+    for name, value in disabled_config_values.items():
+        disabled_config_text = disabled_config_text.replace(
+            "${" + name + "}", value
+        )
+    disabled_config = yaml.safe_load(disabled_config_text)
+    disabled_settings = disabled_config["polar_task_template"]["agent"]["settings"]
+    assert disabled_settings["pool_episode_admission_enabled"] is False
+    assert disabled_settings["pool_episode_admission_wait_budget_seconds"] == 0
+
+
 def test_shared_launcher_rejects_per_gateway_capacity_amplification():
     launcher = (SHARED / "run.sh").read_text()
     start = launcher.index('case "${POLAR_MULTI_GATEWAY:-0}"')
@@ -2561,12 +3006,30 @@ def test_shared_launcher_renders_and_validates_early_stop_grace():
         SHARED / "polar_config.yaml",
         TMAX / "topology.yaml",
         TMAX / "polar_config.yaml",
+        SPILOT / "topology.yaml",
+        SPILOT / "polar_config.yaml",
     ):
         template_names.update(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", template.read_text()))
 
     assert "export POLAR_EARLY_STOP_GRACE_SESSIONS=" in launcher
     assert template_names <= rendered_names
     assert "unresolved template variable(s)" in launcher
+    submitter = (SHARED / "submit_slurm.sh").read_text()
+    for name in (
+        "SPILOT_EPISODE_ADMISSION_ENABLED",
+        "SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS",
+        "SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT",
+        "SPILOT_QWEN_MAX_ACTIVE_EPISODES",
+        "SPILOT_GPT_MAX_ACTIVE_EPISODES",
+        "SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES",
+        "SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES",
+        "SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY",
+        "SPILOT_GPT_GATEWAY_MAX_CONCURRENCY",
+        "SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES",
+        "SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES",
+    ):
+        assert name in submitter
+    assert "SPILOT_*" not in submitter
 
 
 def test_graceful_deadline_prefers_slurm_end_time():
@@ -2711,6 +3174,51 @@ printf '%s|%s|%s' \
     assert "export MINI_SWE_AGENT_SPEC=spilot_router\n" in content
 
 
+def test_run_state_round_trips_spilot_episode_admission_contract(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state.env"
+    expected = {
+        "SPILOT_EPISODE_ADMISSION_ENABLED": "true",
+        "SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS": "14400",
+        "SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT": "8",
+        "SPILOT_QWEN_MAX_ACTIVE_EPISODES": "8",
+        "SPILOT_GPT_MAX_ACTIVE_EPISODES": "32",
+        "SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES": "1",
+        "SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES": "4",
+        "SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY": "1",
+        "SPILOT_GPT_GATEWAY_MAX_CONCURRENCY": "4",
+        "SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES": "8",
+        "SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES": "32",
+        "PARTITION": "backfill",
+        "WALL_TIME": "2-00:00:00",
+        "TMAX_MIN_WALL_TIME": "2-00:00:00",
+        "SAVE_INTERVAL": "5",
+        "TMAX_GRACEFUL_EXIT_BUFFER_SECONDS": "43200",
+        "TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS": "43200",
+        "TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT": "0",
+    }
+    env = clean_env(tmp_path)
+    env.update(STATE=str(state), RUN_ID="router-run", SAVE_DIR="/tmp/router-save")
+    env.update(expected)
+    names = " ".join(expected)
+    print_args = " ".join(f'"${{{name}}}"' for name in expected)
+    script = f"""
+source {TMAX / "run_state.sh"}
+tmax_write_run_state "$STATE"
+unset {names}
+tmax_load_run_state "$STATE"
+printf '%s\\n' {print_args}
+"""
+
+    values = run_bash(script, env=env).stdout.splitlines()
+
+    assert values == list(expected.values())
+    content = state.read_text()
+    for name, value in expected.items():
+        assert f"export {name}={value}\n" in content
+
+
 def test_run_state_detects_fields_present_in_legacy_files(tmp_path: Path):
     state = tmp_path / "state.env"
     state.write_text(
@@ -2782,6 +3290,51 @@ def watcher_env(tmp_path: Path, bin_dir: Path) -> dict[str, str]:
         TMAX_WATCH_QUICK_FAILURE_SECONDS="900",
     )
     return env
+
+
+def enabled_spilot_watcher_env(tmp_path: Path, bin_dir: Path) -> dict[str, str]:
+    env = watcher_env(tmp_path, bin_dir)
+    # The canonical exclusion file lives in the real reference-data tree.
+    # These watcher unit tests use a one-row synthetic dataset, so select that
+    # explicit smoke-mode contract before sourcing the wrapper defaults.
+    env["TMAX_EXCLUDE_DATA"] = ""
+    env["TMAX_EVAL_ENABLED"] = "0"
+    env["TMAX_TRAINING_EVAL_ENABLED"] = "0"
+    completed = run_bash(
+        f"source {SPILOT / 'experiment_defaults.sh'}; env -0",
+        env=env,
+    )
+    for item in completed.stdout.split("\0"):
+        if "=" in item:
+            name, value = item.split("=", 1)
+            env[name] = value
+    env["POLAR_NVIDIA_API_KEY"] = "test-model-pool-key"
+    return env
+
+
+def write_spilot_admission_fatal_marker(
+    state_file: Path,
+    *,
+    job_id: str,
+    rank: int = 0,
+) -> Path:
+    marker = Path(
+        f"{state_file}.job-{job_id}.admission-fatal.rank-{rank}.json"
+    )
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "model_pool_episode_admission_fatal_retained",
+                "job_id": job_id,
+                "rank": rank,
+                "node_id": f"slurm-rank-{rank}",
+                "observed_at": "2026-07-07T12:00:00+00:00",
+                "retained_count": 1,
+            }
+        )
+    )
+    return marker
 
 
 @pytest.mark.parametrize(
@@ -2894,6 +3447,87 @@ def test_watcher_legacy_state_ignores_inherited_new_eval_defaults(tmp_path: Path
     assert result.returncode == 0, result.stderr
     assert "training complete marker found" in result.stdout
     assert "final eval is incomplete" not in result.stdout
+
+
+def test_watcher_legacy_spilot_state_disables_admission_and_keeps_old_timeouts(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_command(bin_dir / "squeue", "exit 0\n")
+    write_command(bin_dir / "sacct", "exit 0\n")
+    env = watcher_env(tmp_path, bin_dir)
+    env.update(
+        RUN_ID="legacy-spilot",
+        POLAR_NVIDIA_API_KEY="test-model-pool-key",
+        **spilot_entrypoint_env(),
+    )
+    state = Path(env["TMAX_RUN_STATE_FILE"])
+    state.write_text(
+        f"export RUN_ID={env['RUN_ID']}\n"
+        f"export SAVE_DIR={env['SAVE_DIR']}\n"
+        f"export TMAX_TRAIN_DATA={env['TMAX_TRAIN_DATA']}\n"
+        f"export TMAX_EVAL_DATA={env['TMAX_EVAL_DATA']}\n"
+        "export TMAX_AGENT_HARNESS=spilot_router\n"
+        "export TMAX_EVAL_ENABLED=0\n"
+        "export TMAX_TRAIN_AGENT_TIMEOUT_SECONDS=3300\n"
+        "export POLAR_TASK_TIMEOUT_FLOOR_SECONDS=4500\n"
+        "export POLAR_REQUEST_TIMEOUT=5100\n"
+        "export JOB_NAME=polar-tmax-legacy-spilot\n"
+    )
+    (Path(env["SAVE_DIR"]) / "TRAINING_COMPLETE").write_text("legacy marker\n")
+
+    result = subprocess.run(
+        ["bash", str(TMAX / "watch_training.sh")],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "legacy SPilot run state: episode admission disabled" in result.stderr
+    content = state.read_text()
+    assert "export SPILOT_EPISODE_ADMISSION_ENABLED=false\n" in content
+    assert "export SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS=0\n" in content
+    assert "export SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES=null\n" in content
+    assert "export SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES=null\n" in content
+    assert "export TMAX_TRAIN_AGENT_TIMEOUT_SECONDS=3300\n" in content
+    assert "export POLAR_TASK_TIMEOUT_FLOOR_SECONDS=4500\n" in content
+    assert "export POLAR_REQUEST_TIMEOUT=5100\n" in content
+
+
+def test_watcher_rejects_partial_spilot_admission_run_state(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_command(bin_dir / "squeue", "exit 0\n")
+    write_command(bin_dir / "sacct", "exit 0\n")
+    env = watcher_env(tmp_path, bin_dir)
+    env.update(
+        RUN_ID="partial-spilot",
+        POLAR_NVIDIA_API_KEY="test-model-pool-key",
+        **spilot_entrypoint_env(),
+    )
+    state = Path(env["TMAX_RUN_STATE_FILE"])
+    state.write_text(
+        f"export RUN_ID={env['RUN_ID']}\n"
+        f"export SAVE_DIR={env['SAVE_DIR']}\n"
+        "export TMAX_AGENT_HARNESS=spilot_router\n"
+        "export SPILOT_EPISODE_ADMISSION_ENABLED=true\n"
+    )
+
+    result = subprocess.run(
+        ["bash", str(TMAX / "watch_training.sh")],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert "partial SPilot episode-admission contract" in result.stderr
 
 
 def write_checkpoint_pair(save_dir: Path, iteration: int) -> None:
@@ -3160,6 +3794,137 @@ printf 'export POLAR_SUBMITTED_JOB_ID=333\\nexport POLAR_SUBMITTED_AT_UNIX=12345
     assert reset.returncode == 0, reset.stderr
     assert "submission succeeded: job=333" in reset.stdout
     assert submit_called.exists()
+
+
+def test_watcher_relaunches_quick_spilot_retained_fatal_and_counts_run_metric(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_command(bin_dir / "squeue", "exit 0\n")
+    write_command(bin_dir / "sacct", "printf '%s\\n' \"$SACCT_RECORD\"\n")
+    submit_called = tmp_path / "submit-called"
+    bash_proxy = bin_dir / "bash"
+    bash_proxy.write_text(
+        """#!/bin/sh
+if [ "${1:-}" = "$EXPECTED_SUBMIT_SCRIPT" ]; then
+    touch "$SUBMIT_CALLED"
+    mkdir -p "$(dirname "$TMAX_SUBMIT_RECEIPT_FILE")"
+    printf 'export POLAR_SUBMITTED_JOB_ID=333\nexport POLAR_SUBMITTED_AT_UNIX=12345\n' > "$TMAX_SUBMIT_RECEIPT_FILE"
+    exit 0
+fi
+exec /bin/bash "$@"
+"""
+    )
+    bash_proxy.chmod(0o755)
+    env = enabled_spilot_watcher_env(tmp_path, bin_dir)
+    env.update(
+        TMAX_LAST_JOB_ID="101",
+        TMAX_LAST_JOB_CHECKPOINT_ITER="-1",
+        EXPECTED_SUBMIT_SCRIPT=str(SPILOT / "submit_slurm.sh"),
+        SUBMIT_CALLED=str(submit_called),
+        SACCT_RECORD="101|FAILED|120|70:0|",
+    )
+    state_file = Path(env["TMAX_RUN_STATE_FILE"])
+    write_spilot_admission_fatal_marker(state_file, job_id="101", rank=3)
+
+    result = subprocess.run(
+        ["/bin/bash", str(TMAX / "watch_training.sh"), "--relaunch"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert submit_called.exists()
+    assert "SPilot admission fatal job metric: count_total=1" in result.stderr
+    assert "fail-closed quick failure" not in result.stderr
+    assert "submission succeeded: job=333" in result.stdout
+    state = state_file.read_text()
+    assert "export TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT=1\n" in state
+    assert (
+        "recoverable/model-pool-episode-admission-retained/FAILED/exit=70:0/checkpoint=-1"
+        in state
+    )
+
+
+def test_watcher_stops_after_three_no_progress_spilot_retained_fatals(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_command(bin_dir / "squeue", "exit 0\n")
+    write_command(bin_dir / "sacct", "printf '%s\\n' \"$SACCT_RECORD\"\n")
+    publisher = bin_dir / "wandb-publisher-python"
+    publish_args = tmp_path / "wandb-publish-args"
+    write_command(publisher, "printf '%s\\n' \"$@\" > \"$PUBLISH_ARGS\"\n")
+    env = enabled_spilot_watcher_env(tmp_path, bin_dir)
+    env.update(
+        TMAX_LAST_JOB_ID="103",
+        TMAX_LAST_JOB_CHECKPOINT_ITER="-1",
+        TMAX_WATCH_FAILURE_COUNT="2",
+        TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT="2",
+        SACCT_RECORD="103|FAILED|120|70:0|",
+        WANDB_API_KEY="test-wandb-key",
+        WANDB_MODE="online",
+        TMAX_SPILOT_FATAL_WANDB_PYTHON_BIN=str(publisher),
+        PUBLISH_ARGS=str(publish_args),
+    )
+    state_file = Path(env["TMAX_RUN_STATE_FILE"])
+    write_spilot_admission_fatal_marker(state_file, job_id="103")
+
+    result = subprocess.run(
+        ["bash", str(TMAX / "watch_training.sh"), "--relaunch"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert "no-progress failure 3/3" in result.stderr
+    assert "refusing another automatic submission" in result.stderr
+    state = state_file.read_text()
+    assert "export TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT=3\n" in state
+    assert "export TMAX_WATCH_FAILURE_COUNT=3\n" in state
+    assert publish_args.exists()
+    published = publish_args.read_text().splitlines()
+    assert "--one-shot-static" in published
+    assert "polar/spilot_router/admission_fatal_job_count_total=3" in published
+    assert "published final SPilot admission fatal count=3 to W&B" in result.stderr
+
+
+def test_watcher_does_not_trust_malformed_spilot_retained_fatal_marker(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_command(bin_dir / "squeue", "exit 0\n")
+    write_command(bin_dir / "sacct", "printf '%s\\n' \"$SACCT_RECORD\"\n")
+    env = enabled_spilot_watcher_env(tmp_path, bin_dir)
+    env.update(
+        TMAX_LAST_JOB_ID="104",
+        TMAX_LAST_JOB_CHECKPOINT_ITER="-1",
+        SACCT_RECORD="104|FAILED|120|70:0|",
+    )
+    state_file = Path(env["TMAX_RUN_STATE_FILE"])
+    marker = Path(f"{state_file}.job-104.admission-fatal.rank-0.json")
+    marker.write_text('{"job_id":"wrong-job"}\n')
+
+    result = subprocess.run(
+        ["bash", str(TMAX / "watch_training.sh"), "--relaunch"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert "malformed SPilot admission fatal marker" in result.stderr
+    assert "fail-closed quick failure" in result.stderr
+    state = state_file.read_text()
+    assert "export TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT=0\n" in state
 
 
 @pytest.mark.parametrize("terminal_state", ["PREEMPTED", "NODE_FAIL", "REVOKED"])

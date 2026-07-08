@@ -176,6 +176,114 @@ polar_select_load_dir() {
     fi
 }
 
+polar_spilot_admission_fatal_marker_path() {
+    local state_file="${TMAX_RUN_STATE_FILE:-}"
+    local job_id="${SLURM_JOB_ID:-}"
+    local rank="${RAY_NODE_RANK:-}"
+    if [ -z "${state_file}" ] || ! [[ "${job_id}" =~ ^[0-9]+$ ]] || \
+       ! [[ "${rank}" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: SPilot admission health monitor requires TMAX_RUN_STATE_FILE, numeric SLURM_JOB_ID, and numeric RAY_NODE_RANK" >&2
+        return 1
+    fi
+    printf '%s.job-%s.admission-fatal.rank-%s.json\n' \
+        "${state_file}" "${job_id}" "${rank}"
+}
+
+polar_check_spilot_admission_health() {
+    # A retained episode lease means a candidate process may still be alive.
+    # Only the gateway can make that determination, so this monitor reacts to
+    # its explicit structured 503 rather than treating transient HTTP errors
+    # or unrelated unhealthy upstreams as retained-process events.
+    [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ] || return 0
+    [ "${SPILOT_EPISODE_ADMISSION_ENABLED:-false}" = "true" ] || return 0
+
+    local health_url="${POLAR_GATEWAY_LOCAL_URL:-}/health"
+    local health_file marker_path http_code parser_output parser_status
+    if [ -z "${POLAR_GATEWAY_LOCAL_URL:-}" ] || [ -z "${RUN_DIR:-}" ] || \
+       [ -z "${PYTHON_BIN:-}" ]; then
+        echo "ERROR: SPilot admission health monitor is missing gateway, run-dir, or Python configuration" >&2
+        return 1
+    fi
+    marker_path="$(polar_spilot_admission_fatal_marker_path)" || return 1
+    health_file="${RUN_DIR}/.spilot-admission-health.rank-${RAY_NODE_RANK}.$$"
+    http_code="$(
+        curl --noproxy '*' -sS --max-time 5 \
+            -o "${health_file}" -w '%{http_code}' "${health_url}" 2>/dev/null || true
+    )"
+    if [ "${http_code}" != "503" ]; then
+        rm -f "${health_file}"
+        return 0
+    fi
+
+    parser_status=0
+    parser_output="$(
+        "${PYTHON_BIN}" - "${health_file}" "${marker_path}" \
+            "${SLURM_JOB_ID}" "${RAY_NODE_RANK}" <<'PY'
+import datetime
+import json
+import os
+import pathlib
+import sys
+
+health_path, marker_path, job_id, rank_text = sys.argv[1:]
+try:
+    payload = json.loads(pathlib.Path(health_path).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(10)
+if not isinstance(payload, dict):
+    raise SystemExit(10)
+health = payload.get("model_pool_episode_admission_health")
+if not isinstance(health, dict) or health.get("fatal_retained") is not True:
+    raise SystemExit(10)
+retained = health.get("retained_session_ids")
+if not isinstance(retained, list) or not retained or not all(
+    isinstance(value, str) and value for value in retained
+):
+    raise SystemExit(10)
+node_id = payload.get("node_id")
+if not isinstance(node_id, str) or not node_id:
+    node_id = f"slurm-rank-{rank_text}"
+marker = {
+    "schema_version": 1,
+    "kind": "model_pool_episode_admission_fatal_retained",
+    "job_id": job_id,
+    "rank": int(rank_text),
+    "node_id": node_id,
+    "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "retained_count": len(retained),
+}
+path = pathlib.Path(marker_path)
+temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+try:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary.write_text(
+        json.dumps(marker, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+except OSError as exc:
+    print(f"could not write SPilot admission fatal marker: {exc}", file=sys.stderr)
+    raise SystemExit(20)
+finally:
+    temporary.unlink(missing_ok=True)
+print(len(retained))
+PY
+    )" || parser_status=$?
+    rm -f "${health_file}"
+    if [ "${parser_status}" -eq 0 ]; then
+        echo "[spilot admission fatal] job=${SLURM_JOB_ID} rank=${RAY_NODE_RANK} retained_count=${parser_output} action=fail-allocation marker=${marker_path}" >&2
+        return 70
+    fi
+    if [ "${parser_status}" -eq 20 ]; then
+        echo "[spilot admission fatal] job=${SLURM_JOB_ID} rank=${RAY_NODE_RANK} retained_count=unknown action=fail-allocation marker_write=failed" >&2
+        return 70
+    fi
+    # Generic/malformed 503s are handled by the normal gateway heartbeat and
+    # PID policy; they are not evidence that a process-retaining lease exists.
+    return 0
+}
+
 polar_checkpoint_is_release_seed() {
     local load_dir="${1:?missing load dir}"
     local tracker="${load_dir}/latest_checkpointed_iteration.txt"

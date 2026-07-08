@@ -15,6 +15,7 @@ Adapter contract:
 from __future__ import annotations
 
 import logging
+import math
 import statistics
 from typing import Any
 
@@ -35,7 +36,7 @@ def post_process_rewards(
         if _is_failed_trajectory(sample)
         or bool(getattr(sample, "remove_sample", False))
         or _is_trainable_negative(sample)
-        else float(sample.get_reward_value(args))
+        else _finite_reward_or_zero(sample, args)
         for sample in samples
     ]
 
@@ -102,6 +103,19 @@ def post_process_rewards(
                 ) / group_scale
 
     return raw_rewards, normalized_by_sample
+
+
+def _finite_reward_or_zero(sample: Any, args: Any) -> float:
+    """Fail closed at the optimizer boundary for stale or malformed rewards."""
+
+    try:
+        value = sample.get_reward_value(args)
+        if isinstance(value, bool):
+            return 0.0
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
 
 
 def _trajectory_key(sample: Any, sample_position: int) -> tuple[Any, tuple[Any, Any]]:

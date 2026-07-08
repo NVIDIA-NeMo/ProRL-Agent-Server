@@ -546,6 +546,30 @@ for _polar_capacity_pair in \
 done
 unset _polar_capacity_pair _polar_total_name _polar_per_gateway_name \
     _polar_effective_total
+if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ]; then
+    if [ "${SPILOT_EPISODE_ADMISSION_ENABLED:-false}" = "true" ]; then
+        if [ "${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT:-0}" -ne "${POLAR_GATEWAY_COUNT}" ]; then
+            echo "ERROR: persisted SPilot admission gateway count ${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT:-unset} does not match runtime gateway count ${POLAR_GATEWAY_COUNT}" >&2
+            exit 1
+        fi
+        if [ $((SPILOT_QWEN_MAX_ACTIVE_EPISODES % POLAR_GATEWAY_COUNT)) -ne 0 ] || \
+           [ $((SPILOT_GPT_MAX_ACTIVE_EPISODES % POLAR_GATEWAY_COUNT)) -ne 0 ]; then
+            echo "ERROR: SPilot aggregate episode caps must be divisible by all ${POLAR_GATEWAY_COUNT} gateways" >&2
+            exit 1
+        fi
+        _spilot_qwen_runtime_local="$((SPILOT_QWEN_MAX_ACTIVE_EPISODES / POLAR_GATEWAY_COUNT))"
+        _spilot_gpt_runtime_local="$((SPILOT_GPT_MAX_ACTIVE_EPISODES / POLAR_GATEWAY_COUNT))"
+        if [ "${SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES}" -ne "${_spilot_qwen_runtime_local}" ] || \
+           [ "${SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES}" -ne "${_spilot_gpt_runtime_local}" ] || \
+           [ "${SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY}" -ne "${_spilot_qwen_runtime_local}" ] || \
+           [ "${SPILOT_GPT_GATEWAY_MAX_CONCURRENCY}" -ne "${_spilot_gpt_runtime_local}" ]; then
+            echo "ERROR: rendered SPilot HTTP/episode caps do not match the runtime gateway split" >&2
+            exit 1
+        fi
+        echo "Using SPilot episode admission: wait_budget=${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS}s aggregate(qwen/gpt)=${SPILOT_QWEN_MAX_ACTIVE_EPISODES}/${SPILOT_GPT_MAX_ACTIVE_EPISODES} effective=${SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES}/${SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES} per_gateway=${SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES}/${SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES}"
+        unset _spilot_qwen_runtime_local _spilot_gpt_runtime_local
+    fi
+fi
 echo "Using Polar gateway fleet: count=${POLAR_GATEWAY_COUNT} per_gateway(init/run/post)=${POLAR_GATEWAY_MAX_INIT_WORKERS}/${POLAR_GATEWAY_MAX_RUN_WORKERS}/${POLAR_GATEWAY_MAX_POSTRUN_WORKERS} completion(queue/writers)=${POLAR_GATEWAY_COMPLETION_QUEUE_SIZE}/${POLAR_GATEWAY_COMPLETION_WRITE_WORKERS}"
 POLAR_ROLLOUT_LOCAL_URL="${POLAR_ROLLOUT_LOCAL_URL:-http://127.0.0.1:${POLAR_ROLLOUT_PORT}}"
 POLAR_GATEWAY_LOCAL_URL="${POLAR_GATEWAY_LOCAL_URL:-http://127.0.0.1:${POLAR_GATEWAY_PORT}}"
@@ -623,6 +647,12 @@ for name in (
     "POLAR_COMPLETION_WRITE_WORKERS",
     "POLAR_GATEWAY_COMPLETION_QUEUE_SIZE",
     "POLAR_GATEWAY_COMPLETION_WRITE_WORKERS",
+    "SPILOT_EPISODE_ADMISSION_ENABLED",
+    "SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS",
+    "SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES",
+    "SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES",
+    "SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY",
+    "SPILOT_GPT_GATEWAY_MAX_CONCURRENCY",
     "POLAR_COMPLETION_BATCH_SIZE",
     "POLAR_COMPLETION_WRITE_MAX_ATTEMPTS",
     "POLAR_COMPLETION_RETRY_BACKOFF_SECONDS",
@@ -713,6 +743,10 @@ echo "Using Polar config: ${CUSTOM_CONFIG_PATH}"
 echo "Using Apptainer image dir: ${APPTAINER_IMAGE_DIR}"
 echo "Using run id: ${RUN_ID}"
 echo "Using save dir: ${SAVE_DIR}"
+if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ] && \
+   [ "${SPILOT_EPISODE_ADMISSION_ENABLED:-false}" = "true" ]; then
+    echo "[spilot admission run metric] fatal_job_count_total=${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT:-0}"
+fi
 echo "Using SGLang router URL for Polar gateway: ${SGLANG_ROUTER_BASE_URL}"
 echo "Using Polar rollout URL: ${POLAR_ROLLOUT_URL}"
 echo "Using Polar gateway URL: ${POLAR_GATEWAY_URL}"
@@ -729,6 +763,16 @@ PROCESS_GROUPS=()
 POLAR_ROLLOUT_PID=""
 POLAR_GATEWAY_PID=""
 POLAR_UDS_TUNNEL_PID=""
+POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS="${POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS:-150}"
+if ! [[ "${POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS must be a non-negative integer" >&2
+    exit 1
+fi
+if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ] && \
+   [ "${POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS}" -lt 150 ]; then
+    echo "ERROR: formal SPilot requires POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS>=150 (60s HTTP drain + 60s runtime proof + 30s margin)" >&2
+    exit 1
+fi
 
 polar_pid_is_active() {
     local pid="$1" proc_stat remainder state
@@ -877,10 +921,43 @@ polar_stop_ray_bounded() {
     polar_terminate_pids_bounded 2 "$ray_stop_pid"
 }
 
+polar_shutdown_gateway_bounded() {
+    local pid="$1" grace_seconds="$2" kill_grace_seconds rc timed_out=0
+    [ -n "${pid}" ] || return 0
+    [[ "${grace_seconds}" =~ ^[0-9]+$ ]] || grace_seconds=150
+    kill_grace_seconds="${POLAR_BACKGROUND_KILL_GRACE_SECONDS:-2}"
+    [[ "${kill_grace_seconds}" =~ ^[0-9]+$ ]] || kill_grace_seconds=2
+
+    kill -TERM "${pid}" 2>/dev/null || true
+    if ! polar_wait_for_pids_bounded "${grace_seconds}" "${pid}"; then
+        timed_out=1
+        echo "ERROR: Polar gateway shutdown exceeded ${grace_seconds}s; sending SIGKILL" >&2
+        kill -KILL "${pid}" 2>/dev/null || true
+        polar_wait_for_pids_bounded "${kill_grace_seconds}" "${pid}" || true
+    fi
+    if polar_pid_is_active "${pid}"; then
+        echo "ERROR: Polar gateway pid ${pid} survived shutdown escalation" >&2
+        return 1
+    fi
+    if wait "${pid}"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    if [ "${timed_out}" -ne 0 ]; then
+        return 1
+    fi
+    if [ "${rc}" -ne 0 ]; then
+        echo "ERROR: Polar gateway exited with status ${rc}; runtime teardown may be unproven" >&2
+        return 1
+    fi
+    return 0
+}
+
 cleanup() {
-    local status=$?
+    local status=$? final_status gateway_shutdown_failed=0
     local pid background_grace_seconds
-    local -a background_pids=("${PIDS[@]}")
+    local -a background_pids=()
     local -a process_groups=("${PROCESS_GROUPS[@]}")
     trap - EXIT
     echo "Shutting down..."
@@ -891,6 +968,10 @@ cleanup() {
     # even the monitor's process group. Snapshot descendants before TERM can
     # reparent them, then include every recorded PID in the bounded teardown.
     for pid in "${PIDS[@]}"; do
+        if [ -n "${POLAR_GATEWAY_PID}" ] && [ "${pid}" = "${POLAR_GATEWAY_PID}" ]; then
+            continue
+        fi
+        background_pids+=("${pid}")
         polar_append_descendant_pids "$pid" background_pids
     done
     # Ask sidecars and Polar services to stop before Ray cleanup. This lets the
@@ -901,7 +982,14 @@ cleanup() {
     for pid in "${process_groups[@]}"; do
         kill -TERM -- "-$pid" 2>/dev/null || true
     done
+    if [ -n "${POLAR_GATEWAY_PID}" ]; then
+        kill -TERM "${POLAR_GATEWAY_PID}" 2>/dev/null || true
+    fi
     polar_stop_ray_bounded
+    if ! polar_shutdown_gateway_bounded \
+        "${POLAR_GATEWAY_PID}" "${POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS}"; then
+        gateway_shutdown_failed=1
+    fi
     background_grace_seconds="${POLAR_BACKGROUND_SHUTDOWN_GRACE_SECONDS:-20}"
     polar_terminate_pids_bounded "$background_grace_seconds" "${background_pids[@]}"
     # Groups received TERM before Ray shutdown and the per-PID grace above.
@@ -910,7 +998,11 @@ cleanup() {
     polar_terminate_process_groups_bounded 0 "${process_groups[@]}"
     PIDS=()
     PROCESS_GROUPS=()
-    return "$status"
+    final_status="${status}"
+    if [ "${gateway_shutdown_failed}" -ne 0 ] && [ "${final_status}" -eq 0 ]; then
+        final_status=70
+    fi
+    exit "${final_status}"
 }
 trap cleanup EXIT
 
@@ -928,6 +1020,7 @@ start_gpu_monitor() {
     fi
 
     local monitor_dir metric_prefix csv_path node_role train_gpus rollout_gpus monitor_pid
+    local -a static_metric_args=()
     monitor_dir="${RUN_DIR}/gpu_monitor"
     mkdir -p "$monitor_dir"
     metric_prefix="${GPU_MONITOR_PREFIX:-polar_system}"
@@ -978,6 +1071,15 @@ start_gpu_monitor() {
             wandb_args+=("--wandb-entity" "$WANDB_ENTITY")
         fi
     fi
+    if [ "${RAY_NODE_RANK}" = "0" ] && \
+       [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ] && \
+       [ "${SPILOT_EPISODE_ADMISSION_ENABLED:-false}" = "true" ] && \
+       [[ "${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT:-0}" =~ ^[0-9]+$ ]]; then
+        static_metric_args=(
+            --static-metric
+            "polar/spilot_router/admission_fatal_job_count_total=${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT:-0}"
+        )
+    fi
 
     local -a monitor_command=(
         "${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/monitor_wandb_gpu.py"
@@ -988,6 +1090,7 @@ start_gpu_monitor() {
         --wandb-finish-timeout-s "${GPU_MONITOR_WANDB_FINISH_TIMEOUT_S:-15}"
         --train-gpus "$train_gpus"
         --rollout-gpus "$rollout_gpus"
+        "${static_metric_args[@]}"
         "${wandb_args[@]}"
     )
     if command -v setsid >/dev/null 2>&1; then
@@ -1141,6 +1244,9 @@ assert actual_ids == expected_ids
 wait_for_run_done_with_sidecars() {
     local pid
     while [ ! -f "${RUN_DONE_FILE}" ]; do
+        if ! polar_check_spilot_admission_health; then
+            return 1
+        fi
         for pid in "${POLAR_GATEWAY_PID}" "${POLAR_UDS_TUNNEL_PID}"; do
             [ -n "${pid}" ] || continue
             if ! polar_pid_is_active "${pid}"; then
@@ -1877,6 +1983,11 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
 RAY_JOB_WAITER_PID=$!
 PIDS+=("${RAY_JOB_WAITER_PID}")
 while polar_pid_is_active "${RAY_JOB_WAITER_PID}"; do
+    if ! polar_check_spilot_admission_health; then
+        kill -TERM "${RAY_JOB_WAITER_PID}" 2>/dev/null || true
+        wait "${RAY_JOB_WAITER_PID}" 2>/dev/null || true
+        exit 1
+    fi
     for _polar_control_pid in \
         "${POLAR_ROLLOUT_PID}" \
         "${POLAR_GATEWAY_PID}" \

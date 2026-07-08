@@ -11,6 +11,10 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+from dataclasses import dataclass
+import fcntl
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -19,6 +23,8 @@ import select
 import signal
 import socket
 import socketserver
+import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -47,8 +53,112 @@ _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _BROKER_PROCESS_NAME = "polar-broker"
 _PROXY_PROCESS_NAME = "polar-proxy"
 _PR_SET_NAME = 15
+_PR_SET_DUMPABLE = 4
+_PROTECTED_READY_FD_ENV = "POLAR_PROTECTED_EXEC_READY_FD"
+_PROTECTED_FD_SUFFIX = "_FD"
+_PROTECTED_SOCKET_ENV = "POLAR_PROTECTED_EXEC_SOCKET"
+_PROTECTED_BROKER_PID_ENV = "POLAR_PROTECTED_EXEC_BROKER_PID"
+_PROTECTED_REQUEST_ID_ENV = "POLAR_PROTECTED_EXEC_REQUEST_ID"
+_PROTECTED_READY_TIMEOUT_SECONDS = 30.0
+_PROTECTED_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+_SHA256_RE = re.compile(r"^[A-Fa-f0-9]{64}$")
+_PROTECTED_PYTHON = "/opt/polar-mini-swe-agent/venv/bin/python"
+_SPILOT_RUNNER = "/polar/session/spilot_router_runner.py"
+_SPILOT_FORCED_RUNNER = "/polar/session/spilot_forced_route_eval_runner.py"
+_PROTECTED_FILE_MAX_BYTES = 8 * 1024 * 1024
+_MFD_CLOEXEC = 0x0001
+_MFD_ALLOW_SEALING = 0x0002
+_F_ADD_SEALS = 1033
+_F_GET_SEALS = 1034
+_F_SEAL_SEAL = 0x0001
+_F_SEAL_SHRINK = 0x0002
+_F_SEAL_GROW = 0x0004
+_F_SEAL_WRITE = 0x0008
+_ALL_FILE_SEALS = _F_SEAL_SEAL | _F_SEAL_SHRINK | _F_SEAL_GROW | _F_SEAL_WRITE
+_FORCED_RUNNER_BOOTSTRAP = (
+    "import importlib.util,runpy,sys;"
+    "p='/proc/self/fd/'+sys.argv[1];"
+    "s=importlib.util.spec_from_file_location('spilot_router_runner',p);"
+    "m=importlib.util.module_from_spec(s);"
+    "sys.modules['spilot_router_runner']=m;"
+    "s.loader.exec_module(m);"
+    "runpy.run_path('/proc/self/fd/'+sys.argv[2],run_name='__main__')"
+)
+_PROTECTED_ENV_DENYLIST = frozenset(
+    {
+        "BASH_ENV",
+        "ENV",
+        "LD_AUDIT",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "PYTHONHOME",
+        "PYTHONINSPECT",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+    }
+)
 _PROXY_START_TIMEOUT_SECONDS = 5.0
 _PROXY_START_POLL_SECONDS = 0.01
+
+
+def _memfd_create(name: str) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    function = getattr(libc, "memfd_create", None)
+    if function is None:
+        raise RuntimeError("protected exec requires Linux memfd_create")
+    function.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    descriptor = function(name.encode("ascii"), _MFD_CLOEXEC | _MFD_ALLOW_SEALING)
+    if descriptor < 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    return descriptor
+
+
+def _sealed_verified_file(path: str, expected_sha256: str) -> int:
+    """Copy one allowlisted file into an immutable, digest-pinned memfd."""
+
+    if not _SHA256_RE.fullmatch(expected_sha256):
+        raise ValueError("protected file digest is invalid")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        raise RuntimeError("protected exec requires O_NOFOLLOW")
+    source = os.open(path, os.O_RDONLY | os.O_CLOEXEC | nofollow)
+    try:
+        metadata = os.fstat(source)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("protected runner must be a regular file")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(source, 128 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _PROTECTED_FILE_MAX_BYTES:
+                raise ValueError("protected runner exceeds the size limit")
+            chunks.append(chunk)
+    finally:
+        os.close(source)
+    payload = b"".join(chunks)
+    actual = hashlib.sha256(payload).hexdigest()
+    if not hmac.compare_digest(actual, expected_sha256.lower()):
+        raise PermissionError("protected runner digest mismatch")
+
+    sealed = _memfd_create("polar-protected-runner")
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(sealed, view)
+            view = view[written:]
+        os.lseek(sealed, 0, os.SEEK_SET)
+        fcntl.fcntl(sealed, _F_ADD_SEALS, _ALL_FILE_SEALS)
+        if fcntl.fcntl(sealed, _F_GET_SEALS) & _ALL_FILE_SEALS != _ALL_FILE_SEALS:
+            raise RuntimeError("protected runner memfd sealing failed")
+        return sealed
+    except BaseException:
+        os.close(sealed)
+        raise
 
 
 def _current_python_executable() -> str:
@@ -87,6 +197,42 @@ def _set_process_name(name: str) -> None:
     if result != 0:
         error_number = ctypes.get_errno()
         raise OSError(error_number, os.strerror(error_number))
+
+
+def _set_process_dumpable(enabled: bool) -> None:
+    """Prevent same-UID task processes from inspecting broker memory."""
+
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("protected broker execution requires Linux prctl")
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.prctl(_PR_SET_DUMPABLE, int(enabled), 0, 0, 0)
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _peer_credentials(connection: socket.socket) -> tuple[int, int, int]:
+    if not hasattr(socket, "SO_PEERCRED"):
+        raise RuntimeError("protected broker execution requires SO_PEERCRED")
+    payload = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+    return struct.unpack("3i", payload)
+
+
+def _process_start_time(pid: int) -> int:
+    stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    close_paren = stat.rfind(")")
+    fields = stat[close_paren + 1 :].strip().split()
+    if close_paren <= 0 or len(fields) <= 19:
+        raise RuntimeError("could not identify protected process")
+    return int(fields[19])
+
+
+@dataclass(slots=True)
+class _PendingProtectedDelivery:
+    pid: int
+    start_time: int
+    values: dict[str, str]
+    delivered: threading.Event
 
 
 def _truthy(value: str | None) -> bool:
@@ -205,17 +351,32 @@ class _LoopbackProxy:
             raise RuntimeError("previous loopback proxy process is still exiting")
         if self.pid_path is not None:
             self.pid_path.unlink(missing_ok=True)
+        argv = [
+            _PROXY_PROCESS_NAME,
+            "-I",
+            str(Path(__file__)),
+            "--forward-proxy-socket",
+            self.unix_path,
+            "--forward-proxy-port",
+            str(self.port),
+        ]
+        executable: str | None = _current_python_executable()
+        child_env: dict[str, str] | None = None
+        if self.pid_path is not None:
+            # CPython 3.13 cannot find its stdlib under ``-I`` when argv[0] is
+            # an exec-a style synthetic name. Resolve that basename through a
+            # local symlink on PATH instead; the child keeps the pkill-safe
+            # ``polar-proxy`` argv while isolated startup remains functional.
+            launcher = self.pid_path.parent / _PROXY_PROCESS_NAME
+            launcher.unlink(missing_ok=True)
+            launcher.symlink_to(executable)
+            child_env = dict(os.environ)
+            child_env["PATH"] = f"{launcher.parent}:{child_env.get('PATH', '')}"
+            executable = None
         process = subprocess.Popen(
-            [
-                _PROXY_PROCESS_NAME,
-                "-I",
-                str(Path(__file__)),
-                "--forward-proxy-socket",
-                self.unix_path,
-                "--forward-proxy-port",
-                str(self.port),
-            ],
-            executable=_current_python_executable(),
+            argv,
+            executable=executable,
+            env=child_env,
         )
         self.process = process
         self._process_ready = False
@@ -417,6 +578,8 @@ class _BrokerServer(socketserver.ThreadingUnixStreamServer):
         proxy: _LoopbackProxy | None,
         proxy_url: str | None,
         allow_internet: bool,
+        protected_only: bool = False,
+        runtime_socket_path: str | None = None,
     ) -> None:
         self.result_dir = result_dir
         self.result_dir.mkdir(parents=True, exist_ok=True)
@@ -424,9 +587,13 @@ class _BrokerServer(socketserver.ThreadingUnixStreamServer):
         self.proxy = proxy
         self.proxy_url = proxy_url
         self.allow_internet = allow_internet
+        self.protected_only = protected_only
+        self.runtime_socket_path = runtime_socket_path or socket_path
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._cancelled_before_start: set[str] = set()
         self._process_lock = threading.Lock()
+        self._trusted_control_peer: tuple[int, int, int] | None = None
+        self._protected_pending: dict[str, _PendingProtectedDelivery] = {}
         self.active_dir = result_dir.parent / "active"
         self.active_dir.mkdir(parents=True, exist_ok=True)
         super().__init__(socket_path, _BrokerHandler)
@@ -498,6 +665,241 @@ class _BrokerServer(socketserver.ThreadingUnixStreamServer):
                 active_marker.unlink(missing_ok=True)
         return {"return_code": return_code}
 
+    def execute_protected(self, request: Mapping[str, Any]) -> dict[str, object]:
+        """Spawn an isolated runner; it fetches secrets only after dumpable=0."""
+
+        if not self.protected_only:
+            raise RuntimeError("protected exec is unavailable on the ordinary broker socket")
+        request_id = str(request.get("id", ""))
+        raw_argv = request.get("argv")
+        if (
+            not isinstance(raw_argv, list)
+            or len(raw_argv) != 2
+            or not all(
+                isinstance(item, str) and item and "\x00" not in item
+                for item in raw_argv
+            )
+        ):
+            raise ValueError("protected exec requires an exact two-element argv")
+        argv = list(raw_argv)
+        if argv[0] != _PROTECTED_PYTHON or argv[1] not in {
+            _SPILOT_RUNNER,
+            _SPILOT_FORCED_RUNNER,
+        }:
+            raise ValueError("protected exec runner argv is not allowlisted")
+
+        raw_file_digests = request.get("file_digests", {})
+        if not isinstance(raw_file_digests, dict) or not all(
+            isinstance(path, str) and isinstance(digest, str)
+            for path, digest in raw_file_digests.items()
+        ):
+            raise ValueError("protected exec file digests must be an object")
+        expected_paths = {argv[1]}
+        if argv[1] == _SPILOT_FORCED_RUNNER:
+            expected_paths.add(_SPILOT_RUNNER)
+        if set(raw_file_digests) != expected_paths:
+            raise ValueError("protected exec file digest set is incomplete")
+
+        raw_env = request.get("env", {})
+        raw_protected = request.get("protected_env", {})
+        if not isinstance(raw_env, dict) or not isinstance(raw_protected, dict):
+            raise ValueError("protected exec environments must be objects")
+        protected_values: dict[str, str] = {}
+        for raw_key, raw_value in raw_protected.items():
+            key = str(raw_key)
+            if not _PROTECTED_KEY_RE.fullmatch(key):
+                raise ValueError("protected exec contains an invalid environment key")
+            if not isinstance(raw_value, str) or not raw_value or "\x00" in raw_value:
+                raise ValueError("protected exec contains an invalid secret value")
+            if len(raw_value.encode("utf-8")) > 16_384:
+                raise ValueError("protected exec secret exceeds the size limit")
+            protected_values[key] = raw_value
+        if not protected_values:
+            raise ValueError("protected exec requires at least one protected value")
+        raw_protected.clear()
+
+        cwd = request.get("cwd")
+        if cwd is not None and not isinstance(cwd, str):
+            raise ValueError("protected exec cwd must be a string or null")
+        raw_timeout = request.get("timeout_sec")
+        timeout = None if raw_timeout is None else float(raw_timeout)
+        if timeout is not None and timeout <= 0:
+            raise ValueError("protected exec timeout_sec must be positive")
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        environment = child_environment(
+            self.base_environment,
+            raw_env,
+            proxy_url=self.proxy_url,
+            allow_internet=self.allow_internet,
+        )
+        task_pythonpath = environment.get("PYTHONPATH")
+        for name in _PROTECTED_ENV_DENYLIST:
+            environment.pop(name, None)
+        for key in protected_values:
+            environment.pop(key, None)
+            environment.pop(f"{key}{_PROTECTED_FD_SUFFIX}", None)
+        if task_pythonpath is not None:
+            environment["POLAR_TASK_PYTHONPATH"] = task_pythonpath
+        environment["PYTHONNOUSERSITE"] = "1"
+        environment["PYTHONSAFEPATH"] = "1"
+        environment[_PROTECTED_SOCKET_ENV] = self.runtime_socket_path
+        environment[_PROTECTED_BROKER_PID_ENV] = str(os.getpid())
+        environment[_PROTECTED_REQUEST_ID_ENV] = request_id
+        base_url = environment.get("OPENAI_BASE_URL")
+        if base_url:
+            environment["OPENAI_API_BASE"] = base_url
+
+        process: subprocess.Popen[bytes] | None = None
+        stdout_path = self._result_path(request_id, "stdout")
+        stderr_path = self._result_path(request_id, "stderr")
+        active_marker = self.active_dir / f"{request_id}.pid"
+        return_code = 127
+        pending: _PendingProtectedDelivery | None = None
+        pinned_files: dict[str, int] = {}
+        ready_read = -1
+        ready_write = -1
+        with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+            try:
+                if self.proxy is not None:
+                    self.proxy.ensure_running()
+                for path in sorted(expected_paths):
+                    pinned_files[path] = _sealed_verified_file(
+                        path,
+                        raw_file_digests[path],
+                    )
+                entry_fd = pinned_files[argv[1]]
+                if argv[1] == _SPILOT_FORCED_RUNNER:
+                    core_fd = pinned_files[_SPILOT_RUNNER]
+                    trusted_argv = [
+                        argv[0],
+                        "-I",
+                        "-c",
+                        _FORCED_RUNNER_BOOTSTRAP,
+                        "polar-forced-route-eval",
+                        str(core_fd),
+                        str(entry_fd),
+                    ]
+                else:
+                    trusted_argv = [argv[0], "-I", f"/proc/self/fd/{entry_fd}"]
+                ready_read, ready_write = os.pipe()
+                environment[_PROTECTED_READY_FD_ENV] = str(ready_read)
+                process = subprocess.Popen(
+                    trusted_argv,
+                    cwd=cwd,
+                    env=environment,
+                    start_new_session=True,
+                    close_fds=True,
+                    pass_fds=(*pinned_files.values(), ready_read),
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                )
+                os.close(ready_read)
+                ready_read = -1
+                pending = _PendingProtectedDelivery(
+                    pid=process.pid,
+                    start_time=_process_start_time(process.pid),
+                    values=protected_values,
+                    delivered=threading.Event(),
+                )
+                with self._process_lock:
+                    self._processes[request_id] = process
+                    self._protected_pending[request_id] = pending
+                    cancelled = request_id in self._cancelled_before_start
+                    self._cancelled_before_start.discard(request_id)
+                # The child cannot connect until its PID/start-time ownership
+                # record is visible to the protected socket handler.
+                os.write(ready_write, b"1")
+                os.close(ready_write)
+                ready_write = -1
+                if cancelled:
+                    _kill_process_group(process)
+
+                ready_budget = _PROTECTED_READY_TIMEOUT_SECONDS
+                if deadline is not None:
+                    ready_budget = min(
+                        ready_budget,
+                        max(0.0, deadline - time.monotonic()),
+                    )
+                if not pending.delivered.wait(timeout=ready_budget):
+                    raise RuntimeError("protected runner did not establish its secure channel")
+                wait_timeout = None
+                if deadline is not None:
+                    wait_timeout = max(0.0, deadline - time.monotonic())
+                try:
+                    return_code = process.wait(timeout=wait_timeout)
+                except subprocess.TimeoutExpired:
+                    _kill_process_group(process)
+                    process.wait()
+                    return_code = -1
+            except Exception as exc:
+                if process is not None and process.poll() is None:
+                    _kill_process_group(process)
+                    process.wait()
+                stderr_file.write(
+                    f"polar apptainer broker: protected exec failed: {type(exc).__name__}\n".encode()
+                )
+                return_code = 127
+            finally:
+                for descriptor in (ready_read, ready_write):
+                    if descriptor >= 0:
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            pass
+                for descriptor in pinned_files.values():
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                pinned_files.clear()
+                with self._process_lock:
+                    self._processes.pop(request_id, None)
+                    self._protected_pending.pop(request_id, None)
+                protected_values.clear()
+                if pending is not None:
+                    pending.values.clear()
+                active_marker.unlink(missing_ok=True)
+        return {"return_code": return_code}
+
+    def pin_secure_control(self, peer: tuple[int, int, int]) -> dict[str, object]:
+        if not self.protected_only:
+            raise RuntimeError("secure control pinning requires the protected socket")
+        with self._process_lock:
+            if self._trusted_control_peer is None:
+                self._trusted_control_peer = peer
+            elif self._trusted_control_peer != peer:
+                raise PermissionError("protected broker control peer changed")
+        return {
+            "broker_pid": os.getpid(),
+            "broker_start_time": _process_start_time(os.getpid()),
+        }
+
+    def authorize_secure_control(self, peer: tuple[int, int, int]) -> None:
+        with self._process_lock:
+            if self._trusted_control_peer is None or peer != self._trusted_control_peer:
+                raise PermissionError("protected broker control peer is not pinned")
+
+    def deliver_protected(
+        self,
+        request: Mapping[str, Any],
+        peer: tuple[int, int, int],
+    ) -> dict[str, object]:
+        request_id = str(request.get("id", ""))
+        with self._process_lock:
+            pending = self._protected_pending.get(request_id)
+            if pending is None:
+                raise PermissionError("protected runner request is unknown")
+            if peer[0] != pending.pid:
+                raise PermissionError("protected runner peer identity is invalid")
+            if _process_start_time(peer[0]) != pending.start_time:
+                raise PermissionError("protected runner process identity changed")
+            values = dict(pending.values)
+            pending.values.clear()
+            pending.delivered.set()
+        return {"protected_env": values}
+
     def cancel_command(self, request_id: str) -> bool:
         if not _REQUEST_ID_RE.fullmatch(request_id):
             raise ValueError(f"invalid request id: {request_id!r}")
@@ -530,16 +932,30 @@ class _BrokerHandler(socketserver.StreamRequestHandler):
             operation = request.get("operation")
             server = self.server
             assert isinstance(server, _BrokerServer)
+            peer = _peer_credentials(self.request)
             if operation == "ping":
                 response = {"ok": True}
+            elif operation == "secure_pin":
+                response = {"ok": True, **server.pin_secure_control(peer)}
             elif operation == "exec":
+                if server.protected_only:
+                    raise PermissionError("ordinary exec is disabled on protected socket")
                 response = {"ok": True, **server.execute(request)}
+            elif operation == "exec_protected":
+                server.authorize_secure_control(peer)
+                response = {"ok": True, **server.execute_protected(request)}
+            elif operation == "protected_child_ready":
+                response = {"ok": True, **server.deliver_protected(request, peer)}
             elif operation == "cancel":
+                if server.protected_only:
+                    server.authorize_secure_control(peer)
                 response = {
                     "ok": True,
                     "cancelled": server.cancel_command(str(request.get("id", ""))),
                 }
             elif operation == "shutdown":
+                if server.protected_only:
+                    server.authorize_secure_control(peer)
                 server.kill_active_commands()
                 response = {"ok": True}
                 shutdown = True
@@ -560,14 +976,17 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket")
     parser.add_argument("--result-dir")
+    parser.add_argument("--protected-socket")
     parser.add_argument("--forward-proxy-socket")
     parser.add_argument("--forward-proxy-port", type=int)
     args = parser.parse_args()
     if args.forward_proxy_socket is not None:
         if args.forward_proxy_port is None:
             parser.error("--forward-proxy-port is required in proxy mode")
-    elif args.socket is None or args.result_dir is None:
-        parser.error("--socket and --result-dir are required in broker mode")
+    elif args.socket is None or args.result_dir is None or args.protected_socket is None:
+        parser.error(
+            "--socket, --protected-socket and --result-dir are required in broker mode"
+        )
     return args
 
 
@@ -594,12 +1013,19 @@ def main() -> int:
         return _run_forward_proxy(args.forward_proxy_socket, args.forward_proxy_port)
 
     _set_process_name(_BROKER_PROCESS_NAME)
+    # Protected-exec secrets arrive in RPC bodies, never argv/environment.
+    # Make the long-lived broker non-dumpable before it accepts any client so
+    # arbitrary same-UID task processes cannot inspect handler memory.
+    _set_process_dumpable(False)
     assert args.socket is not None
+    assert args.protected_socket is not None
     assert args.result_dir is not None
     socket_path = Path(args.socket)
+    protected_socket_path = Path(args.protected_socket)
     result_dir = Path(args.result_dir)
     socket_path.parent.mkdir(parents=True, exist_ok=True)
     socket_path.unlink(missing_ok=True)
+    protected_socket_path.unlink(missing_ok=True)
 
     environment = dict(os.environ)
     proxy, proxy_url, allow_internet = configure_proxy_environment(
@@ -614,10 +1040,29 @@ def main() -> int:
         proxy_url=proxy_url,
         allow_internet=allow_internet,
     )
+    protected_server = _BrokerServer(
+        str(protected_socket_path),
+        result_dir,
+        base_environment=environment,
+        proxy=proxy,
+        proxy_url=proxy_url,
+        allow_internet=allow_internet,
+        protected_only=True,
+        runtime_socket_path=str(protected_socket_path),
+    )
     socket_path.chmod(0o600)
+    protected_socket_path.chmod(0o600)
+    protected_thread = threading.Thread(
+        target=protected_server.serve_forever,
+        kwargs={"poll_interval": 0.05},
+        daemon=True,
+    )
+    protected_thread.start()
 
     def request_shutdown(_signum: int, _frame: object) -> None:
         server.kill_active_commands()
+        protected_server.kill_active_commands()
+        threading.Thread(target=protected_server.shutdown, daemon=True).start()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, request_shutdown)
@@ -626,7 +1071,11 @@ def main() -> int:
         server.serve_forever(poll_interval=0.1)
     finally:
         server.server_close()
+        protected_server.shutdown()
+        protected_server.server_close()
+        protected_thread.join(timeout=1.0)
         socket_path.unlink(missing_ok=True)
+        protected_socket_path.unlink(missing_ok=True)
         if proxy is not None:
             proxy.close()
     return 0

@@ -15,10 +15,10 @@ to the task container.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 from pathlib import Path
-import shlex
 from typing import Any
 
 from polar.agent.base import BaseHarness
@@ -41,6 +41,7 @@ SPILOT_LOG_PATH = f"{RUNTIME_AGENT_LOG_DIR}/spilot-router.txt"
 _DEFAULT_PORTABLE_PYTHON = "/opt/polar-mini-swe-agent/venv/bin/python"
 _DEFAULT_MINI_SWE_BIN = "/opt/polar-mini-swe-agent/bin/mini-swe-agent"
 _DEFAULT_ROUTER_REQUEST_MODEL = "router/policy"
+_MAX_EPISODE_ADMISSION_WAIT_SECONDS = 86_400.0
 _FORCED_EVAL_ACK = "SPILOT_FORCED_ROUTE_EVAL_ONLY_V1"
 _FORCED_EVAL_AGENT_ACK_ENV = "SPILOT_FORCED_ROUTE_EVAL_ACK"
 _FORCED_EVAL_RUNTIME_ACK_ENV = "SPILOT_FORCED_ROUTE_EVAL_RUNTIME_ACK"
@@ -82,28 +83,31 @@ class SpilotRouterHarness(BaseHarness):
     def run_steps(self, instruction: str) -> list[ExecInput]:
         config_b64 = _encode_json_b64(self._runner_config)
         task_b64 = base64.b64encode(instruction.encode("utf-8")).decode("ascii")
-        python = shlex.quote(str(self._runner_config["runner_python"]))
+        python = str(self._runner_config["runner_python"])
         runner_path = (
             SPILOT_FORCED_EVAL_RUNNER_PATH
             if self._forced_eval is not None
             else SPILOT_RUNNER_PATH
         )
-        runner = shlex.quote(runner_path)
-        log_path = shlex.quote(SPILOT_LOG_PATH)
-        command = (
-            "set -o pipefail; "
-            # The portable interpreter must not import task-owned Python
-            # modules during startup.  Its child mini-SWE wrapper restores the
-            # image PYTHONPATH for tool commands via this private marker.
-            'if [ "${PYTHONPATH+x}" = x ]; then '
-            'export POLAR_TASK_PYTHONPATH="${PYTHONPATH}"; fi; '
-            "unset PYTHONPATH; "
-            'export OPENAI_API_BASE="$OPENAI_BASE_URL"; '
-            f"{python} {runner} 2>&1 | tee {log_path}"
-        )
+        protected_env_keys: list[str] = []
+        if self._forced_eval is None:
+            protected_env_keys.append("POLAR_ROUTER_CAPABILITY")
+        if self._runner_config["pool_episode_admission_enabled"]:
+            protected_env_keys.append("POLAR_MODEL_POOL_ADMISSION_CAPABILITY")
+        core_source = Path(__file__).with_name("spilot_router_runner.py")
+        protected_file_digests = {
+            SPILOT_RUNNER_PATH: hashlib.sha256(core_source.read_bytes()).hexdigest()
+        }
+        if self._forced_eval is not None:
+            forced_source = Path(__file__).with_name("spilot_forced_route_eval_runner.py")
+            protected_file_digests[SPILOT_FORCED_EVAL_RUNNER_PATH] = hashlib.sha256(
+                forced_source.read_bytes()
+            ).hexdigest()
         return [
             ExecInput(
-                command=command,
+                protected_argv=[python, runner_path],
+                protected_env_keys=protected_env_keys,
+                protected_file_digests=protected_file_digests,
                 env={
                     **self.env,
                     "SPILOT_ROUTER_CONFIG_B64": config_b64,
@@ -222,6 +226,14 @@ def _build_runner_config(agent_spec: AgentSpec) -> dict[str, Any]:
         "pool_timeout_seconds": _positive_number(
             settings.pop("pool_timeout_seconds", 1200), "pool_timeout_seconds"
         ),
+        "pool_episode_admission_enabled": _strict_bool(
+            settings.pop("pool_episode_admission_enabled", False),
+            "pool_episode_admission_enabled",
+        ),
+        "pool_episode_admission_wait_budget_seconds": _nonnegative_number(
+            settings.pop("pool_episode_admission_wait_budget_seconds", 0),
+            "pool_episode_admission_wait_budget_seconds",
+        ),
         "total_timeout_seconds": _positive_number(
             settings.pop("total_timeout_seconds", 3000), "total_timeout_seconds"
         ),
@@ -295,6 +307,21 @@ def _build_runner_config(agent_spec: AgentSpec) -> dict[str, Any]:
     if config["reserve_evaluator_seconds"] >= config["total_timeout_seconds"]:
         raise ValueError(
             "spilot_router reserve_evaluator_seconds must be smaller than total_timeout_seconds"
+        )
+    if bool(config["pool_episode_admission_enabled"]) != bool(
+        config["pool_episode_admission_wait_budget_seconds"]
+    ):
+        raise ValueError(
+            "spilot_router pool episode admission must be enabled exactly when "
+            "its wait budget is positive"
+        )
+    if (
+        config["pool_episode_admission_wait_budget_seconds"]
+        > _MAX_EPISODE_ADMISSION_WAIT_SECONDS
+    ):
+        raise ValueError(
+            "spilot_router pool_episode_admission_wait_budget_seconds must be "
+            f"at most {_MAX_EPISODE_ADMISSION_WAIT_SECONDS:g}"
         )
     if config["router_model"] != _DEFAULT_ROUTER_REQUEST_MODEL:
         raise ValueError(

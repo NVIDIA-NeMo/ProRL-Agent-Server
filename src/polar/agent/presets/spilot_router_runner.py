@@ -17,7 +17,9 @@ separate so training can zero-reward the former and mask the latter.
 from __future__ import annotations
 
 import base64
+import ctypes
 from dataclasses import dataclass, field
+import errno
 import hashlib
 import json
 import math
@@ -25,7 +27,10 @@ import os
 from pathlib import Path
 import random
 import re
+import select
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -36,7 +41,54 @@ _CONFIG_ENV = "SPILOT_ROUTER_CONFIG_B64"
 _TASK_ENV = "SPILOT_TASK_B64"
 _ROUTER_CAPABILITY_ENV = "POLAR_ROUTER_CAPABILITY"
 _MODEL_POOL_CAPABILITY_ENV = "POLAR_MODEL_POOL_CAPABILITY"
+_MODEL_POOL_ADMISSION_CAPABILITY_ENV = "POLAR_MODEL_POOL_ADMISSION_CAPABILITY"
+_PROTECTED_EXEC_SOCKET_ENV = "POLAR_PROTECTED_EXEC_SOCKET"
+_PROTECTED_EXEC_BROKER_PID_ENV = "POLAR_PROTECTED_EXEC_BROKER_PID"
+_PROTECTED_EXEC_REQUEST_ID_ENV = "POLAR_PROTECTED_EXEC_REQUEST_ID"
+_PROTECTED_EXEC_READY_FD_ENV = "POLAR_PROTECTED_EXEC_READY_FD"
 _MINI_SWE_TASK_B64_ENV = "POLAR_MINI_SWE_TASK_B64"
+_POOL_CALL_CAPABILITY_FD_ENV = "POLAR_POOL_CALL_CAPABILITY_FD"
+_POOL_CALL_READY_FD_ENV = "POLAR_POOL_CALL_READY_FD"
+_POOL_CALL_READY_TIMEOUT_SECONDS = 30.0
+_POOL_CHILD_ENV_ALLOWLIST = frozenset(
+    {
+        "ALL_PROXY",
+        "CURL_CA_BUNDLE",
+        "HOME",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LITELLM_LOCAL_MODEL_COST_MAP",
+        "NO_PROXY",
+        "OPENAI_API_BASE",
+        "OPENAI_BASE_URL",
+        "PATH",
+        "POLAR_APT_HTTP_SOURCE_POLICY",
+        "POLAR_ALLOW_INTERNET",
+        "POLAR_GATEWAY_UDS",
+        "POLAR_HTTP_PROXY_BROKER_READY",
+        "POLAR_HTTP_PROXY_PORT",
+        "POLAR_HTTP_PROXY_UDS",
+        "POLAR_TASK_PYTHONPATH",
+        "REQUESTS_CA_BUNDLE",
+        "SHELL",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "TMPDIR",
+        "TZ",
+        "USER",
+        "VIRTUAL_ENV",
+        "all_proxy",
+        "https_proxy",
+        "http_proxy",
+        "no_proxy",
+    }
+)
 _VANILLUX2_CONFIG_PATH = "/opt/polar-mini-swe-agent/config/vanillux2.yaml"
 _VANILLUX2_MODEL_CLASS = "polar_mini_swe_vanillux.Vanillux2LitellmModel"
 _VANILLUX2_ENVIRONMENT_CLASS = "polar_mini_swe_timing.Vanillux2TimedLocalEnvironment"
@@ -44,6 +96,22 @@ _SLOT_RE = re.compile(r"^M(?:0|[1-9][0-9]*)$")
 _MAX_ERROR_CHARS = 500
 _MAX_CARD_CHARS = 4_000
 _GIT_COMMAND_TIMEOUT_SECONDS = 10.0
+_PROCESS_SCOPE_TERM_TIMEOUT_SECONDS = 5.0
+_PROCESS_SCOPE_KILL_TIMEOUT_SECONDS = 5.0
+_PROCESS_SCOPE_PROBE_INTERVAL_SECONDS = 0.05
+_PROCESS_SCOPE_STABLE_PROBES = 2
+_PR_SET_CHILD_SUBREAPER = 36
+_PR_GET_CHILD_SUBREAPER = 37
+_PR_GET_DUMPABLE = 3
+_PR_SET_DUMPABLE = 4
+_CAPABILITY_MAX_BYTES = 16_384
+_ADMISSION_HTTP_MAX_ATTEMPTS = 3
+_ADMISSION_HTTP_BACKOFF_SECONDS = 0.1
+_ADMISSION_RELEASE_BUDGET_SECONDS = 30.0
+_ADMISSION_ACQUIRE_ACK_RESERVE_SECONDS = 5.0
+_ADMISSION_RELEASE_POLL_SECONDS = 2.0
+_ADMISSION_RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_MAX_EPISODE_ADMISSION_WAIT_SECONDS = 86_400.0
 _FORBIDDEN_REQUEST_KEYS = {
     "api_key",
     "apikey",
@@ -64,6 +132,10 @@ class GatewayInfrastructureError(RuntimeError):
 
 class PoolInfrastructureError(RuntimeError):
     """The local pool-agent executable could not be launched."""
+
+
+class UnreapedPoolProcessError(PoolInfrastructureError):
+    """A candidate process could not be confirmed dead after termination."""
 
 
 def _classify_process_failure(
@@ -128,6 +200,8 @@ class PoolCallResult:
     failure_kind: str | None = None
     signal_number: int | None = None
     signal_name: str | None = None
+    admission_wait_ms: int = 0
+    admission_local_cap: int | None = None
 
     def metadata(self, *, index: int, cost: float) -> dict[str, object]:
         result: dict[str, object] = {
@@ -143,7 +217,10 @@ class PoolCallResult:
             "cost": cost,
             "log_file": self.log_file,
             "workspace_fingerprint": self.workspace_fingerprint,
+            "admission_wait_ms": self.admission_wait_ms,
         }
+        if self.admission_local_cap is not None:
+            result["admission_local_cap"] = self.admission_local_cap
         if self.error:
             result["error"] = _bounded_text(self.error, _MAX_ERROR_CHARS)
         if self.failure_kind is not None:
@@ -195,7 +272,139 @@ class PoolExecutor(Protocol):
         role: str,
         call_index: int,
         timeout_seconds: float,
+        model_call_capability: str,
     ) -> PoolCallResult: ...
+
+
+@dataclass(frozen=True)
+class EpisodeLeaseGrant:
+    lease_id: str
+    model: str
+    attempt_id: str
+    wait_ms: int
+    local_cap: int
+    call_capability: str = ""
+
+
+class EpisodeAdmissionClient(Protocol):
+    def acquire(
+        self,
+        *,
+        model: str,
+        attempt_id: str,
+        timeout_seconds: float,
+    ) -> EpisodeLeaseGrant: ...
+
+    def release(self, lease_id: str) -> None: ...
+
+    def close(self) -> None: ...
+
+
+_PROTECTED_ENV_CACHE: dict[str, str] | None = None
+
+
+def _set_and_verify_non_dumpable() -> None:
+    if sys.platform != "linux":
+        raise GatewayInfrastructureError("protected runner requires Linux prctl")
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise GatewayInfrastructureError(
+            f"could not harden protected runner: errno {error_number}"
+        )
+    dumpable = libc.prctl(_PR_GET_DUMPABLE, 0, 0, 0, 0)
+    if dumpable != 0:
+        raise GatewayInfrastructureError("protected runner dumpability verification failed")
+
+
+def _receive_protected_environment() -> dict[str, str]:
+    """Fetch secrets over a fresh peer-authenticated socket after hardening."""
+
+    global _PROTECTED_ENV_CACHE
+    if _PROTECTED_ENV_CACHE is not None:
+        return _PROTECTED_ENV_CACHE
+    for key in (_ROUTER_CAPABILITY_ENV, _MODEL_POOL_ADMISSION_CAPABILITY_ENV):
+        if os.environ.pop(key, ""):
+            raise GatewayInfrastructureError(
+                "protected capability appeared in the runner's initial environment"
+            )
+    _set_and_verify_non_dumpable()
+    raw_ready_fd = os.environ.pop(_PROTECTED_EXEC_READY_FD_ENV, "")
+    try:
+        ready_fd = int(raw_ready_fd)
+    except ValueError as exc:
+        raise GatewayInfrastructureError("protected runner readiness gate is unavailable") from exc
+    if ready_fd < 3:
+        raise GatewayInfrastructureError("protected runner readiness gate is unavailable")
+    try:
+        if os.read(ready_fd, 1) != b"1":
+            raise GatewayInfrastructureError("protected runner readiness gate was not released")
+    except OSError as exc:
+        raise GatewayInfrastructureError("protected runner readiness gate failed") from exc
+    finally:
+        try:
+            os.close(ready_fd)
+        except OSError:
+            pass
+
+    socket_path = os.environ.pop(_PROTECTED_EXEC_SOCKET_ENV, "")
+    request_id = os.environ.pop(_PROTECTED_EXEC_REQUEST_ID_ENV, "")
+    raw_broker_pid = os.environ.pop(_PROTECTED_EXEC_BROKER_PID_ENV, "")
+    try:
+        broker_pid = int(raw_broker_pid)
+    except ValueError as exc:
+        raise GatewayInfrastructureError("protected broker identity is unavailable") from exc
+    if not socket_path or not request_id or broker_pid <= 0:
+        raise GatewayInfrastructureError("protected runner channel is unavailable")
+
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(30.0)
+    try:
+        connection.connect(socket_path)
+        peer = struct.unpack(
+            "3i",
+            connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12),
+        )
+        if peer[0] != broker_pid:
+            raise GatewayInfrastructureError("protected runner connected to the wrong broker")
+        request = json.dumps(
+            {"operation": "protected_child_ready", "id": request_id},
+            separators=(",", ":"),
+        ).encode()
+        connection.sendall(request + b"\n")
+        response = bytearray()
+        while b"\n" not in response:
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+            if len(response) > _CAPABILITY_MAX_BYTES * 4:
+                raise GatewayInfrastructureError("protected runner response is too large")
+        payload = json.loads(bytes(response).split(b"\n", 1)[0])
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        if isinstance(exc, GatewayInfrastructureError):
+            raise
+        raise GatewayInfrastructureError("protected runner secret exchange failed") from exc
+    finally:
+        connection.close()
+    values = payload.get("protected_env") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or payload.get("ok") is not True or not isinstance(values, dict):
+        raise GatewayInfrastructureError("protected runner received an invalid secret response")
+    normalized: dict[str, str] = {}
+    for key, value in values.items():
+        if not isinstance(key, str) or not isinstance(value, str) or not value:
+            raise GatewayInfrastructureError("protected runner received an invalid secret")
+        normalized[key] = value
+    _PROTECTED_ENV_CACHE = normalized
+    return normalized
+
+
+def _read_protected_capability(key: str) -> str:
+    values = _receive_protected_environment()
+    capability = values.pop(key, "")
+    if not capability:
+        raise GatewayInfrastructureError(f"protected capability {key} is unavailable")
+    return capability
 
 
 class OpenAIGatewayClient:
@@ -207,6 +416,7 @@ class OpenAIGatewayClient:
         except ImportError as exc:  # pragma: no cover - portable image contract
             raise GatewayInfrastructureError("portable runtime is missing httpx") from exc
 
+        capability = _read_protected_capability(_ROUTER_CAPABILITY_ENV)
         base_url = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/")
         if not base_url:
             raise GatewayInfrastructureError("OPENAI_BASE_URL is not configured")
@@ -221,6 +431,10 @@ class OpenAIGatewayClient:
             self._client = httpx.Client(transport=transport, trust_env=False)
         else:
             self._client = httpx.Client(trust_env=False)
+        self._headers = {
+            "Authorization": f"Bearer {capability}",
+            "Content-Type": "application/json",
+        }
 
     def close(self) -> None:
         self._client.close()
@@ -238,18 +452,11 @@ class OpenAIGatewayClient:
             messages=messages,
             model_kwargs=model_kwargs,
         )
-        headers = {"Content-Type": "application/json"}
-        api_key = (
-            os.environ.get(_ROUTER_CAPABILITY_ENV, "").strip()
-            or os.environ.get("OPENAI_API_KEY", "").strip()
-        )
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
         try:
             response = self._client.post(
                 self._url,
                 json=payload,
-                headers=headers,
+                headers=self._headers,
                 timeout=timeout_seconds,
             )
             response.raise_for_status()
@@ -284,6 +491,217 @@ class OpenAIGatewayClient:
         )
 
 
+class GatewayEpisodeAdmissionClient:
+    """Capability-scoped client for the gateway's full-episode lease API."""
+
+    def __init__(self) -> None:
+        try:
+            import httpx
+        except ImportError as exc:  # pragma: no cover - portable image contract
+            raise GatewayInfrastructureError("portable runtime is missing httpx") from exc
+
+        capability = _read_protected_capability(
+            _MODEL_POOL_ADMISSION_CAPABILITY_ENV
+        )
+        base_url = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/")
+        if not base_url:
+            raise GatewayInfrastructureError("OPENAI_BASE_URL is not configured")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
+        self._acquire_url = f"{base_url}/internal/model-pool/episode-leases/acquire"
+        self._release_url = f"{base_url}/internal/model-pool/episode-leases/release"
+        self._headers = {
+            "Authorization": f"Bearer {capability}",
+            "Content-Type": "application/json",
+        }
+        socket_path = os.environ.get("POLAR_GATEWAY_UDS", "").strip()
+        if socket_path:
+            transport = httpx.HTTPTransport(uds=socket_path)
+            self._client = httpx.Client(transport=transport, trust_env=False)
+        else:
+            self._client = httpx.Client(trust_env=False)
+        self._clock = time.monotonic
+        self._sleep = time.sleep
+
+    def close(self) -> None:
+        self._client.close()
+
+    def acquire(
+        self,
+        *,
+        model: str,
+        attempt_id: str,
+        timeout_seconds: float,
+    ) -> EpisodeLeaseGrant:
+        body = self._post(
+            self._acquire_url,
+            payload={
+                "model": model,
+                "attempt_id": attempt_id,
+                "wait_timeout_seconds": timeout_seconds,
+            },
+            # Queue residency remains exactly timeout_seconds.  The extra
+            # transport reserve exists only to recover a lost grant ACK with
+            # the same attempt id; it never extends gateway queue admission.
+            budget_seconds=(
+                timeout_seconds + _ADMISSION_ACQUIRE_ACK_RESERVE_SECONDS
+            ),
+        )
+        try:
+            lease_id = body["lease_id"]
+            response_model = body["model"]
+            response_attempt = body["attempt_id"]
+            wait_ms = body["wait_ms"]
+            local_cap = body["local_cap"]
+            call_capability = body["call_capability"]
+        except (KeyError, TypeError) as exc:
+            raise GatewayInfrastructureError(
+                "episode admission returned an invalid grant"
+            ) from exc
+        if (
+            not isinstance(lease_id, str)
+            or not lease_id
+            or response_model != model
+            or response_attempt != attempt_id
+            or isinstance(wait_ms, bool)
+            or not isinstance(wait_ms, int)
+            or wait_ms < 0
+            or isinstance(local_cap, bool)
+            or not isinstance(local_cap, int)
+            or local_cap <= 0
+            or not isinstance(call_capability, str)
+            or not call_capability
+        ):
+            raise GatewayInfrastructureError("episode admission returned an invalid grant")
+        return EpisodeLeaseGrant(
+            lease_id=lease_id,
+            model=model,
+            attempt_id=attempt_id,
+            wait_ms=wait_ms,
+            local_cap=local_cap,
+            call_capability=call_capability,
+        )
+
+    def release(self, lease_id: str) -> None:
+        deadline = self._clock() + _ADMISSION_RELEASE_BUDGET_SECONDS
+        while True:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise GatewayInfrastructureError(
+                    "episode admission release did not drain before its deadline"
+                )
+            body = self._post(
+                self._release_url,
+                payload={
+                    "lease_id": lease_id,
+                    "wait_timeout_seconds": min(
+                        _ADMISSION_RELEASE_POLL_SECONDS,
+                        remaining,
+                    ),
+                },
+                budget_seconds=min(
+                    _ADMISSION_RELEASE_POLL_SECONDS + 1.0,
+                    remaining,
+                ),
+            )
+            if body.get("draining") is True:
+                self._sleep(min(0.1, max(0.0, deadline - self._clock()) / 2.0))
+                continue
+            if isinstance(body.get("released"), bool):
+                return
+            raise GatewayInfrastructureError(
+                "episode admission returned an invalid release acknowledgement"
+            )
+
+    def _post(
+        self,
+        url: str,
+        *,
+        payload: dict[str, object],
+        budget_seconds: float,
+    ) -> dict[str, Any]:
+        if not math.isfinite(budget_seconds) or budget_seconds <= 0:
+            raise GatewayInfrastructureError("episode admission request budget is exhausted")
+        deadline = self._clock() + budget_seconds
+        last_detail = "request budget was exhausted"
+        attempts = 0
+        for attempt in range(_ADMISSION_HTTP_MAX_ATTEMPTS):
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                break
+            attempts += 1
+            response: object | None = None
+            body: object = None
+            retryable = True
+            request_payload = dict(payload)
+            wait_timeout = request_payload.get("wait_timeout_seconds")
+            if isinstance(wait_timeout, (int, float)) and not isinstance(
+                wait_timeout, bool
+            ):
+                request_payload["wait_timeout_seconds"] = min(
+                    float(wait_timeout),
+                    remaining,
+                )
+            try:
+                response = self._client.post(
+                    url,
+                    json=request_payload,
+                    headers=self._headers,
+                    timeout=remaining,
+                )
+                status_code = int(response.status_code)
+                try:
+                    body = response.json()
+                except Exception:
+                    body = None
+                if 200 <= status_code < 300:
+                    if isinstance(body, dict):
+                        return body
+                    # A truncated success body is equivalent to response loss
+                    # for these idempotent endpoints and is safe to retry.
+                    last_detail = "HTTP success with an invalid response body"
+                    retryable = True
+                else:
+                    message: object = None
+                    code: object = None
+                    if isinstance(body, dict):
+                        error = body.get("error")
+                        if isinstance(error, dict):
+                            message = error.get("message")
+                            code = error.get("code")
+                    detail = _bounded_text(
+                        str(message or code or f"HTTP {status_code}"),
+                        300,
+                    )
+                    last_detail = f"HTTP {status_code}: {detail}"
+                    retryable = (
+                        status_code in _ADMISSION_RETRYABLE_STATUS_CODES
+                        and code != "episode_admission_timeout"
+                    )
+            except GatewayInfrastructureError:
+                raise
+            except Exception as exc:
+                last_detail = _http_exception_detail(exc)
+                retryable = True
+
+            if not retryable or attempt + 1 >= _ADMISSION_HTTP_MAX_ATTEMPTS:
+                break
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                break
+            backoff = min(
+                _ADMISSION_HTTP_BACKOFF_SECONDS * (2**attempt),
+                remaining / 2.0,
+            )
+            if backoff > 0:
+                self._sleep(backoff)
+
+        raise GatewayInfrastructureError(
+            "episode admission request failed after "
+            f"{attempts} attempt(s): {_bounded_text(last_detail, 300)}"
+        )
+
+
 class MiniSwePoolExecutor:
     """Run each frozen candidate as a complete mini-SWE coding agent."""
 
@@ -301,6 +719,7 @@ class MiniSwePoolExecutor:
         role: str,
         call_index: int,
         timeout_seconds: float,
+        model_call_capability: str,
     ) -> PoolCallResult:
         log_path = self.log_dir / f"spilot-pool-{call_index:02d}-{role}.txt"
         timing_path = self.log_dir / f"spilot-pool-{call_index:02d}-timing.jsonl"
@@ -317,19 +736,25 @@ class MiniSwePoolExecutor:
             state_dir=str(state_dir),
             model_kwargs=model_kwargs,
         )
-        child_env = dict(os.environ)
+        child_env = {
+            key: value
+            for key, value in os.environ.items()
+            if key in _POOL_CHILD_ENV_ALLOWLIST or key.startswith("LC_")
+        }
         # The frozen coding agent gets only the model-pool-scoped capability.
         # Keep the Router capability and outer protocol/config out of its
         # ordinary child environment.
         child_env.pop(_CONFIG_ENV, None)
         child_env.pop(_TASK_ENV, None)
         child_env.pop(_ROUTER_CAPABILITY_ENV, None)
+        child_env.pop(_MODEL_POOL_ADMISSION_CAPABILITY_ENV, None)
         child_env[_MINI_SWE_TASK_B64_ENV] = base64.b64encode(
             instruction.encode("utf-8")
         ).decode("ascii")
-        pool_capability = child_env.pop(_MODEL_POOL_CAPABILITY_ENV, "").strip()
-        if pool_capability:
-            child_env["OPENAI_API_KEY"] = pool_capability
+        child_env.pop(_MODEL_POOL_CAPABILITY_ENV, None)
+        child_env.pop("OPENAI_API_KEY", None)
+        if not model_call_capability:
+            raise PoolInfrastructureError("lease-scoped pool-call capability is missing")
         base_url = child_env.get("OPENAI_BASE_URL", "")
         if base_url:
             child_env["OPENAI_API_BASE"] = base_url
@@ -344,10 +769,19 @@ class MiniSwePoolExecutor:
             }
         )
 
+        # Containment is an error-path cleanup boundary only. Successful task
+        # agents intentionally leave services running for TMAX evaluation.
+        process_scope = _ProcessContainmentScope.capture()
         started = time.monotonic()
+        deadline = started + timeout_seconds
         process: subprocess.Popen[str] | None = None
+        process_handled = False
         timed_out = False
         error: str | None = None
+        secret_read, secret_write = os.pipe()
+        ready_read, ready_write = os.pipe()
+        child_env[_POOL_CALL_CAPABILITY_FD_ENV] = str(secret_read)
+        child_env[_POOL_CALL_READY_FD_ENV] = str(ready_write)
         try:
             with log_path.open("w", encoding="utf-8", errors="replace") as stream:
                 try:
@@ -359,24 +793,83 @@ class MiniSwePoolExecutor:
                         stderr=subprocess.STDOUT,
                         text=True,
                         start_new_session=True,
+                        close_fds=True,
+                        pass_fds=(secret_read, ready_write),
                     )
                 except (FileNotFoundError, PermissionError, OSError) as exc:
                     raise PoolInfrastructureError(
                         f"could not launch mini-SWE pool agent: {_bounded_text(str(exc), 240)}"
                     ) from exc
+                os.close(secret_read)
+                secret_read = -1
+                os.close(ready_write)
+                ready_write = -1
+                _deliver_pool_call_capability(
+                    capability=model_call_capability,
+                    ready_read=ready_read,
+                    secret_write=secret_write,
+                    deadline=deadline,
+                )
+                os.close(ready_read)
+                ready_read = -1
+                os.close(secret_write)
+                secret_write = -1
                 try:
-                    return_code = process.wait(timeout=timeout_seconds)
+                    return_code = process.wait(
+                        timeout=max(0.0, deadline - time.monotonic())
+                    )
                 except subprocess.TimeoutExpired:
                     timed_out = True
-                    _terminate_process_group(process)
+                    if _terminate_process_scope(process, process_scope) is not True:
+                        raise UnreapedPoolProcessError(
+                            "could not reap timed-out mini-SWE pool agent"
+                        )
+                    process_handled = True
                     return_code = -1
                     error = f"pool agent exceeded {timeout_seconds:.1f}s timeout"
-        except PoolInfrastructureError:
+                else:
+                    if return_code == 0:
+                        # Preserve successful task daemons. Provider safety is
+                        # enforced by lease token revocation + in-flight drain.
+                        process_handled = True
+                    else:
+                        if _terminate_process_scope(process, process_scope) is not True:
+                            raise UnreapedPoolProcessError(
+                                "could not reap failed mini-SWE process scope"
+                            )
+                        process_handled = True
+        except UnreapedPoolProcessError:
+            raise
+        except PoolInfrastructureError as exc:
+            if process is not None and not process_handled:
+                if _terminate_process_scope(process, process_scope) is not True:
+                    raise UnreapedPoolProcessError(
+                        "could not reap mini-SWE pool agent after infrastructure failure"
+                    ) from exc
             raise
         except (OSError, UnicodeError) as exc:
+            if process is not None and not process_handled:
+                if _terminate_process_scope(process, process_scope) is not True:
+                    raise UnreapedPoolProcessError(
+                        "could not reap mini-SWE pool agent after log failure"
+                    ) from exc
             raise PoolInfrastructureError(
                 f"could not write pool-agent log: {_bounded_text(str(exc), 240)}"
             ) from exc
+        except BaseException as exc:
+            if process is not None and not process_handled:
+                if _terminate_process_scope(process, process_scope) is not True:
+                    raise UnreapedPoolProcessError(
+                        "could not reap mini-SWE pool agent after execution failure"
+                    ) from exc
+            raise
+        finally:
+            for descriptor in (secret_read, secret_write, ready_read, ready_write):
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
 
         duration_ms = max(0, int((time.monotonic() - started) * 1000))
         failure_kind, signal_number, signal_name = _classify_process_failure(
@@ -413,7 +906,6 @@ class MiniSwePoolExecutor:
             signal_number=signal_number,
             signal_name=signal_name,
         )
-
     def deadline_result(
         self,
         *,
@@ -490,6 +982,31 @@ class MiniSwePoolExecutor:
         return args
 
 
+def _deliver_pool_call_capability(
+    *,
+    capability: str,
+    ready_read: int,
+    secret_write: int,
+    deadline: float,
+) -> None:
+    """Deliver a lease token only after the model child has hardened itself."""
+
+    ready_budget = min(
+        _POOL_CALL_READY_TIMEOUT_SECONDS,
+        max(0.0, deadline - time.monotonic()),
+    )
+    readable, _, _ = select.select([ready_read], [], [], ready_budget)
+    if not readable or os.read(ready_read, 2) != b"1":
+        raise PoolInfrastructureError(
+            "mini-SWE did not establish its protected model-call channel"
+        )
+    secret_payload = (capability + "\n").encode("utf-8")
+    view = memoryview(secret_payload)
+    while view:
+        written = os.write(secret_write, view)
+        view = view[written:]
+
+
 class SpilotOrchestrator:
     """Execute and record one bounded SPilot routing episode."""
 
@@ -500,12 +1017,14 @@ class SpilotOrchestrator:
         task: str,
         router: RouterClient,
         pool: PoolExecutor,
+        admission: EpisodeAdmissionClient | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.config = _validate_config(config)
         self.task = task
         self.router = router
         self.pool = pool
+        self.admission = admission
         self.clock = clock
         self.candidates = _assign_slots(
             self.config["model_pool"],
@@ -525,6 +1044,10 @@ class SpilotOrchestrator:
             "calls": [],
             "submitted": False,
             "total_cost": 0.0,
+            "admission_enabled": bool(
+                self.config["pool_episode_admission_enabled"]
+            ),
+            "admission_wait_ms": 0,
             "slot_mapping": mapping,
             "slot_mapping_fingerprint": hashlib.sha256(mapping_json.encode()).hexdigest(),
             "termination_reason": "not_started",
@@ -533,6 +1056,19 @@ class SpilotOrchestrator:
             self.config["reserve_evaluator_seconds"]
         )
         self.deadline = self.clock() + usable_seconds
+        self.admission_wait_budget_seconds = float(
+            self.config["pool_episode_admission_wait_budget_seconds"]
+        )
+        self.admission_wait_used_seconds = 0.0
+
+    def _record_admission_wait(self, waited_seconds: float) -> int:
+        """Record control-plane wait without creating a candidate-call outcome."""
+
+        waited_seconds = max(0.0, float(waited_seconds))
+        self.admission_wait_used_seconds += waited_seconds
+        cumulative_ms = int(round(self.admission_wait_used_seconds * 1000))
+        self.result["admission_wait_ms"] = cumulative_ms
+        return int(round(waited_seconds * 1000))
 
     def run(self) -> dict[str, Any]:
         initial_messages = self._initial_messages()
@@ -715,14 +1251,103 @@ class SpilotOrchestrator:
                 error="pool call skipped because the episode deadline was exhausted",
                 failure_kind="timeout",
             )
+        admission_enabled = bool(self.config["pool_episode_admission_enabled"])
+        grant: EpisodeLeaseGrant | None = None
+        if admission_enabled:
+            if self.admission is None:
+                raise GatewayInfrastructureError(
+                    "pool episode admission is enabled but no client is configured"
+                )
+            queue_budget = (
+                self.admission_wait_budget_seconds
+                - self.admission_wait_used_seconds
+            )
+            if queue_budget <= 0:
+                raise GatewayInfrastructureError(
+                    "pool episode admission wait budget is exhausted"
+                )
+            attempt_id = f"{call_index}:{role}"
+            acquire_started = self.clock()
+            try:
+                grant = self.admission.acquire(
+                    model=candidate.model,
+                    attempt_id=attempt_id,
+                    timeout_seconds=queue_budget,
+                )
+            except Exception as exc:
+                # A timed-out/failed acquire has no grant and therefore no
+                # gateway-provided wait_ms. Measure it in this process before
+                # propagating the infrastructure failure so postprocess/W&B
+                # can account for the worst queue-pressure samples. This is
+                # top-level infrastructure telemetry: no candidate call, cost,
+                # or trainable reward outcome is fabricated.
+                local_waited_seconds = max(0.0, self.clock() - acquire_started)
+                local_wait_ms = self._record_admission_wait(local_waited_seconds)
+                self.result["admission_failure"] = {
+                    "model": candidate.model,
+                    "attempt_id": attempt_id,
+                    "wait_ms": local_wait_ms,
+                    "error": _bounded_text(f"{type(exc).__name__}: {exc}", 300),
+                }
+                raise
+            local_waited_seconds = max(0.0, self.clock() - acquire_started)
+            queue_waited_seconds = grant.wait_ms / 1000.0
+            observed_wait_ms = self._record_admission_wait(queue_waited_seconds)
+            self.result["admission_transport_ms"] = max(
+                0,
+                int(local_waited_seconds * 1000) - grant.wait_ms,
+            )
+            if queue_waited_seconds > queue_budget + 0.001:
+                self.admission.release(grant.lease_id)
+                raise GatewayInfrastructureError(
+                    "gateway granted an episode lease after the wait budget expired"
+                )
+            # The inner deadline measures active Router/candidate work.  Its
+            # fixed budget must not be consumed by gateway admission queueing.
+            self.deadline += queue_waited_seconds
+
+            # Recompute the active candidate budget after queue-time credit.
+            remaining = self.deadline - self.clock()
+            available = remaining - reserve
+            if available <= 0:
+                self.admission.release(grant.lease_id)
+                deadline_result = getattr(self.pool, "deadline_result", None)
+                if callable(deadline_result):
+                    return deadline_result(
+                        candidate=candidate,
+                        role=role,
+                        call_index=call_index,
+                    )
+                raise GatewayInfrastructureError(
+                    "episode deadline exhausted after admission"
+                )
+
         timeout = min(float(self.config["pool_timeout_seconds"]), available)
-        return self.pool.run(
-            candidate=candidate,
-            task=self.task,
-            role=role,
-            call_index=call_index,
-            timeout_seconds=timeout,
-        )
+        try:
+            result = self.pool.run(
+                candidate=candidate,
+                task=self.task,
+                role=role,
+                call_index=call_index,
+                timeout_seconds=timeout,
+                model_call_capability=(grant.call_capability if grant else ""),
+            )
+        except UnreapedPoolProcessError:
+            # Releasing here could start another candidate while the prior
+            # process is still alive. Gateway postrun will retain the lease,
+            # mark the node unhealthy, and reject further dispatches.
+            raise
+        except BaseException:
+            if grant is not None:
+                assert self.admission is not None
+                self.admission.release(grant.lease_id)
+            raise
+        if grant is not None:
+            assert self.admission is not None
+            self.admission.release(grant.lease_id)
+            result.admission_wait_ms = observed_wait_ms
+            result.admission_local_cap = grant.local_cap
+        return result
 
     def _record_call(self, call: PoolCallResult, candidate: Candidate) -> None:
         cost = candidate.cost_weight if call.attempted else 0.0
@@ -871,6 +1496,11 @@ def _parse_candidate(value: object) -> dict[str, Any]:
 
 
 def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
+    # Preserve standalone/forced-eval configs written before episode admission
+    # existed.  The gateway remains unrestricted unless both topology and the
+    # runner explicitly opt in.
+    config.setdefault("pool_episode_admission_enabled", False)
+    config.setdefault("pool_episode_admission_wait_budget_seconds", 0.0)
     required = {
         "router_model",
         "model_pool",
@@ -880,6 +1510,8 @@ def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
         "router_max_tokens",
         "router_timeout_seconds",
         "pool_timeout_seconds",
+        "pool_episode_admission_enabled",
+        "pool_episode_admission_wait_budget_seconds",
         "total_timeout_seconds",
         "reserve_evaluator_seconds",
         "deadline_margin_seconds",
@@ -902,6 +1534,25 @@ def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"runner config missing fields: {', '.join(sorted(missing))}")
     if config["max_pool_calls"] not in (1, 2):
         raise ValueError("max_pool_calls must be 1 or 2")
+    admission_enabled = config["pool_episode_admission_enabled"]
+    if not isinstance(admission_enabled, bool):
+        raise ValueError("pool_episode_admission_enabled must be boolean")
+    admission_budget = config["pool_episode_admission_wait_budget_seconds"]
+    if (
+        isinstance(admission_budget, bool)
+        or not isinstance(admission_budget, (int, float))
+        or not math.isfinite(float(admission_budget))
+        or float(admission_budget) < 0
+        or float(admission_budget) > _MAX_EPISODE_ADMISSION_WAIT_SECONDS
+    ):
+        raise ValueError(
+            "pool_episode_admission_wait_budget_seconds must be finite and between "
+            f"0 and {_MAX_EPISODE_ADMISSION_WAIT_SECONDS:g}"
+        )
+    if admission_enabled != (float(admission_budget) > 0):
+        raise ValueError(
+            "pool episode admission must be enabled exactly when its wait budget is positive"
+        )
     slot_assignment_seed = config.get("slot_assignment_seed")
     if slot_assignment_seed is not None and (
         isinstance(slot_assignment_seed, bool)
@@ -995,23 +1646,269 @@ def _read_tail(path: Path, limit: int) -> str:
         return _bounded_text(f"log unavailable: {exc}", 240)
 
 
-def _terminate_process_group(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
+@dataclass(frozen=True, slots=True)
+class _ProcIdentity:
+    pid: int
+    ppid: int
+    start_time: int
+    state: str
+
+    @property
+    def key(self) -> tuple[int, int]:
+        return (self.pid, self.start_time)
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessContainmentScope:
+    """Start-time-qualified descendants owned by this Linux child subreaper."""
+
+    owner_pid: int
+    baseline: frozenset[tuple[int, int]]
+
+    @classmethod
+    def capture(cls) -> _ProcessContainmentScope:
+        _ensure_child_subreaper()
+        snapshot = _read_proc_snapshot()
+        if snapshot is None or os.getpid() not in snapshot:
+            raise PoolInfrastructureError(
+                "could not establish a trustworthy candidate process scope"
+            )
+        descendants = _descendants_of(os.getpid(), snapshot)
+        return cls(
+            owner_pid=os.getpid(),
+            baseline=frozenset(record.key for record in descendants.values()),
+        )
+
+
+_CHILD_SUBREAPER_ENABLED = False
+
+
+def _ensure_child_subreaper() -> None:
+    """Make daemonized candidate descendants reparent to this runner."""
+
+    global _CHILD_SUBREAPER_ENABLED
+    if _CHILD_SUBREAPER_ENABLED:
         return
+    if sys.platform != "linux" or not Path("/proc/self/stat").is_file():
+        raise PoolInfrastructureError(
+            "candidate process containment requires Linux procfs"
+        )
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=5.0)
-        return
-    except (ProcessLookupError, subprocess.TimeoutExpired):
-        pass
+        libc = ctypes.CDLL(None, use_errno=True)
+        set_result = libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+        if set_result != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number))
+        enabled = ctypes.c_int(0)
+        get_result = libc.prctl(
+            _PR_GET_CHILD_SUBREAPER,
+            ctypes.byref(enabled),
+            0,
+            0,
+            0,
+        )
+        if get_result != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number))
+    except (AttributeError, OSError) as exc:
+        raise PoolInfrastructureError(
+            "could not enable candidate child-subreaper containment"
+        ) from exc
+    if enabled.value != 1:
+        raise PoolInfrastructureError(
+            "candidate child-subreaper containment was not enabled"
+        )
+    _CHILD_SUBREAPER_ENABLED = True
+
+
+def _parse_proc_stat(text: str) -> _ProcIdentity:
+    open_paren = text.find("(")
+    close_paren = text.rfind(")")
+    if open_paren <= 0 or close_paren <= open_paren:
+        raise ValueError("invalid proc stat comm field")
+    pid = int(text[:open_paren].strip())
+    fields = text[close_paren + 1 :].strip().split()
+    # fields[0] is stat field 3 (state); starttime is field 22.
+    if len(fields) <= 19:
+        raise ValueError("truncated proc stat record")
+    return _ProcIdentity(
+        pid=pid,
+        ppid=int(fields[1]),
+        start_time=int(fields[19]),
+        state=fields[0],
+    )
+
+
+def _read_proc_identity(pid: int) -> _ProcIdentity | None:
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError as exc:
+        if exc.errno in {errno.ENOENT, errno.ESRCH}:
+            return None
+        raise
+    return _parse_proc_stat(text)
+
+
+def _read_proc_snapshot() -> dict[int, _ProcIdentity] | None:
+    """Read procfs or return None when absence cannot be proven safely."""
+
+    result: dict[int, _ProcIdentity] = {}
+    try:
+        entries = tuple(os.scandir("/proc"))
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            record = _read_proc_identity(int(entry.name))
+        except (OSError, UnicodeError, ValueError):
+            return None
+        if record is not None:
+            result[record.pid] = record
+    return result
+
+
+def _descendants_of(
+    owner_pid: int,
+    snapshot: dict[int, _ProcIdentity],
+) -> dict[int, _ProcIdentity]:
+    descendants: dict[int, _ProcIdentity] = {}
+    frontier = {owner_pid}
+    while frontier:
+        next_frontier: set[int] = set()
+        for record in snapshot.values():
+            if record.pid == owner_pid or record.pid in descendants:
+                continue
+            if record.ppid in frontier:
+                descendants[record.pid] = record
+                next_frontier.add(record.pid)
+        frontier = next_frontier
+    return descendants
+
+
+def _scope_members(
+    scope: _ProcessContainmentScope,
+    snapshot: dict[int, _ProcIdentity],
+) -> dict[int, _ProcIdentity]:
+    return {
+        pid: record
+        for pid, record in _descendants_of(scope.owner_pid, snapshot).items()
+        if record.key not in scope.baseline
+    }
+
+
+def _signal_proc_identity(record: _ProcIdentity, signal_number: int) -> bool:
+    """Signal exactly one PID incarnation, never a reused numeric PID."""
+
+    try:
+        current = _read_proc_identity(record.pid)
+    except (OSError, UnicodeError, ValueError):
+        return False
+    if current is None or current.start_time != record.start_time:
+        return True
+    try:
+        os.kill(record.pid, signal_number)
     except ProcessLookupError:
-        pass
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _reap_scope_zombies(members: dict[int, _ProcIdentity]) -> bool:
+    for record in members.values():
+        if record.state != "Z" or record.ppid != os.getpid():
+            continue
+        try:
+            os.waitpid(record.pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        except OSError:
+            return False
+    return True
+
+
+def _drive_process_scope(
+    scope: _ProcessContainmentScope,
+    *,
+    signal_number: int,
+    timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    stable_empty = 0
+    while True:
+        snapshot = _read_proc_snapshot()
+        if snapshot is None:
+            return False
+        members = _scope_members(scope, snapshot)
+        if not _reap_scope_zombies(members):
+            return False
+        live_members = [record for record in members.values() if record.state != "Z"]
+        if live_members:
+            stable_empty = 0
+            # Signal every current member; the fixed-point loop catches a
+            # descendant forked between the procfs snapshot and this pass.
+            for record in live_members:
+                if not _signal_proc_identity(record, signal_number):
+                    return False
+        elif not members:
+            stable_empty += 1
+            if stable_empty >= _PROCESS_SCOPE_STABLE_PROBES:
+                return True
+        else:
+            stable_empty = 0
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_PROCESS_SCOPE_PROBE_INTERVAL_SECONDS)
+
+
+def _terminate_process_scope(
+    process: subprocess.Popen[str],
+    scope: _ProcessContainmentScope,
+) -> bool:
+    """Terminate and prove empty a scope that survives setsid/double-fork.
+
+    ``process`` is intentionally not treated as the whole scope.  Linux
+    subreaper adoption plus two stable, start-time-qualified procfs snapshots
+    are the proof boundary.  Any unreadable proc record or signal error fails
+    closed so the caller retains the episode lease.
+    """
+
     try:
-        process.wait(timeout=5.0)
-    except subprocess.TimeoutExpired:
-        pass
+        return _terminate_process_scope_checked(process, scope)
+    except BaseException:
+        # No containment/procfs exception may escape into the orchestrator's
+        # generic error path, which would release the lease. Unknown cleanup
+        # is always reported as unreaped/fail-closed by the caller.
+        return False
+
+
+def _terminate_process_scope_checked(
+    process: subprocess.Popen[str],
+    scope: _ProcessContainmentScope,
+) -> bool:
+    gone = _drive_process_scope(
+        scope,
+        signal_number=signal.SIGTERM,
+        timeout_seconds=_PROCESS_SCOPE_TERM_TIMEOUT_SECONDS,
+    )
+    if not gone:
+        gone = _drive_process_scope(
+            scope,
+            signal_number=signal.SIGKILL,
+            timeout_seconds=_PROCESS_SCOPE_KILL_TIMEOUT_SECONDS,
+        )
+    if gone:
+        # The scope proof is authoritative; poll only synchronizes Popen's
+        # bookkeeping after adopted-zombie reaping and is never used as proof.
+        poll = getattr(process, "poll", None)
+        if callable(poll):
+            try:
+                poll()
+            except OSError:
+                pass
+    return gone
 
 
 def _sanitize_usage(value: object) -> dict[str, int]:
@@ -1109,15 +2006,19 @@ def main() -> int:
         return 2
 
     gateway: OpenAIGatewayClient | None = None
+    admission: GatewayEpisodeAdmissionClient | None = None
     orchestrator: SpilotOrchestrator | None = None
     try:
         gateway = OpenAIGatewayClient()
+        if config_obj.get("pool_episode_admission_enabled") is True:
+            admission = GatewayEpisodeAdmissionClient()
         pool = MiniSwePoolExecutor(config_obj)
         orchestrator = SpilotOrchestrator(
             config=config_obj,
             task=task,
             router=gateway,
             pool=pool,
+            admission=admission,
         )
         result = orchestrator.run()
         _write_result(result_path, result)
@@ -1148,6 +2049,8 @@ def main() -> int:
         )
         return 2
     finally:
+        if admission is not None:
+            admission.close()
         if gateway is not None:
             gateway.close()
 

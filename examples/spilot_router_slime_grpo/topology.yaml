@@ -31,7 +31,11 @@ gateway:
           model: nvidia/qwen/qwen3.6-27b
           base_url: "${POLAR_MODEL_POOL_BASE_URL}"
           api_key_env: POLAR_NVIDIA_API_KEY
+          max_concurrency: ${SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY}
+          max_active_episodes: ${SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES}
         - alias: pool/gpt-5.5
           model: openai/openai/gpt-5.5
           base_url: "${POLAR_MODEL_POOL_BASE_URL}"
           api_key_env: POLAR_NVIDIA_API_KEY
+          max_concurrency: ${SPILOT_GPT_GATEWAY_MAX_CONCURRENCY}
+          max_active_episodes: ${SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES}

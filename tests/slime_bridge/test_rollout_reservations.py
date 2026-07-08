@@ -461,6 +461,11 @@ def test_training_dynamic_filter_replaces_zero_std_groups_and_commits_mixed_grou
     assert output.metrics["polar/candidate/trainable_reward_mean"] == 0.5
     assert output.metrics["polar/candidate/quality_coverage_fraction"] == 1.0
     assert output.metrics["polar/accepted/reward_mean"] == 0.5
+    assert output.metrics["rollout/session_reward_mean"] == 0.5
+    assert (
+        output.metrics["rollout/session_reward_accounted_sessions"]
+        == output.metrics["polar/accepted/accounted_sessions"]
+    )
     assert output.metrics["polar/dropped_dynamic_filter_groups_delta"] == 2.0
     assert output.metrics["polar/reservations/consumed_dynamic_filter_since_worker_start"] == 2.0
     assert output.metrics["polar/reservations/consumed_accepted_since_worker_start"] == 1.0

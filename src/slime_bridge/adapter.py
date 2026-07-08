@@ -418,7 +418,14 @@ def _reward_value(trace: "Trace") -> float:
     Reward assignment is the evaluator's job (including any broadcasting
     from session-level outcomes). slime_bridge just consumes what's there.
     """
-    return float(trace.reward) if trace.reward is not None else 0.0
+    value = trace.reward
+    if value is None or isinstance(value, bool):
+        return 0.0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
 
 
 def _scheduler_metadata(result: "SessionResult", trace: "Trace | None") -> dict[str, Any]:

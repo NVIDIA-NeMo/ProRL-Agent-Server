@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
+import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -15,12 +19,16 @@ from polar.agent.models import AgentRunResult, AgentSpec
 from polar.agent.presets.spilot_router import SpilotRouterHarness
 from polar.agent.presets.spilot_router_runner import (
     Candidate,
+    EpisodeLeaseGrant,
+    GatewayEpisodeAdmissionClient,
+    GatewayInfrastructureError,
     MiniSwePoolExecutor,
     OpenAIGatewayClient,
     PoolCallResult,
     RouterCompletion,
     RouterProtocolError,
     SpilotOrchestrator,
+    UnreapedPoolProcessError,
     _classify_process_failure,
     _openai_chat_payload,
     _verification_instruction,
@@ -147,7 +155,9 @@ class FakePool:
         role: str,
         call_index: int,
         timeout_seconds: float,
+        model_call_capability: str = "",
     ) -> PoolCallResult:
+        del model_call_capability
         assert timeout_seconds > 0
         self.calls.append((candidate.slot, role))
         if self.workspace is not None:
@@ -158,6 +168,14 @@ class FakePool:
                 assert marker.read_text(encoding="utf-8") == "first"
                 marker.write_text("verified", encoding="utf-8")
         return _call_result(candidate, role, call_index, status=self.status)
+
+
+def _bypass_pool_capability_delivery(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        spilot_router_runner,
+        "_deliver_pool_call_capability",
+        lambda **_kwargs: None,
+    )
 
 
 @pytest.mark.parametrize(
@@ -240,6 +258,376 @@ def test_verify_runs_fresh_agent_on_same_mutable_workspace(tmp_path: Path) -> No
     assert result["total_cost"] == 3.0
 
 
+def test_episode_admission_wraps_each_selected_candidate_before_pool_run() -> None:
+    events: list[str] = []
+
+    class EventRouter(FakeRouter):
+        def complete(self, **kwargs) -> RouterCompletion:
+            events.append("router")
+            return super().complete(**kwargs)
+
+    class EventPool(FakePool):
+        def run(self, **kwargs) -> PoolCallResult:
+            events.append(f"pool:{kwargs['candidate'].model}")
+            return super().run(**kwargs)
+
+    class Admission:
+        def __init__(self) -> None:
+            self.count = 0
+
+        def acquire(
+            self, *, model: str, attempt_id: str, timeout_seconds: float
+        ) -> EpisodeLeaseGrant:
+            assert timeout_seconds > 0
+            events.append(f"acquire:{model}:{attempt_id}")
+            self.count += 1
+            return EpisodeLeaseGrant(
+                lease_id=f"lease-{self.count}",
+                model=model,
+                attempt_id=attempt_id,
+                wait_ms=2_000,
+                local_cap=4,
+                call_capability=f"call-capability-{self.count}",
+            )
+
+        def release(self, lease_id: str) -> None:
+            events.append(f"release:{lease_id}")
+
+        def close(self) -> None:
+            return None
+
+    router = EventRouter(
+        '{"action":"ROUTE","model_slot":"M0"}',
+        '{"action":"VERIFY","model_slot":"M1"}',
+    )
+    result = SpilotOrchestrator(
+        config=_runner_config(
+            pool_episode_admission_enabled=True,
+            pool_episode_admission_wait_budget_seconds=10.0,
+        ),
+        task="Task",
+        router=router,
+        pool=EventPool(),
+        admission=Admission(),
+    ).run()
+
+    assert events == [
+        "router",
+        "acquire:pool/qwen3.6-27b:0:solve",
+        "pool:pool/qwen3.6-27b",
+        "release:lease-1",
+        "router",
+        "acquire:pool/gpt-5.5:1:verify",
+        "pool:pool/gpt-5.5",
+        "release:lease-2",
+    ]
+    assert result["admission_wait_ms"] == 4_000
+    assert [call["admission_wait_ms"] for call in result["calls"]] == [2_000, 2_000]
+    assert [call["admission_local_cap"] for call in result["calls"]] == [4, 4]
+    # Queue pressure is infrastructure telemetry, not a policy observation.
+    assert "admission_wait" not in router.requests[1]["messages"][-1]["content"]
+
+
+def test_episode_admission_timeout_records_local_wait_without_candidate_outcome() -> None:
+    now = [100.0]
+
+    class TimeoutAdmission:
+        def acquire(self, **_kwargs) -> EpisodeLeaseGrant:
+            now[0] += 7.25
+            raise GatewayInfrastructureError("episode admission request timed out")
+
+        def release(self, _lease_id: str) -> None:
+            raise AssertionError("an acquire without a grant must not release")
+
+        def close(self) -> None:
+            return None
+
+    orchestrator = SpilotOrchestrator(
+        config=_runner_config(
+            pool_episode_admission_enabled=True,
+            pool_episode_admission_wait_budget_seconds=10.0,
+        ),
+        task="Task",
+        router=FakeRouter('{"action":"ROUTE","model_slot":"M0"}'),
+        pool=FakePool(),
+        admission=TimeoutAdmission(),
+        clock=lambda: now[0],
+    )
+
+    with pytest.raises(GatewayInfrastructureError, match="timed out"):
+        orchestrator.run()
+    orchestrator.mark_infrastructure_error(
+        GatewayInfrastructureError("episode admission request timed out")
+    )
+
+    assert orchestrator.result["admission_wait_ms"] == 7_250
+    assert orchestrator.result["admission_failure"] == {
+        "model": "pool/qwen3.6-27b",
+        "attempt_id": "0:solve",
+        "wait_ms": 7_250,
+        "error": "GatewayInfrastructureError: episode admission request timed out",
+    }
+    assert orchestrator.result["calls"] == []
+    assert orchestrator.result["total_cost"] == 0.0
+    assert orchestrator.result["termination_reason"] == "infrastructure_error"
+
+
+def test_unreaped_pool_process_leaves_lease_for_gateway_fatal_retention() -> None:
+    released: list[str] = []
+
+    class Admission:
+        def acquire(self, **_kwargs) -> EpisodeLeaseGrant:
+            return EpisodeLeaseGrant(
+                lease_id="lease-still-live",
+                model="pool/qwen3.6-27b",
+                attempt_id="0:solve",
+                wait_ms=0,
+                local_cap=1,
+                call_capability="lease-call-capability",
+            )
+
+        def release(self, lease_id: str) -> None:
+            released.append(lease_id)
+
+        def close(self) -> None:
+            return None
+
+    class UnreapedPool(FakePool):
+        def run(self, **_kwargs) -> PoolCallResult:
+            raise UnreapedPoolProcessError("still alive")
+
+    orchestrator = SpilotOrchestrator(
+        config=_runner_config(
+            pool_episode_admission_enabled=True,
+            pool_episode_admission_wait_budget_seconds=10.0,
+        ),
+        task="Task",
+        router=FakeRouter('{"action":"ROUTE","model_slot":"M0"}'),
+        pool=UnreapedPool(),
+        admission=Admission(),
+    )
+
+    with pytest.raises(UnreapedPoolProcessError):
+        orchestrator.run()
+    assert released == []
+
+
+def test_process_scope_proof_error_retains_episode_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    released: list[str] = []
+
+    class Admission:
+        def acquire(self, **_kwargs) -> EpisodeLeaseGrant:
+            return EpisodeLeaseGrant(
+                lease_id="lease-unverifiable-scope",
+                model="pool/qwen3.6-27b",
+                attempt_id="0:solve",
+                wait_ms=0,
+                local_cap=1,
+                call_capability="lease-call-capability",
+            )
+
+        def release(self, lease_id: str) -> None:
+            released.append(lease_id)
+
+        def close(self) -> None:
+            return None
+
+    class Process:
+        pid = 12_345
+
+        def wait(self, timeout: float) -> int:
+            assert timeout > 0
+            return 42
+
+    monkeypatch.setattr(
+        "polar.agent.presets.spilot_router_runner.subprocess.Popen",
+        lambda *_args, **_kwargs: Process(),
+    )
+    monkeypatch.setattr(
+        "polar.agent.presets.spilot_router_runner._terminate_process_scope",
+        lambda _process, _scope: False,
+    )
+    _bypass_pool_capability_delivery(monkeypatch)
+    pool = MiniSwePoolExecutor(
+        _runner_config(agent_log_dir=str(tmp_path), mini_swe_bin="mini-swe-agent"),
+        cwd=tmp_path,
+    )
+    orchestrator = SpilotOrchestrator(
+        config=_runner_config(
+            pool_episode_admission_enabled=True,
+            pool_episode_admission_wait_budget_seconds=10.0,
+        ),
+        task="Task",
+        router=FakeRouter('{"action":"ROUTE","model_slot":"M0"}'),
+        pool=pool,
+        admission=Admission(),
+    )
+
+    with pytest.raises(UnreapedPoolProcessError, match="failed mini-SWE process scope"):
+        orchestrator.run()
+    assert released == []
+
+
+def test_successful_pool_call_preserves_setsid_double_fork_task_daemon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    released: list[str] = []
+    daemon_pid_path = tmp_path / "daemon.pid"
+
+    class Admission:
+        def acquire(self, **_kwargs) -> EpisodeLeaseGrant:
+            return EpisodeLeaseGrant(
+                lease_id="lease-daemon-contained",
+                model="pool/qwen3.6-27b",
+                attempt_id="0:solve",
+                wait_ms=0,
+                local_cap=1,
+                call_capability="lease-call-capability",
+            )
+
+        def release(self, lease_id: str) -> None:
+            assert daemon_pid_path.is_file()
+            daemon_pid = int(daemon_pid_path.read_text(encoding="utf-8"))
+            assert Path(f"/proc/{daemon_pid}/stat").exists()
+            released.append(lease_id)
+
+        def close(self) -> None:
+            return None
+
+    daemon_code = r"""
+import ctypes
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+secret_read = int(os.environ.pop("POLAR_POOL_CALL_CAPABILITY_FD"))
+ready_write = int(os.environ.pop("POLAR_POOL_CALL_READY_FD"))
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(4, 0, 0, 0, 0) != 0 or libc.prctl(3, 0, 0, 0, 0) != 0:
+    raise SystemExit(4)
+os.write(ready_write, b"1")
+os.close(ready_write)
+if not os.read(secret_read, 16384).rstrip(b"\r\n"):
+    raise SystemExit(5)
+os.close(secret_read)
+ready_read, ready_write = os.pipe()
+first = os.fork()
+if first:
+    os.close(ready_write)
+    if os.read(ready_read, 1) != b"1":
+        raise SystemExit(3)
+    os.close(ready_read)
+    os.waitpid(first, 0)
+    raise SystemExit(0)
+
+os.close(ready_read)
+os.setsid()
+second = os.fork()
+if second:
+    os._exit(0)
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+os.write(ready_write, b"1")
+os.close(ready_write)
+while True:
+    time.sleep(10)
+"""
+    monkeypatch.setattr(
+        MiniSwePoolExecutor,
+        "_command",
+        lambda *_args, **_kwargs: [
+            sys.executable,
+            "-c",
+            daemon_code,
+            str(daemon_pid_path),
+        ],
+    )
+    monkeypatch.setattr(
+        spilot_router_runner,
+        "_PROCESS_SCOPE_TERM_TIMEOUT_SECONDS",
+        0.1,
+    )
+    monkeypatch.setattr(
+        spilot_router_runner,
+        "_PROCESS_SCOPE_KILL_TIMEOUT_SECONDS",
+        2.0,
+    )
+    monkeypatch.setattr(
+        spilot_router_runner,
+        "_workspace_summary",
+        lambda _cwd: ("", "", "fingerprint"),
+    )
+    pool = MiniSwePoolExecutor(
+        _runner_config(agent_log_dir=str(tmp_path), mini_swe_bin="mini-swe-agent"),
+        cwd=tmp_path,
+    )
+    orchestrator = SpilotOrchestrator(
+        config=_runner_config(
+            max_pool_calls=1,
+            pool_episode_admission_enabled=True,
+            pool_episode_admission_wait_budget_seconds=10.0,
+        ),
+        task="Task",
+        router=FakeRouter('{"action":"ROUTE","model_slot":"M0"}'),
+        pool=pool,
+        admission=Admission(),
+    )
+
+    try:
+        result = orchestrator.run()
+        assert result["submitted"] is True
+        assert released == ["lease-daemon-contained"]
+        daemon_pid = int(daemon_pid_path.read_text(encoding="utf-8"))
+        assert Path(f"/proc/{daemon_pid}/stat").exists()
+    finally:
+        if daemon_pid_path.is_file():
+            daemon_pid = int(daemon_pid_path.read_text(encoding="utf-8"))
+            try:
+                os.kill(daemon_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + 2
+            while Path(f"/proc/{daemon_pid}/stat").exists() and time.monotonic() < deadline:
+                try:
+                    os.waitpid(daemon_pid, os.WNOHANG)
+                except ChildProcessError:
+                    pass
+                time.sleep(0.01)
+
+
+def test_episode_admission_wait_budget_matches_gateway_api_limit() -> None:
+    with pytest.raises(ValueError, match="between 0 and 86400"):
+        SpilotOrchestrator(
+            config=_runner_config(
+                pool_episode_admission_enabled=True,
+                pool_episode_admission_wait_budget_seconds=86_400.001,
+            ),
+            task="Task",
+            router=FakeRouter('{"action":"SUBMIT"}'),
+            pool=FakePool(),
+        )
+
+    with pytest.raises(ValueError, match="at most 86400"):
+        create_harness(
+            AgentSpec(
+                harness="spilot_router",
+                model_name="Qwen/Qwen3.5-9B",
+                settings={
+                    "model_pool": ["pool/qwen3.6-27b", "pool/gpt-5.5"],
+                    "pool_episode_admission_enabled": True,
+                    "pool_episode_admission_wait_budget_seconds": 86_400.001,
+                },
+            )
+        )
+
+
 def test_invalid_router_action_is_trainable_policy_failure_not_pool_failure() -> None:
     router = FakeRouter('{"action":"SUBMIT"}')
     pool = FakePool()
@@ -320,6 +708,8 @@ def test_pool_child_does_not_inherit_outer_router_protocol_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured_env: dict[str, str] = {}
+    captured_close_fds: list[bool] = []
+    captured_pass_fds: list[tuple[int, ...]] = []
     real_popen = subprocess.Popen
 
     class Process:
@@ -333,12 +723,30 @@ def test_pool_child_does_not_inherit_outer_router_protocol_env(
         if "env" not in kwargs:
             return real_popen(*_args, **kwargs)
         captured_env.update(kwargs["env"])
+        captured_close_fds.append(kwargs["close_fds"])
+        captured_pass_fds.append(kwargs["pass_fds"])
         return Process()
 
     monkeypatch.setenv("SPILOT_ROUTER_CONFIG_B64", "private-router-config")
     monkeypatch.setenv("SPILOT_TASK_B64", "private-task")
     monkeypatch.setenv("POLAR_ROUTER_CAPABILITY", "router-only-capability")
     monkeypatch.setenv("POLAR_MODEL_POOL_CAPABILITY", "pool-only-capability")
+    monkeypatch.setenv("SESSION_ID", "legacy-session-credential")
+    monkeypatch.setenv("OPENAI_API_KEY", "legacy-openai-credential")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "legacy-anthropic-credential")
+    monkeypatch.setenv("GOOGLE_API_KEY", "legacy-google-credential")
+    monkeypatch.setenv("NVIDIA_API_KEY", "host-provider-credential")
+    monkeypatch.setenv("POLAR_CONTROL_PLANE_TOKEN", "control-plane-credential")
+    monkeypatch.setenv("POLAR_GATEWAY_UDS", "/polar/gateway/gateway.sock")
+    monkeypatch.setenv("POLAR_HTTP_PROXY_UDS", "/polar/proxy/proxy.sock")
+    monkeypatch.setenv("POLAR_HTTP_PROXY_PORT", "28100")
+    monkeypatch.setenv("POLAR_HTTP_PROXY_BROKER_READY", "true")
+    monkeypatch.setenv("POLAR_ALLOW_INTERNET", "true")
+    monkeypatch.setenv("POLAR_APT_HTTP_SOURCE_POLICY", "https")
+    monkeypatch.setenv("POLAR_TASK_PYTHONPATH", "/task/python")
+    monkeypatch.setenv(
+        "POLAR_MODEL_POOL_ADMISSION_CAPABILITY", "admission-only-capability"
+    )
     monkeypatch.setattr(
         "polar.agent.presets.spilot_router_runner.subprocess.Popen",
         fake_popen,
@@ -347,6 +755,7 @@ def test_pool_child_does_not_inherit_outer_router_protocol_env(
         "polar.agent.presets.spilot_router_runner._workspace_summary",
         lambda _cwd: ("", "", "fingerprint"),
     )
+    _bypass_pool_capability_delivery(monkeypatch)
     config = _runner_config(
         agent_log_dir=str(tmp_path),
         mini_swe_bin="mini-swe-agent",
@@ -359,6 +768,7 @@ def test_pool_child_does_not_inherit_outer_router_protocol_env(
         role="solve",
         call_index=0,
         timeout_seconds=10,
+        model_call_capability="lease-call-capability",
     )
 
     assert result.status == "completed"
@@ -366,7 +776,28 @@ def test_pool_child_does_not_inherit_outer_router_protocol_env(
     assert "SPILOT_TASK_B64" not in captured_env
     assert "POLAR_ROUTER_CAPABILITY" not in captured_env
     assert "POLAR_MODEL_POOL_CAPABILITY" not in captured_env
-    assert captured_env["OPENAI_API_KEY"] == "pool-only-capability"
+    assert "POLAR_MODEL_POOL_ADMISSION_CAPABILITY" not in captured_env
+    assert "POLAR_ROUTER_CAPABILITY_FD" not in captured_env
+    assert "POLAR_MODEL_POOL_ADMISSION_CAPABILITY_FD" not in captured_env
+    assert captured_close_fds == [True]
+    assert len(captured_pass_fds) == 1
+    assert len(captured_pass_fds[0]) == 2
+    assert "OPENAI_API_KEY" not in captured_env
+    assert "ANTHROPIC_API_KEY" not in captured_env
+    assert "GOOGLE_API_KEY" not in captured_env
+    assert "NVIDIA_API_KEY" not in captured_env
+    assert "POLAR_CONTROL_PLANE_TOKEN" not in captured_env
+    assert "SESSION_ID" not in captured_env
+    assert "lease-call-capability" not in captured_env.values()
+    assert captured_env["POLAR_GATEWAY_UDS"] == "/polar/gateway/gateway.sock"
+    assert captured_env["POLAR_HTTP_PROXY_UDS"] == "/polar/proxy/proxy.sock"
+    assert captured_env["POLAR_HTTP_PROXY_PORT"] == "28100"
+    assert captured_env["POLAR_HTTP_PROXY_BROKER_READY"] == "true"
+    assert captured_env["POLAR_ALLOW_INTERNET"] == "true"
+    assert captured_env["POLAR_APT_HTTP_SOURCE_POLICY"] == "https"
+    assert captured_env["POLAR_TASK_PYTHONPATH"] == "/task/python"
+    assert "POLAR_POOL_CALL_CAPABILITY_FD" in captured_env
+    assert "POLAR_POOL_CALL_READY_FD" in captured_env
     assert captured_env["MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT"] == "5"
     assert (
         base64.b64decode(captured_env["POLAR_MINI_SWE_TASK_B64"], validate=True).decode("utf-8")
@@ -398,6 +829,7 @@ def test_pool_task_round_trips_for_solve_and_verify_without_entering_argv(
         "polar.agent.presets.spilot_router_runner._workspace_summary",
         lambda _cwd: ("", "", "fingerprint"),
     )
+    _bypass_pool_capability_delivery(monkeypatch)
     config = _runner_config(agent_log_dir=str(tmp_path), mini_swe_bin="mini-swe-agent")
     executor = MiniSwePoolExecutor(config, cwd=tmp_path)
     candidate = Candidate(slot="M0", model="pool/test", card={})
@@ -409,6 +841,7 @@ def test_pool_task_round_trips_for_solve_and_verify_without_entering_argv(
         role="solve",
         call_index=0,
         timeout_seconds=10,
+        model_call_capability="lease-call-capability",
     )
     executor.run(
         candidate=candidate,
@@ -416,6 +849,7 @@ def test_pool_task_round_trips_for_solve_and_verify_without_entering_argv(
         role="verify",
         call_index=1,
         timeout_seconds=10,
+        model_call_capability="lease-call-capability",
     )
 
     decoded_tasks = [
@@ -485,13 +919,14 @@ def test_pool_result_exposes_signal_exit_and_timeout_metadata(
         lambda *_args, **_kwargs: Process(),
     )
     monkeypatch.setattr(
-        "polar.agent.presets.spilot_router_runner._terminate_process_group",
-        lambda _process: None,
+        "polar.agent.presets.spilot_router_runner._terminate_process_scope",
+        lambda _process, _scope: True,
     )
     monkeypatch.setattr(
         "polar.agent.presets.spilot_router_runner._workspace_summary",
         lambda _cwd: ("", "", "fingerprint"),
     )
+    _bypass_pool_capability_delivery(monkeypatch)
     executor = MiniSwePoolExecutor(
         _runner_config(agent_log_dir=str(tmp_path), mini_swe_bin="mini-swe-agent"),
         cwd=tmp_path,
@@ -503,6 +938,7 @@ def test_pool_result_exposes_signal_exit_and_timeout_metadata(
         role="solve",
         call_index=0,
         timeout_seconds=0.1,
+        model_call_capability="lease-call-capability",
     )
     metadata = result.metadata(index=0, cost=1.0)
 
@@ -536,12 +972,22 @@ def test_harness_is_builtin_and_uploads_portable_runner() -> None:
     assert harness._runner_config["observation_max_chars"] == 10_000
 
     step = harness.run_steps("Fix quoted 'bug'")[0]
-    assert "/opt/polar-mini-swe-agent/venv/bin/python" in step.command
-    assert "/polar/session/spilot_router_runner.py" in step.command
-    assert 'export OPENAI_API_BASE="$OPENAI_BASE_URL"' in step.command
-    assert step.command.startswith("set -o pipefail; ")
+    assert step.command is None
+    assert step.protected_argv == [
+        "/opt/polar-mini-swe-agent/venv/bin/python",
+        "/polar/session/spilot_router_runner.py",
+    ]
+    assert step.protected_env_keys == ["POLAR_ROUTER_CAPABILITY"]
+    runner_source = Path(spilot_router_runner.__file__)
+    assert step.protected_file_digests == {
+        "/polar/session/spilot_router_runner.py": hashlib.sha256(
+            runner_source.read_bytes()
+        ).hexdigest()
+    }
     assert "SPILOT_ROUTER_CONFIG_B64" in step.env
     assert "SPILOT_TASK_B64" in step.env
+    assert "POLAR_ROUTER_CAPABILITY" not in step.env
+    assert "POLAR_MODEL_POOL_ADMISSION_CAPABILITY" not in step.env
 
     uploaded: list[tuple[str, str]] = []
 
@@ -551,6 +997,182 @@ def test_harness_is_builtin_and_uploads_portable_runner() -> None:
     asyncio.run(harness.setup(SimpleNamespace(upload_file=upload_file)))
     assert Path(uploaded[0][0]).name == "spilot_router_runner.py"
     assert uploaded[0][1] == "/polar/session/spilot_router_runner.py"
+
+
+def test_runner_fetches_capabilities_over_fresh_peer_authenticated_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+    response = json.dumps(
+        {
+            "ok": True,
+            "protected_env": {
+                "POLAR_ROUTER_CAPABILITY": "router-secret",
+                "POLAR_MODEL_POOL_ADMISSION_CAPABILITY": "admission-secret",
+            },
+        }
+    ).encode() + b"\n"
+
+    class ProtectedConnection:
+        def __init__(self) -> None:
+            self.response_pending = True
+
+        def settimeout(self, _timeout: float) -> None:
+            return None
+
+        def connect(self, path: str) -> None:
+            assert path == "/protected/socket"
+
+        def getsockopt(self, *_args: object) -> bytes:
+            return spilot_router_runner.struct.pack("3i", os.getpid(), os.getuid(), os.getgid())
+
+        def sendall(self, data: bytes) -> None:
+            observed.update(json.loads(data))
+
+        def recv(self, _size: int) -> bytes:
+            if self.response_pending:
+                self.response_pending = False
+                return response
+            return b""
+
+        def close(self) -> None:
+            return None
+
+    hardened: list[bool] = []
+    monkeypatch.setattr(
+        spilot_router_runner,
+        "_set_and_verify_non_dumpable",
+        lambda: hardened.append(True),
+    )
+    monkeypatch.setattr(
+        spilot_router_runner.socket,
+        "socket",
+        lambda *_args, **_kwargs: ProtectedConnection(),
+    )
+    monkeypatch.setattr(spilot_router_runner, "_PROTECTED_ENV_CACHE", None)
+    monkeypatch.setenv("POLAR_PROTECTED_EXEC_SOCKET", "/protected/socket")
+    monkeypatch.setenv("POLAR_PROTECTED_EXEC_REQUEST_ID", "request-123")
+    monkeypatch.setenv("POLAR_PROTECTED_EXEC_BROKER_PID", str(os.getpid()))
+    ready_read, ready_write = os.pipe()
+    os.write(ready_write, b"1")
+    os.close(ready_write)
+    monkeypatch.setenv("POLAR_PROTECTED_EXEC_READY_FD", str(ready_read))
+    monkeypatch.delenv("POLAR_ROUTER_CAPABILITY", raising=False)
+    monkeypatch.delenv("POLAR_MODEL_POOL_ADMISSION_CAPABILITY", raising=False)
+
+    values = spilot_router_runner._receive_protected_environment()
+
+    assert hardened == [True]
+    assert observed == {"operation": "protected_child_ready", "id": "request-123"}
+    assert values == {
+        "POLAR_ROUTER_CAPABILITY": "router-secret",
+        "POLAR_MODEL_POOL_ADMISSION_CAPABILITY": "admission-secret",
+    }
+    assert "POLAR_PROTECTED_EXEC_SOCKET" not in os.environ
+    assert "POLAR_PROTECTED_EXEC_REQUEST_ID" not in os.environ
+    assert "POLAR_PROTECTED_EXEC_BROKER_PID" not in os.environ
+    assert "POLAR_PROTECTED_EXEC_READY_FD" not in os.environ
+
+
+def test_admission_http_retries_response_loss_with_stable_ids() -> None:
+    lease_id = "lease-response-loss-stable-id"
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, body: dict[str, object]) -> None:
+            self._body = body
+
+        def json(self) -> dict[str, object]:
+            return self._body
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object], float]] = []
+            self.outcomes: list[object] = [
+                OSError("response lost after acquire commit"),
+                Response(
+                    {
+                        "lease_id": lease_id,
+                        "model": "pool/qwen",
+                        "attempt_id": "0:solve",
+                        "wait_ms": 7,
+                        "local_cap": 1,
+                        "call_capability": "lease-call-capability",
+                    }
+                ),
+                OSError("response lost after release commit"),
+                Response({"released": False}),
+            ]
+
+        def post(self, url: str, **kwargs: object) -> Response:
+            self.calls.append((url, dict(kwargs["json"]), float(kwargs["timeout"])))
+            outcome = self.outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            assert isinstance(outcome, Response)
+            return outcome
+
+    transport = Client()
+    client = GatewayEpisodeAdmissionClient.__new__(GatewayEpisodeAdmissionClient)
+    client._acquire_url = "http://gateway/internal/acquire"
+    client._release_url = "http://gateway/internal/release"
+    client._headers = {"Authorization": "Bearer redacted"}
+    client._client = transport
+    client._clock = spilot_router_runner.time.monotonic
+    client._sleep = lambda _seconds: None
+
+    grant = client.acquire(
+        model="pool/qwen",
+        attempt_id="0:solve",
+        timeout_seconds=10,
+    )
+    client.release(grant.lease_id)
+
+    assert [call[1]["attempt_id"] for call in transport.calls[:2]] == [
+        "0:solve",
+        "0:solve",
+    ]
+    assert [call[1]["lease_id"] for call in transport.calls[2:]] == [
+        lease_id,
+        lease_id,
+    ]
+    assert all(call[2] > 0 for call in transport.calls)
+
+
+def test_admission_http_retry_never_exceeds_total_budget() -> None:
+    class Clock:
+        now = 100.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = Clock()
+
+    class Client:
+        timeouts: list[float] = []
+
+        def post(self, _url: str, **kwargs: object) -> object:
+            timeout = float(kwargs["timeout"])
+            self.timeouts.append(timeout)
+            clock.now += timeout
+            raise TimeoutError("simulated full request timeout")
+
+    transport = Client()
+    client = GatewayEpisodeAdmissionClient.__new__(GatewayEpisodeAdmissionClient)
+    client._headers = {"Authorization": "Bearer redacted"}
+    client._client = transport
+    client._clock = clock
+    client._sleep = lambda seconds: setattr(clock, "now", clock.now + seconds)
+
+    with pytest.raises(GatewayInfrastructureError, match="after 1 attempt"):
+        client._post(
+            "http://gateway/internal/acquire",
+            payload={"attempt_id": "same-attempt"},
+            budget_seconds=2.5,
+        )
+    assert transport.timeouts == [2.5]
+    assert clock.now == 102.5
 
 
 def test_harness_normalizes_fixed_eval_settings_without_expanding_action_budget() -> None:
@@ -714,8 +1336,10 @@ def test_router_null_content_is_sampled_invalid_action_not_infrastructure_error(
     client = OpenAIGatewayClient.__new__(OpenAIGatewayClient)
     client._url = "http://gateway/v1/chat/completions"
     client._client = FakeHttpClient()
-    monkeypatch.setenv("OPENAI_API_KEY", "session-id")
-    monkeypatch.setenv("POLAR_ROUTER_CAPABILITY", "router-only-capability")
+    client._headers = {
+        "Authorization": "Bearer router-only-capability",
+        "Content-Type": "application/json",
+    }
 
     completion = client.complete(
         model="router",

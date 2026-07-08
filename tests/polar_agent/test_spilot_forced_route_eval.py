@@ -14,7 +14,11 @@ from polar.agent.presets.spilot_forced_route_eval_runner import (
     run_forced_eval,
 )
 from polar.agent.presets.spilot_router import SpilotRouterHarness
-from polar.agent.presets.spilot_router_runner import Candidate, PoolCallResult
+from polar.agent.presets.spilot_router_runner import (
+    Candidate,
+    EpisodeLeaseGrant,
+    PoolCallResult,
+)
 from polar.trajectory.builder.spilot_forced_eval import SpilotForcedEvalBuilder
 from polar.trajectory.models import CompletionRecord, CompletionSession, StrategySpec
 from polar.trajectory.registry import default_builder_registry
@@ -29,6 +33,8 @@ def _settings(**updates: object) -> dict[str, object]:
         "max_pool_calls": 1,
         "shuffle_slots": True,
         "sampling_seed": 17,
+        "pool_episode_admission_enabled": True,
+        "pool_episode_admission_wait_budget_seconds": 300,
         "forced_route_eval": {
             "enabled": True,
             "acknowledgement": EVAL_ONLY_ACK,
@@ -92,7 +98,15 @@ def test_forced_eval_harness_uploads_separate_runner_and_never_uses_normal_entry
         "spilot_forced_route_eval_runner.py",
     ]
     step = harness.run_steps("Fix it")[0]
-    assert "/polar/session/spilot_forced_route_eval_runner.py" in step.command
+    assert step.command is None
+    assert step.protected_argv == [
+        "/opt/polar-mini-swe-agent/venv/bin/python",
+        "/polar/session/spilot_forced_route_eval_runner.py",
+    ]
+    assert set(step.protected_file_digests) == {
+        "/polar/session/spilot_router_runner.py",
+        "/polar/session/spilot_forced_route_eval_runner.py",
+    }
     assert "SPILOT_FORCED_ROUTE_EVAL_RUNTIME_ACK" in step.env
     config = json.loads(
         __import__("base64").b64decode(step.env["SPILOT_ROUTER_CONFIG_B64"])
@@ -112,7 +126,9 @@ class _FakePool:
         role: str,
         call_index: int,
         timeout_seconds: float,
+        model_call_capability: str = "",
     ) -> PoolCallResult:
+        assert model_call_capability == "forced-eval-lease-capability"
         del task, call_index, timeout_seconds
         self.calls.append((candidate.model, role))
         return PoolCallResult(
@@ -132,6 +148,32 @@ class _FakePool:
         )
 
 
+class _FakeAdmission:
+    last: _FakeAdmission | None = None
+
+    def __init__(self) -> None:
+        self.released: list[str] = []
+        self.closed = False
+        _FakeAdmission.last = self
+
+    def acquire(self, *, model: str, attempt_id: str, timeout_seconds: float):
+        assert timeout_seconds == 300
+        return EpisodeLeaseGrant(
+            lease_id="forced-eval-lease",
+            model=model,
+            attempt_id=attempt_id,
+            wait_ms=0,
+            local_cap=1,
+            call_capability="forced-eval-lease-capability",
+        )
+
+    def release(self, lease_id: str) -> None:
+        self.released.append(lease_id)
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def test_forced_runner_selects_model_identity_and_auto_submits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -140,6 +182,7 @@ def test_forced_runner_selects_model_identity_and_auto_submits(
     harness = SpilotRouterHarness(_spec())
     monkeypatch.setenv("SPILOT_FORCED_ROUTE_EVAL_RUNTIME_ACK", EVAL_ONLY_ACK)
     monkeypatch.setattr(module.core, "MiniSwePoolExecutor", _FakePool)
+    monkeypatch.setattr(module.core, "GatewayEpisodeAdmissionClient", _FakeAdmission)
 
     result = run_forced_eval(harness._runner_config, "Fix it")
 
@@ -160,6 +203,9 @@ def test_forced_runner_selects_model_identity_and_auto_submits(
     ]
     assert result["calls"][0]["model"] == "pool/qwen3.6-27b"
     assert len(result["calls"]) == 1
+    assert _FakeAdmission.last is not None
+    assert _FakeAdmission.last.released == ["forced-eval-lease"]
+    assert _FakeAdmission.last.closed is True
 
 
 def test_forced_route_client_refuses_second_decision() -> None:
@@ -169,6 +215,26 @@ def test_forced_route_client_refuses_second_decision() -> None:
     assert json.loads(first.content) == {"action": "ROUTE", "model_slot": "M1"}
     with pytest.raises(Exception, match="more than one"):
         client.complete(model="unused", messages=[], timeout_seconds=1, model_kwargs={})
+
+
+def test_forced_runner_rejects_total_timeout_that_cannot_cover_one_pool_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = SpilotRouterHarness(
+        _spec(
+            settings=_settings(
+                pool_timeout_seconds=1200,
+                router_timeout_seconds=180,
+                reserve_evaluator_seconds=300,
+                deadline_margin_seconds=5,
+                total_timeout_seconds=1684,
+            )
+        )
+    )
+    monkeypatch.setenv("SPILOT_FORCED_ROUTE_EVAL_RUNTIME_ACK", EVAL_ONLY_ACK)
+
+    with pytest.raises(ValueError, match="total_timeout_seconds must cover"):
+        run_forced_eval(harness._runner_config, "Fix it")
 
 
 @pytest.mark.asyncio

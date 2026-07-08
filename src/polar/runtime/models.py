@@ -10,9 +10,51 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 class ExecInput(BaseModel):
     """Command specification for runtime execution."""
 
-    command: str
+    command: str | None = None
+    # Security-sensitive entrypoint for the persistent Apptainer broker.  It
+    # bypasses every task-controlled shell/startup hook and transfers the
+    # selected environment values only after the child has made itself
+    # non-dumpable.  Unsupported runtimes fail closed.
+    protected_argv: list[str] | None = None
+    protected_env_keys: list[str] = Field(default_factory=list)
+    protected_file_digests: dict[str, str] = Field(default_factory=dict)
     cwd: str | None = None
     env: dict[str, str] | None = None
+
+    @model_validator(mode="after")
+    def _validate_execution_mode(self) -> ExecInput:
+        has_command = isinstance(self.command, str) and bool(self.command)
+        has_protected = bool(self.protected_argv)
+        if has_command == has_protected:
+            raise ValueError("ExecInput requires exactly one command or protected_argv")
+        if (self.protected_env_keys or self.protected_file_digests) and not has_protected:
+            raise ValueError("protected metadata requires protected_argv")
+        if self.protected_argv is not None:
+            if not self.protected_argv or not self.protected_argv[0].startswith("/"):
+                raise ValueError("protected_argv requires an absolute executable")
+            if any(not item or "\x00" in item for item in self.protected_argv):
+                raise ValueError("protected_argv entries must be non-empty and NUL-free")
+            if len(set(self.protected_env_keys)) != len(self.protected_env_keys):
+                raise ValueError("protected_env_keys must be unique")
+            for key in self.protected_env_keys:
+                if not key or not key.replace("_", "A").isalnum() or key.upper() != key:
+                    raise ValueError("protected_env_keys must be uppercase environment names")
+            if len(self.protected_argv) != 2:
+                raise ValueError("protected_argv requires an exact executable and runner path")
+            if self.protected_argv[1] not in self.protected_file_digests:
+                raise ValueError("protected runner path requires a pinned digest")
+            for path, digest in self.protected_file_digests.items():
+                if not path.startswith("/") or "\x00" in path:
+                    raise ValueError("protected file paths must be absolute and NUL-free")
+                if len(digest) != 64:
+                    raise ValueError("protected file digests must be SHA-256 hex strings")
+                try:
+                    int(digest, 16)
+                except ValueError as exc:
+                    raise ValueError(
+                        "protected file digests must be SHA-256 hex strings"
+                    ) from exc
+        return self
 
 
 class PrepareAction(BaseModel):

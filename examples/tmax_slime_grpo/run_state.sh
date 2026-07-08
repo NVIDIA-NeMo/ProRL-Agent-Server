@@ -38,6 +38,65 @@ tmax_load_selected_run_state() {
     fi
 }
 
+tmax_restore_spilot_admission_resume_contract() {
+    local state_file="${1:?missing run state file}"
+    local log_prefix="${2:-[tmax resume]}"
+    local name present=0
+    local -a names=(
+        SPILOT_EPISODE_ADMISSION_ENABLED
+        SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS
+        SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT
+        SPILOT_QWEN_MAX_ACTIVE_EPISODES
+        SPILOT_GPT_MAX_ACTIVE_EPISODES
+        SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES
+        SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES
+        SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY
+        SPILOT_GPT_GATEWAY_MAX_CONCURRENCY
+        SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES
+        SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES
+    )
+
+    [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ] || return 0
+    for name in "${names[@]}"; do
+        if tmax_run_state_has_export "$state_file" "$name"; then
+            present="$((present + 1))"
+        fi
+    done
+    if [ "$present" -ne 0 ] && [ "$present" -ne "${#names[@]}" ]; then
+        echo "ERROR: run state has a partial SPilot episode-admission contract" >&2
+        return 1
+    fi
+    if [ "$present" -ne 0 ]; then
+        return 0
+    fi
+
+    # Logical runs that predate episode admission must retain their original
+    # provider pressure and timeout semantics. In particular, do this before
+    # sourcing current defaults: otherwise the new enabled contract would fill
+    # the missing fields and make a legacy resume look like a fresh run.
+    export SPILOT_EPISODE_ADMISSION_ENABLED=false
+    export SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS=0
+    export SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT="${NUM_NODES:-1}"
+    export SPILOT_QWEN_MAX_ACTIVE_EPISODES=0
+    export SPILOT_GPT_MAX_ACTIVE_EPISODES=0
+    export SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES=null
+    export SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES=null
+    export SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY=32
+    export SPILOT_GPT_GATEWAY_MAX_CONCURRENCY=32
+    export SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES=0
+    export SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES=0
+    if ! tmax_run_state_has_export "$state_file" TMAX_TRAIN_AGENT_TIMEOUT_SECONDS; then
+        export TMAX_TRAIN_AGENT_TIMEOUT_SECONDS=3300
+    fi
+    if ! tmax_run_state_has_export "$state_file" POLAR_TASK_TIMEOUT_FLOOR_SECONDS; then
+        export POLAR_TASK_TIMEOUT_FLOOR_SECONDS=4500
+    fi
+    if ! tmax_run_state_has_export "$state_file" POLAR_REQUEST_TIMEOUT; then
+        export POLAR_REQUEST_TIMEOUT=5100
+    fi
+    echo "${log_prefix} legacy SPilot run state: episode admission disabled; preserving old timeout envelopes" >&2
+}
+
 tmax_git_source_revision() {
     local label="${1:?missing source label}"
     local source_root="${2:?missing source repository}"
@@ -214,6 +273,17 @@ tmax_write_run_state() {
         TMAX_TRAIN_AGENT_TIMEOUT_SECONDS TMAX_TRAIN_TASK_TIMEOUT_RESERVE_SECONDS
         POLAR_REQUEST_TIMEOUT
         POLAR_TASK_TIMEOUT_SECONDS POLAR_TASK_TIMEOUT_FLOOR_SECONDS
+        SPILOT_EPISODE_ADMISSION_ENABLED
+        SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS
+        SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT
+        SPILOT_QWEN_MAX_ACTIVE_EPISODES SPILOT_GPT_MAX_ACTIVE_EPISODES
+        SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES
+        SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES
+        SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY
+        SPILOT_GPT_GATEWAY_MAX_CONCURRENCY
+        SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES
+        SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES
+        TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT
         POLAR_MIN_COMPLETE_ACCEPT_FRACTION
         POLAR_EARLY_STOP_GRACE_SESSIONS TMAX_DYNAMIC_SAMPLING_FILTER_PATH
         TMAX_MIN_ACTIVE_SESSIONS_PER_ROLLOUT_GPU

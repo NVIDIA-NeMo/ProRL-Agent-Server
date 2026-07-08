@@ -7,6 +7,8 @@ containers mount only that portable runtime.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import ctypes
 import os
 import time
 from typing import Any
@@ -44,6 +46,64 @@ _TOKENIZE_RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504}
 _TOKENIZE_ERROR_DETAIL_LIMIT = 240
 _MAX_TOKENS_FIELD = "max_tokens"
 _MAX_COMPLETION_TOKENS_FIELD = "max_completion_tokens"
+_POOL_CALL_CAPABILITY_FD_ENV = "POLAR_POOL_CALL_CAPABILITY_FD"
+_POOL_CALL_READY_FD_ENV = "POLAR_POOL_CALL_READY_FD"
+_PR_GET_DUMPABLE = 3
+_PR_SET_DUMPABLE = 4
+
+
+def _consume_pool_call_capability() -> str | None:
+    raw_secret_fd = os.environ.pop(_POOL_CALL_CAPABILITY_FD_ENV, "")
+    raw_ready_fd = os.environ.pop(_POOL_CALL_READY_FD_ENV, "")
+    if not raw_secret_fd and not raw_ready_fd:
+        return None
+    try:
+        secret_fd = int(raw_secret_fd)
+        ready_fd = int(raw_ready_fd)
+    except ValueError as exc:
+        raise RuntimeError("invalid protected pool-call descriptors") from exc
+    if secret_fd < 3 or ready_fd < 3:
+        raise RuntimeError("invalid protected pool-call descriptors")
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+        raise RuntimeError("could not harden mini-SWE model process")
+    if libc.prctl(_PR_GET_DUMPABLE, 0, 0, 0, 0) != 0:
+        raise RuntimeError("mini-SWE dumpability verification failed")
+    try:
+        os.write(ready_fd, b"1")
+    finally:
+        os.close(ready_fd)
+    chunks: list[bytes] = []
+    try:
+        while True:
+            chunk = os.read(secret_fd, 4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if sum(map(len, chunks)) > 16_384:
+                raise RuntimeError("pool-call capability is too large")
+    finally:
+        os.close(secret_fd)
+    capability = b"".join(chunks).decode("utf-8").rstrip("\r\n")
+    if not capability or "\n" in capability or "\x00" in capability:
+        raise RuntimeError("pool-call capability is invalid")
+    os.environ.pop("OPENAI_API_KEY", None)
+    return capability
+
+
+@contextmanager
+def _temporary_api_key(capability: str | None):
+    if capability is None:
+        yield
+        return
+    previous = os.environ.pop("OPENAI_API_KEY", None)
+    os.environ["OPENAI_API_KEY"] = capability
+    try:
+        yield
+    finally:
+        os.environ.pop("OPENAI_API_KEY", None)
+        if previous is not None:
+            os.environ["OPENAI_API_KEY"] = previous
 
 
 def _bounded_error_detail(detail: object) -> str:
@@ -82,7 +142,9 @@ class Vanillux2LitellmModel(LitellmModel):
         if parsed_budget < 0 or parsed_budget != response_token_budget:
             raise ValueError("response_token_budget must be a non-negative integer")
 
-        super().__init__(**kwargs)
+        self._pool_call_capability = _consume_pool_call_capability()
+        with _temporary_api_key(self._pool_call_capability):
+            super().__init__(**kwargs)
         # mini-SWE recursively merges the protocol YAML with per-candidate
         # model kwargs.  GPT-5-family candidates therefore inherit the YAML's
         # ``max_tokens`` unless it is removed here, leaving both OpenAI token
@@ -100,6 +162,12 @@ class Vanillux2LitellmModel(LitellmModel):
         self.used_response_tokens = 0
 
     def query(self, messages: list[dict[str, str]], **kwargs: Any) -> dict:
+        with _temporary_api_key(self._pool_call_capability):
+            return self._query_with_budget(messages, **kwargs)
+
+    def _query_with_budget(
+        self, messages: list[dict[str, str]], **kwargs: Any
+    ) -> dict:
         """Clamp this turn to the remaining cumulative trajectory budget.
 
         The released Tmax protocol defines response length as growth from the
