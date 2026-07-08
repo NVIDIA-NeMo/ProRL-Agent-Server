@@ -223,6 +223,7 @@ def test_vanillux_budget_uses_only_max_completion_tokens_when_explicit(
 ) -> None:
     module = _load_vanillux_module(monkeypatch)
     tokenize_counts = iter((100, 150))
+    tokenize_payloads: list[dict] = []
     completion_requests: list[dict] = []
 
     class TokenizeResponse:
@@ -233,7 +234,8 @@ def test_vanillux_budget_uses_only_max_completion_tokens_when_explicit(
             return {"count": next(tokenize_counts)}
 
     class TokenizeClient:
-        def post(self, *_args, **_kwargs):
+        def post(self, _url, *, json, **_kwargs):
+            tokenize_payloads.append(json)
             return TokenizeResponse()
 
     def fake_completion(**kwargs):
@@ -261,6 +263,10 @@ def test_vanillux_budget_uses_only_max_completion_tokens_when_explicit(
     assert "max_tokens" not in model.config.model_kwargs
     assert [request["max_completion_tokens"] for request in completion_requests] == [40, 14]
     assert all("max_tokens" not in request for request in completion_requests)
+    assert [payload["model"] for payload in tokenize_payloads] == [
+        "pool/gpt-5.5",
+        "pool/gpt-5.5",
+    ]
 
 
 def test_vanillux_budget_fails_closed_when_gateway_count_is_invalid(

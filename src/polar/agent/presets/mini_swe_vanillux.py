@@ -240,8 +240,13 @@ class Vanillux2LitellmModel(LitellmModel):
         tokenize_url = (
             f"{base_url}/tokenize" if base_url.endswith("/v1") else f"{base_url}/v1/tokenize"
         )
+        # ``openai/`` is LiteLLM's provider namespace, not part of the model
+        # alias sent over its OpenAI-compatible HTTP request. Match that wire
+        # representation here so Polar can resolve protected ``pool/*``
+        # aliases during exact prompt tokenization as well as completion.
+        gateway_model_name = self.config.model_name.removeprefix("openai/")
         payload: dict[str, Any] = {
-            "model": self.config.model_name,
+            "model": gateway_model_name,
             "messages": messages,
             "tools": [VANILLUX2_BASH_TOOL],
         }
