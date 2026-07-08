@@ -56,6 +56,17 @@ export POLAR_MAX_RUN_WORKERS="${POLAR_MAX_RUN_WORKERS:-576}"
 export POLAR_MAX_POSTRUN_WORKERS="${POLAR_MAX_POSTRUN_WORKERS:-384}"
 export POLAR_APPTAINER_BROKER_START_CONCURRENCY="${POLAR_APPTAINER_BROKER_START_CONCURRENCY:-8}"
 
+# The Router runner receives short-lived model-pool capabilities through
+# ``exec_protected``.  That operation is intentionally unavailable in the
+# legacy one-Apptainer-process-per-command backend used by ordinary direct
+# Qwen training.  Keep this opt-in here, rather than changing the shared TMax
+# default, so direct Qwen3.5 experiments retain their existing runtime mode.
+export POLAR_APPTAINER_PERSISTENT_BROKER="${POLAR_APPTAINER_PERSISTENT_BROKER:-1}"
+if [ "${POLAR_APPTAINER_PERSISTENT_BROKER}" != 1 ]; then
+    echo "ERROR: SPilot Router requires POLAR_APPTAINER_PERSISTENT_BROKER=1" >&2
+    return 1 2>/dev/null || exit 1
+fi
+
 # The protected broker and host-supplied read-only mini-SWE runtime are only a
 # security boundary when task images cannot inherit host mounts/environment or
 # share the host PID/IPC namespaces.  Default missing values, but never repair

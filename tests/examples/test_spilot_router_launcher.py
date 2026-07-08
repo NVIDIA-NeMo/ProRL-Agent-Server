@@ -368,6 +368,21 @@ def test_spilot_uses_reference_gpu_adam_by_default() -> None:
     assert "TMAX_OPTIMIZER_CPU_OFFLOAD" in run_state
 
 
+def test_spilot_requires_persistent_broker_without_changing_shared_default() -> None:
+    defaults = (EXAMPLE / "experiment_defaults.sh").read_text()
+    shared_env = (ROOT / "examples" / "tmax_slime_grpo" / "env.cwdfw.sh").read_text()
+
+    assert (
+        'POLAR_APPTAINER_PERSISTENT_BROKER="${POLAR_APPTAINER_PERSISTENT_BROKER:-1}"'
+        in defaults
+    )
+    assert 'if [ "${POLAR_APPTAINER_PERSISTENT_BROKER}" != 1 ]; then' in defaults
+    assert (
+        'POLAR_APPTAINER_PERSISTENT_BROKER="${POLAR_APPTAINER_PERSISTENT_BROKER:-0}"'
+        in shared_env
+    )
+
+
 def test_spilot_smoke_is_one_node_one_step_without_dynamic_filtering() -> None:
     script = (EXAMPLE / "submit_smoke.sh").read_text()
 
