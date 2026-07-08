@@ -182,6 +182,10 @@ async def test_spilot_tokenize_requires_exact_active_pool_lease(
         attempt_id="0:solve",
         timeout_seconds=1,
     )
+    session_pool_capability = registry.issue_capability(
+        "tokenize-session",
+        scope=MODEL_POOL_CAPABILITY_SCOPE,
+    )
     state = SimpleNamespace(
         inference=SimpleNamespace(tokenize=tokenize),
         model_pool={
@@ -204,6 +208,13 @@ async def test_spilot_tokenize_requires_exact_active_pool_lease(
             authorization=None,
         )
     )
+    session_capability_denied = await server.tokenize_request(
+        _request(
+            "/v1/tokenize",
+            {"model": "pool/qwen", "messages": []},
+            authorization=f"Bearer {session_pool_capability}",
+        )
+    )
     accepted = await server.tokenize_request(
         _request(
             "/v1/tokenize",
@@ -216,6 +227,10 @@ async def test_spilot_tokenize_requires_exact_active_pool_lease(
     assert orjson.loads(denied.body)["error"]["code"] == (
         "missing_pool_call_capability"
     )
+    assert session_capability_denied.status_code == 401
+    assert orjson.loads(session_capability_denied.body)["error"]["code"] == (
+        "invalid_pool_call_capability"
+    )
     assert accepted.status_code == 200
     assert orjson.loads(accepted.body) == {"count": 3, "max_model_len": 1024}
     tokenize.assert_awaited_once()
@@ -225,6 +240,74 @@ async def test_spilot_tokenize_requires_exact_active_pool_lease(
         session_id="tokenize-session",
         lease_id=grant.lease_id,
     ) is True
+
+
+@pytest.mark.asyncio
+async def test_uncapped_spilot_tokenize_uses_session_pool_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokenize = AsyncMock(return_value={"count": 7, "max_model_len": 2048})
+    registry = SessionRegistry()
+    registry.register(
+        "uncapped-tokenize-session",
+        registered=True,
+        status=SessionStatus.RUNNING,
+    )
+    pool_capability = registry.issue_capability(
+        "uncapped-tokenize-session",
+        scope=MODEL_POOL_CAPABILITY_SCOPE,
+    )
+    router_capability = registry.issue_capability(
+        "uncapped-tokenize-session",
+        scope=ROUTER_CAPABILITY_SCOPE,
+    )
+    state = SimpleNamespace(
+        inference=SimpleNamespace(tokenize=tokenize),
+        model_pool={
+            "pool/qwen": server.ModelPoolRoute(
+                model="upstream-qwen",
+                inference=SimpleNamespace(),  # type: ignore[arg-type]
+                max_active_episodes=None,
+            )
+        },
+        session_registry=registry,
+        node=SimpleNamespace(model_served="local-router-policy"),
+    )
+    monkeypatch.setattr(server, "get_state", lambda: state)
+
+    missing = await server.tokenize_request(
+        _request(
+            "/v1/tokenize",
+            {"model": "pool/qwen", "messages": []},
+            authorization=None,
+        )
+    )
+    wrong_scope = await server.tokenize_request(
+        _request(
+            "/v1/tokenize",
+            {"model": "pool/qwen", "messages": []},
+            authorization=f"Bearer {router_capability}",
+        )
+    )
+    accepted = await server.tokenize_request(
+        _request(
+            "/v1/tokenize",
+            {"model": "pool/qwen", "messages": []},
+            authorization=f"Bearer {pool_capability}",
+        )
+    )
+
+    assert missing.status_code == 401
+    assert orjson.loads(missing.body)["error"]["code"] == "missing_session_credential"
+    assert wrong_scope.status_code == 401
+    assert orjson.loads(wrong_scope.body)["error"]["code"] == (
+        "invalid_session_capability"
+    )
+    assert accepted.status_code == 200
+    assert orjson.loads(accepted.body) == {"count": 7, "max_model_len": 2048}
+    tokenize.assert_awaited_once_with(
+        {"model": "local-router-policy", "messages": []}
+    )
 
 
 @pytest.mark.asyncio

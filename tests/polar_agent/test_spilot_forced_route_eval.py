@@ -103,6 +103,9 @@ def test_forced_eval_harness_uploads_separate_runner_and_never_uses_normal_entry
         "/opt/polar-mini-swe-agent/venv/bin/python",
         "/polar/session/spilot_forced_route_eval_runner.py",
     ]
+    assert step.protected_env_keys == [
+        "POLAR_MODEL_POOL_ADMISSION_CAPABILITY"
+    ]
     assert set(step.protected_file_digests) == {
         "/polar/session/spilot_router_runner.py",
         "/polar/session/spilot_forced_route_eval_runner.py",

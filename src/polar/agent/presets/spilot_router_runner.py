@@ -323,7 +323,11 @@ def _receive_protected_environment() -> dict[str, str]:
     global _PROTECTED_ENV_CACHE
     if _PROTECTED_ENV_CACHE is not None:
         return _PROTECTED_ENV_CACHE
-    for key in (_ROUTER_CAPABILITY_ENV, _MODEL_POOL_ADMISSION_CAPABILITY_ENV):
+    for key in (
+        _ROUTER_CAPABILITY_ENV,
+        _MODEL_POOL_CAPABILITY_ENV,
+        _MODEL_POOL_ADMISSION_CAPABILITY_ENV,
+    ):
         if os.environ.pop(key, ""):
             raise GatewayInfrastructureError(
                 "protected capability appeared in the runner's initial environment"
@@ -1018,6 +1022,7 @@ class SpilotOrchestrator:
         router: RouterClient,
         pool: PoolExecutor,
         admission: EpisodeAdmissionClient | None = None,
+        model_pool_capability: str | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.config = _validate_config(config)
@@ -1025,6 +1030,7 @@ class SpilotOrchestrator:
         self.router = router
         self.pool = pool
         self.admission = admission
+        self.model_pool_capability = (model_pool_capability or "").strip()
         self.clock = clock
         self.candidates = _assign_slots(
             self.config["model_pool"],
@@ -1323,6 +1329,13 @@ class SpilotOrchestrator:
                 )
 
         timeout = min(float(self.config["pool_timeout_seconds"]), available)
+        model_call_capability = (
+            grant.call_capability if grant is not None else self.model_pool_capability
+        )
+        if not model_call_capability:
+            raise GatewayInfrastructureError(
+                "session-scoped model-pool capability is unavailable"
+            )
         try:
             result = self.pool.run(
                 candidate=candidate,
@@ -1330,7 +1343,7 @@ class SpilotOrchestrator:
                 role=role,
                 call_index=call_index,
                 timeout_seconds=timeout,
-                model_call_capability=(grant.call_capability if grant else ""),
+                model_call_capability=model_call_capability,
             )
         except UnreapedPoolProcessError:
             # Releasing here could start another candidate while the prior
@@ -2007,11 +2020,16 @@ def main() -> int:
 
     gateway: OpenAIGatewayClient | None = None
     admission: GatewayEpisodeAdmissionClient | None = None
+    model_pool_capability: str | None = None
     orchestrator: SpilotOrchestrator | None = None
     try:
         gateway = OpenAIGatewayClient()
         if config_obj.get("pool_episode_admission_enabled") is True:
             admission = GatewayEpisodeAdmissionClient()
+        else:
+            model_pool_capability = _read_protected_capability(
+                _MODEL_POOL_CAPABILITY_ENV
+            )
         pool = MiniSwePoolExecutor(config_obj)
         orchestrator = SpilotOrchestrator(
             config=config_obj,
@@ -2019,6 +2037,7 @@ def main() -> int:
             router=gateway,
             pool=pool,
             admission=admission,
+            model_pool_capability=model_pool_capability,
         )
         result = orchestrator.run()
         _write_result(result_path, result)

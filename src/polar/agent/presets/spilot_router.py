@@ -94,6 +94,8 @@ class SpilotRouterHarness(BaseHarness):
             protected_env_keys.append("POLAR_ROUTER_CAPABILITY")
         if self._runner_config["pool_episode_admission_enabled"]:
             protected_env_keys.append("POLAR_MODEL_POOL_ADMISSION_CAPABILITY")
+        else:
+            protected_env_keys.append("POLAR_MODEL_POOL_CAPABILITY")
         core_source = Path(__file__).with_name("spilot_router_runner.py")
         protected_file_digests = {
             SPILOT_RUNNER_PATH: hashlib.sha256(core_source.read_bytes()).hexdigest()

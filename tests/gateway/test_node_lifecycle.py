@@ -21,6 +21,7 @@ from polar.gateway.session import (
     MODEL_POOL_ADMISSION_CAPABILITY_ENV,
     MODEL_POOL_ADMISSION_CAPABILITY_SCOPE,
     MODEL_POOL_CAPABILITY_ENV,
+    MODEL_POOL_CAPABILITY_SCOPE,
     ROUTER_CAPABILITY_ENV,
     ROUTER_CAPABILITY_SCOPE,
     SessionRegistry,
@@ -186,12 +187,17 @@ async def test_spilot_dispatch_issues_and_injects_scoped_capabilities(
         await manager.dispatch(request)
         managed = enqueue.await_args.args[0]
         assert managed.router_capability not in (None, request.session_id)
-        # Capped pool calls no longer receive a session-wide capability. Each
-        # episode lease mints an alias-bound call credential instead.
-        assert managed.model_pool_capability is None
+        assert managed.model_pool_capability not in (None, request.session_id)
         assert managed.model_pool_admission_capability not in (
             None,
             request.session_id,
+        )
+        assert (
+            registry.resolve_capability(
+                managed.model_pool_capability,
+                scope=MODEL_POOL_CAPABILITY_SCOPE,
+            ).session_id
+            == request.session_id
         )
         assert (
             registry.resolve_capability(
@@ -219,7 +225,7 @@ async def test_spilot_dispatch_issues_and_injects_scoped_capabilities(
         assert environment["OPENAI_API_KEY"] == request.session_id
         assert "POLAR_CONTROL_PLANE_TOKEN" not in environment
         assert environment[ROUTER_CAPABILITY_ENV] == managed.router_capability
-        assert MODEL_POOL_CAPABILITY_ENV not in environment
+        assert environment[MODEL_POOL_CAPABILITY_ENV] == managed.model_pool_capability
         assert (
             environment[MODEL_POOL_ADMISSION_CAPABILITY_ENV]
             == managed.model_pool_admission_capability

@@ -146,6 +146,7 @@ class FakePool:
         self.status = status
         self.workspace = workspace
         self.calls: list[tuple[str, str]] = []
+        self.capabilities: list[str] = []
 
     def run(
         self,
@@ -157,9 +158,9 @@ class FakePool:
         timeout_seconds: float,
         model_call_capability: str = "",
     ) -> PoolCallResult:
-        del model_call_capability
         assert timeout_seconds > 0
         self.calls.append((candidate.slot, role))
+        self.capabilities.append(model_call_capability)
         if self.workspace is not None:
             marker = self.workspace / "shared.txt"
             if role == "solve":
@@ -221,6 +222,7 @@ def test_route_then_submit_records_router_contract_and_bounded_observation() -> 
         task="Fix the bug",
         router=router,
         pool=pool,
+        model_pool_capability="session-pool-capability",
     )
 
     result = orchestrator.run()
@@ -232,6 +234,7 @@ def test_route_then_submit_records_router_contract_and_bounded_observation() -> 
     assert len(result["calls"]) == 1
     assert result["calls"][0]["status"] == "failed"
     assert result["total_cost"] == 1.0
+    assert pool.capabilities == ["session-pool-capability"]
     second_prompt = router.requests[1]["messages"][-1]["content"]
     assert '"status": "failed"' in second_prompt
     assert "hidden evaluator tests have not run" in second_prompt
@@ -248,9 +251,14 @@ def test_verify_runs_fresh_agent_on_same_mutable_workspace(tmp_path: Path) -> No
         task="Implement the feature",
         router=router,
         pool=pool,
+        model_pool_capability="session-pool-capability",
     ).run()
 
     assert pool.calls == [("M0", "solve"), ("M1", "verify")]
+    assert pool.capabilities == [
+        "session-pool-capability",
+        "session-pool-capability",
+    ]
     assert (tmp_path / "shared.txt").read_text(encoding="utf-8") == "verified"
     assert result["submitted"] is True
     assert result["termination_reason"] == "verify_auto_submit"
@@ -300,6 +308,7 @@ def test_episode_admission_wraps_each_selected_candidate_before_pool_run() -> No
         '{"action":"ROUTE","model_slot":"M0"}',
         '{"action":"VERIFY","model_slot":"M1"}',
     )
+    pool = EventPool()
     result = SpilotOrchestrator(
         config=_runner_config(
             pool_episode_admission_enabled=True,
@@ -307,8 +316,9 @@ def test_episode_admission_wraps_each_selected_candidate_before_pool_run() -> No
         ),
         task="Task",
         router=router,
-        pool=EventPool(),
+        pool=pool,
         admission=Admission(),
+        model_pool_capability="must-not-use-session-capability",
     ).run()
 
     assert events == [
@@ -324,6 +334,7 @@ def test_episode_admission_wraps_each_selected_candidate_before_pool_run() -> No
     assert result["admission_wait_ms"] == 4_000
     assert [call["admission_wait_ms"] for call in result["calls"]] == [2_000, 2_000]
     assert [call["admission_local_cap"] for call in result["calls"]] == [4, 4]
+    assert pool.capabilities == ["call-capability-1", "call-capability-2"]
     # Queue pressure is infrastructure telemetry, not a policy observation.
     assert "admission_wait" not in router.requests[1]["messages"][-1]["content"]
 
@@ -650,12 +661,29 @@ def test_m0_routes_once_then_auto_submits() -> None:
         task="Task",
         router=router,
         pool=pool,
+        model_pool_capability="session-pool-capability",
     ).run()
 
     assert len(router.requests) == 1
     assert pool.calls == [("M1", "solve")]
+    assert pool.capabilities == ["session-pool-capability"]
     assert result["submitted"] is True
     assert result["termination_reason"] == "m0_auto_submit"
+
+
+def test_uncapped_pool_call_without_session_capability_fails_closed() -> None:
+    orchestrator = SpilotOrchestrator(
+        config=_runner_config(max_pool_calls=1),
+        task="Task",
+        router=FakeRouter('{"action":"ROUTE","model_slot":"M0"}'),
+        pool=FakePool(),
+    )
+
+    with pytest.raises(
+        GatewayInfrastructureError,
+        match="session-scoped model-pool capability is unavailable",
+    ):
+        orchestrator.run()
 
 
 def test_pool_command_merges_global_and_per_candidate_request_kwargs(tmp_path: Path) -> None:
@@ -977,7 +1005,10 @@ def test_harness_is_builtin_and_uploads_portable_runner() -> None:
         "/opt/polar-mini-swe-agent/venv/bin/python",
         "/polar/session/spilot_router_runner.py",
     ]
-    assert step.protected_env_keys == ["POLAR_ROUTER_CAPABILITY"]
+    assert step.protected_env_keys == [
+        "POLAR_ROUTER_CAPABILITY",
+        "POLAR_MODEL_POOL_CAPABILITY",
+    ]
     runner_source = Path(spilot_router_runner.__file__)
     assert step.protected_file_digests == {
         "/polar/session/spilot_router_runner.py": hashlib.sha256(
@@ -987,6 +1018,7 @@ def test_harness_is_builtin_and_uploads_portable_runner() -> None:
     assert "SPILOT_ROUTER_CONFIG_B64" in step.env
     assert "SPILOT_TASK_B64" in step.env
     assert "POLAR_ROUTER_CAPABILITY" not in step.env
+    assert "POLAR_MODEL_POOL_CAPABILITY" not in step.env
     assert "POLAR_MODEL_POOL_ADMISSION_CAPABILITY" not in step.env
 
     uploaded: list[tuple[str, str]] = []
@@ -998,6 +1030,24 @@ def test_harness_is_builtin_and_uploads_portable_runner() -> None:
     assert Path(uploaded[0][0]).name == "spilot_router_runner.py"
     assert uploaded[0][1] == "/polar/session/spilot_router_runner.py"
 
+    admitted_harness = create_harness(
+        AgentSpec(
+            harness="spilot_router",
+            model_name="Qwen/Qwen3.5-9B",
+            settings={
+                "model_pool": ["pool/qwen3.6-27b", "pool/gpt-5.5"],
+                "pool_episode_admission_enabled": True,
+                "pool_episode_admission_wait_budget_seconds": 60,
+            },
+        )
+    )
+    admitted_step = admitted_harness.run_steps("Fix it")[0]
+    assert admitted_step.protected_env_keys == [
+        "POLAR_ROUTER_CAPABILITY",
+        "POLAR_MODEL_POOL_ADMISSION_CAPABILITY",
+    ]
+    assert "POLAR_MODEL_POOL_CAPABILITY" not in admitted_step.protected_env_keys
+
 
 def test_runner_fetches_capabilities_over_fresh_peer_authenticated_socket(
     monkeypatch: pytest.MonkeyPatch,
@@ -1008,6 +1058,7 @@ def test_runner_fetches_capabilities_over_fresh_peer_authenticated_socket(
             "ok": True,
             "protected_env": {
                 "POLAR_ROUTER_CAPABILITY": "router-secret",
+                "POLAR_MODEL_POOL_CAPABILITY": "pool-secret",
                 "POLAR_MODEL_POOL_ADMISSION_CAPABILITY": "admission-secret",
             },
         }
@@ -1058,6 +1109,7 @@ def test_runner_fetches_capabilities_over_fresh_peer_authenticated_socket(
     os.close(ready_write)
     monkeypatch.setenv("POLAR_PROTECTED_EXEC_READY_FD", str(ready_read))
     monkeypatch.delenv("POLAR_ROUTER_CAPABILITY", raising=False)
+    monkeypatch.delenv("POLAR_MODEL_POOL_CAPABILITY", raising=False)
     monkeypatch.delenv("POLAR_MODEL_POOL_ADMISSION_CAPABILITY", raising=False)
 
     values = spilot_router_runner._receive_protected_environment()
@@ -1066,6 +1118,7 @@ def test_runner_fetches_capabilities_over_fresh_peer_authenticated_socket(
     assert observed == {"operation": "protected_child_ready", "id": "request-123"}
     assert values == {
         "POLAR_ROUTER_CAPABILITY": "router-secret",
+        "POLAR_MODEL_POOL_CAPABILITY": "pool-secret",
         "POLAR_MODEL_POOL_ADMISSION_CAPABILITY": "admission-secret",
     }
     assert "POLAR_PROTECTED_EXEC_SOCKET" not in os.environ
@@ -1384,8 +1437,20 @@ def test_main_returns_success_for_pool_model_failure_and_writes_result(
 
     monkeypatch.setattr(spilot_router_runner, "OpenAIGatewayClient", MainRouter)
     monkeypatch.setattr(spilot_router_runner, "MiniSwePoolExecutor", MainPool)
+    capability_reads: list[str] = []
+
+    def read_capability(key: str) -> str:
+        capability_reads.append(key)
+        return "session-pool-capability"
+
+    monkeypatch.setattr(
+        spilot_router_runner,
+        "_read_protected_capability",
+        read_capability,
+    )
 
     assert spilot_router_runner.main() == 0
+    assert capability_reads == ["POLAR_MODEL_POOL_CAPABILITY"]
     payload = json.loads((tmp_path / "router_result.json").read_text(encoding="utf-8"))
     assert payload["action_valid"] is True
     assert payload["calls"][0]["status"] == "failed"

@@ -113,6 +113,11 @@ def run_forced_eval(config: dict[str, object], task: str) -> dict[str, object]:
         if core_config.get("pool_episode_admission_enabled") is True
         else None
     )
+    model_pool_capability = (
+        None
+        if admission is not None
+        else core._read_protected_capability(core._MODEL_POOL_CAPABILITY_ENV)
+    )
     try:
         orchestrator = core.SpilotOrchestrator(
             config=core_config,
@@ -120,6 +125,7 @@ def run_forced_eval(config: dict[str, object], task: str) -> dict[str, object]:
             router=router,
             pool=pool,
             admission=admission,
+            model_pool_capability=model_pool_capability,
         )
         matching = [
             candidate

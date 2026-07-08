@@ -808,8 +808,9 @@ async def tokenize_request(request: Request) -> Response:
 
     pool_request_handle = None
     # A formal Router gateway exposes its UDS to untrusted task sandboxes.
-    # Tokenization still consumes local serving capacity, so bind it to the
-    # same active alias-specific episode lease as the candidate completion.
+    # Tokenization uses the same authorization mode as candidate completion:
+    # capped aliases require an active episode lease, while uncapped aliases
+    # use the session-scoped model-pool capability.
     if getattr(state, "model_pool", None):
         requested_model = body.get("model")
         pool_route = (
@@ -817,53 +818,63 @@ async def tokenize_request(request: Request) -> Response:
             if isinstance(requested_model, str)
             else None
         )
-        if pool_route is None or pool_route.max_active_episodes is None:
+        if pool_route is None:
             return _privileged_session_error(
-                "Tokenization requires an active capped model-pool lease",
+                "Tokenization requires a configured model-pool alias",
                 status_code=403,
                 code="tokenize_model_forbidden",
             )
-        credential = extract_api_key({key: value for key, value in request.headers.items()})
-        if credential is None:
-            return _privileged_session_error(
-                "A lease-scoped pool-call credential is required",
-                status_code=401,
-                code="missing_pool_call_capability",
+        headers = {key: value for key, value in request.headers.items()}
+        if pool_route.max_active_episodes is None:
+            _session_id, auth_error = _resolve_privileged_session_id(
+                headers,
+                state.session_registry,
+                scope=MODEL_POOL_CAPABILITY_SCOPE,
             )
-        try:
-            pool_request_handle = await state.episode_admission.begin_request(
-                call_capability=credential,
-                alias=requested_model,
-            )
-        except EpisodeCallUnauthorized:
-            return _privileged_session_error(
-                "The pool-call capability is invalid",
-                status_code=401,
-                code="invalid_pool_call_capability",
-            )
-        except EpisodeLeaseClosing:
-            return _episode_admission_error(
-                "The episode lease is closing",
-                status_code=409,
-                code="episode_lease_closing",
-            )
-        except EpisodeAdmissionPoisoned:
-            return _episode_admission_error(
-                "Model-pool episode admission is poisoned",
-                status_code=503,
-                code="episode_admission_poisoned",
-            )
-        info = state.session_registry.get(pool_request_handle.session_id)
-        if info is None or info.status != SessionStatus.RUNNING:
-            await _end_request_despite_cancellation(
-                state.episode_admission,
-                pool_request_handle,
-            )
-            return _privileged_session_error(
-                "The rollout session is not running",
-                status_code=403,
-                code="inactive_pool_call_capability",
-            )
+            if auth_error is not None:
+                return auth_error
+        else:
+            credential = extract_api_key(headers)
+            if credential is None:
+                return _privileged_session_error(
+                    "A lease-scoped pool-call credential is required",
+                    status_code=401,
+                    code="missing_pool_call_capability",
+                )
+            try:
+                pool_request_handle = await state.episode_admission.begin_request(
+                    call_capability=credential,
+                    alias=requested_model,
+                )
+            except EpisodeCallUnauthorized:
+                return _privileged_session_error(
+                    "The pool-call capability is invalid",
+                    status_code=401,
+                    code="invalid_pool_call_capability",
+                )
+            except EpisodeLeaseClosing:
+                return _episode_admission_error(
+                    "The episode lease is closing",
+                    status_code=409,
+                    code="episode_lease_closing",
+                )
+            except EpisodeAdmissionPoisoned:
+                return _episode_admission_error(
+                    "Model-pool episode admission is poisoned",
+                    status_code=503,
+                    code="episode_admission_poisoned",
+                )
+            info = state.session_registry.get(pool_request_handle.session_id)
+            if info is None or info.status != SessionStatus.RUNNING:
+                await _end_request_despite_cancellation(
+                    state.episode_admission,
+                    pool_request_handle,
+                )
+                return _privileged_session_error(
+                    "The rollout session is not running",
+                    status_code=403,
+                    code="inactive_pool_call_capability",
+                )
 
     tokenize_body = dict(body)
     tokenize_body["model"] = state.node.model_served

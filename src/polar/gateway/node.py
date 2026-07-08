@@ -23,6 +23,7 @@ from polar.gateway.session import (
     MODEL_POOL_ADMISSION_CAPABILITY_ENV,
     MODEL_POOL_ADMISSION_CAPABILITY_SCOPE,
     MODEL_POOL_CAPABILITY_ENV,
+    MODEL_POOL_CAPABILITY_SCOPE,
     ROUTER_CAPABILITY_ENV,
     ROUTER_CAPABILITY_SCOPE,
     SessionRegistry,
@@ -272,6 +273,13 @@ class GatewayNodeManager:
                 router_capability = self.session_registry.issue_capability(
                     session_id,
                     scope=ROUTER_CAPABILITY_SCOPE,
+                )
+                # Uncapped model-pool routes use a session-scoped capability.
+                # Capped routes ignore it and require the per-episode call
+                # capability minted by admission instead.
+                model_pool_capability = self.session_registry.issue_capability(
+                    session_id,
+                    scope=MODEL_POOL_CAPABILITY_SCOPE,
                 )
                 model_pool_admission_capability = self.session_registry.issue_capability(
                     session_id,
@@ -1418,12 +1426,15 @@ class GatewayNodeManager:
         # caller-controlled runtime/agent env.  They exist only for the SPilot
         # harness and never reuse the externally visible session id.
         router_capability = getattr(managed, "router_capability", None)
+        model_pool_capability = getattr(managed, "model_pool_capability", None)
         model_pool_admission_capability = getattr(
             managed, "model_pool_admission_capability", None
         )
         if getattr(managed, "stage", None) == SessionStage.RUNNING:
             if router_capability:
                 environment[ROUTER_CAPABILITY_ENV] = router_capability
+            if model_pool_capability:
+                environment[MODEL_POOL_CAPABILITY_ENV] = model_pool_capability
             if model_pool_admission_capability:
                 environment[MODEL_POOL_ADMISSION_CAPABILITY_ENV] = (
                     model_pool_admission_capability
