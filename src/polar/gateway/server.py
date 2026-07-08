@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 import json
 import logging
 import os
 import secrets
+import signal
 from datetime import datetime, timezone
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -1756,13 +1757,46 @@ def serve(
         timeout_graceful_shutdown=_GATEWAY_HTTP_DRAIN_TIMEOUT_SECONDS,
     )
     server = uvicorn.Server(config=config)
+    captured_signals: list[int] = []
+    original_capture_signals = server.capture_signals
+
+    @contextmanager
+    def capture_signals_without_reraise():
+        # Uvicorn restores the prior handlers after graceful shutdown and then
+        # deliberately re-raises every signal it captured. That makes a clean
+        # SIGTERM-driven shutdown appear to the launcher as status 143. Capture
+        # and clear the signals while still inside Uvicorn's context so its
+        # post-context re-raise has nothing to deliver; validate the exact
+        # shutdown state below instead of accepting status 143 generically.
+        with original_capture_signals():
+            try:
+                yield
+            finally:
+                captured_signals.extend(server._captured_signals)
+                server._captured_signals.clear()
+
+    server.capture_signals = capture_signals_without_reraise  # type: ignore[method-assign]
     server.run()
     lifespan = getattr(server, "lifespan", None)
-    if not server.started or bool(getattr(lifespan, "shutdown_failed", False)):
+    clean_signal_exit = not captured_signals or captured_signals == [signal.SIGTERM]
+    if (
+        not server.started
+        or server.force_exit
+        or bool(getattr(lifespan, "shutdown_failed", False))
+        or not clean_signal_exit
+    ):
         # uvicorn.run() reports startup failures nonzero but silently returns
         # zero when ASGI lifespan shutdown fails. A gateway teardown failure
         # means runtime containment is unproven, so surface it to Slurm and the
         # launcher instead of publishing a successful experiment exit.
+        logger.error(
+            "Rejecting unproven gateway shutdown: started=%s force_exit=%s "
+            "lifespan_shutdown_failed=%s captured_signals=%s",
+            server.started,
+            server.force_exit,
+            bool(getattr(lifespan, "shutdown_failed", False)),
+            captured_signals,
+        )
         raise SystemExit(1)
 
 
