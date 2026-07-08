@@ -1461,7 +1461,7 @@ set -euo pipefail
 {helpers}
 ready=$(mktemp)
 action={json.dumps(term_action)}
-bash -c 'trap "$2" TERM; touch "$1"; while true; do read -r -t 1 _ || true; done' _ "$ready" "$action" &
+bash -c 'trap "$2" TERM; printf ready >"$1"; while true; do read -r -t 1 _ || true; done' _ "$ready" "$action" &
 pid=$!
 for _ in $(seq 1 100); do
     [ -s "$ready" ] && break
@@ -1479,6 +1479,32 @@ fi
     result = run_bash(script)
 
     assert result.stdout == expected
+
+
+def test_shared_launcher_gateway_shutdown_does_not_repeat_pre_sent_term() -> None:
+    shared_run = (SHARED / "run.sh").read_text()
+    helpers_start = shared_run.index("polar_pid_is_active() {")
+    helpers_end = shared_run.index("\ncleanup() {", helpers_start)
+    helpers = shared_run[helpers_start:helpers_end]
+    script = f"""
+set -euo pipefail
+{helpers}
+ready=$(mktemp)
+python -c 'import pathlib, signal, sys, time; signal.signal(signal.SIGTERM, lambda *_: (signal.signal(signal.SIGTERM, signal.SIG_DFL), time.sleep(0.2), sys.exit(0))); pathlib.Path(sys.argv[1]).write_text("ready"); signal.pause()' "$ready" &
+pid=$!
+for _ in $(seq 1 100); do
+    [ -s "$ready" ] && break
+    sleep 0.01
+done
+[ -s "$ready" ]
+kill -TERM "$pid"
+POLAR_BACKGROUND_KILL_GRACE_SECONDS=1 \
+    polar_shutdown_gateway_bounded "$pid" 2 1
+"""
+
+    result = run_bash(script)
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_spilot_gateway_shutdown_budget_covers_http_and_runtime_teardown() -> None:

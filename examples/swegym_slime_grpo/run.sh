@@ -922,13 +922,20 @@ polar_stop_ray_bounded() {
 }
 
 polar_shutdown_gateway_bounded() {
-    local pid="$1" grace_seconds="$2" kill_grace_seconds rc timed_out=0
+    local pid="$1" grace_seconds="$2" term_already_sent="${3:-0}"
+    local kill_grace_seconds rc timed_out=0
     [ -n "${pid}" ] || return 0
     [[ "${grace_seconds}" =~ ^[0-9]+$ ]] || grace_seconds=150
     kill_grace_seconds="${POLAR_BACKGROUND_KILL_GRACE_SECONDS:-2}"
     [[ "${kill_grace_seconds}" =~ ^[0-9]+$ ]] || kill_grace_seconds=2
 
-    kill -TERM "${pid}" 2>/dev/null || true
+    # cleanup() starts gateway shutdown before the potentially-slow Ray stop
+    # so both drains overlap. Do not deliver a second SIGTERM afterwards: it
+    # can interrupt Uvicorn's already-running graceful shutdown and turn a
+    # successful exit into status 143.
+    if [ "${term_already_sent}" != 1 ]; then
+        kill -TERM "${pid}" 2>/dev/null || true
+    fi
     if ! polar_wait_for_pids_bounded "${grace_seconds}" "${pid}"; then
         timed_out=1
         echo "ERROR: Polar gateway shutdown exceeded ${grace_seconds}s; sending SIGKILL" >&2
@@ -956,7 +963,7 @@ polar_shutdown_gateway_bounded() {
 
 cleanup() {
     local status=$? final_status gateway_shutdown_failed=0
-    local pid background_grace_seconds
+    local pid background_grace_seconds gateway_term_sent=0
     local -a background_pids=()
     local -a process_groups=("${PROCESS_GROUPS[@]}")
     trap - EXIT
@@ -983,11 +990,14 @@ cleanup() {
         kill -TERM -- "-$pid" 2>/dev/null || true
     done
     if [ -n "${POLAR_GATEWAY_PID}" ]; then
-        kill -TERM "${POLAR_GATEWAY_PID}" 2>/dev/null || true
+        if kill -TERM "${POLAR_GATEWAY_PID}" 2>/dev/null; then
+            gateway_term_sent=1
+        fi
     fi
     polar_stop_ray_bounded
     if ! polar_shutdown_gateway_bounded \
-        "${POLAR_GATEWAY_PID}" "${POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS}"; then
+        "${POLAR_GATEWAY_PID}" "${POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS}" \
+        "${gateway_term_sent}"; then
         gateway_shutdown_failed=1
     fi
     background_grace_seconds="${POLAR_BACKGROUND_SHUTDOWN_GRACE_SECONDS:-20}"
