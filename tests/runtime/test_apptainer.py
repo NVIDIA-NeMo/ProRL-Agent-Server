@@ -490,6 +490,105 @@ def test_containment_snapshot_fails_closed_when_procfs_is_unreadable(
         )
 
 
+def test_containment_snapshot_ignores_process_that_exits_during_stat_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    pid = 8_225_001
+    _write_fake_proc_process(
+        proc_root,
+        pid=pid,
+        ppid=1,
+        session_id=pid,
+        start_time=1,
+    )
+    process_stat = proc_root / str(pid) / "stat"
+    real_read_text = Path.read_text
+
+    def exited_stat(path: Path, *args, **kwargs) -> str:
+        if path == process_stat:
+            raise ProcessLookupError("synthetic procfs ESRCH")
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", exited_stat)
+
+    sessions, processes = apptainer._direct_broker_process_snapshot(  # noqa: SLF001
+        tmp_path / "session",
+        proc_root=proc_root,
+    )
+
+    assert sessions == set()
+    assert processes == {}
+
+
+def test_containment_ownership_scan_ignores_process_that_exits_during_stat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    pid = 8_225_002
+    _write_fake_proc_process(
+        proc_root,
+        pid=pid,
+        ppid=1,
+        session_id=pid,
+        start_time=1,
+    )
+    process_dir = proc_root / str(pid)
+    real_stat = Path.stat
+
+    def exited_process(path: Path, *args, **kwargs):
+        if path == process_dir:
+            raise ProcessLookupError("synthetic procfs ESRCH")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", exited_process)
+
+    sessions, processes = apptainer._direct_broker_process_snapshot(  # noqa: SLF001
+        tmp_path / "session",
+        proc_root=proc_root,
+    )
+
+    assert sessions == set()
+    assert processes == {}
+
+
+def test_containment_ownership_scan_ignores_process_that_exits_during_environ_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    pid = 8_225_003
+    _write_fake_proc_process(
+        proc_root,
+        pid=pid,
+        ppid=1,
+        session_id=pid,
+        start_time=1,
+    )
+    process_environ = proc_root / str(pid) / "environ"
+    real_read_bytes = Path.read_bytes
+
+    def exited_environ(path: Path) -> bytes:
+        if path == process_environ:
+            raise ProcessLookupError("synthetic procfs ESRCH")
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", exited_environ)
+
+    sessions, processes = apptainer._direct_broker_process_snapshot(  # noqa: SLF001
+        tmp_path / "session",
+        proc_root=proc_root,
+    )
+
+    assert sessions == set()
+    assert processes == {}
+
+
 def test_containment_ownership_scan_fails_closed_on_unreadable_environment(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -613,6 +712,7 @@ def test_force_stop_scans_for_runtime_after_launcher_task_is_gone(
     tmp_path: Path,
 ) -> None:
     runtime = _runtime(monkeypatch, tmp_path, direct=True)
+    runtime._broker_was_started = True  # noqa: SLF001
     cleanup_called = threading.Event()
     observed_sessions: list[set[int]] = []
 
@@ -1371,6 +1471,14 @@ def test_broker_start_defaults_are_slow_mount_safe(monkeypatch, tmp_path: Path) 
 
     runtime._run_local_command = fake_run  # type: ignore[method-assign]
     runtime._wait_for_broker_ready = fake_ready  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        apptainer,
+        "_direct_broker_process_snapshot",
+        lambda *_args, **_kwargs: ({8_600_001}, {}),
+    )
+    runtime._cleanup_direct_broker_processes = (  # type: ignore[method-assign]  # noqa: SLF001
+        lambda *, known_sessions: None
+    )
 
     async def exercise() -> None:
         await runtime._start_direct_broker_once()  # noqa: SLF001
@@ -1388,6 +1496,14 @@ def test_broker_readiness_wait_survives_concurrent_task_clear(
     tmp_path: Path,
 ) -> None:
     runtime = _runtime(monkeypatch, tmp_path, direct=True)
+    monkeypatch.setattr(
+        apptainer,
+        "_direct_broker_process_snapshot",
+        lambda *_args, **_kwargs: ({8_600_002}, {}),
+    )
+    runtime._cleanup_direct_broker_processes = (  # type: ignore[method-assign]  # noqa: SLF001
+        lambda *, known_sessions: None
+    )
 
     async def exercise() -> None:
         broker_task = asyncio.create_task(asyncio.Event().wait())

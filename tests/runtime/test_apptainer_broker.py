@@ -261,6 +261,96 @@ print(hashlib.sha256(secret.encode()).hexdigest())
     ).hexdigest()
 
 
+def test_forced_protected_runner_loads_sealed_core_before_entrypoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    core_runner = tmp_path / "spilot_router_runner.py"
+    core_runner.write_text(
+        """
+import json
+import os
+import socket
+
+MARKER = "sealed-core-loaded"
+
+
+def establish_secure_channel():
+    ready_fd = int(os.environ.pop("POLAR_PROTECTED_EXEC_READY_FD"))
+    assert os.read(ready_fd, 1) == b"1"
+    os.close(ready_fd)
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.connect(os.environ.pop("POLAR_PROTECTED_EXEC_SOCKET"))
+    request_id = os.environ.pop("POLAR_PROTECTED_EXEC_REQUEST_ID")
+    connection.sendall(
+        json.dumps({"operation": "protected_child_ready", "id": request_id}).encode()
+        + b"\\n"
+    )
+    response = json.loads(connection.makefile("rb").readline())
+    connection.close()
+    return response["protected_env"]["TEST_SECRET"]
+""".lstrip()
+    )
+    forced_runner = tmp_path / "spilot_forced_route_eval_runner.py"
+    forced_runner.write_text(
+        """
+import spilot_router_runner as core
+
+print(core.MARKER + ":" + core.establish_secure_channel())
+""".lstrip()
+    )
+    socket_path = tmp_path / "protected.sock"
+    result_dir = tmp_path / "results"
+    monkeypatch.setattr(apptainer_broker, "_PROTECTED_PYTHON", sys.executable)
+    monkeypatch.setattr(apptainer_broker, "_SPILOT_RUNNER", str(core_runner))
+    monkeypatch.setattr(
+        apptainer_broker,
+        "_SPILOT_FORCED_RUNNER",
+        str(forced_runner),
+    )
+    server = apptainer_broker._BrokerServer(  # noqa: SLF001
+        str(socket_path),
+        result_dir,
+        base_environment={},
+        proxy=None,
+        proxy_url=None,
+        allow_internet=False,
+        protected_only=True,
+        runtime_socket_path=str(socket_path),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    request_id = "forced-sealed-runner-test"
+    secret = "delivered-to-forced-entrypoint"
+    try:
+        result = server.execute_protected(
+            {
+                "id": request_id,
+                "argv": [sys.executable, str(forced_runner)],
+                "env": {},
+                "protected_env": {"TEST_SECRET": secret},
+                "file_digests": {
+                    str(core_runner): hashlib.sha256(
+                        core_runner.read_bytes()
+                    ).hexdigest(),
+                    str(forced_runner): hashlib.sha256(
+                        forced_runner.read_bytes()
+                    ).hexdigest(),
+                },
+                "timeout_sec": 5,
+            }
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result == {"return_code": 0}
+    assert (result_dir / f"{request_id}.stdout").read_text().strip() == (
+        f"sealed-core-loaded:{secret}"
+    )
+
+
 def test_supervisor_cleans_residual_proxy_after_clean_broker_exit(tmp_path: Path) -> None:
     broker_source = tmp_path / "fake_broker.py"
     broker_source.write_text(

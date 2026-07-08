@@ -76,13 +76,14 @@ _F_SEAL_GROW = 0x0004
 _F_SEAL_WRITE = 0x0008
 _ALL_FILE_SEALS = _F_SEAL_SEAL | _F_SEAL_SHRINK | _F_SEAL_GROW | _F_SEAL_WRITE
 _FORCED_RUNNER_BOOTSTRAP = (
-    "import importlib.util,runpy,sys;"
-    "p='/proc/self/fd/'+sys.argv[1];"
-    "s=importlib.util.spec_from_file_location('spilot_router_runner',p);"
+    "import importlib.machinery,importlib.util,runpy,sys;"
+    "p='/proc/self/fd/'+sys.argv[2];"
+    "l=importlib.machinery.SourceFileLoader('spilot_router_runner',p);"
+    "s=importlib.util.spec_from_loader(l.name,l);"
     "m=importlib.util.module_from_spec(s);"
-    "sys.modules['spilot_router_runner']=m;"
-    "s.loader.exec_module(m);"
-    "runpy.run_path('/proc/self/fd/'+sys.argv[2],run_name='__main__')"
+    "sys.modules[l.name]=m;"
+    "l.exec_module(m);"
+    "runpy.run_path('/proc/self/fd/'+sys.argv[3],run_name='__main__')"
 )
 _PROTECTED_ENV_DENYLIST = frozenset(
     {

@@ -268,7 +268,7 @@ def _read_proc_table(proc_root: Path) -> dict[int, tuple[int, int, int]]:
             # fields 4/6/22 respectively.
             remainder = (entry / "stat").read_text().rsplit(")", 1)[1].split()
             processes[pid] = (int(remainder[1]), int(remainder[3]), int(remainder[19]))
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             # Processes can disappear at every point in a procfs walk.
             continue
         except (IndexError, OSError, ValueError) as exc:
@@ -288,7 +288,7 @@ def _engine_config_references_session(
 
     try:
         entries = (proc_root / str(pid) / "environ").read_bytes().split(b"\0")
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
     except OSError as exc:
         raise RuntimeContainmentError(
@@ -339,7 +339,7 @@ def _direct_broker_process_snapshot(
             try:
                 if (proc_root / str(pid)).stat().st_uid != os.getuid():
                     continue
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 continue
             except OSError as exc:
                 raise RuntimeContainmentError(
