@@ -17,9 +17,12 @@ _SPILOT_REFERENCE_DATA_DIR="${POLAR_DATA_ROOT}/runs/tmax-14598r-14498t100h-20260
 # changing the gateway pools would otherwise confound Router quality with a
 # rollout-throughput change.
 export NUM_NODES="${NUM_NODES:-8}"
-export PARTITION="${PARTITION:-backfill}"
-export WALL_TIME="${WALL_TIME:-2-00:00:00}"
-export TMAX_MIN_WALL_TIME="${TMAX_MIN_WALL_TIME:-2-00:00:00}"
+# Operator policy: no backfill. Run 4-hour batch chunks and let the
+# checkpoint-aware watcher resume; the graceful-exit buffer below must stay
+# well under one wall chunk.
+export PARTITION="${PARTITION:-batch}"
+export WALL_TIME="${WALL_TIME:-04:00:00}"
+export TMAX_MIN_WALL_TIME="${TMAX_MIN_WALL_TIME:-04:00:00}"
 export SLURM_GPUS="${SLURM_GPUS:-8}"
 export RAY_NUM_GPUS_PER_NODE="${RAY_NUM_GPUS_PER_NODE:-8}"
 export ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-2}"
@@ -198,8 +201,8 @@ fi
 export TMAX_TRAIN_AGENT_TIMEOUT_SECONDS="${TMAX_TRAIN_AGENT_TIMEOUT_SECONDS:-${_spilot_agent_timeout}}"
 export POLAR_TASK_TIMEOUT_FLOOR_SECONDS="${POLAR_TASK_TIMEOUT_FLOOR_SECONDS:-${_spilot_task_timeout}}"
 export POLAR_REQUEST_TIMEOUT="${POLAR_REQUEST_TIMEOUT:-${_spilot_request_timeout}}"
-export TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS:-43200}"
-export TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS:-43200}"
+export TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS:-1800}"
+export TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS:-1800}"
 unset _spilot_agent_timeout _spilot_task_timeout _spilot_request_timeout
 
 # Reuse the exact reference train ordering and held-out task set.  Router cards
