@@ -1755,6 +1755,11 @@ def serve(
         # Node.close then gets its separate dispatcher/runtime proof budget;
         # launcher teardown covers both phases plus a margin.
         timeout_graceful_shutdown=_GATEWAY_HTTP_DRAIN_TIMEOUT_SECONDS,
+        # Keep idle control-plane connections open much longer than the
+        # rollout client's keepalive_expiry (2 s). With both at the 5 s
+        # defaults, bursty dispatch reused sockets the server was closing at
+        # the same instant, surfacing as simultaneous httpx.ReadErrors.
+        timeout_keep_alive=75,
     )
     server = uvicorn.Server(config=config)
     captured_signals: list[int] = []
