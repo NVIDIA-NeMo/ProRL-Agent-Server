@@ -1144,7 +1144,9 @@ export TRAINING_COMPLETE_MARKER="${TRAINING_COMPLETE_MARKER:-${SAVE_DIR}/TRAININ
 export FINAL_EVAL_COMPLETE_MARKER="${FINAL_EVAL_COMPLETE_MARKER:-${SAVE_DIR}/FINAL_EVAL_COMPLETE}"
 export TMAX_RUN_STATE_FILE="${TMAX_RUN_STATE_FILE:-${POLAR_DATA_ROOT}/runs/tmax_slime_grpo/current_run.env}"
 export TMAX_SUBMIT_RECEIPT_FILE="${TMAX_SUBMIT_RECEIPT_FILE:-${POLAR_DATA_ROOT}/runs/${RUN_ID}/submit/last_submission.env}"
-export WANDB_PROJECT="${WANDB_PROJECT:-polar-tmax-grpo}"
+# All SPilot-repo experiments log to the shared SPilot project by default;
+# in-flight logical runs keep their serialized project from run state.
+export WANDB_PROJECT="${WANDB_PROJECT:-SPilot}"
 export WANDB_GROUP="${WANDB_GROUP:-tmax-mini-swe-qwen35-9b-full-async-8t24r}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
 export WANDB_ALWAYS_USE_TRAIN_STEP="${WANDB_ALWAYS_USE_TRAIN_STEP:-1}"
