@@ -23,6 +23,14 @@ export NUM_NODES="${NUM_NODES:-8}"
 export PARTITION="${PARTITION:-batch}"
 export WALL_TIME="${WALL_TIME:-04:00:00}"
 export TMAX_MIN_WALL_TIME="${TMAX_MIN_WALL_TIME:-04:00:00}"
+# Router rollouts hold GPUs at ~0% SM utilization while the frozen pool
+# executes on the remote endpoint and mini-SWE runs on CPU, which the
+# OccupiedIdleGPUsJobReaper otherwise kills mid-rollout (it cancelled chunks
+# 13663902/13671216). Declare the sanctioned exemption for the wall window.
+if [ -z "${TMAX_SBATCH_COMMENT:-}" ]; then
+    TMAX_SBATCH_COMMENT='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"240","reason":"remote-pool RL rollout","description":"SPilot router RL: GPUs idle in bursts while frozen-pool solves run on the remote NVIDIA endpoint"}}'
+fi
+export TMAX_SBATCH_COMMENT
 export SLURM_GPUS="${SLURM_GPUS:-8}"
 export RAY_NUM_GPUS_PER_NODE="${RAY_NUM_GPUS_PER_NODE:-8}"
 export ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-2}"

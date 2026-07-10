@@ -201,6 +201,14 @@ SBATCH_EXCLUDE_ARG=()
 if [ -n "${SLURM_EXCLUDE}" ]; then
     SBATCH_EXCLUDE_ARG=(--exclude="${SLURM_EXCLUDE}")
 fi
+# Cluster policy hooks (e.g. the OccupiedIdleGPUsJobReaper exemption JSON)
+# ride on the job comment. Rollout phases of pool-routed RL runs hold GPUs
+# at low utilization while remote model calls execute, so those runs must
+# declare an exemption window instead of being reaped mid-rollout.
+SBATCH_COMMENT_ARG=()
+if [ -n "${TMAX_SBATCH_COMMENT:-}" ]; then
+    SBATCH_COMMENT_ARG=(--comment="${TMAX_SBATCH_COMMENT}")
+fi
 
 SUBMIT_BACKEND="${SUBMIT_BACKEND:-srun}"
 if [ -n "${POLAR_SUBMIT_RECEIPT_FILE:-}" ] && [ "${SUBMIT_BACKEND}" != "sbatch" ]; then
@@ -335,6 +343,7 @@ JOB_ID=$(env \
     "${SBATCH_CONSTRAINT_ARG[@]}" \
     "${SBATCH_DEPENDENCY_ARG[@]}" \
     "${SBATCH_EXCLUDE_ARG[@]}" \
+    "${SBATCH_COMMENT_ARG[@]}" \
     --output="${LOG_DIR}/%x-%j.out" \
     --error="${LOG_DIR}/%x-%j.err" \
     --export="POLAR_TRAIN_ENV_FILE=${POLAR_TRAIN_ENV_FILE}" \
