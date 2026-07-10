@@ -27,8 +27,11 @@ export TMAX_MIN_WALL_TIME="${TMAX_MIN_WALL_TIME:-04:00:00}"
 # executes on the remote endpoint and mini-SWE runs on CPU, which the
 # OccupiedIdleGPUsJobReaper otherwise kills mid-rollout (it cancelled chunks
 # 13663902/13671216). Declare the sanctioned exemption for the wall window.
+# The reaper accepts only whitelisted reason values; free-form reasons are
+# rejected as "Invalid format" and the job stays flagged. Use the sanctioned
+# interactive reason verbatim (same as the operator's igpu helper).
 if [ -z "${TMAX_SBATCH_COMMENT:-}" ]; then
-    TMAX_SBATCH_COMMENT='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"240","reason":"remote-pool RL rollout","description":"SPilot router RL: GPUs idle in bursts while frozen-pool solves run on the remote NVIDIA endpoint"}}'
+    TMAX_SBATCH_COMMENT='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"240","reason":"interactive","description":"Interactive and debugging sessions"}}'
 fi
 export TMAX_SBATCH_COMMENT
 export SLURM_GPUS="${SLURM_GPUS:-8}"
