@@ -6,7 +6,10 @@
 set -euo pipefail
 umask 077
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+# sbatch copies the batch script into the Slurm spool directory, so a worker
+# resolving its own location would look for companion files (the checkpoint
+# validator) in the spool. The submitter therefore exports the real directory.
+SCRIPT_DIR="${TMAX_HF_EXPORT_SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)}"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 SPILOT_ROOT="$(cd -- "${PROJECT_ROOT}/../.." && pwd)"
 USER_ROOT="$(dirname "${SPILOT_ROOT}")"
@@ -283,6 +286,7 @@ slurm_export_values=(
     "MEGATRON_DIR=${MEGATRON_DIR}"
     "TMAX_HF_EXPORT_ORIGIN=${ORIGIN_HF_DIR}"
     "TMAX_HF_EXPORT_CHUNK_SIZE=${CHUNK_SIZE}"
+    "TMAX_HF_EXPORT_SCRIPT_DIR=${SCRIPT_DIR}"
 )
 for export_value in "${slurm_export_values[@]}"; do
     case "${export_value}" in
