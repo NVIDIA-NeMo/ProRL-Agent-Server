@@ -279,6 +279,46 @@ if [ -n "${SAVE_RETAIN_INTERVAL}" ]; then
         return 1 2>/dev/null || exit 1
     fi
 fi
+# Checkpoint formats. SAVE_HF_ENABLED=1 (default) writes an HF safetensors
+# export to ${SAVE_DIR}/hf/iter_XXXXXXX at every save interval, so evaluation
+# no longer needs export_hf_checkpoint.sh conversion jobs. SAVE_MEGATRON=0
+# drops the Megatron torch_dist checkpoint (fp32 optimizer state, ~10x the HF
+# export size); the run then cannot resume exactly after preemption or a
+# graceful-deadline exit, and the lifecycle watchers never see a checkpoint
+# tracker advance, so only disable it for runs that are disposable.
+# Default the HF export on only when the exporter can actually run: it copies
+# tokenizer/config assets from HF_CHECKPOINT, so a hub id (legacy run states)
+# must degrade to the pre-HF-export behaviour instead of failing the run.
+if [ -z "${SAVE_HF_ENABLED:-}" ]; then
+    if [ -d "${HF_CHECKPOINT}" ]; then
+        SAVE_HF_ENABLED=1
+    else
+        SAVE_HF_ENABLED=0
+        echo "[tmax env] WARNING: HF safetensors export disabled: HF_CHECKPOINT=${HF_CHECKPOINT} is not a local directory" >&2
+    fi
+fi
+export SAVE_HF_ENABLED
+export SAVE_MEGATRON="${SAVE_MEGATRON:-1}"
+case "${SAVE_HF_ENABLED}" in
+    0|1|true|false) ;;
+    *)
+        echo "ERROR: SAVE_HF_ENABLED must be 0/1/false/true, got ${SAVE_HF_ENABLED}" >&2
+        return 1 2>/dev/null || exit 1
+        ;;
+esac
+case "${SAVE_MEGATRON}" in
+    0|1|true|false) ;;
+    *)
+        echo "ERROR: SAVE_MEGATRON must be 0/1/false/true, got ${SAVE_MEGATRON}" >&2
+        return 1 2>/dev/null || exit 1
+        ;;
+esac
+case "${SAVE_MEGATRON}:${SAVE_HF_ENABLED}" in
+    0:0|0:false|false:0|false:false)
+        echo "ERROR: SAVE_MEGATRON=0 requires SAVE_HF_ENABLED=1, or nothing is saved at save time" >&2
+        return 1 2>/dev/null || exit 1
+        ;;
+esac
 export NUM_EPOCH="${NUM_EPOCH:-1}"
 # Optional absolute rollout-loop boundary. Slime treats --num-rollout as an
 # exclusive upper bound, so the matching final checkpoint/watcher target is

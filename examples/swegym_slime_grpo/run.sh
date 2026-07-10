@@ -1876,6 +1876,61 @@ SAVE_RETENTION_ARGS=()
 if [ -n "${SAVE_RETAIN_INTERVAL:-}" ]; then
     SAVE_RETENTION_ARGS+=(--save-retain-interval "${SAVE_RETAIN_INTERVAL}")
 fi
+# Checkpoint formats. The HuggingFace safetensors export is written at every
+# save so evaluation never needs a separate torch_dist->HF conversion job; the
+# Megatron torch_dist checkpoint additionally carries fp32 optimizer state
+# (roughly 10x the HF export) and is only required to resume training exactly.
+# The raw Megatron-to-HF exporter copies tokenizer/config assets from
+# HF_CHECKPOINT, so it needs a local snapshot directory rather than a hub id.
+SAVE_FORMAT_ARGS=()
+if [ -n "${SAVE_HF_ENABLED:-}" ]; then
+    SAVE_HF_EFFECTIVE="${SAVE_HF_ENABLED}"
+elif [ -d "${HF_CHECKPOINT}" ]; then
+    SAVE_HF_EFFECTIVE=1
+else
+    SAVE_HF_EFFECTIVE=0
+    echo "WARNING: HF safetensors export disabled: HF_CHECKPOINT=${HF_CHECKPOINT} is not a local directory" >&2
+fi
+case "${SAVE_HF_EFFECTIVE}" in
+    1|true)
+        if [ ! -d "${HF_CHECKPOINT}" ]; then
+            echo "ERROR: SAVE_HF_ENABLED=1 requires HF_CHECKPOINT to be a local directory, got ${HF_CHECKPOINT}" >&2
+            exit 1
+        fi
+        # A literal closing brace inside a ${VAR:-default} word terminates the
+        # expansion early, so assign the default template separately.
+        if [ -z "${SAVE_HF_TEMPLATE:-}" ]; then
+            SAVE_HF_TEMPLATE="${SAVE_DIR}/hf/iter_{rollout_id:07d}"
+        fi
+        # Qwen3.5 checkpoints are VLM containers trained text-only: the frozen
+        # vision/mtp tensors live only in the origin snapshot and must be
+        # copied in for the export to be loadable standalone.
+        SAVE_FORMAT_ARGS+=(--save-hf "${SAVE_HF_TEMPLATE}" --save-hf-add-missing-from-origin)
+        ;;
+    0|false) ;;
+    *)
+        echo "ERROR: SAVE_HF_ENABLED must be 0/1/false/true, got ${SAVE_HF_ENABLED}" >&2
+        exit 1
+        ;;
+esac
+case "${SAVE_MEGATRON:-1}" in
+    1|true) ;;
+    0|false)
+        case "${SAVE_HF_EFFECTIVE}" in
+            1|true) ;;
+            *)
+                echo "ERROR: SAVE_MEGATRON=0 requires the HF safetensors export to stay enabled, or nothing is saved" >&2
+                exit 1
+                ;;
+        esac
+        SAVE_FORMAT_ARGS+=(--no-save-megatron)
+        echo "WARNING: Megatron torch_dist checkpointing disabled (SAVE_MEGATRON=0); this run cannot resume exactly - a resubmitted allocation restarts from the seed checkpoint" >&2
+        ;;
+    *)
+        echo "ERROR: SAVE_MEGATRON must be 0/1/false/true, got ${SAVE_MEGATRON}" >&2
+        exit 1
+        ;;
+esac
 echo "=== Launching train_async.py (Ray submission ${RAY_JOB_SUBMISSION_ID}) ==="
 # The custom reward post-processor already computes prompt-local GRPO
 # advantages.  Slime's --normalize-advantages whitens them again across every
@@ -1902,6 +1957,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     --save "$SAVE_DIR" \
     --save-interval "${SAVE_INTERVAL:-10}" \
     "${SAVE_RETENTION_ARGS[@]}" \
+    "${SAVE_FORMAT_ARGS[@]}" \
     "${TRAINING_LIFECYCLE_ARGS[@]}" \
     --update-weights-interval 1 \
     --rollout-function-path slime_bridge.rollout.generate_rollout_polar_async \
