@@ -1,0 +1,132 @@
+# SPilot Router task template used by Slime's custom rollout bridge.
+polar_rollout_url: "${POLAR_ROLLOUT_URL}"
+polar_gateway_url: "${POLAR_GATEWAY_URL}"
+polar_reward_key: "score"
+polar_max_async_level: ${POLAR_MAX_ASYNC_LEVEL}
+polar_fully_async: ${POLAR_FULLY_ASYNC}
+polar_request_timeout: ${POLAR_REQUEST_TIMEOUT}
+polar_task_timeout_floor: ${POLAR_TASK_TIMEOUT_FLOOR_SECONDS}
+polar_train_agent_timeout: ${TMAX_TRAIN_AGENT_TIMEOUT_SECONDS}
+polar_eval_agent_timeout: ${TMAX_TRAIN_AGENT_TIMEOUT_SECONDS}
+polar_callback_host: "${POLAR_CALLBACK_HOST}"
+polar_min_complete_accept_fraction: ${POLAR_MIN_COMPLETE_ACCEPT_FRACTION}
+polar_early_stop_grace_sessions: ${POLAR_EARLY_STOP_GRACE_SESSIONS}
+polar_max_trajectory_tokens: ${TMAX_TRAIN_PACK_LENGTH}
+polar_allow_single_sample_over_token_cap: ${TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP}
+polar_agent_cli_dir: ${AGENT_CLI_DIR}
+polar_apptainer_image_dir: ${APPTAINER_IMAGE_DIR}
+
+polar_task_template:
+  timeout_seconds: "{sample.metadata.timeout_seconds}"
+  runtime:
+    backend: "apptainer"
+    image: "{sample.metadata.sif_path}"
+    network: "${POLAR_SANDBOX_NETWORK}"
+    allow_internet: "{sample.metadata.allow_internet}"
+    workdir: "{sample.metadata.workdir}"
+    direct_exec_init_command: >-
+      if [ -f /.singularity.d/env/99-rogue.sh ]; then
+        . /.singularity.d/env/99-rogue.sh;
+      fi
+    env:
+      HOME: "/polar/session/home"
+      PATH: "${POLAR_AGENT_PATH}"
+      OMP_NUM_THREADS: "${OMP_NUM_THREADS}"
+      OPENBLAS_NUM_THREADS: "${OPENBLAS_NUM_THREADS}"
+      MKL_NUM_THREADS: "${MKL_NUM_THREADS}"
+      NUMEXPR_NUM_THREADS: "${NUMEXPR_NUM_THREADS}"
+      TOKENIZERS_PARALLELISM: "${TOKENIZERS_PARALLELISM}"
+      POLAR_GATEWAY_UDS: "${POLAR_SANDBOX_GATEWAY_UDS}"
+      POLAR_HTTP_PROXY_UDS: "${POLAR_SANDBOX_HTTP_PROXY_UDS}"
+      POLAR_HTTP_PROXY_PORT: "${POLAR_SANDBOX_HTTP_PROXY_PORT}"
+      POLAR_APPTAINER_BROKER_PYTHON: "/opt/polar-mini-swe-agent/venv/bin/python"
+      POLAR_APT_HTTP_SOURCE_POLICY: "${POLAR_APT_HTTP_SOURCE_POLICY}"
+      http_proxy: "${http_proxy}"
+      https_proxy: "${https_proxy}"
+      HTTP_PROXY: "${HTTP_PROXY}"
+      HTTPS_PROXY: "${HTTPS_PROXY}"
+      no_proxy: "${no_proxy}"
+      NO_PROXY: "${NO_PROXY}"
+    kwargs:
+      volumes:
+        - "{args.polar_agent_cli_dir}:/opt/node:ro"
+        - "${POLAR_GATEWAY_UDS_DIR}:/polar/gateway:ro"
+${POLAR_AGENT_RUNTIME_VOLUME}
+${POLAR_INTERNET_RUNTIME_VOLUME}
+    prepare:
+      - type: exec
+        command: >-
+          mkdir -p /polar/session/home /polar/session/logs/agent &&
+          if command -v git >/dev/null 2>&1; then
+            git config --global core.pager '';
+          fi
+        max_attempts: 3
+        retry_backoff_seconds: 0.1
+  agent:
+    harness: "spilot_router"
+    model_name: "${POLAR_AGENT_MODEL_NAME}"
+    settings:
+      model_pool:
+        M0:
+          model: pool/qwen3.6-27b
+          card:
+            name: Qwen3.6-27B
+            provider: NVIDIA
+            role: efficient open-weight coding model
+          cost_weight: ${SPILOT_QWEN_COST_WEIGHT}
+          model_kwargs:
+            max_tokens: 16384
+            temperature: 1.0
+            top_p: 1.0
+            extra_body:
+              chat_template_kwargs:
+                enable_thinking: true
+        M1:
+          model: pool/gpt-5.5
+          card:
+            name: GPT-5.5
+            provider: NVIDIA
+            role: high-capability general coding model
+          cost_weight: ${SPILOT_GPT_COST_WEIGHT}
+          model_kwargs:
+            max_completion_tokens: 16384
+      max_pool_calls: 2
+      router_request_model: router/policy
+      shuffle_slots: true
+      shuffle_seed: 0
+      router_max_tokens: 192
+      router_timeout_seconds: 180
+      pool_timeout_seconds: 1200
+      pool_episode_admission_enabled: ${SPILOT_EPISODE_ADMISSION_ENABLED}
+      pool_episode_admission_wait_budget_seconds: ${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS}
+      total_timeout_seconds: 3000
+      reserve_evaluator_seconds: 300
+      deadline_margin_seconds: 5
+      pool_step_limit: 64
+      pool_cost_limit: 0
+      pool_command_timeout: 120
+      pool_max_format_errors: 64
+      pool_response_token_budget: 65536
+      pool_model_retry_attempts: 5
+      observation_max_chars: 10000
+      log_tail_chars: 6000
+      router_model_kwargs:
+        temperature: ${POLAR_AGENT_TEMPERATURE}
+        top_p: ${POLAR_AGENT_TOP_P}
+        extra_body:
+          chat_template_kwargs:
+            enable_thinking: false
+      pool_model_kwargs: {}
+  builder:
+    strategy: "router_policy"
+  evaluator:
+    strategy: "spilot_harbor"
+    refresh_runtime: false
+    config:
+      tests_dir: "{sample.metadata.tests_dir}"
+      verifier_timeout: "{sample.metadata.verifier_timeout}"
+      require_valid_action: true
+      cost_penalty_lambda: ${SPILOT_COST_PENALTY_LAMBDA}
+      cost_normalizer: ${SPILOT_COST_NORMALIZER}
+
+polar_task_id_template: "polar-spilot-router-{rollout_id}-{sample.group_index}"
