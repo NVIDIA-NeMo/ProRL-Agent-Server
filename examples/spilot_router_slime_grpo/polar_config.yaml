@@ -73,7 +73,7 @@ ${POLAR_INTERNET_RUNTIME_VOLUME}
             name: Qwen3.6-27B
             provider: NVIDIA
             role: efficient open-weight coding model
-          cost_weight: 1.0
+          cost_weight: ${SPILOT_QWEN_COST_WEIGHT}
           model_kwargs:
             max_tokens: 16384
             temperature: 1.0
@@ -87,7 +87,7 @@ ${POLAR_INTERNET_RUNTIME_VOLUME}
             name: GPT-5.5
             provider: NVIDIA
             role: high-capability general coding model
-          cost_weight: 1.0
+          cost_weight: ${SPILOT_GPT_COST_WEIGHT}
           model_kwargs:
             max_completion_tokens: 16384
       max_pool_calls: 2
@@ -126,7 +126,7 @@ ${POLAR_INTERNET_RUNTIME_VOLUME}
       tests_dir: "{sample.metadata.tests_dir}"
       verifier_timeout: "{sample.metadata.verifier_timeout}"
       require_valid_action: true
-      cost_penalty_lambda: 0.0
-      cost_normalizer: 1.0
+      cost_penalty_lambda: ${SPILOT_COST_PENALTY_LAMBDA}
+      cost_normalizer: ${SPILOT_COST_NORMALIZER}
 
 polar_task_id_template: "polar-spilot-router-{rollout_id}-{sample.group_index}"

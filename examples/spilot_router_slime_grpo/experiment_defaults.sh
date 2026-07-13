@@ -262,3 +262,11 @@ export POLAR_CONFIG_TEMPLATE="${POLAR_CONFIG_TEMPLATE:-${_SPILOT_ROUTER_DIR}/pol
 export TOPOLOGY_TEMPLATE="${TOPOLOGY_TEMPLATE:-${_SPILOT_ROUTER_DIR}/topology.yaml}"
 
 unset _SPILOT_ROUTER_DIR _SPILOT_PROJECT_ROOT _SPILOT_ROOT _SPILOT_REFERENCE_DATA_DIR
+
+# Per-model cost contract rendered into polar_config.yaml. Defaults preserve
+# the lambda=0 arm exactly; submit_lambda02.sh overrides for the cost-aware
+# arm and run state serializes whatever a logical run was started with.
+export SPILOT_QWEN_COST_WEIGHT="${SPILOT_QWEN_COST_WEIGHT:-1.0}"
+export SPILOT_GPT_COST_WEIGHT="${SPILOT_GPT_COST_WEIGHT:-1.0}"
+export SPILOT_COST_PENALTY_LAMBDA="${SPILOT_COST_PENALTY_LAMBDA:-0.0}"
+export SPILOT_COST_NORMALIZER="${SPILOT_COST_NORMALIZER:-1.0}"

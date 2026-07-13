@@ -19,7 +19,7 @@ export SPILOT_QWEN_COST_WEIGHT="${SPILOT_QWEN_COST_WEIGHT:-1.0}"
 export SPILOT_GPT_COST_WEIGHT="${SPILOT_GPT_COST_WEIGHT:-15.0}"
 export SPILOT_COST_PENALTY_LAMBDA="${SPILOT_COST_PENALTY_LAMBDA:-0.2}"
 export SPILOT_COST_NORMALIZER="${SPILOT_COST_NORMALIZER:-30.0}"
-export POLAR_CONFIG_TEMPLATE="${POLAR_CONFIG_TEMPLATE:-${SCRIPT_DIR}/polar_config_cost.yaml}"
+
 
 # Validated 4-node topology from the lambda=0 arm (TOPOLOGY_CHANGE_20260710):
 # learner 2x8 TP4/DP4 unchanged, 16 TP1 rollout engines, aggregate provider
