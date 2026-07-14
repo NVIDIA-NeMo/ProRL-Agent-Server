@@ -761,11 +761,38 @@ def scan_remote_rows(
     requested_keys = [axis_key, *metric_keys]
     rows: dict[int, dict[str, float | int]] = {}
     try:
-        history = remote_run.scan_history(
-            keys=requested_keys,
-            page_size=1_000,
-            use_cache=False,
-        )
+        try:
+            history = list(
+                remote_run.scan_history(
+                    keys=requested_keys,
+                    page_size=1_000,
+                    use_cache=False,
+                )
+            )
+        except Exception as scan_exc:
+            if "Step column '_step' not found in schema" not in str(scan_exc):
+                raise
+            axis_count = _remote_history_numeric_count(remote_run, axis_key)
+            history_method = getattr(remote_run, "history", None)
+            if axis_count is None or not callable(history_method):
+                raise BackfillError(
+                    "W&B scan_history rejected the run schema and Public API metadata "
+                    "cannot prove a complete sampled-history fallback"
+                ) from scan_exc
+            history = history_method(
+                keys=requested_keys,
+                samples=max(10_000, axis_count),
+                pandas=False,
+            )
+            history = [
+                row for row in history if row.get(axis_key) is not None
+            ]
+            if len(history) != axis_count:
+                raise BackfillError(
+                    "W&B sampled-history fallback is incomplete: "
+                    f"historyKeys reports {axis_count} {axis_key!r} values, "
+                    f"but history() returned {len(history)}"
+                )
         for raw_row in history:
             if axis_key not in raw_row or raw_row[axis_key] is None:
                 continue
@@ -812,6 +839,43 @@ def _remote_history_key_names(remote_run: Any) -> set[str] | None:
     if not isinstance(keys, Mapping):
         return None
     return {str(key) for key in keys}
+
+
+def _remote_history_numeric_count(remote_run: Any, key: str) -> int | None:
+    """Return an exact numeric history count when Public API metadata provides it."""
+
+    attrs = getattr(remote_run, "_attrs", None)
+    if not isinstance(attrs, Mapping):
+        return None
+    history_keys = attrs.get("historyKeys")
+    if not isinstance(history_keys, Mapping):
+        return None
+    keys = history_keys.get("keys")
+    if not isinstance(keys, Mapping):
+        return None
+    metadata = keys.get(key)
+    if not isinstance(metadata, Mapping):
+        return None
+    type_counts = metadata.get("typeCounts")
+    if not isinstance(type_counts, Sequence) or isinstance(type_counts, (str, bytes)):
+        return None
+    numeric_count = 0
+    found_numeric = False
+    for item in type_counts:
+        if not isinstance(item, Mapping) or item.get("type") != "number":
+            continue
+        raw_count = item.get("count")
+        if isinstance(raw_count, bool):
+            return None
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if count < 0 or raw_count != count:
+            return None
+        numeric_count += count
+        found_numeric = True
+    return numeric_count if found_numeric else None
 
 
 def _metric_keys(rows: Sequence[Mapping[str, float | int]], *, axis_key: str) -> list[str]:

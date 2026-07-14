@@ -369,6 +369,28 @@ class _RemoteRunWithHistoryKeys(_RemoteRun):
         }
 
 
+class _RemoteRunWithHistoryFallback(_RemoteRun):
+    def __init__(self, rows, *, axis_count):
+        super().__init__(rows=rows)
+        self._attrs = {
+            "historyKeys": {
+                "keys": {
+                    "postrun_v1/rollout_step": {
+                        "typeCounts": [{"type": "number", "count": axis_count}]
+                    }
+                }
+            }
+        }
+        self.history_kwargs = None
+
+    def scan_history(self, **_kwargs):
+        raise RuntimeError("Step column '_step' not found in schema")
+
+    def history(self, **kwargs):
+        self.history_kwargs = kwargs
+        return list(self._rows)
+
+
 class _Api:
     def __init__(self, run):
         self._run = run
@@ -459,6 +481,40 @@ def test_scan_remote_rows_rejects_partial_and_duplicate_axis_rows() -> None:
             axis_key=axis,
             metric_keys=metric_keys,
         )
+
+
+@pytest.mark.unit
+def test_scan_remote_rows_uses_count_checked_history_fallback() -> None:
+    axis = "postrun_v1/rollout_step"
+    metric = "postrun_v1/value"
+    source = _RemoteRunWithHistoryFallback(
+        [{axis: 0, metric: 1.0}, {axis: 1, metric: 2.0}],
+        axis_count=2,
+    )
+
+    assert backfill.scan_remote_rows(
+        source,
+        axis_key=axis,
+        metric_keys=[metric],
+    ) == {
+        0: {axis: 0, metric: 1.0},
+        1: {axis: 1, metric: 2.0},
+    }
+    assert source.history_kwargs == {
+        "keys": [axis, metric],
+        "samples": 10_000,
+        "pandas": False,
+    }
+
+
+@pytest.mark.unit
+def test_scan_remote_rows_rejects_incomplete_history_fallback() -> None:
+    axis = "postrun_v1/rollout_step"
+    metric = "postrun_v1/value"
+    source = _RemoteRunWithHistoryFallback([{axis: 0, metric: 1.0}], axis_count=2)
+
+    with pytest.raises(backfill.BackfillError, match="fallback is incomplete"):
+        backfill.scan_remote_rows(source, axis_key=axis, metric_keys=[metric])
 
 
 @pytest.mark.unit
