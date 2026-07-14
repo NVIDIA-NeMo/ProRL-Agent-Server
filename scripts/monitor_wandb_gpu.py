@@ -36,6 +36,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT_DIR = ROOT / "tmp" / "gpu_monitor"
 QUERY = "timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw"
+NVIDIA_SMI_WARNING_INTERVAL_S = 60.0
 CSV_FIELDS = [
     "sample_time",
     "timestamp",
@@ -176,13 +177,25 @@ def main(argv: list[str] | None = None) -> int:
     start_monotonic = time.monotonic()
     sample_index = 0
     train_step = 0
+    next_nvidia_smi_warning = 0.0
     with csv_path.open("a", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
         if fh.tell() == 0:
             writer.writeheader()
 
         while not stop:
-            rows = _sample_nvidia_smi()
+            try:
+                rows = _sample_nvidia_smi()
+            except (subprocess.TimeoutExpired, RuntimeError) as exc:
+                now = time.monotonic()
+                if now >= next_nvidia_smi_warning:
+                    print(
+                        f"warning: nvidia-smi sampling failed ({exc}); retrying",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    next_nvidia_smi_warning = now + NVIDIA_SMI_WARNING_INTERVAL_S
+                rows = []
             wall_time_unix_s = time.time()
             train_step = _read_train_step(train_progress_file, default=train_step)
             for row in rows:

@@ -89,6 +89,10 @@ _BROKER_READ_CHUNK_BYTES = 64 * 1024
 _PROC_ROOT = Path("/proc")
 _DIRECT_BROKER_TERM_GRACE_SEC = 0.25
 _DIRECT_BROKER_KILL_TIMEOUT_SEC = 2.0
+_DIRECT_BROKER_CLEANUP_TIMEOUT_ENV = "POLAR_APPTAINER_BROKER_CLEANUP_TIMEOUT_SEC"
+_DEFAULT_DIRECT_BROKER_CLEANUP_TIMEOUT_SEC = 15.0
+_MIN_DIRECT_BROKER_CLEANUP_TIMEOUT_SEC = 1.0
+_MAX_DIRECT_BROKER_CLEANUP_TIMEOUT_SEC = 60.0
 _DIRECT_BROKER_CLEANUP_POLL_SEC = 0.05
 _DIRECT_BROKER_STABLE_EMPTY_PROBES = 2
 
@@ -176,6 +180,17 @@ def _bounded_env_float(
         )
         return default
     return parsed
+
+
+def _direct_broker_cleanup_timeout_seconds() -> float:
+    """Return the bounded final containment-proof window."""
+
+    return _bounded_env_float(
+        _DIRECT_BROKER_CLEANUP_TIMEOUT_ENV,
+        _DEFAULT_DIRECT_BROKER_CLEANUP_TIMEOUT_SEC,
+        minimum=_MIN_DIRECT_BROKER_CLEANUP_TIMEOUT_SEC,
+        maximum=_MAX_DIRECT_BROKER_CLEANUP_TIMEOUT_SEC,
+    )
 
 
 def _broker_start_gate() -> asyncio.Semaphore:
@@ -1046,8 +1061,11 @@ class ApptainerRuntime(BaseRuntime):
         proc_root: Path = _PROC_ROOT,
         term_grace_seconds: float = _DIRECT_BROKER_TERM_GRACE_SEC,
         kill_timeout_seconds: float = _DIRECT_BROKER_KILL_TIMEOUT_SEC,
+        cleanup_timeout_seconds: float | None = None,
         known_sessions: set[int] | None = None,
     ) -> None:
+        if cleanup_timeout_seconds is None:
+            cleanup_timeout_seconds = _direct_broker_cleanup_timeout_seconds()
         runtime_sessions, processes = _direct_broker_process_snapshot(
             self.session_dir,
             proc_root=proc_root,
@@ -1097,7 +1115,7 @@ class ApptainerRuntime(BaseRuntime):
         stable_empty = 0
         proof_deadline = time.monotonic() + max(
             _DIRECT_BROKER_CLEANUP_POLL_SEC,
-            kill_timeout_seconds,
+            cleanup_timeout_seconds,
         )
         while stable_empty < _DIRECT_BROKER_STABLE_EMPTY_PROBES:
             runtime_sessions, residual = _direct_broker_process_snapshot(

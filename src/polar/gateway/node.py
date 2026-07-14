@@ -1737,21 +1737,40 @@ class GatewayNodeManager:
         session_id: str,
         label: str,
     ) -> bool:
-        try:
-            await runtime.stop()
-            if not runtime.destroyed:
-                raise RuntimeContainmentError(
-                    f"{label} stop returned without destruction proof"
+        for attempt in range(2):
+            try:
+                await runtime.stop()
+                if not runtime.destroyed:
+                    raise RuntimeContainmentError(
+                        f"{label} stop returned without destruction proof"
+                    )
+                return True
+            except RuntimeContainmentError as exc:
+                if attempt == 0:
+                    logger.warning(
+                        "Containment proof failed while stopping %s for session %s; "
+                        "retrying once: %s",
+                        label,
+                        session_id,
+                        exc,
+                    )
+                    continue
+                logger.warning(
+                    "Failed to stop %s for session %s after one containment retry",
+                    label,
+                    session_id,
+                    exc_info=True,
                 )
-            return True
-        except Exception:
-            logger.warning(
-                "Failed to stop %s for session %s",
-                label,
-                session_id,
-                exc_info=True,
-            )
-            return False
+                return False
+            except Exception:
+                logger.warning(
+                    "Failed to stop %s for session %s",
+                    label,
+                    session_id,
+                    exc_info=True,
+                )
+                return False
+        return False
 
     async def _remove_session_dir_best_effort(
         self,

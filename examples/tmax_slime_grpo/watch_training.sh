@@ -501,8 +501,9 @@ account_terminal_job() {
         progressed=true
     fi
 
-    if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ] && \
-       [ "${SPILOT_EPISODE_ADMISSION_ENABLED:-false}" = "true" ]; then
+    # Runtime-containment fatal markers remain authoritative after admission
+    # has been disabled to quiesce a draining or incident-affected allocation.
+    if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ]; then
         marker_summary="$(spilot_admission_fatal_marker_status "$id")" || marker_status=$?
     else
         marker_status=1

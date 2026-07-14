@@ -1,6 +1,7 @@
 from argparse import Namespace
 import importlib.util
 from pathlib import Path
+import subprocess
 import threading
 
 import pytest
@@ -211,6 +212,92 @@ def test_read_train_step_is_monotonic_and_tolerates_partial_file(tmp_path):
     assert monitor_wandb_gpu._read_train_step(progress, default=8) == 8
     progress.write_text("2\n")
     assert monitor_wandb_gpu._read_train_step(progress, default=8) == 8
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "failure",
+    [
+        subprocess.TimeoutExpired(cmd="nvidia-smi", timeout=10.0),
+        subprocess.CompletedProcess(
+            args=["nvidia-smi"],
+            returncode=9,
+            stdout="",
+            stderr="driver busy",
+        ),
+    ],
+    ids=["timeout", "nonzero-exit"],
+)
+def test_gpu_monitor_retries_transient_nvidia_smi_failures(failure, tmp_path, monkeypatch, capsys):
+    successful = subprocess.CompletedProcess(
+        args=["nvidia-smi"],
+        returncode=0,
+        stdout="2026/07/14 02:00:00.000, 0, 75, 20, 2048, 81920, 350\n",
+        stderr="",
+    )
+    results = iter([failure, successful])
+
+    def run(*_args, **_kwargs):
+        result = next(results)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(
+        monitor_wandb_gpu.shutil,
+        "which",
+        lambda _name: "/usr/bin/nvidia-smi",
+    )
+    monkeypatch.setattr(monitor_wandb_gpu.subprocess, "run", run)
+    monkeypatch.setattr(monitor_wandb_gpu.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(monitor_wandb_gpu, "_sleep_interruptibly", lambda *_args: None)
+    csv_path = tmp_path / "gpu.csv"
+
+    result = monitor_wandb_gpu.main(
+        [
+            "--samples",
+            "2",
+            "--interval-s",
+            "0.01",
+            "--out-csv",
+            str(csv_path),
+            "--no-wandb",
+        ]
+    )
+
+    assert result == 0
+    assert "nvidia-smi sampling failed" in capsys.readouterr().err
+    assert "2026/07/14 02:00:00.000,0,75.0" in csv_path.read_text()
+
+
+@pytest.mark.unit
+def test_gpu_monitor_rate_limits_repeated_nvidia_smi_warnings(tmp_path, monkeypatch, capsys):
+    def timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd="nvidia-smi", timeout=10.0)
+
+    monkeypatch.setattr(
+        monitor_wandb_gpu.shutil,
+        "which",
+        lambda _name: "/usr/bin/nvidia-smi",
+    )
+    monkeypatch.setattr(monitor_wandb_gpu.subprocess, "run", timeout)
+    monkeypatch.setattr(monitor_wandb_gpu.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(monitor_wandb_gpu, "_sleep_interruptibly", lambda *_args: None)
+
+    result = monitor_wandb_gpu.main(
+        [
+            "--samples",
+            "3",
+            "--interval-s",
+            "0.01",
+            "--out-csv",
+            str(tmp_path / "gpu.csv"),
+            "--no-wandb",
+        ]
+    )
+
+    assert result == 0
+    assert capsys.readouterr().err.count("nvidia-smi sampling failed") == 1
 
 
 @pytest.mark.unit

@@ -36,6 +36,7 @@ def _runtime(
         "POLAR_APPTAINER_ISOLATE_PID",
         "POLAR_APPTAINER_ISOLATE_IPC",
         "POLAR_APPTAINER_PERSISTENT_BROKER",
+        "POLAR_APPTAINER_BROKER_CLEANUP_TIMEOUT_SEC",
     ):
         monkeypatch.delenv(name, raising=False)
     if direct:
@@ -87,6 +88,26 @@ def _write_fake_proc_process(
     remainder.append(str(start_time))
     (process_dir / "stat").write_text(f"{pid} (runtime parent) {' '.join(remainder)}\n")
     (process_dir / "environ").write_bytes(environ)
+
+
+def test_direct_broker_cleanup_timeout_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_name = "POLAR_APPTAINER_BROKER_CLEANUP_TIMEOUT_SEC"
+    monkeypatch.delenv(env_name, raising=False)
+    assert apptainer._direct_broker_cleanup_timeout_seconds() == 15.0  # noqa: SLF001
+
+    for valid, expected in (("1", 1.0), ("7.5", 7.5), ("60", 60.0)):
+        monkeypatch.setenv(env_name, valid)
+        assert (  # noqa: SLF001
+            apptainer._direct_broker_cleanup_timeout_seconds() == expected
+        )
+
+    for invalid in ("0", "0.99", "60.01", "nan", "inf", "not-a-number"):
+        monkeypatch.setenv(env_name, invalid)
+        assert (  # noqa: SLF001
+            apptainer._direct_broker_cleanup_timeout_seconds() == 15.0
+        )
 
 
 def test_broker_rpc_concurrency_is_independent_of_blocked_default_executor(

@@ -107,6 +107,71 @@ async def test_node_close_propagates_dispatcher_containment_failure() -> None:
     manager._client.aclose.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_stop_runtime_retries_one_containment_failure(tmp_path: Path) -> None:
+    class Runtime(_PostrunRuntime):
+        stop_attempts = 0
+
+        async def stop(self) -> None:
+            self.stop_attempts += 1
+            if self.stop_attempts == 1:
+                raise RuntimeContainmentError("synthetic delayed containment proof")
+            self._destroyed = True  # noqa: SLF001
+
+    manager = object.__new__(GatewayNodeManager)
+    runtime = Runtime(RuntimeSpec(image="task.sif"), "session-retry", tmp_path)
+
+    assert await manager._stop_runtime_best_effort(  # noqa: SLF001
+        runtime,
+        "session-retry",
+        "runtime",
+    )
+    assert runtime.stop_attempts == 2
+    assert runtime.destroyed
+
+
+@pytest.mark.asyncio
+async def test_stop_runtime_bounds_containment_retry_to_one(tmp_path: Path) -> None:
+    class Runtime(_PostrunRuntime):
+        stop_attempts = 0
+
+        async def stop(self) -> None:
+            self.stop_attempts += 1
+            raise RuntimeContainmentError("synthetic persistent containment failure")
+
+    manager = object.__new__(GatewayNodeManager)
+    runtime = Runtime(RuntimeSpec(image="task.sif"), "session-failure", tmp_path)
+
+    assert not await manager._stop_runtime_best_effort(  # noqa: SLF001
+        runtime,
+        "session-failure",
+        "runtime",
+    )
+    assert runtime.stop_attempts == 2
+    assert not runtime.destroyed
+
+
+@pytest.mark.asyncio
+async def test_stop_runtime_does_not_retry_other_failures(tmp_path: Path) -> None:
+    class Runtime(_PostrunRuntime):
+        stop_attempts = 0
+
+        async def stop(self) -> None:
+            self.stop_attempts += 1
+            raise RuntimeError("synthetic non-containment failure")
+
+    manager = object.__new__(GatewayNodeManager)
+    runtime = Runtime(RuntimeSpec(image="task.sif"), "session-error", tmp_path)
+
+    assert not await manager._stop_runtime_best_effort(  # noqa: SLF001
+        runtime,
+        "session-error",
+        "runtime",
+    )
+    assert runtime.stop_attempts == 1
+    assert not runtime.destroyed
+
+
 def test_fatal_containment_result_is_error_and_fully_masked() -> None:
     result = SessionResult(
         session_id="session-fatal-mask",

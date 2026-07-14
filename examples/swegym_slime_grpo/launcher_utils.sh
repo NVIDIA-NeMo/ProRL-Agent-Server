@@ -190,12 +190,12 @@ polar_spilot_admission_fatal_marker_path() {
 }
 
 polar_check_spilot_admission_health() {
-    # A retained episode lease means a candidate process may still be alive.
-    # Only the gateway can make that determination, so this monitor reacts to
-    # its explicit structured 503 rather than treating transient HTTP errors
-    # or unrelated unhealthy upstreams as retained-process events.
+    # A fatal runtime-containment failure means a candidate process may still
+    # be alive, regardless of whether new episode admission is enabled. Only
+    # the gateway can make that determination, so this monitor reacts to its
+    # explicit structured 503 rather than treating transient HTTP errors or
+    # unrelated unhealthy upstreams as retained-process events.
     [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ] || return 0
-    [ "${SPILOT_EPISODE_ADMISSION_ENABLED:-false}" = "true" ] || return 0
 
     local health_url="${POLAR_GATEWAY_LOCAL_URL:-}/health"
     local health_file marker_path http_code parser_output parser_status

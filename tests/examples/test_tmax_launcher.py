@@ -2367,8 +2367,10 @@ printf '%s|%s/%s/%s\n' \
     assert run_bash(script).stdout.splitlines()[-1] == "1|96/576/384"
 
 
+@pytest.mark.parametrize("admission_enabled", ["true", "false"])
 def test_spilot_gateway_health_monitor_writes_sanitized_job_marker(
     tmp_path: Path,
+    admission_enabled: str,
 ) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -2403,7 +2405,7 @@ printf '%s' "$FAKE_HEALTH_STATUS"
     env.update(
         PATH=f"{bin_dir}:{env['PATH']}",
         TMAX_AGENT_HARNESS="spilot_router",
-        SPILOT_EPISODE_ADMISSION_ENABLED="true",
+        SPILOT_EPISODE_ADMISSION_ENABLED=admission_enabled,
         POLAR_GATEWAY_LOCAL_URL="http://127.0.0.1:18100",
         RUN_DIR=str(run_dir),
         PYTHON_BIN=sys.executable,
@@ -3334,6 +3336,13 @@ def enabled_spilot_watcher_env(tmp_path: Path, bin_dir: Path) -> dict[str, str]:
         if "=" in item:
             name, value = item.split("=", 1)
             env[name] = value
+    # Give admission-enabled watcher tests a self-consistent resumable wall
+    # contract so they reach terminal-job accounting rather than preflight.
+    env.update(
+        PARTITION="backfill",
+        TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="40800",
+        WALL_TIME="1-00:00:00",
+    )
     env["POLAR_NVIDIA_API_KEY"] = "test-model-pool-key"
     return env
 
@@ -3822,8 +3831,10 @@ printf 'export POLAR_SUBMITTED_JOB_ID=333\\nexport POLAR_SUBMITTED_AT_UNIX=12345
     assert submit_called.exists()
 
 
+@pytest.mark.parametrize("admission_enabled", ["true", "false"])
 def test_watcher_relaunches_quick_spilot_retained_fatal_and_counts_run_metric(
     tmp_path: Path,
+    admission_enabled: str,
 ) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -3847,10 +3858,17 @@ exec /bin/bash "$@"
     env.update(
         TMAX_LAST_JOB_ID="101",
         TMAX_LAST_JOB_CHECKPOINT_ITER="-1",
+        SPILOT_EPISODE_ADMISSION_ENABLED=admission_enabled,
         EXPECTED_SUBMIT_SCRIPT=str(SPILOT / "submit_slurm.sh"),
         SUBMIT_CALLED=str(submit_called),
         SACCT_RECORD="101|FAILED|120|70:0|",
     )
+    if admission_enabled == "false":
+        env.update(
+            SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS="0",
+            SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES="null",
+            SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES="null",
+        )
     state_file = Path(env["TMAX_RUN_STATE_FILE"])
     write_spilot_admission_fatal_marker(state_file, job_id="101", rank=3)
 
