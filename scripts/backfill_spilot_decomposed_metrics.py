@@ -1016,10 +1016,19 @@ def commit_rows(
     expected_keys_by_step = _expected_keys_by_step(rows, axis_key=axis_key)
     known_history_keys = _remote_history_key_names(remote_run)
     if known_history_keys is not None and axis_key not in known_history_keys:
+        orphaned_namespace_keys = sorted(
+            key for key in known_history_keys if key.startswith(f"{metric_prefix}/")
+        )
+        if orphaned_namespace_keys:
+            raise BackfillError(
+                f"remote metric namespace {metric_prefix!r} has keys but no "
+                f"business axis {axis_key!r}: {orphaned_namespace_keys!r}"
+            )
         # W&B currently raises "Step column '_step' not found in schema" when
         # scan_history selects an entirely new metric namespace.  A freshly
-        # loaded Public API historyKeys map can prove that the namespace is
-        # absent without weakening validation once its business axis exists.
+        # loaded Public API historyKeys map can prove that the *entire*
+        # namespace is absent without weakening validation once any key from
+        # that namespace exists.
         existing = {}
     else:
         existing = scan_remote_rows(

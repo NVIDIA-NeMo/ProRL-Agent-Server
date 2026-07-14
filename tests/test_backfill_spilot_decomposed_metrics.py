@@ -520,6 +520,109 @@ def test_commit_skips_broken_scan_for_authoritatively_new_namespace(
 
 
 @pytest.mark.unit
+def test_commit_rejects_orphaned_namespace_without_axis(monkeypatch, tmp_path: Path) -> None:
+    axis = "postrun_v1/rollout_step"
+    row = {axis: 0, "postrun_v1/accuracy_outcome": 0.75}
+    api = _Api(_RemoteRunWithHistoryKeys(history_keys=["postrun_v1/reward_shaped"]))
+
+    class _CommitWandb:
+        @staticmethod
+        def Api():
+            return api
+
+    monkeypatch.setenv("WANDB_API_KEY", "test-only")
+    monkeypatch.setattr(backfill, "_assert_progress_unchanged", lambda *_args: None)
+
+    with pytest.raises(backfill.BackfillError, match="has keys but no business axis"):
+        backfill.commit_rows(
+            [row],
+            checkpoint_root=tmp_path,
+            completed_step=0,
+            entity="hwinf_dcm",
+            project="SPilot",
+            run_id="run-id",
+            metric_prefix="postrun_v1",
+            wandb_dir=None,
+            readback_timeout_s=1.0,
+            readback_interval_s=0.01,
+            wandb_module=_CommitWandb(),
+        )
+
+
+@pytest.mark.unit
+def test_commit_without_history_metadata_still_scans_existing_rows(
+    monkeypatch, tmp_path: Path
+) -> None:
+    axis = "postrun_v1/rollout_step"
+    row = {axis: 0, "postrun_v1/accuracy_outcome": 0.75}
+    api = _Api(_RemoteRun(rows=[row]))
+
+    class _CommitWandb:
+        @staticmethod
+        def Api():
+            return api
+
+    monkeypatch.setenv("WANDB_API_KEY", "test-only")
+    monkeypatch.setattr(
+        backfill,
+        "append_missing_rows",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an existing exact row must not be appended again")
+        ),
+    )
+    monkeypatch.setattr(backfill, "wait_for_readback", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backfill, "_assert_progress_unchanged", lambda *_args: None)
+
+    written = backfill.commit_rows(
+        [row],
+        checkpoint_root=tmp_path,
+        completed_step=0,
+        entity="hwinf_dcm",
+        project="SPilot",
+        run_id="run-id",
+        metric_prefix="postrun_v1",
+        wandb_dir=None,
+        readback_timeout_s=1.0,
+        readback_interval_s=0.01,
+        wandb_module=_CommitWandb(),
+    )
+
+    assert written == 0
+
+
+@pytest.mark.unit
+def test_commit_with_known_axis_keeps_partial_row_validation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    axis = "postrun_v1/rollout_step"
+    row = {axis: 0, "postrun_v1/accuracy_outcome": 0.75}
+    api = _Api(_RemoteRunWithHistoryKeys(rows=[{axis: 0}], history_keys=[axis]))
+
+    class _CommitWandb:
+        @staticmethod
+        def Api():
+            return api
+
+    monkeypatch.setenv("WANDB_API_KEY", "test-only")
+    monkeypatch.setattr(backfill, "_assert_progress_unchanged", lambda *_args: None)
+
+    with pytest.raises(backfill.BackfillError, match="partial"):
+        backfill.commit_rows(
+            [row],
+            checkpoint_root=tmp_path,
+            completed_step=0,
+            entity="hwinf_dcm",
+            project="SPilot",
+            run_id="run-id",
+            metric_prefix="postrun_v1",
+            wandb_dir=None,
+            readback_timeout_s=1.0,
+            readback_interval_s=0.01,
+            wandb_module=_CommitWandb(),
+        )
+
+
+@pytest.mark.unit
 def test_remote_readback_supports_legitimate_optional_candidate_mean() -> None:
     axis = "postrun_v1/rollout_step"
     count = "postrun_v1/accuracy_outcome_candidate_c1_accounted_session_count"
