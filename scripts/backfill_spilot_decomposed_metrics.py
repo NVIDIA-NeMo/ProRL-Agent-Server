@@ -779,13 +779,43 @@ def scan_remote_rows(
                     "W&B scan_history rejected the run schema and Public API metadata "
                     "cannot prove a complete sampled-history fallback"
                 ) from scan_exc
-            history = history_method(
-                keys=requested_keys,
-                samples=max(10_000, axis_count),
-                pandas=False,
+            if expected_keys_by_step is not None:
+                if axis_count != len(expected_keys_by_step):
+                    raise BackfillError(
+                        f"remote {axis_key} count {axis_count} does not match "
+                        f"the {len(expected_keys_by_step)} expected rows"
+                    )
+                for key in metric_keys:
+                    expected_count = sum(
+                        key in expected_keys for expected_keys in expected_keys_by_step.values()
+                    )
+                    observed_count = _remote_history_numeric_count(remote_run, key)
+                    if observed_count != expected_count:
+                        raise BackfillError(
+                            f"remote {key} numeric count {observed_count!r} does not match "
+                            f"the expected count {expected_count}"
+                        )
+            sampled_history = list(
+                history_method(
+                    keys=requested_keys,
+                    samples=max(10_000, axis_count + 1),
+                    x_axis="_step",
+                    pandas=False,
+                )
             )
+            orphaned_rows = [
+                row
+                for row in sampled_history
+                if row.get(axis_key) is None
+                and any(row.get(key) is not None for key in metric_keys)
+            ]
+            if orphaned_rows:
+                raise BackfillError(
+                    f"W&B sampled-history fallback found {len(orphaned_rows)} metric rows "
+                    f"without business axis {axis_key!r}"
+                )
             history = [
-                row for row in history if row.get(axis_key) is not None
+                row for row in sampled_history if row.get(axis_key) is not None
             ]
             if len(history) != axis_count:
                 raise BackfillError(
@@ -1027,6 +1057,9 @@ def wait_for_readback(
     while True:
         try:
             remote_run = api.run(f"{entity}/{project}/{run_id}")
+            load = getattr(remote_run, "load", None)
+            if callable(load):
+                load(force=True)
             remote_rows = scan_remote_rows(
                 remote_run,
                 axis_key=axis_key,

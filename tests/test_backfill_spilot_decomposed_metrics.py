@@ -503,6 +503,7 @@ def test_scan_remote_rows_uses_count_checked_history_fallback() -> None:
     assert source.history_kwargs == {
         "keys": [axis, metric],
         "samples": 10_000,
+        "x_axis": "_step",
         "pandas": False,
     }
 
@@ -515,6 +516,37 @@ def test_scan_remote_rows_rejects_incomplete_history_fallback() -> None:
 
     with pytest.raises(backfill.BackfillError, match="fallback is incomplete"):
         backfill.scan_remote_rows(source, axis_key=axis, metric_keys=[metric])
+
+
+@pytest.mark.unit
+def test_scan_remote_rows_rejects_orphaned_metric_fallback_row() -> None:
+    axis = "postrun_v1/rollout_step"
+    metric = "postrun_v1/value"
+    source = _RemoteRunWithHistoryFallback(
+        [{axis: 0, metric: 1.0}, {metric: 9.0}],
+        axis_count=1,
+    )
+
+    with pytest.raises(backfill.BackfillError, match="without business axis"):
+        backfill.scan_remote_rows(source, axis_key=axis, metric_keys=[metric])
+
+
+@pytest.mark.unit
+def test_scan_remote_rows_checks_fallback_metric_counts() -> None:
+    axis = "postrun_v1/rollout_step"
+    metric = "postrun_v1/value"
+    source = _RemoteRunWithHistoryFallback([{axis: 0, metric: 1.0}], axis_count=1)
+    source._attrs["historyKeys"]["keys"][metric] = {
+        "typeCounts": [{"type": "number", "count": 2}]
+    }
+
+    with pytest.raises(backfill.BackfillError, match="does not match the expected count"):
+        backfill.scan_remote_rows(
+            source,
+            axis_key=axis,
+            metric_keys=[metric],
+            expected_keys_by_step={0: {metric}},
+        )
 
 
 @pytest.mark.unit
@@ -790,3 +822,35 @@ def test_readback_requires_every_exact_row() -> None:
         sleep=lambda _seconds: None,
     )
     assert api.paths == ["hwinf_dcm/SPilot/run-id"]
+
+
+@pytest.mark.unit
+def test_readback_refreshes_cached_remote_metadata() -> None:
+    axis = "postrun_v1/rollout_step"
+    metric = "postrun_v1/accuracy_outcome"
+    row = {axis: 0, metric: 0.75}
+
+    class _RefreshableRemoteRun(_RemoteRun):
+        def __init__(self):
+            super().__init__(rows=[row])
+            self.loads = []
+
+        def load(self, *, force):
+            self.loads.append(force)
+            return self
+
+    remote = _RefreshableRemoteRun()
+    backfill.wait_for_readback(
+        _Api(remote),
+        [row],
+        entity="hwinf_dcm",
+        project="SPilot",
+        run_id="run-id",
+        axis_key=axis,
+        metric_keys=[metric],
+        timeout_s=1.0,
+        interval_s=0.01,
+        sleep=lambda _seconds: None,
+    )
+
+    assert remote.loads == [True]
