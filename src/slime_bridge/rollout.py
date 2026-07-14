@@ -23,6 +23,7 @@ import statistics
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,9 @@ from slime_bridge.partial_rollout import (
 
 logger = logging.getLogger(__name__)
 
+_WEIGHT_UPDATE_GATEWAY_STATE_LOCK = threading.Lock()
+_WEIGHT_UPDATE_PAUSED_GATEWAYS: tuple[str, ...] = ()
+
 
 def _control_plane_headers() -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
@@ -65,6 +69,152 @@ def _control_plane_headers() -> dict[str, str]:
     if token:
         headers["X-Polar-Control-Token"] = token
     return headers
+
+
+def _weight_update_gateway_urls(args: Any) -> tuple[str, ...]:
+    """Discover the complete registered gateway fleet from the rollout service."""
+
+    rollout_url = str(getattr(args, "polar_rollout_url", "") or "").rstrip("/")
+    if not rollout_url:
+        raise RuntimeError("polar_rollout_url is required for weight-update coordination")
+    with httpx.Client(timeout=30.0, headers=_control_plane_headers()) as client:
+        response = client.get(f"{rollout_url}/nodes")
+        response.raise_for_status()
+        nodes = response.json()
+    if not isinstance(nodes, list) or not nodes:
+        raise RuntimeError("Polar rollout service returned an empty or malformed gateway fleet")
+
+    urls: list[str] = []
+    for node in nodes:
+        gateway_url = node.get("gateway_url") if isinstance(node, dict) else None
+        if not isinstance(gateway_url, str) or not gateway_url.strip():
+            raise RuntimeError("Polar rollout service returned a node without gateway_url")
+        urls.append(gateway_url.rstrip("/"))
+    if len(set(urls)) != len(urls):
+        raise RuntimeError("Polar rollout service returned duplicate gateway URLs")
+    return tuple(urls)
+
+
+def _gateway_generation_control(
+    gateway_url: str,
+    action: str,
+    *,
+    pause_timeout_seconds: float,
+) -> dict[str, Any]:
+    request_timeout = pause_timeout_seconds + 30.0 if action == "pause" else 30.0
+    params = {"timeout_seconds": pause_timeout_seconds} if action == "pause" else None
+    with httpx.Client(
+        timeout=request_timeout,
+        headers=_control_plane_headers(),
+    ) as client:
+        response = client.post(
+            f"{gateway_url}/admin/inference/{action}",
+            params=params,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Gateway {gateway_url} returned malformed {action} status")
+    expected_paused = action == "pause"
+    if payload.get("paused") is not expected_paused:
+        raise RuntimeError(
+            f"Gateway {gateway_url} did not enter expected paused={expected_paused} state"
+        )
+    inflight = payload.get("inflight")
+    if action == "pause" and (type(inflight) is not int or inflight != 0):
+        raise RuntimeError(
+            f"Gateway {gateway_url} pause returned nonzero or malformed inflight={inflight!r}"
+        )
+    return payload
+
+
+def _control_gateway_fleet(
+    gateway_urls: tuple[str, ...],
+    action: str,
+    *,
+    pause_timeout_seconds: float,
+) -> None:
+    errors: list[str] = []
+    with ThreadPoolExecutor(
+        max_workers=len(gateway_urls),
+        thread_name_prefix=f"polar-gateway-{action}",
+    ) as executor:
+        futures = {
+            executor.submit(
+                _gateway_generation_control,
+                url,
+                action,
+                pause_timeout_seconds=pause_timeout_seconds,
+            ): url
+            for url in gateway_urls
+        }
+        for future in as_completed(futures):
+            url = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                errors.append(f"{url}: {type(exc).__name__}: {exc}")
+    if errors:
+        raise RuntimeError(
+            f"Failed to {action} Polar gateway inference fleet: " + "; ".join(errors)
+        )
+
+
+def pause_for_weight_update(args: Any) -> None:
+    """Freeze new Router generations and drain every gateway before weight sync.
+
+    Slime may keep a fully-async Polar window alive after ``generate`` returns.
+    Draining the gateway proxies closes that race before SGLang's destructive
+    pause/flush cycle.  A partial pause is rolled back before the error is
+    surfaced, so a failed precondition cannot strand rollout traffic.
+    """
+
+    global _WEIGHT_UPDATE_PAUSED_GATEWAYS
+    timeout = float(getattr(args, "polar_weight_update_pause_timeout", 300.0))
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("polar_weight_update_pause_timeout must be positive and finite")
+    with _WEIGHT_UPDATE_GATEWAY_STATE_LOCK:
+        if _WEIGHT_UPDATE_PAUSED_GATEWAYS:
+            raise RuntimeError("Polar gateway fleet is already paused for a weight update")
+    gateway_urls = _weight_update_gateway_urls(args)
+    try:
+        _control_gateway_fleet(
+            gateway_urls,
+            "pause",
+            pause_timeout_seconds=timeout,
+        )
+    except Exception:
+        try:
+            _control_gateway_fleet(
+                gateway_urls,
+                "resume",
+                pause_timeout_seconds=timeout,
+            )
+        except Exception:
+            logger.exception("Failed to roll back a partial Polar gateway pause")
+        raise
+    with _WEIGHT_UPDATE_GATEWAY_STATE_LOCK:
+        _WEIGHT_UPDATE_PAUSED_GATEWAYS = gateway_urls
+    logger.info("Paused and drained %d Polar gateways for weight update", len(gateway_urls))
+
+
+def resume_after_weight_update(args: Any) -> None:
+    """Resume the exact gateway fleet frozen by :func:`pause_for_weight_update`."""
+
+    global _WEIGHT_UPDATE_PAUSED_GATEWAYS
+    timeout = float(getattr(args, "polar_weight_update_pause_timeout", 300.0))
+    with _WEIGHT_UPDATE_GATEWAY_STATE_LOCK:
+        gateway_urls = _WEIGHT_UPDATE_PAUSED_GATEWAYS
+    if not gateway_urls:
+        raise RuntimeError("Polar gateway fleet was not paused for a weight update")
+    _control_gateway_fleet(
+        gateway_urls,
+        "resume",
+        pause_timeout_seconds=timeout,
+    )
+    with _WEIGHT_UPDATE_GATEWAY_STATE_LOCK:
+        _WEIGHT_UPDATE_PAUSED_GATEWAYS = ()
+    logger.info("Resumed %d Polar gateways after weight update", len(gateway_urls))
 
 
 _POLL_INTERVAL = 2.0  # seconds between task-status polls (eval / no-callback path)
@@ -4939,5 +5089,13 @@ def _load_sample_type() -> Any:
 # on a custom rollout function. Stop speculative work before it finishes W&B
 # and releases the Ray actor.
 setattr(generate_rollout_polar_async, "dispose", stop_global_worker)
+# The paired weight-update hooks freeze new gateway-to-SGLang generations and
+# drain in-flight calls before Slime performs its destructive pause/cache flush.
+setattr(generate_rollout_polar_async, "pause_for_weight_update", pause_for_weight_update)
+setattr(
+    generate_rollout_polar_async,
+    "resume_after_weight_update",
+    resume_after_weight_update,
+)
 
 atexit.register(stop_global_worker)
