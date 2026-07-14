@@ -375,6 +375,63 @@ print(f"{len(paths)}|{retained_total}")
 PY
 }
 
+spilot_candidate_pool_health_incident_status() {
+    local id="$1"
+    python3 - "${SAVE_DIR}" "${TMAX_RUN_STATE_FILE}" "${id}" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+save_dir = pathlib.Path(sys.argv[1])
+state_file = pathlib.Path(sys.argv[2])
+job_id = sys.argv[3]
+incident_dirs = (
+    save_dir / "rollout" / "candidate_pool_health_incidents",
+    pathlib.Path(f"{state_file}.candidate_pool_health_incidents"),
+)
+paths = sorted(
+    {
+        path
+        for incident_dir in incident_dirs
+        for path in incident_dir.glob("rollout_*.json")
+    }
+)
+matches = []
+for path in paths:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        # A file that cannot identify its producing allocation cannot safely
+        # be attributed to this terminal job. Valid incident files are written
+        # atomically, so leave unrelated/corrupt historical files alone.
+        continue
+    if not isinstance(payload, dict) or payload.get("slurm_job_id") != job_id:
+        continue
+    filename_match = re.fullmatch(r"rollout_([0-9]{7})\.json", path.name)
+    reasons = payload.get("trigger_reasons")
+    rollout_id = payload.get("rollout_id")
+    if (
+        filename_match is None
+        or payload.get("schema_version") != 1
+        or payload.get("triggered") is not True
+        or type(rollout_id) is not int
+        or rollout_id < 0
+        or rollout_id != int(filename_match.group(1))
+        or not isinstance(reasons, list)
+        or not reasons
+        or any(not isinstance(reason, str) or not reason for reason in reasons)
+    ):
+        raise SystemExit(2)
+    matches.append((rollout_id, reasons))
+
+if not matches:
+    raise SystemExit(1)
+latest_rollout_id, latest_reasons = max(matches, key=lambda item: item[0])
+print(f"{len(matches)}|{latest_rollout_id}|{','.join(latest_reasons)}")
+PY
+}
+
 normalize_slurm_state() {
     local state="${1%% *}"
     printf '%s\n' "${state%+}"
@@ -422,22 +479,24 @@ record_failure_signature() {
     export TMAX_WATCH_FAILURE_COUNT="$((TMAX_WATCH_FAILURE_COUNT + 1))"
 }
 
-publish_spilot_admission_fatal_metric() {
-    local publish_python publish_script publish_timeout wandb_dir
+publish_spilot_static_metrics() {
+    local wandb_label="${1:?missing W&B publisher label}"
+    shift
+    local publish_python publish_script publish_timeout wandb_dir static_metric
     local -a publish_args
     [ -n "${WANDB_API_KEY:-}" ] || {
-        echo "[tmax watch] W&B fatal metric publish skipped: WANDB_API_KEY is unavailable" >&2
+        echo "[tmax watch] W&B ${wandb_label} metric publish skipped: WANDB_API_KEY is unavailable" >&2
         return 0
     }
     case "${WANDB_MODE:-offline}" in
         online|shared) ;;
         *)
-            echo "[tmax watch] W&B fatal metric publish skipped: WANDB_MODE=${WANDB_MODE:-offline}" >&2
+            echo "[tmax watch] W&B ${wandb_label} metric publish skipped: WANDB_MODE=${WANDB_MODE:-offline}" >&2
             return 0
             ;;
     esac
     command -v timeout >/dev/null || {
-        echo "[tmax watch] WARNING: cannot publish final W&B fatal metric without timeout(1)" >&2
+        echo "[tmax watch] WARNING: cannot publish W&B ${wandb_label} metric without timeout(1)" >&2
         return 0
     }
     publish_python="${TMAX_SPILOT_FATAL_WANDB_PYTHON_BIN:-${POLR_TRAIN_VENV}/bin/python3}"
@@ -462,20 +521,37 @@ publish_spilot_admission_fatal_metric() {
         --wandb-project "${WANDB_PROJECT:-polar-tmax-grpo}"
         --wandb-group "${WANDB_GROUP:-spilot-router-qwen35-9b-8n64}"
         --wandb-dir "$wandb_dir"
-        --wandb-label spilot-fatal-watcher
+        --wandb-label "${wandb_label}"
         --wandb-mode shared
         --wandb-finish-timeout-s 15
-        --static-metric
-        "polar/spilot_router/admission_fatal_job_count_total=${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT}"
     )
+    for static_metric in "$@"; do
+        publish_args+=(--static-metric "${static_metric}")
+    done
     if [ -n "${WANDB_ENTITY:-}" ]; then
         publish_args+=(--wandb-entity "${WANDB_ENTITY}")
     fi
     if timeout --signal=TERM --kill-after=5 "$publish_timeout" "${publish_args[@]}"; then
-        echo "[tmax watch] published final SPilot admission fatal count=${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT} to W&B" >&2
+        if [ "${wandb_label}" = "spilot-fatal-watcher" ]; then
+            echo "[tmax watch] published final SPilot admission fatal count=${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT} to W&B" >&2
+        else
+            echo "[tmax watch] published SPilot ${wandb_label} metric(s) to W&B" >&2
+        fi
     else
-        echo "[tmax watch] WARNING: bounded final W&B fatal metric publish failed; count remains authoritative in ${TMAX_RUN_STATE_FILE}" >&2
+        echo "[tmax watch] WARNING: bounded W&B ${wandb_label} metric publish failed; run state/incident remains authoritative" >&2
     fi
+}
+
+publish_spilot_admission_fatal_metric() {
+    publish_spilot_static_metrics \
+        spilot-fatal-watcher \
+        "polar/spilot_router/admission_fatal_job_count_total=${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT}"
+}
+
+publish_spilot_candidate_pool_health_metric() {
+    publish_spilot_static_metrics \
+        spilot-candidate-health-watcher \
+        "polar/candidate_pool_health/gate_triggered=1"
 }
 
 account_terminal_job() {
@@ -483,6 +559,7 @@ account_terminal_job() {
     local submitted_iter="${TMAX_LAST_JOB_CHECKPOINT_ITER:--1}"
     local progressed=false fail_closed_quick=false signature
     local admission_fatal=false marker_status=0 marker_summary=""
+    local candidate_health_incident=false health_status=0 health_summary=""
 
     if [ "${TMAX_WATCH_LAST_ACCOUNTED_JOB_ID}" = "$id" ]; then
         if is_fail_closed_failure_signature "${TMAX_WATCH_FAILURE_SIGNATURE}"; then
@@ -505,8 +582,10 @@ account_terminal_job() {
     # has been disabled to quiesce a draining or incident-affected allocation.
     if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ]; then
         marker_summary="$(spilot_admission_fatal_marker_status "$id")" || marker_status=$?
+        health_summary="$(spilot_candidate_pool_health_incident_status "$id")" || health_status=$?
     else
         marker_status=1
+        health_status=1
     fi
     if [ "$marker_status" -eq 0 ]; then
         admission_fatal=true
@@ -514,6 +593,34 @@ account_terminal_job() {
         echo "[tmax watch] SPilot admission fatal job metric: count_total=${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT} job=${id} markers_retained=${marker_summary}" >&2
     elif [ "$marker_status" -eq 2 ]; then
         echo "[tmax watch] malformed SPilot admission fatal marker for job=${id}; retaining normal fail-closed policy" >&2
+    fi
+    if [ "$health_status" -eq 0 ]; then
+        candidate_health_incident=true
+    elif [ "$health_status" -eq 2 ]; then
+        # The payload explicitly names this allocation, so an invalid schema
+        # must not turn a provider outage into an automatic retry loop.
+        candidate_health_incident=true
+        health_summary="malformed"
+        echo "[tmax watch] malformed candidate-pool health incident for job=${id}; failing closed" >&2
+    fi
+
+    if [ "$candidate_health_incident" = true ]; then
+        signature="quick-fail-closed/candidate-pool-health/job=${id}/incident=${health_summary}/${state}/exit=${exit_code}/checkpoint=${iter}"
+        record_failure_signature "$signature"
+        export TMAX_WATCH_LAST_ACCOUNTED_JOB_ID="$id"
+        tmax_write_run_state "${TMAX_RUN_STATE_FILE}"
+        if [ "$admission_fatal" = true ]; then
+            publish_spilot_admission_fatal_metric
+        fi
+        publish_spilot_candidate_pool_health_metric
+        echo "[tmax watch] candidate-pool health incident: job=${id} incident=${health_summary}; refusing automatic resubmission" >&2
+        if [[ "${health_summary}" == *partial_wal_quarantine_failed* ]]; then
+            echo "[tmax watch] partial WAL quarantine failed; do not reset this SAVE_DIR for ordinary resume" >&2
+        else
+            echo "[tmax watch] verify provider health, then restart with TMAX_WATCH_RESET_FAILURES=1" >&2
+        fi
+        WATCH_ABORT=true
+        return
     fi
 
     # Completion without either the final marker (handled before this function)

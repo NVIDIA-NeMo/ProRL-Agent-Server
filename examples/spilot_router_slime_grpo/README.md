@@ -108,6 +108,23 @@ Per-call cost is additionally reported by stable candidate and by `solve` versus
 `verify`, with `pool_cost_reconciliation_delta` comparing the call ledger to
 accepted-session `total_cost`.
 
+Formal Router training also enables a fail-closed frozen-candidate availability
+gate. It incrementally evaluates every pre-filter result by stable candidate
+alias, including groups rejected by the completion floor or dynamic sampler,
+and gives each exposed session one health vote even when the session made both
+solve and verify calls. Once a candidate has at least
+`POLAR_CANDIDATE_POOL_HEALTH_MIN_OBSERVED_SESSIONS` observations (16 by
+default), a completion fraction below
+`POLAR_CANDIDATE_POOL_HEALTH_MIN_COMPLETION_FRACTION` (0.1 by default) aborts
+the rollout before the batch is marked ready, reservations are committed, or
+the optimizer sees it. The incident is written under
+`rollout/candidate_pool_health_incidents/` (with a run-state-adjacent durability
+fallback) without response bodies or secrets. The checkpoint watcher binds the
+incident to the exact Slurm job, refuses automatic resubmission, and publishes a
+one-shot `polar/candidate_pool_health/gate_triggered=1` metric when W&B is
+available. This gate detects provider/runtime outages; it does not reject
+candidates for low task accuracy.
+
 ## Paired forced-route evaluation
 
 `forced_route_eval.py` measures the frozen candidates on an identical fixed

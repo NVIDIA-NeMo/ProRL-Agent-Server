@@ -38,6 +38,9 @@ def _args(**overrides):
         "polar_callback_host": "127.0.0.1",
         "polar_scoring_mode": "group",
         "polar_min_complete_accept_fraction": 0.0,
+        "polar_candidate_pool_health_gate_enabled": False,
+        "polar_candidate_pool_health_min_observed_sessions": 16,
+        "polar_candidate_pool_health_min_completion_fraction": 0.1,
         "hf_checkpoint": "tokenizer-name",
         "polar_add_generation_prompt": True,
         "polar_eval_dataset_name": "eval",
@@ -63,6 +66,9 @@ def test_resolve_polar_slime_config_computes_concurrency_and_normalizes_url() ->
     assert config.eval_agent_timeout is None
     assert config.min_complete_accept_fraction == 0.0
     assert config.early_stop_grace_sessions == 2
+    assert config.candidate_pool_health_gate_enabled is False
+    assert config.candidate_pool_health_min_observed_sessions == 16
+    assert config.candidate_pool_health_min_completion_fraction == 0.1
 
 
 def test_resolve_polar_slime_config_requires_agent_template() -> None:
@@ -84,6 +90,38 @@ def test_resolve_polar_slime_config_accepts_complete_fraction_threshold() -> Non
 def test_resolve_polar_slime_config_rejects_negative_early_stop_grace() -> None:
     with pytest.raises(ValueError, match="polar_early_stop_grace_sessions"):
         resolve_polar_slime_config(_args(polar_early_stop_grace_sessions=-1))
+
+
+@pytest.mark.parametrize("value", ["sometimes", 1, None])
+def test_resolve_polar_slime_config_rejects_invalid_candidate_health_enabled(value) -> None:
+    with pytest.raises(ValueError, match="polar_candidate_pool_health_gate_enabled"):
+        resolve_polar_slime_config(
+            _args(polar_candidate_pool_health_gate_enabled=value)
+        )
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, True, "sixteen"])
+def test_resolve_polar_slime_config_rejects_invalid_candidate_health_min_sessions(
+    value,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="polar_candidate_pool_health_min_observed_sessions",
+    ):
+        resolve_polar_slime_config(
+            _args(polar_candidate_pool_health_min_observed_sessions=value)
+        )
+
+
+@pytest.mark.parametrize("value", [-0.1, 1.1, float("inf"), float("nan"), True])
+def test_resolve_polar_slime_config_rejects_invalid_candidate_health_fraction(value) -> None:
+    with pytest.raises(
+        ValueError,
+        match="polar_candidate_pool_health_min_completion_fraction",
+    ):
+        resolve_polar_slime_config(
+            _args(polar_candidate_pool_health_min_completion_fraction=value)
+        )
 
 
 @pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])

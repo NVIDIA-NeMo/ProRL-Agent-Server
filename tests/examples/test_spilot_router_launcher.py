@@ -106,6 +106,10 @@ def test_spilot_agent_template_builds_registered_harness() -> None:
     text = text.replace(
         "${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS}", "14400"
     )
+    text = text.replace("${SPILOT_QWEN_COST_WEIGHT}", "1.0")
+    text = text.replace("${SPILOT_GPT_COST_WEIGHT}", "1.0")
+    text = text.replace("${SPILOT_COST_PENALTY_LAMBDA}", "0.0")
+    text = text.replace("${SPILOT_COST_NORMALIZER}", "1.0")
     document = yaml.safe_load(text)
     template = document["polar_task_template"]
     harness = create_harness(AgentSpec.model_validate(template["agent"]))
@@ -145,6 +149,8 @@ def test_spilot_fixed_eval_payload_normalizes_generic_overrides() -> None:
     text = text.replace(
         "${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS}", "14400"
     )
+    text = text.replace("${SPILOT_QWEN_COST_WEIGHT}", "1.0")
+    text = text.replace("${SPILOT_GPT_COST_WEIGHT}", "1.0")
     document = yaml.safe_load(text)
     agent = deepcopy(document["polar_task_template"]["agent"])
     agent["model_name"] = "Qwen/Qwen3.5-9B"
@@ -216,9 +222,9 @@ def test_spilot_submit_wrapper_pins_8_nodes_and_200_steps() -> None:
 
     assert 'source "${SCRIPT_DIR}/experiment_defaults.sh"' in script
     assert 'NUM_NODES="${NUM_NODES:-8}"' in defaults
-    assert 'PARTITION="${PARTITION:-backfill}"' in defaults
-    assert 'WALL_TIME="${WALL_TIME:-2-00:00:00}"' in defaults
-    assert 'TMAX_MIN_WALL_TIME="${TMAX_MIN_WALL_TIME:-2-00:00:00}"' in defaults
+    assert 'PARTITION="${PARTITION:-batch}"' in defaults
+    assert 'WALL_TIME="${WALL_TIME:-04:00:00}"' in defaults
+    assert 'TMAX_MIN_WALL_TIME="${TMAX_MIN_WALL_TIME:-04:00:00}"' in defaults
     assert 'SLURM_GPUS="${SLURM_GPUS:-8}"' in defaults
     assert 'RAY_NUM_GPUS_PER_NODE="${RAY_NUM_GPUS_PER_NODE:-8}"' in defaults
     assert 'ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-2}"' in defaults
@@ -237,6 +243,18 @@ def test_spilot_submit_wrapper_pins_8_nodes_and_200_steps() -> None:
     assert 'POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-3}"' in defaults
     assert 'POLAR_MIN_COMPLETE_ACCEPT_FRACTION="${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.5}"' in defaults
     assert 'POLAR_EARLY_STOP_GRACE_SESSIONS="${POLAR_EARLY_STOP_GRACE_SESSIONS:-16}"' in defaults
+    assert (
+        'POLAR_CANDIDATE_POOL_HEALTH_GATE_ENABLED="${POLAR_CANDIDATE_POOL_HEALTH_GATE_ENABLED:-true}"'
+        in defaults
+    )
+    assert (
+        'POLAR_CANDIDATE_POOL_HEALTH_MIN_OBSERVED_SESSIONS="${POLAR_CANDIDATE_POOL_HEALTH_MIN_OBSERVED_SESSIONS:-16}"'
+        in defaults
+    )
+    assert (
+        'POLAR_CANDIDATE_POOL_HEALTH_MIN_COMPLETION_FRACTION="${POLAR_CANDIDATE_POOL_HEALTH_MIN_COMPLETION_FRACTION:-0.1}"'
+        in defaults
+    )
     assert 'TMAX_MIN_RUN_WORKERS_PER_ROLLOUT_GPU="${TMAX_MIN_RUN_WORKERS_PER_ROLLOUT_GPU:-12}"' in defaults
     assert 'POLAR_MAX_INIT_WORKERS="${POLAR_MAX_INIT_WORKERS:-96}"' in defaults
     assert 'POLAR_MAX_RUN_WORKERS="${POLAR_MAX_RUN_WORKERS:-576}"' in defaults
@@ -251,11 +269,11 @@ def test_spilot_submit_wrapper_pins_8_nodes_and_200_steps() -> None:
     assert 'TMAX_NUM_ROLLOUT="${TMAX_NUM_ROLLOUT:-200}"' in defaults
     assert 'SAVE_INTERVAL="${SAVE_INTERVAL:-5}"' in defaults
     assert (
-        'TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS:-43200}"'
+        'TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS:-1800}"'
         in defaults
     )
     assert (
-        'TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS:-43200}"'
+        'TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS:-1800}"'
         in defaults
     )
     assert 'SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-5}"' in defaults

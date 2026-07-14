@@ -314,6 +314,10 @@ class PolarLowCompleteAcceptFractionError(PolarRolloutSchedulerError):
     """Raised when a completed task has too few trainable completed sessions."""
 
 
+class CandidatePoolHealthGateError(PolarRolloutSchedulerError):
+    """Raised before training when one required pool candidate is unavailable."""
+
+
 class PolarEvalDataIntegrityError(ValueError):
     """Raised when an eval JSONL no longer matches its launcher manifest."""
 
@@ -1004,6 +1008,11 @@ class AsyncPolarRolloutWorker:
         # `_completed_buffer`, which is drained in bounded chunks by training.
         queue_maxsize = max(32, batch_size * self.config.max_async_level * 2)
         self.output_queue: queue.Queue[_CompletedGroup] = queue.Queue(maxsize=queue_maxsize)
+        # Rejected groups can still contain the only trustworthy evidence that
+        # a frozen candidate is unavailable.  Keep that evidence on a separate
+        # unbounded handoff: it is consumed by the trainer immediately and is
+        # never eligible for optimizer input.
+        self.health_output_queue: queue.Queue[_CompletedGroup] = queue.Queue()
         self.deferred_queue: queue.Queue[_DeferredGroup] = queue.Queue()
         self._completed_buffer: deque[_CompletedGroup] = deque()
         self._running = True
@@ -1152,6 +1161,7 @@ class AsyncPolarRolloutWorker:
                     completed.task_id,
                     reason,
                 )
+                self._emit_health_observation(completed)
                 self._record_wasted_samples(completed.samples)
                 if completed.partial_store is not None:
                     completed.partial_store.record_drop(
@@ -1177,6 +1187,20 @@ class AsyncPolarRolloutWorker:
         with self._state_lock:
             self._completed_buffer_size = len(self._completed_buffer)
         return accepted
+
+    def drain_health_observations(self) -> list[_CompletedGroup]:
+        """Drain rejected pre-filter groups for fail-closed pool monitoring."""
+
+        observations: list[_CompletedGroup] = []
+        while True:
+            try:
+                observations.append(self.health_output_queue.get_nowait())
+            except queue.Empty:
+                return observations
+
+    def _emit_health_observation(self, completed: _CompletedGroup) -> None:
+        if self.config.candidate_pool_health_gate_enabled:
+            self.health_output_queue.put_nowait(completed)
 
     def queue_size(self) -> int:
         with self._state_lock:
@@ -1532,20 +1556,6 @@ class AsyncPolarRolloutWorker:
             raise PolarRolloutSchedulerError(
                 f"Task {task_result.task_id} converted to zero samples"
             )
-        if not _has_trainable_tokens(group_samples):
-            self._record_wasted_samples(group_samples)
-            raise PolarRolloutSchedulerError(
-                f"Task {task_result.task_id} produced zero trainable tokens"
-            )
-        rejection_reason = _low_complete_accept_fraction_rejection_reason(
-            self.config, task_result, group_samples
-        )
-        if rejection_reason is not None:
-            self._record_wasted_samples(group_samples)
-            raise PolarLowCompleteAcceptFractionError(
-                f"Task {task_result.task_id} cannot be accepted: {rejection_reason}"
-            )
-
         completed = _CompletedGroup(
             group_id=pending.group_id,
             group=pending.group,
@@ -1561,6 +1571,21 @@ class AsyncPolarRolloutWorker:
             sample_conversion_seconds=sample_conversion_seconds,
             partial_store=pending.partial_store,
         )
+        if not _has_trainable_tokens(group_samples):
+            self._emit_health_observation(completed)
+            self._record_wasted_samples(group_samples)
+            raise PolarRolloutSchedulerError(
+                f"Task {task_result.task_id} produced zero trainable tokens"
+            )
+        rejection_reason = _low_complete_accept_fraction_rejection_reason(
+            self.config, task_result, group_samples
+        )
+        if rejection_reason is not None:
+            self._emit_health_observation(completed)
+            self._record_wasted_samples(group_samples)
+            raise PolarLowCompleteAcceptFractionError(
+                f"Task {task_result.task_id} cannot be accepted: {rejection_reason}"
+            )
         if pending.partial_store is not None:
             pending.partial_store.record_result_ready(completed)
         return completed
@@ -2768,6 +2793,569 @@ _CANDIDATE_DECOMPOSED_METRICS = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class _CandidatePoolHealthGateConfig:
+    candidate_aliases: tuple[str, ...]
+    min_observed_sessions: int
+    min_completion_fraction: float
+
+
+def _candidate_pool_health_gate_config(
+    config: Any,
+) -> _CandidatePoolHealthGateConfig | None:
+    """Validate the opt-in candidate-availability gate and its model identities."""
+
+    enabled = getattr(config, "candidate_pool_health_gate_enabled", False)
+    if type(enabled) is not bool:
+        raise ValueError("candidate_pool_health_gate_enabled must be a boolean")
+    if not enabled:
+        return None
+
+    raw_min_sessions = getattr(config, "candidate_pool_health_min_observed_sessions", 16)
+    if isinstance(raw_min_sessions, bool):
+        raise ValueError("candidate_pool_health_min_observed_sessions must be an integer")
+    try:
+        min_observed_sessions = int(raw_min_sessions)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "candidate_pool_health_min_observed_sessions must be an integer"
+        ) from exc
+    if min_observed_sessions <= 0 or min_observed_sessions != raw_min_sessions:
+        raise ValueError("candidate_pool_health_min_observed_sessions must be positive")
+
+    raw_min_fraction = getattr(config, "candidate_pool_health_min_completion_fraction", 0.1)
+    if isinstance(raw_min_fraction, bool):
+        raise ValueError("candidate_pool_health_min_completion_fraction must be numeric")
+    try:
+        min_completion_fraction = float(raw_min_fraction)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "candidate_pool_health_min_completion_fraction must be numeric"
+        ) from exc
+    if not math.isfinite(min_completion_fraction) or not 0.0 <= min_completion_fraction <= 1.0:
+        raise ValueError(
+            "candidate_pool_health_min_completion_fraction must be between 0 and 1"
+        )
+
+    task_template = getattr(config, "task_template", None)
+    agent = task_template.get("agent") if isinstance(task_template, dict) else None
+    settings = agent.get("settings") if isinstance(agent, dict) else None
+    raw_pool = settings.get("model_pool") if isinstance(settings, dict) else None
+    if isinstance(raw_pool, dict):
+        raw_candidates = list(raw_pool.values())
+    elif isinstance(raw_pool, list):
+        raw_candidates = list(raw_pool)
+    else:
+        raise ValueError(
+            "candidate pool health gate requires agent.settings.model_pool"
+        )
+
+    aliases: list[str] = []
+    for candidate in raw_candidates:
+        alias = candidate if isinstance(candidate, str) else None
+        if isinstance(candidate, dict):
+            alias = candidate.get("model")
+        if not isinstance(alias, str) or not alias.strip():
+            raise ValueError(
+                "candidate pool health gate requires a model alias for every candidate"
+            )
+        aliases.append(alias.strip())
+    if len(aliases) < 2 or len(set(aliases)) != len(aliases):
+        raise ValueError(
+            "candidate pool health gate requires at least two unique model aliases"
+        )
+    return _CandidatePoolHealthGateConfig(
+        candidate_aliases=tuple(sorted(aliases)),
+        min_observed_sessions=min_observed_sessions,
+        min_completion_fraction=min_completion_fraction,
+    )
+
+
+@dataclass(slots=True)
+class _CandidatePoolHealthAccumulator:
+    """Retain per-session pool availability before dynamic sampling selection."""
+
+    expected_aliases: tuple[str, ...]
+    sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    conflicting_sessions: set[str] = field(default_factory=set)
+    missing_session_id_telemetry_count: int = 0
+    group_count: int = 0
+    reservation_ids: set[int] = field(default_factory=set)
+    policy_versions: set[int] = field(default_factory=set)
+
+    def add(self, completed: _CompletedGroup) -> None:
+        self.group_count += 1
+        if completed.reservation_id is not None:
+            self.reservation_ids.add(int(completed.reservation_id))
+        self.policy_versions.add(int(completed.policy_version))
+        for sample in completed.samples:
+            sample_metadata = getattr(sample, "metadata", None)
+            polar = sample_metadata.get("polar") if isinstance(sample_metadata, dict) else None
+            if not isinstance(polar, dict):
+                continue
+            trajectory = polar.get("trajectory_metadata")
+            evaluation = (
+                trajectory.get("evaluation") if isinstance(trajectory, dict) else None
+            )
+            router = evaluation.get("spilot_router") if isinstance(evaluation, dict) else None
+            if not isinstance(router, dict):
+                continue
+            session_id = polar.get("session_id")
+            if not isinstance(session_id, str) or not session_id:
+                self.missing_session_id_telemetry_count += 1
+                continue
+            if session_id in self.conflicting_sessions:
+                continue
+            previous = self.sessions.get(session_id)
+            if previous is None:
+                self.sessions[session_id] = router
+            elif not _strict_telemetry_equal(previous, router):
+                self.sessions.pop(session_id, None)
+                self.conflicting_sessions.add(session_id)
+
+    def report(
+        self,
+        gate_config: _CandidatePoolHealthGateConfig,
+        *,
+        rollout_id: int,
+        accepted_group_count: int,
+    ) -> dict[str, Any]:
+        expected = set(self.expected_aliases)
+        if tuple(sorted(expected)) != gate_config.candidate_aliases:
+            raise ValueError("candidate pool health accumulator/config aliases differ")
+
+        labels = {
+            alias: f"C{index}" for index, alias in enumerate(gate_config.candidate_aliases)
+        }
+        candidate_stats: dict[str, dict[str, Any]] = {
+            alias: {
+                "label": labels[alias],
+                "alias": alias,
+                "observed_session_count": 0,
+                "available_session_count": 0,
+                "unavailable_session_count": 0,
+                "telemetry_error_session_count": 0,
+                "attempted_call_count": 0,
+                "completed_call_count": 0,
+                "failed_call_count": 0,
+                "timeout_call_count": 0,
+                "unknown_status_call_count": 0,
+                "skipped_call_count": 0,
+                "admission_failure_session_count": 0,
+                "pre_call_infrastructure_failure_session_count": 0,
+            }
+            for alias in gate_config.candidate_aliases
+        }
+        globally_invalid_sessions: set[str] = set(self.conflicting_sessions)
+        unattributed_observation_sessions: set[str] = set()
+        observed_session_ids: set[str] = set()
+
+        for session_id, router in self.sessions.items():
+            aliases_by_slot: dict[str, str] = {}
+            slot_mapping = router.get("slot_mapping")
+            if isinstance(slot_mapping, dict):
+                for raw_slot, raw_candidate in slot_mapping.items():
+                    alias = (
+                        raw_candidate.get("model")
+                        if isinstance(raw_candidate, dict)
+                        else None
+                    )
+                    if isinstance(alias, str) and alias:
+                        aliases_by_slot[str(raw_slot).upper()] = alias
+            mapping_valid = (
+                len(aliases_by_slot) == len(expected)
+                and set(aliases_by_slot.values()) == expected
+            )
+            expected_action_calls: list[tuple[str, str, str]] = []
+            actions = router.get("actions")
+            if actions is not None and not isinstance(actions, list):
+                globally_invalid_sessions.add(session_id)
+                actions = []
+            for action in actions or []:
+                if not isinstance(action, dict) or action.get("valid") is not True:
+                    continue
+                action_name = str(action.get("action") or "").upper()
+                if action_name not in {"ROUTE", "VERIFY"}:
+                    continue
+                action_slot = str(action.get("model_slot") or "").upper()
+                action_alias = aliases_by_slot.get(action_slot)
+                if action_alias not in expected:
+                    globally_invalid_sessions.add(session_id)
+                    unattributed_observation_sessions.add(session_id)
+                    continue
+                role = "solve" if action_name == "ROUTE" else "verify"
+                expected_action_calls.append((role, action_slot, action_alias))
+
+            evidence: dict[str, dict[str, bool]] = {
+                alias: {
+                    "completed": False,
+                    "unavailable": False,
+                    "telemetry_error": False,
+                }
+                for alias in gate_config.candidate_aliases
+            }
+            covered_action_keys: set[tuple[str, str]] = set()
+            calls = router.get("calls")
+            if calls is not None and not isinstance(calls, list):
+                globally_invalid_sessions.add(session_id)
+                calls = []
+            for call in calls or []:
+                if not isinstance(call, dict):
+                    globally_invalid_sessions.add(session_id)
+                    continue
+                call_model = call.get("model")
+                model_alias = call_model if call_model in expected else None
+                call_slot = str(call.get("slot") or "").upper()
+                slot_alias = aliases_by_slot.get(call_slot)
+                alias = model_alias if model_alias == slot_alias else None
+                if alias is None:
+                    globally_invalid_sessions.add(session_id)
+                    if model_alias is not None:
+                        evidence[model_alias]["telemetry_error"] = True
+                    if slot_alias in expected:
+                        evidence[slot_alias]["telemetry_error"] = True
+
+                attempted = call.get("attempted")
+                if attempted is False:
+                    if alias is not None:
+                        candidate_stats[alias]["skipped_call_count"] += 1
+                    continue
+                if attempted is not True:
+                    globally_invalid_sessions.add(session_id)
+                    if alias is not None:
+                        evidence[alias]["telemetry_error"] = True
+                    continue
+                if alias is None:
+                    unattributed_observation_sessions.add(session_id)
+                    continue
+
+                observed_session_ids.add(session_id)
+                role = str(call.get("role") or "").lower()
+                if role in {"solve", "verify"}:
+                    covered_action_keys.add((role, call_slot))
+                else:
+                    globally_invalid_sessions.add(session_id)
+                    evidence[alias]["telemetry_error"] = True
+                stats = candidate_stats[alias]
+                stats["attempted_call_count"] += 1
+                status = str(call.get("status") or "").lower()
+                if status == "completed":
+                    stats["completed_call_count"] += 1
+                    evidence[alias]["completed"] = True
+                elif status in {"failed", "timeout"}:
+                    stats[f"{status}_call_count"] += 1
+                    evidence[alias]["unavailable"] = True
+                else:
+                    stats["unknown_status_call_count"] += 1
+                    evidence[alias]["unavailable"] = True
+                    evidence[alias]["telemetry_error"] = True
+                    globally_invalid_sessions.add(session_id)
+
+            admission_failure = router.get("admission_failure")
+            if isinstance(admission_failure, dict):
+                failure_model = admission_failure.get("model")
+                if failure_model in expected:
+                    evidence[failure_model]["unavailable"] = True
+                    candidate_stats[failure_model]["admission_failure_session_count"] += 1
+                    observed_session_ids.add(session_id)
+                    # Admission fails before a call record exists. Attribute it
+                    # to the latest unmatched action for that stable alias so
+                    # the infrastructure reconciliation below does not count
+                    # the same failure twice.
+                    for role, slot, alias in reversed(expected_action_calls):
+                        key = (role, slot)
+                        if alias == failure_model and key not in covered_action_keys:
+                            covered_action_keys.add(key)
+                            break
+                else:
+                    globally_invalid_sessions.add(session_id)
+                    unattributed_observation_sessions.add(session_id)
+
+            if router.get("termination_reason") == "infrastructure_error":
+                pre_call_failure_aliases: set[str] = set()
+                for role, slot, alias in expected_action_calls:
+                    if (role, slot) not in covered_action_keys:
+                        evidence[alias]["unavailable"] = True
+                        pre_call_failure_aliases.add(alias)
+                        observed_session_ids.add(session_id)
+                for alias in pre_call_failure_aliases:
+                    candidate_stats[alias][
+                        "pre_call_infrastructure_failure_session_count"
+                    ] += 1
+                if not expected_action_calls:
+                    globally_invalid_sessions.add(session_id)
+                    unattributed_observation_sessions.add(session_id)
+
+            has_candidate_evidence = any(
+                item["completed"] or item["unavailable"] for item in evidence.values()
+            )
+            if not mapping_valid and has_candidate_evidence:
+                globally_invalid_sessions.add(session_id)
+                for alias, item in evidence.items():
+                    if item["completed"] or item["unavailable"]:
+                        item["telemetry_error"] = True
+
+            for alias, item in evidence.items():
+                if not (item["completed"] or item["unavailable"]):
+                    continue
+                stats = candidate_stats[alias]
+                stats["observed_session_count"] += 1
+                if item["completed"]:
+                    stats["available_session_count"] += 1
+                else:
+                    stats["unavailable_session_count"] += 1
+                if item["telemetry_error"]:
+                    stats["telemetry_error_session_count"] += 1
+
+        triggered_candidates: list[str] = []
+        trigger_reasons: list[str] = []
+        for alias in gate_config.candidate_aliases:
+            stats = candidate_stats[alias]
+            observed = int(stats["observed_session_count"])
+            available = int(stats["available_session_count"])
+            fraction = available / observed if observed else None
+            eligible = observed >= gate_config.min_observed_sessions
+            stats["completion_fraction"] = fraction
+            stats["eligible"] = eligible
+            stats["insufficient_evidence"] = not eligible
+            stats["triggered"] = False
+            reasons: list[str] = []
+            if eligible and fraction is not None:
+                if fraction < gate_config.min_completion_fraction:
+                    reasons.append("completion_fraction_below_threshold")
+                if int(stats["telemetry_error_session_count"]) > 0:
+                    reasons.append("candidate_telemetry_integrity_error")
+            if reasons:
+                stats["triggered"] = True
+                stats["trigger_reasons"] = reasons
+                triggered_candidates.append(labels[alias])
+                trigger_reasons.extend(f"{labels[alias]}:{reason}" for reason in reasons)
+
+        total_observed_sessions = len(observed_session_ids)
+        health_evidence_sessions = (
+            observed_session_ids
+            | globally_invalid_sessions
+            | unattributed_observation_sessions
+        )
+        if (
+            len(health_evidence_sessions) >= gate_config.min_observed_sessions
+            and globally_invalid_sessions
+        ):
+            trigger_reasons.append("global:candidate_telemetry_integrity_error")
+        if len(unattributed_observation_sessions) >= gate_config.min_observed_sessions:
+            trigger_reasons.append("global:unattributed_candidate_observations")
+        if self.missing_session_id_telemetry_count >= gate_config.min_observed_sessions:
+            trigger_reasons.append("global:missing_session_identity_telemetry")
+
+        return {
+            "schema_version": 1,
+            "rollout_id": int(rollout_id),
+            "accepted_group_count": int(accepted_group_count),
+            "decision_window_group_count": int(self.group_count),
+            "decision_window_session_count": len(self.sessions),
+            "reservation_ids": sorted(self.reservation_ids),
+            "policy_versions": sorted(self.policy_versions),
+            "thresholds": {
+                "min_observed_sessions": gate_config.min_observed_sessions,
+                "min_completion_fraction": gate_config.min_completion_fraction,
+            },
+            "candidates": {
+                labels[alias]: candidate_stats[alias]
+                for alias in gate_config.candidate_aliases
+            },
+            "telemetry": {
+                "conflicting_session_count": len(self.conflicting_sessions),
+                "globally_invalid_session_count": len(globally_invalid_sessions),
+                "missing_session_id_telemetry_count": self.missing_session_id_telemetry_count,
+                "unattributed_observation_session_count": len(
+                    unattributed_observation_sessions
+                ),
+                "total_observed_session_count": total_observed_sessions,
+            },
+            "triggered": bool(trigger_reasons),
+            "triggered_candidates": triggered_candidates,
+            "trigger_reasons": trigger_reasons,
+        }
+
+
+def _candidate_pool_health_metrics(report: dict[str, Any]) -> dict[str, float]:
+    prefix = "polar/candidate_pool_health"
+    metrics = {
+        f"{prefix}/gate_triggered": float(bool(report.get("triggered"))),
+        f"{prefix}/decision_window_group_count": float(
+            report.get("decision_window_group_count", 0)
+        ),
+    }
+    for label, raw_stats in (report.get("candidates") or {}).items():
+        if not isinstance(label, str) or not isinstance(raw_stats, dict):
+            continue
+        candidate_prefix = f"{prefix}/{label.lower()}"
+        for field_name in (
+            "observed_session_count",
+            "available_session_count",
+            "unavailable_session_count",
+            "telemetry_error_session_count",
+            "attempted_call_count",
+            "completed_call_count",
+            "failed_call_count",
+            "timeout_call_count",
+            "unknown_status_call_count",
+            "skipped_call_count",
+            "admission_failure_session_count",
+            "pre_call_infrastructure_failure_session_count",
+        ):
+            metrics[f"{candidate_prefix}/{field_name}"] = float(
+                raw_stats.get(field_name, 0)
+            )
+        metrics[f"{candidate_prefix}/eligible"] = float(bool(raw_stats.get("eligible")))
+        completion_fraction = raw_stats.get("completion_fraction")
+        if completion_fraction is not None:
+            metrics[f"{candidate_prefix}/completion_fraction"] = float(completion_fraction)
+    return metrics
+
+
+def _persist_candidate_pool_health_incident(
+    args: Any,
+    report: dict[str, Any],
+) -> Path:
+    save_root = getattr(args, "save", None)
+    state_file = os.environ.get("TMAX_RUN_STATE_FILE")
+    incident_dirs: list[Path] = []
+    if save_root:
+        incident_dirs.append(
+            Path(save_root) / "rollout" / "candidate_pool_health_incidents"
+        )
+    if state_file:
+        # This independent lineage-scoped location is a durability fallback if
+        # the checkpoint tree itself becomes temporarily unwritable.  The
+        # watcher scans both locations and still binds payloads to SLURM_JOB_ID.
+        incident_dirs.append(
+            Path(f"{state_file}.candidate_pool_health_incidents")
+        )
+    incident_dirs = list(dict.fromkeys(incident_dirs))
+    if not incident_dirs:
+        raise OSError(
+            "candidate-pool health incident has neither args.save nor "
+            "TMAX_RUN_STATE_FILE storage"
+        )
+
+    rollout_id = int(report["rollout_id"])
+    payload = dict(report)
+    payload["created_unix_time"] = time.time()
+    # The watcher must only latch an incident produced by the terminal Slurm
+    # job it is accounting.  Keeping the scheduler identity in the durable
+    # payload lets a later, explicitly restarted job reuse the same SAVE_DIR
+    # without being blocked by a stale incident from an older attempt.
+    payload["slurm_job_id"] = os.environ.get("SLURM_JOB_ID")
+
+    failures: list[Exception] = []
+    for incident_dir in incident_dirs:
+        destination = incident_dir / f"rollout_{rollout_id:07d}.json"
+        temporary = incident_dir / (
+            f".{destination.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+        )
+        try:
+            incident_dir.mkdir(parents=True, exist_ok=True)
+            with temporary.open("x", encoding="utf-8") as stream:
+                json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+            directory_fd = os.open(incident_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            return destination
+        except Exception as exc:
+            failures.append(exc)
+            logger.exception(
+                "Failed to persist candidate-pool health incident under %s",
+                incident_dir,
+            )
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                # The directory itself may be the failed component.  Cleanup
+                # must not suppress the attempt at the independent fallback.
+                pass
+    raise OSError(
+        "candidate-pool health incident could not be persisted to any durable location"
+    ) from failures[-1]
+
+
+def _enforce_candidate_pool_health_gate(
+    args: Any,
+    accumulator: _CandidatePoolHealthAccumulator,
+    gate_config: _CandidatePoolHealthGateConfig,
+    *,
+    rollout_id: int,
+    accepted_group_count: int,
+    partial_store: PartialRolloutStore | None = None,
+) -> dict[str, Any]:
+    report = accumulator.report(
+        gate_config,
+        rollout_id=rollout_id,
+        accepted_group_count=accepted_group_count,
+    )
+    if not report["triggered"]:
+        return report
+
+    try:
+        stop_global_worker()
+    except Exception:
+        logger.exception("Failed to stop Polar worker after candidate-pool health gate")
+    # Accepted groups have durable KEEP records before the complete decision
+    # window is available.  They are intentionally not sealed with READY, but
+    # ordinary partial recovery would still reuse those bad provider results.
+    # Quarantine the whole uncommitted WAL so the exact checkpoint cursor
+    # regenerates the batch after the backend is healthy.
+    wal_quarantine_succeeded: bool | None = None
+    wal_quarantine_error_type: str | None = None
+    if partial_store is not None:
+        try:
+            partial_store.quarantine(
+                "candidate-pool health gate rejected the uncommitted decision window"
+            )
+            wal_quarantine_succeeded = True
+        except Exception as exc:
+            wal_quarantine_succeeded = False
+            wal_quarantine_error_type = type(exc).__name__
+            report["trigger_reasons"].append(
+                "global:partial_wal_quarantine_failed"
+            )
+            logger.exception(
+                "Failed to quarantine partial rollout WAL after candidate-pool health gate"
+            )
+    report["partial_wal"] = {
+        "present": partial_store is not None,
+        "quarantine_succeeded": wal_quarantine_succeeded,
+        "quarantine_error_type": wal_quarantine_error_type,
+    }
+    try:
+        incident_path = _persist_candidate_pool_health_incident(args, report)
+    except Exception as exc:
+        logger.exception(
+            "Candidate-pool health incident persistence failed in every durable location"
+        )
+        raise CandidatePoolHealthGateError(
+            f"candidate-pool health gate rejected rollout {rollout_id}, but its "
+            "incident could not be persisted; refusing to continue"
+        ) from exc
+    logger.error(
+        "Candidate-pool health gate rejected rollout %d before training: %s incident=%s",
+        rollout_id,
+        ", ".join(report["trigger_reasons"]),
+        incident_path or "unavailable",
+    )
+    raise CandidatePoolHealthGateError(
+        f"candidate-pool health gate rejected rollout {rollout_id}: "
+        + ", ".join(report["trigger_reasons"])
+    )
+
+
 @dataclass(slots=True)
 class _CandidateQualityAccumulator:
     """Streaming quality summary before dynamic-sampling selection."""
@@ -3304,18 +3892,49 @@ def generate_rollout_polar_async(
             partial_recovery,
             rollout_id,
         )
+    candidate_pool_gate_config = _candidate_pool_health_gate_config(async_worker.config)
+    candidate_pool_health = (
+        _CandidatePoolHealthAccumulator(candidate_pool_gate_config.candidate_aliases)
+        if candidate_pool_gate_config is not None
+        else None
+    )
     async_worker.set_rollout_context(rollout_id)
     target = int(getattr(args, "rollout_batch_size", 1))
     if len(partial_recovery.kept) > target:
         raise PartialRolloutError(
             f"recovered {len(partial_recovery.kept)} KEEP groups for target {target}"
         )
-    async_worker.request_groups(target - len(partial_recovery.kept))
 
     data: list[list[Any]] = [completed.samples for completed in partial_recovery.kept]
     accepted_completions: list[_CompletedGroup] = list(partial_recovery.kept)
+
+    def observe_candidate_health(completed: _CompletedGroup) -> None:
+        if candidate_pool_health is None or candidate_pool_gate_config is None:
+            return
+        candidate_pool_health.add(completed)
+        # Enforce incrementally, before any DROP/KEEP record is consumed or a
+        # replacement request is admitted.  Otherwise a provider outage whose
+        # groups all fail the low-complete or dynamic-sampling filters can loop
+        # forever without ever reaching a full accepted batch.
+        _enforce_candidate_pool_health_gate(
+            args,
+            candidate_pool_health,
+            candidate_pool_gate_config,
+            rollout_id=rollout_id,
+            accepted_group_count=len(data),
+            partial_store=partial_recovery.store,
+        )
+
+    def drain_candidate_health_observations() -> None:
+        drainer = getattr(async_worker, "drain_health_observations", None)
+        if not callable(drainer):
+            return
+        for observation in drainer():
+            observe_candidate_health(observation)
+
     candidate_quality = _CandidateQualityAccumulator()
     for completed in (*partial_recovery.candidate_only, *partial_recovery.kept):
+        observe_candidate_health(completed)
         try:
             candidate_quality.add(completed, reward_key=async_worker.config.reward_key)
         except Exception:
@@ -3325,6 +3944,7 @@ def generate_rollout_polar_async(
                 completed.group_id,
                 exc_info=True,
             )
+    async_worker.request_groups(target - len(partial_recovery.kept))
     dynamic_filter_metrics: dict[str, float] = dict(partial_recovery.dynamic_filter_metrics)
     dynamic_filter_reservation_metrics: dict[str, float] = dict(
         partial_recovery.reservation_metrics
@@ -3364,12 +3984,21 @@ def generate_rollout_polar_async(
             stop_global_worker()
             raise TaskCancelledError(error_message="Polar rollout generation was cancelled")
         made_progress = False
+        # Permanent worker-side rejections (for example, a whole provider
+        # cohort failing the trainable-completion floor) never enter the normal
+        # completed queue.  Inspect them before raise_if_failed and before
+        # asking for any replacement work.
+        drain_candidate_health_observations()
         completed_groups = async_worker.drain_completed(
             max_groups=target - len(data),
             rollout_id=rollout_id,
         )
+        # drain_completed can itself reject stale groups and publish their
+        # pre-filter health evidence.
+        drain_candidate_health_observations()
         replacement_groups = 0
         for completed in completed_groups:
+            observe_candidate_health(completed)
             try:
                 candidate_quality.add(
                     completed,
@@ -3447,6 +4076,17 @@ def generate_rollout_polar_async(
         elapsed,
         async_worker.queue_size(),
     )
+    drain_candidate_health_observations()
+    candidate_pool_health_report: dict[str, Any] | None = None
+    if candidate_pool_health is not None and candidate_pool_gate_config is not None:
+        candidate_pool_health_report = _enforce_candidate_pool_health_gate(
+            args,
+            candidate_pool_health,
+            candidate_pool_gate_config,
+            rollout_id=rollout_id,
+            accepted_group_count=len(data),
+            partial_store=partial_recovery.store,
+        )
     if partial_recovery.store is not None:
         partial_recovery.store.mark_ready(
             completed.reservation_id for completed in accepted_completions
@@ -3458,6 +4098,8 @@ def generate_rollout_polar_async(
     metrics: dict[str, Any] = dict(dynamic_filter_metrics)
     metrics.update(dynamic_filter_reservation_metrics)
     metrics.update(partial_recovery_metrics)
+    if candidate_pool_health_report is not None:
+        metrics.update(_candidate_pool_health_metrics(candidate_pool_health_report))
     metrics.update(
         _candidate_quality_metrics_fail_open(
             candidate_quality,

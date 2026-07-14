@@ -3372,6 +3372,35 @@ def write_spilot_admission_fatal_marker(
     return marker
 
 
+def write_candidate_pool_health_incident(
+    save_dir: Path,
+    *,
+    job_id: str,
+    rollout_id: int = 7,
+    triggered: bool = True,
+    fallback_state_file: Path | None = None,
+) -> Path:
+    incident_dir = (
+        Path(f"{fallback_state_file}.candidate_pool_health_incidents")
+        if fallback_state_file is not None
+        else save_dir / "rollout" / "candidate_pool_health_incidents"
+    )
+    incident_dir.mkdir(parents=True, exist_ok=True)
+    incident = incident_dir / f"rollout_{rollout_id:07d}.json"
+    incident.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "slurm_job_id": job_id,
+                "rollout_id": rollout_id,
+                "triggered": triggered,
+                "trigger_reasons": ["C1:completion_fraction_below_threshold"],
+            }
+        )
+    )
+    return incident
+
+
 @pytest.mark.parametrize(
     ("submit_script", "nvidia_key", "expected_error"),
     [
@@ -3829,6 +3858,113 @@ printf 'export POLAR_SUBMITTED_JOB_ID=333\\nexport POLAR_SUBMITTED_AT_UNIX=12345
     assert reset.returncode == 0, reset.stderr
     assert "submission succeeded: job=333" in reset.stdout
     assert submit_called.exists()
+
+
+@pytest.mark.parametrize("use_fallback_location", [False, True])
+def test_watcher_fail_closes_candidate_pool_health_incident_for_terminal_job(
+    tmp_path: Path,
+    use_fallback_location: bool,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_command(bin_dir / "squeue", "exit 0\n")
+    write_command(bin_dir / "sacct", "printf '%s\\n' \"$SACCT_RECORD\"\n")
+    submit_called = tmp_path / "submit-called"
+    bash_proxy = bin_dir / "bash"
+    bash_proxy.write_text(
+        """#!/bin/sh
+if [ "${1:-}" = "$EXPECTED_SUBMIT_SCRIPT" ]; then
+    touch "$SUBMIT_CALLED"
+    exit 0
+fi
+exec /bin/bash "$@"
+"""
+    )
+    bash_proxy.chmod(0o755)
+    env = enabled_spilot_watcher_env(tmp_path, bin_dir)
+    env.update(
+        TMAX_LAST_JOB_ID="201",
+        TMAX_LAST_JOB_CHECKPOINT_ITER="-1",
+        EXPECTED_SUBMIT_SCRIPT=str(SPILOT / "submit_slurm.sh"),
+        SUBMIT_CALLED=str(submit_called),
+        SACCT_RECORD="201|COMPLETED|7200|0:0|",
+    )
+    write_candidate_pool_health_incident(
+        Path(env["SAVE_DIR"]),
+        job_id="201",
+        rollout_id=50,
+        fallback_state_file=(
+            Path(env["TMAX_RUN_STATE_FILE"])
+            if use_fallback_location
+            else None
+        ),
+    )
+
+    result = subprocess.run(
+        ["/bin/bash", str(TMAX / "watch_training.sh"), "--relaunch"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert not submit_called.exists()
+    assert "candidate-pool health incident: job=201" in result.stderr
+    assert "refusing automatic resubmission" in result.stderr
+    state = Path(env["TMAX_RUN_STATE_FILE"]).read_text()
+    assert "export TMAX_WATCH_LAST_ACCOUNTED_JOB_ID=201\n" in state
+    assert "quick-fail-closed/candidate-pool-health/job=201" in state
+    assert r"incident=1\|50\|C1:completion_fraction_below_threshold" in state
+
+
+def test_watcher_ignores_candidate_pool_health_incident_from_old_job(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_command(bin_dir / "squeue", "exit 0\n")
+    write_command(bin_dir / "sacct", "printf '%s\\n' \"$SACCT_RECORD\"\n")
+    submit_called = tmp_path / "submit-called"
+    bash_proxy = bin_dir / "bash"
+    bash_proxy.write_text(
+        """#!/bin/sh
+if [ "${1:-}" = "$EXPECTED_SUBMIT_SCRIPT" ]; then
+    touch "$SUBMIT_CALLED"
+    mkdir -p "$(dirname "$TMAX_SUBMIT_RECEIPT_FILE")"
+    printf 'export POLAR_SUBMITTED_JOB_ID=333\nexport POLAR_SUBMITTED_AT_UNIX=12345\n' > "$TMAX_SUBMIT_RECEIPT_FILE"
+    exit 0
+fi
+exec /bin/bash "$@"
+"""
+    )
+    bash_proxy.chmod(0o755)
+    env = enabled_spilot_watcher_env(tmp_path, bin_dir)
+    env.update(
+        TMAX_LAST_JOB_ID="202",
+        TMAX_LAST_JOB_CHECKPOINT_ITER="-1",
+        EXPECTED_SUBMIT_SCRIPT=str(SPILOT / "submit_slurm.sh"),
+        SUBMIT_CALLED=str(submit_called),
+        SACCT_RECORD="202|PREEMPTED|120|1:0|",
+    )
+    write_candidate_pool_health_incident(
+        Path(env["SAVE_DIR"]),
+        job_id="201",
+        rollout_id=49,
+    )
+
+    result = subprocess.run(
+        ["/bin/bash", str(TMAX / "watch_training.sh"), "--relaunch"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert submit_called.exists()
+    assert "candidate-pool health incident" not in result.stderr
+    assert "submission succeeded: job=333" in result.stdout
 
 
 @pytest.mark.parametrize("admission_enabled", ["true", "false"])

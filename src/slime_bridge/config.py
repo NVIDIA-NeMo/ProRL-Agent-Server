@@ -35,6 +35,9 @@ class PolarSlimeConfig:
     scoring_mode: str
     min_complete_accept_fraction: float
     early_stop_grace_sessions: int
+    candidate_pool_health_gate_enabled: bool
+    candidate_pool_health_min_observed_sessions: int
+    candidate_pool_health_min_completion_fraction: float
     tokenizer_name_or_path: str | None
     add_generation_prompt: bool
     eval_dataset_name: str
@@ -133,6 +136,68 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
     if early_stop_grace_sessions < 0:
         raise ValueError("polar_early_stop_grace_sessions must be non-negative")
 
+    candidate_pool_health_gate_value = getattr(
+        args,
+        "polar_candidate_pool_health_gate_enabled",
+        False,
+    )
+    if isinstance(candidate_pool_health_gate_value, str):
+        normalized = candidate_pool_health_gate_value.strip().lower()
+        if normalized not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
+            raise ValueError("polar_candidate_pool_health_gate_enabled must be a boolean")
+        candidate_pool_health_gate_enabled = normalized in {"1", "true", "yes", "on"}
+    elif isinstance(candidate_pool_health_gate_value, bool):
+        candidate_pool_health_gate_enabled = candidate_pool_health_gate_value
+    else:
+        raise ValueError("polar_candidate_pool_health_gate_enabled must be a boolean")
+
+    raw_min_observed_sessions = getattr(
+        args,
+        "polar_candidate_pool_health_min_observed_sessions",
+        16,
+    )
+    if isinstance(raw_min_observed_sessions, bool):
+        raise ValueError(
+            "polar_candidate_pool_health_min_observed_sessions must be a positive integer"
+        )
+    try:
+        candidate_pool_health_min_observed_sessions = int(raw_min_observed_sessions)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "polar_candidate_pool_health_min_observed_sessions must be a positive integer"
+        ) from exc
+    if (
+        candidate_pool_health_min_observed_sessions <= 0
+        or str(raw_min_observed_sessions).strip()
+        != str(candidate_pool_health_min_observed_sessions)
+    ):
+        raise ValueError(
+            "polar_candidate_pool_health_min_observed_sessions must be a positive integer"
+        )
+
+    raw_min_completion_fraction = getattr(
+        args,
+        "polar_candidate_pool_health_min_completion_fraction",
+        0.1,
+    )
+    if isinstance(raw_min_completion_fraction, bool):
+        raise ValueError(
+            "polar_candidate_pool_health_min_completion_fraction must be between 0 and 1"
+        )
+    try:
+        candidate_pool_health_min_completion_fraction = float(raw_min_completion_fraction)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "polar_candidate_pool_health_min_completion_fraction must be between 0 and 1"
+        ) from exc
+    if not (
+        math.isfinite(candidate_pool_health_min_completion_fraction)
+        and 0.0 <= candidate_pool_health_min_completion_fraction <= 1.0
+    ):
+        raise ValueError(
+            "polar_candidate_pool_health_min_completion_fraction must be between 0 and 1"
+        )
+
     return PolarSlimeConfig(
         rollout_server_url=str(rollout_server_url).rstrip("/"),
         task_template=task_template,
@@ -158,6 +223,13 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
         scoring_mode=scoring_mode,
         min_complete_accept_fraction=min_complete_accept_fraction,
         early_stop_grace_sessions=early_stop_grace_sessions,
+        candidate_pool_health_gate_enabled=candidate_pool_health_gate_enabled,
+        candidate_pool_health_min_observed_sessions=(
+            candidate_pool_health_min_observed_sessions
+        ),
+        candidate_pool_health_min_completion_fraction=(
+            candidate_pool_health_min_completion_fraction
+        ),
         tokenizer_name_or_path=getattr(args, "hf_checkpoint", None),
         add_generation_prompt=bool(getattr(args, "polar_add_generation_prompt", True)),
         eval_dataset_name=str(getattr(args, "polar_eval_dataset_name", "polar_eval")),

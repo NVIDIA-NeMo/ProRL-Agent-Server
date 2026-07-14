@@ -1054,6 +1054,11 @@ def render_polar_config(
         "POLAR_CALLBACK_HOST": "127.0.0.1",
         "POLAR_MIN_COMPLETE_ACCEPT_FRACTION": "0",
         "POLAR_EARLY_STOP_GRACE_SESSIONS": "0",
+        # Forced-route evaluation never hands samples to an optimizer.  Keep
+        # the training-only provider-health gate disabled in this renderer.
+        "POLAR_CANDIDATE_POOL_HEALTH_GATE_ENABLED": "false",
+        "POLAR_CANDIDATE_POOL_HEALTH_MIN_OBSERVED_SESSIONS": "16",
+        "POLAR_CANDIDATE_POOL_HEALTH_MIN_COMPLETION_FRACTION": "0.1",
         "TMAX_TRAIN_PACK_LENGTH": "67584",
         "TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP": "1",
         "AGENT_CLI_DIR": str(data_root / "agent_cli" / "opt_node"),
@@ -1096,6 +1101,12 @@ def render_polar_config(
         "SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS": str(
             FORCED_EVAL_ADMISSION_WAIT_SECONDS
         ),
+        # Forced-route metrics report actual calls and cost but do not apply
+        # the training experiment's optional cost-shaped reward.
+        "SPILOT_QWEN_COST_WEIGHT": "1.0",
+        "SPILOT_GPT_COST_WEIGHT": "1.0",
+        "SPILOT_COST_PENALTY_LAMBDA": "0.0",
+        "SPILOT_COST_NORMALIZER": "1.0",
     }
     template = (template_path or EXAMPLE_DIR / "polar_config.yaml").read_text(encoding="utf-8")
     missing = sorted(set(TEMPLATE_VARIABLE_RE.findall(template)) - values.keys())
