@@ -361,6 +361,14 @@ class _RemoteRun:
         return iter(self._rows)
 
 
+class _RemoteRunWithHistoryKeys(_RemoteRun):
+    def __init__(self, rows=(), *, history_keys=(), state="finished"):
+        super().__init__(rows=rows, state=state)
+        self._attrs = {
+            "historyKeys": {"keys": {key: {"typeCounts": []} for key in history_keys}}
+        }
+
+
 class _Api:
     def __init__(self, run):
         self._run = run
@@ -451,6 +459,64 @@ def test_scan_remote_rows_rejects_partial_and_duplicate_axis_rows() -> None:
             axis_key=axis,
             metric_keys=metric_keys,
         )
+
+
+@pytest.mark.unit
+def test_remote_history_key_names_distinguishes_absent_metadata() -> None:
+    axis = "postrun_v1/rollout_step"
+
+    assert backfill._remote_history_key_names(_RemoteRun()) is None
+    assert backfill._remote_history_key_names(
+        _RemoteRunWithHistoryKeys(history_keys=[axis, "postrun_v1/value"])
+    ) == {axis, "postrun_v1/value"}
+
+
+@pytest.mark.unit
+def test_commit_skips_broken_scan_for_authoritatively_new_namespace(
+    monkeypatch, tmp_path: Path
+) -> None:
+    axis = "postrun_v1/rollout_step"
+    row = {axis: 0, "postrun_v1/accuracy_outcome": 0.75}
+    api = _Api(_RemoteRunWithHistoryKeys(history_keys=["legacy/value"]))
+
+    class _CommitWandb:
+        @staticmethod
+        def Api():
+            return api
+
+    appended = []
+    monkeypatch.setenv("WANDB_API_KEY", "test-only")
+    monkeypatch.setattr(
+        backfill,
+        "scan_remote_rows",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an absent namespace must not call W&B scan_history")
+        ),
+    )
+    monkeypatch.setattr(
+        backfill,
+        "append_missing_rows",
+        lambda _wandb, rows, **_kwargs: appended.extend(rows),
+    )
+    monkeypatch.setattr(backfill, "wait_for_readback", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backfill, "_assert_progress_unchanged", lambda *_args: None)
+
+    written = backfill.commit_rows(
+        [row],
+        checkpoint_root=tmp_path,
+        completed_step=0,
+        entity="hwinf_dcm",
+        project="SPilot",
+        run_id="run-id",
+        metric_prefix="postrun_v1",
+        wandb_dir=None,
+        readback_timeout_s=1.0,
+        readback_interval_s=0.01,
+        wandb_module=_CommitWandb(),
+    )
+
+    assert written == 1
+    assert appended == [row]
 
 
 @pytest.mark.unit

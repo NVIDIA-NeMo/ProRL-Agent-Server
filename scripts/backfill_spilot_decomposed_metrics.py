@@ -799,6 +799,21 @@ def scan_remote_rows(
     return rows
 
 
+def _remote_history_key_names(remote_run: Any) -> set[str] | None:
+    """Return authoritative Public API history keys when the SDK exposes them."""
+
+    attrs = getattr(remote_run, "_attrs", None)
+    if not isinstance(attrs, Mapping):
+        return None
+    history_keys = attrs.get("historyKeys")
+    if not isinstance(history_keys, Mapping):
+        return None
+    keys = history_keys.get("keys")
+    if not isinstance(keys, Mapping):
+        return None
+    return {str(key) for key in keys}
+
+
 def _metric_keys(rows: Sequence[Mapping[str, float | int]], *, axis_key: str) -> list[str]:
     if not rows:
         raise BackfillError("no local rows were reconstructed")
@@ -999,12 +1014,20 @@ def commit_rows(
     axis_key = _axis_key(metric_prefix)
     metric_keys = _metric_keys(rows, axis_key=axis_key)
     expected_keys_by_step = _expected_keys_by_step(rows, axis_key=axis_key)
-    existing = scan_remote_rows(
-        remote_run,
-        axis_key=axis_key,
-        metric_keys=metric_keys,
-        expected_keys_by_step=expected_keys_by_step,
-    )
+    known_history_keys = _remote_history_key_names(remote_run)
+    if known_history_keys is not None and axis_key not in known_history_keys:
+        # W&B currently raises "Step column '_step' not found in schema" when
+        # scan_history selects an entirely new metric namespace.  A freshly
+        # loaded Public API historyKeys map can prove that the namespace is
+        # absent without weakening validation once its business axis exists.
+        existing = {}
+    else:
+        existing = scan_remote_rows(
+            remote_run,
+            axis_key=axis_key,
+            metric_keys=metric_keys,
+            expected_keys_by_step=expected_keys_by_step,
+        )
     missing = compare_remote_rows(rows, existing, axis_key=axis_key)
     _assert_progress_unchanged(checkpoint_root, completed_step)
     if missing:
