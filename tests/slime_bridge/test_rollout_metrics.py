@@ -6,6 +6,7 @@ import math
 from types import SimpleNamespace
 
 from slime_bridge.rollout import (
+    _CandidateQualityAccumulator,
     _control_plane_headers,
     _log_trajectory_examples_to_wandb,
     _polar_extra_metrics,
@@ -47,6 +48,7 @@ def _sample(
     missing_loss_mask: bool = False,
     truncated: bool | None = None,
     spilot_router: dict | None = None,
+    evaluation_fields: dict | None = None,
 ) -> SimpleNamespace:
     polar = {
         "session_id": session_id,
@@ -108,8 +110,11 @@ def _sample(
             "trainable": True,
             "reason": "agent_timeout",
         }
-    if spilot_router is not None:
-        polar["trajectory_metadata"] = {"evaluation": {"spilot_router": spilot_router}}
+    if spilot_router is not None or evaluation_fields is not None:
+        evaluation = dict(evaluation_fields or {})
+        if spilot_router is not None:
+            evaluation["spilot_router"] = spilot_router
+        polar["trajectory_metadata"] = {"evaluation": evaluation}
     sample_is_truncated = agent_timeout if truncated is None else truncated
     return SimpleNamespace(
         reward={"score": reward},
@@ -186,6 +191,8 @@ def test_spilot_router_metrics_count_each_session_once_with_fixed_slot_keys() ->
                 "slot": "M0",
                 "model": "vendor/model-a",
                 "status": "completed",
+                "role": "solve",
+                "cost": 1.0,
                 "duration_ms": 100,
                 "admission_wait_ms": 0,
                 "admission_local_cap": 1,
@@ -214,6 +221,8 @@ def test_spilot_router_metrics_count_each_session_once_with_fixed_slot_keys() ->
                 "slot": "M1",
                 "model": "vendor/model-b",
                 "status": "failed",
+                "role": "solve",
+                "cost": 2.0,
                 "duration_ms": 200,
                 "admission_wait_ms": 3000,
                 "admission_local_cap": 4,
@@ -222,6 +231,8 @@ def test_spilot_router_metrics_count_each_session_once_with_fixed_slot_keys() ->
                 "slot": "M0",
                 "model": "vendor/model-a",
                 "status": "timeout",
+                "role": "verify",
+                "cost": 1.0,
                 "duration_ms": 1200,
                 "admission_wait_ms": 1000,
                 "admission_local_cap": 1,
@@ -272,12 +283,28 @@ def test_spilot_router_metrics_count_each_session_once_with_fixed_slot_keys() ->
     assert metrics[f"{prefix}/pool_completed_count"] == 1.0
     assert metrics[f"{prefix}/pool_failed_count"] == 1.0
     assert metrics[f"{prefix}/pool_timeout_count"] == 1.0
+    assert metrics[f"{prefix}/pool_cost_accounted_call_count"] == 3.0
+    assert metrics[f"{prefix}/pool_cost_total"] == 4.0
+    assert metrics[f"{prefix}/pool_unattributed_cost_total"] == 0.0
+    assert metrics[f"{prefix}/pool_cost_reconciliation_delta"] == 0.0
     assert metrics[f"{prefix}/pool_completed_candidate_c0_count"] == 1.0
     assert metrics[f"{prefix}/pool_failed_candidate_c0_count"] == 0.0
     assert metrics[f"{prefix}/pool_timeout_candidate_c0_count"] == 1.0
     assert metrics[f"{prefix}/pool_completed_candidate_c1_count"] == 0.0
     assert metrics[f"{prefix}/pool_failed_candidate_c1_count"] == 1.0
     assert metrics[f"{prefix}/pool_timeout_candidate_c1_count"] == 0.0
+    assert metrics[f"{prefix}/pool_cost_candidate_c0_accounted_call_count"] == 2.0
+    assert metrics[f"{prefix}/pool_cost_candidate_c0_total"] == 2.0
+    assert metrics[f"{prefix}/pool_cost_candidate_c0_mean"] == 1.0
+    assert metrics[f"{prefix}/pool_cost_candidate_c1_accounted_call_count"] == 1.0
+    assert metrics[f"{prefix}/pool_cost_candidate_c1_total"] == 2.0
+    assert metrics[f"{prefix}/pool_cost_candidate_c1_mean"] == 2.0
+    assert metrics[f"{prefix}/pool_cost_solve_accounted_call_count"] == 2.0
+    assert metrics[f"{prefix}/pool_cost_solve_total"] == 3.0
+    assert metrics[f"{prefix}/pool_cost_solve_mean"] == 1.5
+    assert metrics[f"{prefix}/pool_cost_verify_accounted_call_count"] == 1.0
+    assert metrics[f"{prefix}/pool_cost_verify_total"] == 1.0
+    assert metrics[f"{prefix}/pool_cost_verify_mean"] == 1.0
     assert metrics[f"{prefix}/pool_duration_candidate_c0_count"] == 2.0
     assert metrics[f"{prefix}/pool_duration_candidate_c0_mean_ms"] == 650.0
     assert metrics[f"{prefix}/pool_duration_candidate_c0_max_ms"] == 1200.0
@@ -317,6 +344,119 @@ def test_spilot_router_metrics_count_each_session_once_with_fixed_slot_keys() ->
     assert metrics[f"{prefix}/reward_candidate_c0_mean"] == 1.0
     assert metrics[f"{prefix}/reward_candidate_c1_mean"] == 0.0
     assert not any("vendor/model" in key for key in metrics)
+
+
+def test_spilot_router_reports_accuracy_cost_and_shaping_separately() -> None:
+    slot_mapping = {
+        "M0": {"model": "pool/gpt"},
+        "M1": {"model": "pool/qwen"},
+    }
+
+    def router_metadata(*, slot: str, total_cost: float) -> dict:
+        return {
+            "action_valid": True,
+            "submitted": True,
+            "actions": [
+                {"step": 0, "valid": True, "action": "ROUTE", "model_slot": slot},
+                {"step": 1, "valid": True, "action": "SUBMIT"},
+            ],
+            "calls": [],
+            "total_cost": total_cost,
+            "termination_reason": "router_submit",
+            "slot_mapping": slot_mapping,
+        }
+
+    samples = [
+        _sample(
+            "gpt-success",
+            0.9,
+            spilot_router=router_metadata(slot="M0", total_cost=15.0),
+            evaluation_fields={
+                "harbor_outcome_reward": 1.0,
+                "applied_cost_penalty": 0.1,
+            },
+        ),
+        _sample(
+            "qwen-success",
+            149.0 / 150.0,
+            spilot_router=router_metadata(slot="M1", total_cost=1.0),
+            evaluation_fields={
+                "harbor_outcome_reward": 1.0,
+                "applied_cost_penalty": 1.0 / 150.0,
+            },
+        ),
+        _sample(
+            "gpt-failure",
+            0.0,
+            spilot_router=router_metadata(slot="M0", total_cost=15.0),
+            evaluation_fields={
+                "harbor_outcome_reward": 0.0,
+                "applied_cost_penalty": 0.0,
+            },
+        ),
+    ]
+
+    metrics = _polar_extra_metrics(
+        samples,
+        rewards=[0.9, 149.0 / 150.0, 0.0],
+        reward_key="score",
+    )
+    prefix = "polar/spilot_router"
+
+    assert metrics[f"{prefix}/accuracy_outcome_accounted_session_count"] == 3.0
+    assert math.isclose(metrics[f"{prefix}/accuracy_outcome_mean"], 2.0 / 3.0)
+    assert metrics[f"{prefix}/accuracy_outcome_positive_count"] == 2.0
+    assert math.isclose(metrics[f"{prefix}/accuracy_outcome_positive_fraction"], 2.0 / 3.0)
+    assert metrics[f"{prefix}/total_cost_accounted_session_count"] == 3.0
+    assert math.isclose(metrics[f"{prefix}/total_cost_mean"], 31.0 / 3.0)
+    assert metrics[f"{prefix}/total_cost_median"] == 15.0
+    assert metrics[f"{prefix}/total_cost_min"] == 1.0
+    assert metrics[f"{prefix}/total_cost_max"] == 15.0
+    assert metrics[f"{prefix}/total_cost_total"] == 31.0
+    assert metrics[f"{prefix}/cost_penalty_fraction_accounted_session_count"] == 3.0
+    assert math.isclose(
+        metrics[f"{prefix}/cost_penalty_fraction_mean"],
+        (0.1 + 1.0 / 150.0) / 3.0,
+    )
+    assert metrics[f"{prefix}/cost_penalty_reward_delta_accounted_session_count"] == 3.0
+    assert math.isclose(
+        metrics[f"{prefix}/cost_penalty_reward_delta_mean"],
+        (0.1 + 1.0 / 150.0) / 3.0,
+    )
+    assert metrics[f"{prefix}/cost_adjusted_reward_accounted_session_count"] == 3.0
+    assert math.isclose(
+        metrics[f"{prefix}/cost_adjusted_reward_mean"],
+        (0.9 + 149.0 / 150.0) / 3.0,
+    )
+
+    # pool/gpt is stable candidate C0 and pool/qwen is C1, independently of slots.
+    assert metrics[f"{prefix}/accuracy_outcome_candidate_c0_accounted_session_count"] == 2.0
+    assert metrics[f"{prefix}/accuracy_outcome_candidate_c0_mean"] == 0.5
+    assert metrics[f"{prefix}/total_cost_candidate_c0_mean"] == 15.0
+    assert metrics[f"{prefix}/cost_penalty_reward_delta_candidate_c0_mean"] == 0.05
+    assert metrics[f"{prefix}/cost_adjusted_reward_candidate_c0_mean"] == 0.45
+    assert metrics[f"{prefix}/accuracy_outcome_candidate_c1_accounted_session_count"] == 1.0
+    assert metrics[f"{prefix}/accuracy_outcome_candidate_c1_mean"] == 1.0
+    assert metrics[f"{prefix}/total_cost_candidate_c1_mean"] == 1.0
+
+    candidate = _CandidateQualityAccumulator()
+    candidate.add(
+        SimpleNamespace(samples=samples, session_count=len(samples)),
+        reward_key="score",
+    )
+    candidate_metrics = candidate.as_metrics(accepted_group_count=1)
+    assert candidate_metrics["polar/candidate/accuracy_outcome_accounted_sessions"] == 3.0
+    assert candidate_metrics["polar/candidate/accuracy_outcome_mean"] == 2.0 / 3.0
+    assert candidate_metrics["polar/candidate/total_cost_total"] == 31.0
+    assert candidate_metrics["polar/candidate/total_cost_mean"] == 31.0 / 3.0
+    assert math.isclose(
+        candidate_metrics["polar/candidate/cost_penalty_reward_delta_mean"],
+        (0.1 + 1.0 / 150.0) / 3.0,
+    )
+    assert math.isclose(
+        candidate_metrics["polar/candidate/cost_adjusted_reward_mean"],
+        (0.9 + 149.0 / 150.0) / 3.0,
+    )
 
 
 def test_spilot_router_candidate_metrics_are_stable_when_slots_shuffle() -> None:
@@ -475,6 +615,8 @@ def test_spilot_router_does_not_attribute_inconsistent_call_model_and_slot() -> 
                 "slot": "M0",
                 "model": "pool/model-b",
                 "status": "completed",
+                "role": "solve",
+                "cost": 1.0,
                 "duration_ms": 100,
             }
         ],
@@ -496,10 +638,202 @@ def test_spilot_router_does_not_attribute_inconsistent_call_model_and_slot() -> 
     assert metrics[f"{prefix}/pool_call_count"] == 1.0
     assert metrics[f"{prefix}/pool_completed_count"] == 1.0
     assert metrics[f"{prefix}/pool_unattributed_call_count"] == 1.0
+    assert metrics[f"{prefix}/pool_unattributed_cost_total"] == 1.0
+    assert metrics[f"{prefix}/pool_cost_reconciliation_delta"] == 0.0
     assert metrics[f"{prefix}/pool_completed_candidate_c0_count"] == 0.0
     assert metrics[f"{prefix}/pool_completed_candidate_c1_count"] == 0.0
     assert metrics[f"{prefix}/pool_duration_candidate_c0_count"] == 0.0
     assert metrics[f"{prefix}/pool_duration_candidate_c1_count"] == 0.0
+
+
+def test_spilot_router_uses_later_trace_metadata_but_omits_conflicting_copies() -> None:
+    router_metadata = {
+        "action_valid": True,
+        "submitted": True,
+        "actions": [
+            {"step": 0, "valid": True, "action": "ROUTE", "model_slot": "M0"},
+            {"step": 1, "valid": True, "action": "SUBMIT"},
+        ],
+        "calls": [],
+        "total_cost": 0.0,
+        "slot_mapping": {
+            "M0": {"model": "pool/model-a"},
+            "M1": {"model": "pool/model-b"},
+        },
+    }
+    missing_first = _sample("late-metadata", 1.0, trace_index=0)
+    complete_second = _sample(
+        "late-metadata",
+        1.0,
+        trace_index=1,
+        spilot_router=router_metadata,
+        evaluation_fields={
+            "harbor_outcome_reward": 1.0,
+            "applied_cost_penalty": 0.0,
+        },
+    )
+
+    metrics = _polar_extra_metrics(
+        [missing_first, complete_second], rewards=[1.0, 1.0], reward_key="score"
+    )
+    prefix = "polar/spilot_router"
+    assert metrics[f"{prefix}/session_count"] == 1.0
+    assert metrics[f"{prefix}/accuracy_outcome_accounted_session_count"] == 1.0
+    assert metrics[f"{prefix}/telemetry_conflict_session_count"] == 0.0
+
+    conflicting_router = dict(router_metadata, total_cost=1.0)
+    conflicting = _sample(
+        "late-metadata",
+        1.0,
+        trace_index=2,
+        spilot_router=conflicting_router,
+        evaluation_fields={
+            "harbor_outcome_reward": 1.0,
+            "applied_cost_penalty": 0.0,
+        },
+    )
+    conflict_metrics = _polar_extra_metrics(
+        [complete_second, conflicting], rewards=[1.0, 1.0], reward_key="score"
+    )
+    assert conflict_metrics[f"{prefix}/telemetry_conflict_session_count"] == 1.0
+    assert f"{prefix}/session_count" not in conflict_metrics
+    assert f"{prefix}/accuracy_outcome_mean" not in conflict_metrics
+
+
+def test_spilot_router_duplicate_comparison_distinguishes_booleans_from_numbers() -> None:
+    def router(total_cost: object) -> dict:
+        return {
+            "action_valid": True,
+            "submitted": True,
+            "actions": [
+                {"step": 0, "valid": True, "action": "ROUTE", "model_slot": "M0"},
+                {"step": 1, "valid": True, "action": "SUBMIT"},
+            ],
+            "calls": [],
+            "total_cost": total_cost,
+            "slot_mapping": {
+                "M0": {"model": "pool/model-a"},
+                "M1": {"model": "pool/model-b"},
+            },
+        }
+
+    conflict_pairs = [
+        (
+            _sample(
+                "typed-router-cost",
+                1.0,
+                trace_index=0,
+                spilot_router=router(True),
+                evaluation_fields={
+                    "harbor_outcome_reward": 1.0,
+                    "applied_cost_penalty": 0.0,
+                },
+            ),
+            _sample(
+                "typed-router-cost",
+                1.0,
+                trace_index=1,
+                spilot_router=router(1.0),
+                evaluation_fields={
+                    "harbor_outcome_reward": 1.0,
+                    "applied_cost_penalty": 0.0,
+                },
+            ),
+        ),
+        (
+            _sample(
+                "typed-evaluation",
+                1.0,
+                trace_index=0,
+                spilot_router=router(0.0),
+                evaluation_fields={
+                    "harbor_outcome_reward": True,
+                    "applied_cost_penalty": False,
+                },
+            ),
+            _sample(
+                "typed-evaluation",
+                1.0,
+                trace_index=1,
+                spilot_router=router(0.0),
+                evaluation_fields={
+                    "harbor_outcome_reward": 1.0,
+                    "applied_cost_penalty": 0.0,
+                },
+            ),
+        ),
+    ]
+    list_router = router(0.0)
+    tuple_router = dict(
+        list_router,
+        actions=tuple(list_router["actions"]),
+        calls=tuple(list_router["calls"]),
+    )
+    conflict_pairs.append(
+        (
+            _sample(
+                "typed-containers",
+                1.0,
+                trace_index=0,
+                spilot_router=tuple_router,
+                evaluation_fields={
+                    "harbor_outcome_reward": 1.0,
+                    "applied_cost_penalty": 0.0,
+                },
+            ),
+            _sample(
+                "typed-containers",
+                1.0,
+                trace_index=1,
+                spilot_router=list_router,
+                evaluation_fields={
+                    "harbor_outcome_reward": 1.0,
+                    "applied_cost_penalty": 0.0,
+                },
+            ),
+        )
+    )
+    prefix = "polar/spilot_router"
+    for first, second in conflict_pairs:
+        for samples in ([first, second], [second, first]):
+            metrics = _polar_extra_metrics(samples, rewards=[1.0, 1.0], reward_key="score")
+            assert metrics[f"{prefix}/telemetry_conflict_session_count"] == 1.0
+            assert f"{prefix}/session_count" not in metrics
+
+
+def test_spilot_router_omits_candidate_attribution_when_alias_pair_changes() -> None:
+    def router(model_a: str, model_b: str) -> dict:
+        return {
+            "action_valid": True,
+            "submitted": True,
+            "actions": [
+                {"step": 0, "valid": True, "action": "ROUTE", "model_slot": "M0"},
+                {"step": 1, "valid": True, "action": "SUBMIT"},
+            ],
+            "calls": [],
+            "total_cost": 0.0,
+            "slot_mapping": {
+                "M0": {"model": model_a},
+                "M1": {"model": model_b},
+            },
+        }
+
+    metrics = _polar_extra_metrics(
+        [
+            _sample("pair-a", 1.0, spilot_router=router("pool/a", "pool/b")),
+            _sample("pair-b", 0.0, spilot_router=router("pool/a", "pool/c")),
+        ],
+        rewards=[1.0, 0.0],
+        reward_key="score",
+    )
+    prefix = "polar/spilot_router"
+    assert metrics[f"{prefix}/candidate_alias_pair_count"] == 2.0
+    assert metrics[f"{prefix}/candidate_alias_pair_conflict"] == 1.0
+    assert metrics[f"{prefix}/route_m0_count"] == 2.0
+    assert metrics[f"{prefix}/route_candidate_c0_count"] == 0.0
+    assert metrics[f"{prefix}/route_candidate_c1_count"] == 0.0
+    assert metrics[f"{prefix}/reward_candidate_c0_count"] == 0.0
+    assert metrics[f"{prefix}/reward_candidate_c1_count"] == 0.0
 
 
 def test_spilot_router_reward_metrics_omit_unsafe_unaccounted_session() -> None:
@@ -520,6 +854,10 @@ def test_spilot_router_reward_metrics_omit_unsafe_unaccounted_session() -> None:
         placeholder=True,
         trainable=False,
         spilot_router=router_metadata,
+        evaluation_fields={
+            "harbor_outcome_reward": float("nan"),
+            "applied_cost_penalty": 1.1,
+        },
     )
 
     metrics = _polar_extra_metrics([unaccounted], rewards=[1.0], reward_key="score")
@@ -527,6 +865,10 @@ def test_spilot_router_reward_metrics_omit_unsafe_unaccounted_session() -> None:
 
     assert metrics[f"{prefix}/session_count"] == 1.0
     assert metrics[f"{prefix}/total_cost"] == 0.0
+    assert metrics[f"{prefix}/total_cost_accounted_session_count"] == 0.0
+    assert metrics[f"{prefix}/accuracy_outcome_accounted_session_count"] == 0.0
+    assert metrics[f"{prefix}/cost_penalty_fraction_accounted_session_count"] == 0.0
+    assert metrics[f"{prefix}/cost_penalty_reward_delta_accounted_session_count"] == 0.0
     assert metrics[f"{prefix}/reward_accounted_session_count"] == 0.0
     assert f"{prefix}/reward_mean" not in metrics
     assert f"{prefix}/reward_m0_mean" not in metrics
@@ -535,6 +877,41 @@ def test_spilot_router_reward_metrics_omit_unsafe_unaccounted_session() -> None:
     assert metrics[f"{prefix}/reward_candidate_c0_count"] == 0.0
     assert metrics[f"{prefix}/reward_candidate_c1_count"] == 0.0
     assert not any("dynamic-model-id" in key for key in metrics)
+
+
+def test_spilot_router_does_not_treat_boolean_cost_as_one() -> None:
+    router_metadata = {
+        "action_valid": True,
+        "submitted": True,
+        "actions": [
+            {"step": 0, "valid": True, "action": "ROUTE", "model_slot": "M0"},
+            {"step": 1, "valid": True, "action": "SUBMIT"},
+        ],
+        "calls": [
+            {
+                "slot": "M0",
+                "model": "pool/model-a",
+                "status": "completed",
+                "role": "solve",
+                "cost": True,
+            }
+        ],
+        "total_cost": True,
+        "slot_mapping": {
+            "M0": {"model": "pool/model-a"},
+            "M1": {"model": "pool/model-b"},
+        },
+    }
+    metrics = _polar_extra_metrics(
+        [_sample("boolean-cost", 1.0, spilot_router=router_metadata)],
+        rewards=[1.0],
+        reward_key="score",
+    )
+    prefix = "polar/spilot_router"
+    assert metrics[f"{prefix}/total_cost"] == 0.0
+    assert metrics[f"{prefix}/total_cost_accounted_session_count"] == 0.0
+    assert metrics[f"{prefix}/pool_cost_accounted_call_count"] == 0.0
+    assert metrics[f"{prefix}/pool_cost_total"] == 0.0
 
 
 def test_polar_reward_mean_counts_trusted_model_failure_but_not_early_stop() -> None:

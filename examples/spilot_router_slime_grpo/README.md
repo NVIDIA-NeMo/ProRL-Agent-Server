@@ -72,9 +72,10 @@ bash examples/spilot_router_slime_grpo/submit_slurm.sh
 The SPilot run state lives under `runs/spilot_router_slime_grpo/` and never
 contains the NVIDIA key.
 
-`cost_penalty_lambda` is deliberately `0.0`; pool usage is logged but does not
-shape reward in this first experiment. Invalid Router actions receive reward
-zero, and only gateway-provenanced `router_policy` completions are trainable.
+`cost_penalty_lambda` defaults to `0.0`; runs can opt into success-gated cost
+shaping through `SPILOT_COST_PENALTY_LAMBDA`. Invalid Router actions receive
+reward zero, and only gateway-provenanced `router_policy` completions are
+trainable.
 
 For training diagnostics, `rollout/raw_reward` is Slime's legacy
 trace/sample-weighted series and can include masked or early-stop placeholder
@@ -84,6 +85,28 @@ quality signal and use `polar/spilot_router/reward_candidate_c0_mean` and
 C-index is the lexical alias order: for this pool C0 is GPT-5.5 and C1 is
 Qwen3.6-27B. Interpret those rewards together with each candidate's timeout and
 admission-failure metrics.
+
+Cost-shaped experiments also publish one-session-one-vote decomposition under
+`polar/spilot_router/` so performance and efficiency do not have to be inferred
+from the combined reward:
+
+- `accuracy_outcome_mean` is the raw Harbor task outcome before Router validity
+  and cost shaping;
+- `total_cost_{mean,median,min,max,total}` is the actual accepted-session pool
+  spend;
+- `cost_penalty_fraction_mean` is the evaluator's applied penalty fraction;
+- `cost_penalty_reward_delta_mean` is the reward removed by cost shaping; and
+- `cost_adjusted_reward_mean` is the final reward used for training.
+
+Every family has an `*_accounted_session_count`; malformed or missing metadata
+is omitted instead of becoming a fabricated zero. These counts are independent:
+for example, a containment-filtered session can still contribute raw accuracy
+and cost while being absent from the training-reward denominator. The same
+values are split by initial slot (`m0`/`m1`) and stable candidate
+(`candidate_c0`/`candidate_c1`).
+Per-call cost is additionally reported by stable candidate and by `solve` versus
+`verify`, with `pool_cost_reconciliation_delta` comparing the call ledger to
+accepted-session `total_cost`.
 
 ## Paired forced-route evaluation
 

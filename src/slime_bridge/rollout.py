@@ -2752,6 +2752,21 @@ _CANDIDATE_SESSION_COUNT_METRICS = {
     "timeout_masked_sessions": "polar/timeout_masked_sessions",
 }
 
+_CANDIDATE_DECOMPOSED_METRICS = {
+    name: (
+        f"polar/spilot_router/{name}_accounted_session_count",
+        f"polar/spilot_router/{name}_mean",
+        f"polar/spilot_router/{name}_std",
+    )
+    for name in (
+        "accuracy_outcome",
+        "total_cost",
+        "cost_penalty_fraction",
+        "cost_penalty_reward_delta",
+        "cost_adjusted_reward",
+    )
+}
+
 
 @dataclass(slots=True)
 class _CandidateQualityAccumulator:
@@ -2769,6 +2784,15 @@ class _CandidateQualityAccumulator:
     group_reward_square_sum: float = 0.0
     trainable_samples: int = 0
     trainable_reward_sum: float = 0.0
+    decomposed_counts: dict[str, float] = field(
+        default_factory=lambda: {name: 0.0 for name in _CANDIDATE_DECOMPOSED_METRICS}
+    )
+    decomposed_sums: dict[str, float] = field(
+        default_factory=lambda: {name: 0.0 for name in _CANDIDATE_DECOMPOSED_METRICS}
+    )
+    decomposed_square_sums: dict[str, float] = field(
+        default_factory=lambda: {name: 0.0 for name in _CANDIDATE_DECOMPOSED_METRICS}
+    )
     session_counts: dict[str, float] = field(
         default_factory=lambda: {name: 0.0 for name in _CANDIDATE_SESSION_COUNT_METRICS}
     )
@@ -2822,6 +2846,19 @@ class _CandidateQualityAccumulator:
             name: float(quality.get(source, 0.0))
             for name, source in _CANDIDATE_SESSION_COUNT_METRICS.items()
         }
+        decomposed: dict[str, tuple[float, float, float]] = {}
+        for name, (count_key, mean_key, std_key) in _CANDIDATE_DECOMPOSED_METRICS.items():
+            count = float(quality.get(count_key, 0.0))
+            mean = quality.get(mean_key)
+            if count <= 0.0 or mean is None:
+                continue
+            parsed_mean = float(mean)
+            parsed_std = float(quality.get(std_key, 0.0))
+            if not all(math.isfinite(value) for value in (count, parsed_mean, parsed_std)):
+                raise ValueError(f"non-finite candidate {name} telemetry")
+            if parsed_std < 0.0:
+                raise ValueError(f"negative candidate {name} standard deviation")
+            decomposed[name] = (count, parsed_mean, parsed_std)
 
         # Commit only after every optional extraction and conversion succeeds.
         # The caller can therefore count a telemetry error without retaining a
@@ -2832,6 +2869,10 @@ class _CandidateQualityAccumulator:
         self.trainable_reward_sum += sum(trainable_rewards)
         for name, count in session_counts.items():
             self.session_counts[name] += count
+        for name, (count, mean, std) in decomposed.items():
+            self.decomposed_counts[name] += count
+            self.decomposed_sums[name] += count * mean
+            self.decomposed_square_sums[name] += count * (std**2 + mean**2)
         if parsed_reward_mean is not None:
             self.accounted_sessions += accounted
             self.reward_sum += accounted * parsed_reward_mean
@@ -2867,6 +2908,22 @@ class _CandidateQualityAccumulator:
         }
         for name, count in self.session_counts.items():
             metrics[f"polar/candidate/{name}"] = count
+        for name in _CANDIDATE_DECOMPOSED_METRICS:
+            count = self.decomposed_counts[name]
+            metrics[f"polar/candidate/{name}_accounted_sessions"] = count
+            if count <= 0.0:
+                continue
+            mean = self.decomposed_sums[name] / count
+            metrics[f"polar/candidate/{name}_mean"] = mean
+            metrics[f"polar/candidate/{name}_std"] = (
+                max(
+                    0.0,
+                    self.decomposed_square_sums[name] / count - mean**2,
+                )
+                ** 0.5
+            )
+            if name in {"total_cost", "cost_penalty_reward_delta"}:
+                metrics[f"polar/candidate/{name}_total"] = self.decomposed_sums[name]
         attempted_sessions = self.session_counts["attempted_sessions"]
         total_sessions = attempted_sessions + self.early_stop_cancelled_sessions
         if total_sessions > 0.0:
@@ -3409,12 +3466,36 @@ def generate_rollout_polar_async(
     )
     accepted_quality = _polar_extra_metrics(flat, rewards, async_worker.config.reward_key)
     metrics.update(accepted_quality)
+    if "polar/spilot_router/session_count" in accepted_quality:
+        metrics["polar/spilot_router/rollout_step"] = float(rollout_id)
     metrics["polar/accepted/group_count"] = float(len(data))
     for source, suffix in (
         ("polar/reward_mean", "reward_mean"),
         ("polar/reward_std", "reward_std"),
         ("polar/reward_accounted_sessions", "accounted_sessions"),
         ("polar/reward_mean_completed", "reward_mean_completed"),
+        (
+            "polar/spilot_router/accuracy_outcome_accounted_session_count",
+            "accuracy_outcome_accounted_sessions",
+        ),
+        ("polar/spilot_router/accuracy_outcome_mean", "accuracy_outcome_mean"),
+        (
+            "polar/spilot_router/total_cost_accounted_session_count",
+            "total_cost_accounted_sessions",
+        ),
+        ("polar/spilot_router/total_cost_mean", "total_cost_mean"),
+        (
+            "polar/spilot_router/cost_penalty_fraction_mean",
+            "cost_penalty_fraction_mean",
+        ),
+        (
+            "polar/spilot_router/cost_penalty_reward_delta_mean",
+            "cost_penalty_reward_delta_mean",
+        ),
+        (
+            "polar/spilot_router/cost_adjusted_reward_mean",
+            "cost_adjusted_reward_mean",
+        ),
     ):
         if source in accepted_quality:
             metrics[f"polar/accepted/{suffix}"] = accepted_quality[source]
@@ -3428,6 +3509,24 @@ def generate_rollout_polar_async(
         metrics["rollout/session_reward_accounted_sessions"] = accepted_quality[
             "polar/reward_accounted_sessions"
         ]
+    for source, target in (
+        ("polar/spilot_router/accuracy_outcome_mean", "rollout/accuracy_outcome_mean"),
+        ("polar/spilot_router/total_cost_mean", "rollout/total_cost_mean"),
+        (
+            "polar/spilot_router/cost_penalty_fraction_mean",
+            "rollout/cost_penalty_fraction_mean",
+        ),
+        (
+            "polar/spilot_router/cost_penalty_reward_delta_mean",
+            "rollout/cost_penalty_reward_delta_mean",
+        ),
+        (
+            "polar/spilot_router/cost_adjusted_reward_mean",
+            "rollout/cost_adjusted_reward_mean",
+        ),
+    ):
+        if source in accepted_quality:
+            metrics[target] = accepted_quality[source]
     metrics.update(_completed_service_metrics(accepted_completions))
     metrics["timing/pipeline_ms/rollout_collect"] = elapsed * 1000.0
     output = RolloutFnTrainOutput(samples=data, metrics=metrics)
@@ -4090,9 +4189,53 @@ def _add_distribution_metrics(
     out[f"{prefix}/max"] = max(values)
 
 
+def _add_session_distribution_metrics(
+    out: dict[str, float],
+    prefix: str,
+    name: str,
+    values: list[float],
+    *,
+    include_total: bool = False,
+) -> None:
+    """Publish one-session-one-vote scalar telemetry with explicit coverage."""
+
+    out[f"{prefix}/{name}_accounted_session_count"] = float(len(values))
+    if not values:
+        return
+    out[f"{prefix}/{name}_mean"] = sum(values) / len(values)
+    out[f"{prefix}/{name}_std"] = statistics.pstdev(values) if len(values) > 1 else 0.0
+    out[f"{prefix}/{name}_median"] = statistics.median(values)
+    out[f"{prefix}/{name}_min"] = min(values)
+    out[f"{prefix}/{name}_max"] = max(values)
+    if include_total:
+        out[f"{prefix}/{name}_total"] = sum(values)
+
+
+def _strict_telemetry_equal(left: Any, right: Any) -> bool:
+    """Compare bounded telemetry without Python's ``True == 1`` coercion."""
+
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, dict) or isinstance(right, dict):
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return False
+        return left.keys() == right.keys() and all(
+            _strict_telemetry_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+        if type(left) is not type(right):
+            return False
+        return len(left) == len(right) and all(
+            _strict_telemetry_equal(left_value, right_value)
+            for left_value, right_value in zip(left, right, strict=True)
+        )
+    return left == right
+
+
 def _spilot_router_metrics(
     sessions: dict[str, dict[str, Any]],
     session_rewards: dict[str, float],
+    session_evaluations: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, float]:
     """Aggregate bounded Router telemetry with one vote per session.
 
@@ -4104,6 +4247,26 @@ def _spilot_router_metrics(
         return {}
 
     prefix = "polar/spilot_router"
+    candidate_alias_pairs: set[tuple[str, str]] = set()
+    for metadata in sessions.values():
+        slot_mapping = metadata.get("slot_mapping")
+        if not isinstance(slot_mapping, dict):
+            continue
+        aliases = [
+            candidate.get("model")
+            for candidate in slot_mapping.values()
+            if isinstance(candidate, dict)
+            and isinstance(candidate.get("model"), str)
+            and candidate.get("model")
+        ]
+        if len(aliases) == 2 and len(set(aliases)) == 2:
+            candidate_alias_pairs.add(tuple(sorted(aliases)))
+    # Candidate labels are meaningful only if the entire accepted batch uses
+    # one canonical pair.  A mixed pair must not silently relabel a model as
+    # C0/C1 and blend incomparable candidate aggregates.
+    canonical_candidate_aliases = (
+        next(iter(candidate_alias_pairs)) if len(candidate_alias_pairs) == 1 else None
+    )
     action_valid_sessions = 0
     submitted_sessions = 0
     route_counts = {"M0": 0, "M1": 0}
@@ -4121,6 +4284,10 @@ def _spilot_router_metrics(
         "C0": [],
         "C1": [],
     }
+    pool_costs: list[float] = []
+    pool_costs_by_candidate: dict[str, list[float]] = {"C0": [], "C1": []}
+    pool_costs_by_role: dict[str, list[float]] = {"solve": [], "verify": []}
+    pool_unattributed_cost = 0.0
     admission_wait_ms_by_candidate: dict[str, list[float]] = {
         "C0": [],
         "C1": [],
@@ -4141,6 +4308,10 @@ def _spilot_router_metrics(
     admission_node_healthy_session_count = 0
     initial_slot_by_session: dict[str, str] = {}
     initial_candidate_by_session: dict[str, str] = {}
+    accuracy_outcome_by_session: dict[str, float] = {}
+    total_cost_by_session: dict[str, float] = {}
+    cost_penalty_fraction_by_session: dict[str, float] = {}
+    cost_penalty_reward_delta_by_session: dict[str, float] = {}
 
     for session_id, metadata in sessions.items():
         admission_enabled = metadata.get("admission_enabled") is True
@@ -4172,6 +4343,26 @@ def _spilot_router_metrics(
         parsed_cost = _optional_nonnegative_finite_float(metadata.get("total_cost"))
         if parsed_cost is not None:
             total_cost += parsed_cost
+            total_cost_by_session[session_id] = parsed_cost
+
+        evaluation = (
+            session_evaluations.get(session_id) if isinstance(session_evaluations, dict) else None
+        )
+        if isinstance(evaluation, dict):
+            accuracy_outcome = _optional_unit_interval_float(
+                evaluation.get("harbor_outcome_reward")
+            )
+            if accuracy_outcome is not None:
+                accuracy_outcome_by_session[session_id] = accuracy_outcome
+            cost_penalty_fraction = _optional_unit_interval_float(
+                evaluation.get("applied_cost_penalty")
+            )
+            if cost_penalty_fraction is not None:
+                cost_penalty_fraction_by_session[session_id] = cost_penalty_fraction
+            if accuracy_outcome is not None and cost_penalty_fraction is not None:
+                cost_penalty_reward_delta_by_session[session_id] = (
+                    accuracy_outcome * cost_penalty_fraction
+                )
 
         candidate_by_slot: dict[str, str] = {}
         candidate_by_alias: dict[str, str] = {}
@@ -4188,10 +4379,14 @@ def _spilot_router_metrics(
             # C0 is the lexicographically first model alias, C1 the second.
             # Duplicate aliases cannot be disambiguated safely, so omit their
             # candidate-level attribution while retaining slot diagnostics.
-            sorted_aliases = sorted(set(aliases_by_slot.values()))
-            if len(sorted_aliases) == 2 and len(aliases_by_slot) == 2:
+            sorted_aliases = tuple(sorted(set(aliases_by_slot.values())))
+            if (
+                len(sorted_aliases) == 2
+                and len(aliases_by_slot) == 2
+                and sorted_aliases == canonical_candidate_aliases
+            ):
                 candidate_by_alias = {
-                    alias: f"C{index}" for index, alias in enumerate(sorted_aliases[:2])
+                    alias: f"C{index}" for index, alias in enumerate(sorted_aliases)
                 }
                 candidate_by_slot = {
                     slot: candidate_by_alias[alias]
@@ -4286,6 +4481,16 @@ def _spilot_router_metrics(
                         )
                 else:
                     pool_unattributed_call_count += 1
+                call_cost = _optional_nonnegative_finite_float(call.get("cost"))
+                if call_cost is not None:
+                    pool_costs.append(call_cost)
+                    if call_candidate in pool_costs_by_candidate:
+                        pool_costs_by_candidate[call_candidate].append(call_cost)
+                    else:
+                        pool_unattributed_cost += call_cost
+                    call_role = str(call.get("role") or "").lower()
+                    if call_role in pool_costs_by_role:
+                        pool_costs_by_role[call_role].append(call_cost)
                 if admission_enabled:
                     local_cap = _optional_nonnegative_finite_float(call.get("admission_local_cap"))
                     if local_cap is not None and local_cap > 0:
@@ -4298,6 +4503,8 @@ def _spilot_router_metrics(
         f"{prefix}/action_valid_fraction": action_valid_sessions / session_count,
         f"{prefix}/submitted_count": float(submitted_sessions),
         f"{prefix}/submitted_fraction": submitted_sessions / session_count,
+        f"{prefix}/candidate_alias_pair_count": float(len(candidate_alias_pairs)),
+        f"{prefix}/candidate_alias_pair_conflict": float(len(candidate_alias_pairs) > 1),
         f"{prefix}/route_m0_count": float(route_counts["M0"]),
         f"{prefix}/route_m1_count": float(route_counts["M1"]),
         f"{prefix}/verify_m0_count": float(verify_counts["M0"]),
@@ -4312,6 +4519,10 @@ def _spilot_router_metrics(
         f"{prefix}/pool_completed_count": float(pool_status_counts["completed"]),
         f"{prefix}/pool_failed_count": float(pool_status_counts["failed"]),
         f"{prefix}/pool_timeout_count": float(pool_status_counts["timeout"]),
+        f"{prefix}/pool_cost_accounted_call_count": float(len(pool_costs)),
+        f"{prefix}/pool_cost_total": sum(pool_costs),
+        f"{prefix}/pool_unattributed_cost_total": pool_unattributed_cost,
+        f"{prefix}/pool_cost_reconciliation_delta": total_cost - sum(pool_costs),
         f"{prefix}/total_cost": total_cost,
         f"{prefix}/admission_session_count": float(admission_session_count),
         f"{prefix}/admission_wait_ms_total": sum(admission_waits_ms),
@@ -4356,6 +4567,61 @@ def _spilot_router_metrics(
         metrics[f"{prefix}/admission_local_cap_min"] = min(admission_local_caps)
         metrics[f"{prefix}/admission_local_cap_max"] = max(admission_local_caps)
 
+    decomposed_metrics = {
+        "accuracy_outcome": accuracy_outcome_by_session,
+        "total_cost": total_cost_by_session,
+        "cost_penalty_fraction": cost_penalty_fraction_by_session,
+        "cost_penalty_reward_delta": cost_penalty_reward_delta_by_session,
+        "cost_adjusted_reward": session_rewards,
+    }
+    for metric_name, values_by_session in decomposed_metrics.items():
+        values = [
+            values_by_session[session_id]
+            for session_id in sessions
+            if session_id in values_by_session
+        ]
+        _add_session_distribution_metrics(
+            metrics,
+            prefix,
+            metric_name,
+            values,
+            include_total=metric_name in {"total_cost", "cost_penalty_reward_delta"},
+        )
+    accuracy_outcomes = list(accuracy_outcome_by_session.values())
+    metrics[f"{prefix}/accuracy_outcome_positive_count"] = float(
+        sum(value > 0.0 for value in accuracy_outcomes)
+    )
+    if accuracy_outcomes:
+        metrics[f"{prefix}/accuracy_outcome_positive_fraction"] = sum(
+            value > 0.0 for value in accuracy_outcomes
+        ) / len(accuracy_outcomes)
+
+    for breakdown_name, initial_by_session in (
+        ("m0", {key: value for key, value in initial_slot_by_session.items() if value == "M0"}),
+        ("m1", {key: value for key, value in initial_slot_by_session.items() if value == "M1"}),
+        (
+            "candidate_c0",
+            {key: value for key, value in initial_candidate_by_session.items() if value == "C0"},
+        ),
+        (
+            "candidate_c1",
+            {key: value for key, value in initial_candidate_by_session.items() if value == "C1"},
+        ),
+    ):
+        for metric_name, values_by_session in decomposed_metrics.items():
+            values = [
+                values_by_session[session_id]
+                for session_id in initial_by_session
+                if session_id in values_by_session
+            ]
+            metrics[f"{prefix}/{metric_name}_{breakdown_name}_accounted_session_count"] = float(
+                len(values)
+            )
+            if values:
+                metrics[f"{prefix}/{metric_name}_{breakdown_name}_mean"] = sum(values) / len(
+                    values
+                )
+
     for candidate in ("C0", "C1"):
         candidate_name = candidate.lower()
         metrics[f"{prefix}/admission_failure_candidate_{candidate_name}_count"] = float(
@@ -4398,6 +4664,21 @@ def _spilot_router_metrics(
             metrics[f"{prefix}/admission_wait_candidate_{candidate_name}_max_ms"] = max(
                 candidate_admission_waits
             )
+        candidate_costs = pool_costs_by_candidate[candidate]
+        metrics[f"{prefix}/pool_cost_candidate_{candidate_name}_accounted_call_count"] = float(
+            len(candidate_costs)
+        )
+        metrics[f"{prefix}/pool_cost_candidate_{candidate_name}_total"] = sum(candidate_costs)
+        if candidate_costs:
+            metrics[f"{prefix}/pool_cost_candidate_{candidate_name}_mean"] = sum(
+                candidate_costs
+            ) / len(candidate_costs)
+
+    for role, role_costs in pool_costs_by_role.items():
+        metrics[f"{prefix}/pool_cost_{role}_accounted_call_count"] = float(len(role_costs))
+        metrics[f"{prefix}/pool_cost_{role}_total"] = sum(role_costs)
+        if role_costs:
+            metrics[f"{prefix}/pool_cost_{role}_mean"] = sum(role_costs) / len(role_costs)
 
     router_rewards = [
         session_rewards[session_id] for session_id in sessions if session_id in session_rewards
@@ -4494,6 +4775,8 @@ def _polar_extra_metrics(
     session_agent_timeout_trace_counts: dict[str, int] = {}
     session_status_buckets: dict[str, str] = {}
     spilot_router_sessions: dict[str, dict[str, Any]] = {}
+    spilot_router_evaluations: dict[str, dict[str, Any]] = {}
+    spilot_router_conflicting_sessions: set[str] = set()
     trainable_traces = 0
     trajectory_rewards_by_group: dict[Any, dict[Any, list[float]]] = {}
     for sample in flat_samples:
@@ -4558,6 +4841,43 @@ def _polar_extra_metrics(
         is_placeholder = bool(polar_meta.get("placeholder"))
         if not session_key:
             continue
+        trajectory_metadata = polar_meta.get("trajectory_metadata")
+        evaluation = (
+            trajectory_metadata.get("evaluation")
+            if isinstance(trajectory_metadata, dict)
+            else None
+        )
+        router_metadata = evaluation.get("spilot_router") if isinstance(evaluation, dict) else None
+        if (
+            isinstance(router_metadata, dict)
+            and session_key not in spilot_router_conflicting_sessions
+        ):
+            previous_router = spilot_router_sessions.get(session_key)
+            previous_evaluation = spilot_router_evaluations.get(session_key)
+            evaluation_fields = {
+                field: evaluation.get(field)
+                for field in ("harbor_outcome_reward", "applied_cost_penalty")
+            }
+            previous_evaluation_fields = (
+                {
+                    field: previous_evaluation.get(field)
+                    for field in ("harbor_outcome_reward", "applied_cost_penalty")
+                }
+                if isinstance(previous_evaluation, dict)
+                else None
+            )
+            if previous_router is None:
+                spilot_router_sessions[session_key] = router_metadata
+                spilot_router_evaluations[session_key] = evaluation
+            elif not _strict_telemetry_equal(
+                previous_router, router_metadata
+            ) or not _strict_telemetry_equal(previous_evaluation_fields, evaluation_fields):
+                # Conflicting trace copies are unsafe for one-session-one-vote
+                # telemetry. Omit the whole session rather than selecting an
+                # arbitrary first trace based on arrival order.
+                spilot_router_sessions.pop(session_key, None)
+                spilot_router_evaluations.pop(session_key, None)
+                spilot_router_conflicting_sessions.add(session_key)
         status_bucket = _session_status_bucket(session_status)
         if session_status_buckets.get(session_key, "unknown") == "unknown":
             session_status_buckets[session_key] = status_bucket
@@ -4602,17 +4922,6 @@ def _polar_extra_metrics(
                 terminal_error_sessions.add(session_key)
         if session_key not in seen:
             seen.add(session_key)
-            trajectory_metadata = polar_meta.get("trajectory_metadata")
-            evaluation = (
-                trajectory_metadata.get("evaluation")
-                if isinstance(trajectory_metadata, dict)
-                else None
-            )
-            router_metadata = (
-                evaluation.get("spilot_router") if isinstance(evaluation, dict) else None
-            )
-            if isinstance(router_metadata, dict):
-                spilot_router_sessions[session_key] = router_metadata
             timing = polar_meta.get("timing") or {}
             # Synthetic straggler placeholders contain rollout-server time to
             # cancellation, not completed gateway stage timings. Keep them out
@@ -4727,8 +5036,13 @@ def _polar_extra_metrics(
         _spilot_router_metrics(
             spilot_router_sessions,
             accounted_session_rewards_by_key,
+            spilot_router_evaluations,
         )
     )
+    if spilot_router_sessions or spilot_router_conflicting_sessions:
+        out["polar/spilot_router/telemetry_conflict_session_count"] = float(
+            len(spilot_router_conflicting_sessions)
+        )
     completed_session_rewards = list(completed_session_rewards_by_key.values())
     accounted_session_rewards = list(accounted_session_rewards_by_key.values())
     if completed_session_rewards:
@@ -5004,11 +5318,25 @@ def _nonnegative_finite_float(value: Any) -> float:
 
 
 def _optional_nonnegative_finite_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
         parsed = float(value)
     except (TypeError, ValueError):
         return None
     if parsed < 0.0 or not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _optional_unit_interval_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0.0 or parsed > 1.0:
         return None
     return parsed
 
