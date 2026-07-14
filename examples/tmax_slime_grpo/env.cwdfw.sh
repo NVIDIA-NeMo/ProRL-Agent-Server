@@ -51,6 +51,19 @@ case "${POLAR_MULTI_GATEWAY:-${_tmax_multi_gateway_default}}" in
         ;;
 esac
 unset _tmax_multi_gateway_default
+export POLAR_GATEWAY_COUNT_OVERRIDE="${POLAR_GATEWAY_COUNT_OVERRIDE:-}"
+if [ -n "${POLAR_GATEWAY_COUNT_OVERRIDE}" ]; then
+    if ! [[ "${POLAR_GATEWAY_COUNT_OVERRIDE}" =~ ^[1-9][0-9]*$ ]] || \
+       [ "${POLAR_GATEWAY_COUNT_OVERRIDE}" -gt "${NUM_NODES}" ]; then
+        echo "ERROR: POLAR_GATEWAY_COUNT_OVERRIDE must be in [1, NUM_NODES=${NUM_NODES}]" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    if [ "${POLAR_MULTI_GATEWAY}" != "1" ] && \
+       [ "${POLAR_GATEWAY_COUNT_OVERRIDE}" -ne 1 ]; then
+        echo "ERROR: POLAR_GATEWAY_COUNT_OVERRIDE>1 requires POLAR_MULTI_GATEWAY=1" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+fi
 _tmax_total_gpus="$((NUM_NODES * SLURM_GPUS))"
 _tmax_short_limit_seconds="$((2 * 60 * 60))"
 
@@ -375,6 +388,18 @@ if ! [[ "${TMAX_OPTIMIZER_CPU_OFFLOAD}" =~ ^[01]$ ]]; then
     return 1 2>/dev/null || exit 1
 fi
 
+# ``fully_async`` is the production default.  ``colocate`` is an explicit
+# synchronous profiling mode: Slime's asynchronous driver intentionally does
+# not support sharing actor and rollout GPUs, while train.py does.
+export TMAX_TRAIN_MODE="${TMAX_TRAIN_MODE:-fully_async}"
+case "${TMAX_TRAIN_MODE}" in
+    fully_async|colocate) ;;
+    *)
+        echo "ERROR: TMAX_TRAIN_MODE must be fully_async or colocate, got ${TMAX_TRAIN_MODE}" >&2
+        return 1 2>/dev/null || exit 1
+        ;;
+esac
+
 _tmax_validate_resource_topology() {
     local name value
     local -a positive_names=(
@@ -401,6 +426,7 @@ _tmax_validate_resource_topology() {
     fi
 
     local actor_gpus actor_parallel_size capacity allocated_gpus rollout_product expected_global_batch
+    local required_gpus
     local global_batch actor_dp train_rollouts_per_dp
     actor_gpus="$((ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE))"
     capacity="$((NUM_NODES * RAY_NUM_GPUS_PER_NODE))"
@@ -416,16 +442,25 @@ _tmax_validate_resource_topology() {
         echo "ERROR: actor topology does not fit NUM_NODES=${NUM_NODES} x RAY_NUM_GPUS_PER_NODE=${RAY_NUM_GPUS_PER_NODE}" >&2
         return 1
     fi
-    if [ "$((actor_gpus + ROLLOUT_NUM_GPUS))" -gt "$capacity" ]; then
-        echo "ERROR: actor (${actor_gpus}) + rollout (${ROLLOUT_NUM_GPUS}) GPUs exceed Ray capacity ${capacity}" >&2
+    if [ "${TMAX_TRAIN_MODE}" = "colocate" ]; then
+        if [ "${actor_gpus}" -gt "${ROLLOUT_NUM_GPUS}" ]; then
+            required_gpus="${actor_gpus}"
+        else
+            required_gpus="${ROLLOUT_NUM_GPUS}"
+        fi
+    else
+        required_gpus="$((actor_gpus + ROLLOUT_NUM_GPUS))"
+    fi
+    if [ "${required_gpus}" -gt "$capacity" ]; then
+        echo "ERROR: ${TMAX_TRAIN_MODE} actor (${actor_gpus}) / rollout (${ROLLOUT_NUM_GPUS}) require ${required_gpus} GPUs, exceeding Ray capacity ${capacity}" >&2
         echo "  For one node, explicitly use e.g. ACTOR_NUM_GPUS_PER_NODE=4 ROLLOUT_NUM_GPUS=4." >&2
         return 1
     fi
     if [ "$TMAX_REQUIRE_FULL_GPU_ALLOCATION" = "1" ] && {
        [ "$capacity" -ne "$allocated_gpus" ] ||
-       [ "$((actor_gpus + ROLLOUT_NUM_GPUS))" -ne "$allocated_gpus" ];
+       [ "${required_gpus}" -ne "$allocated_gpus" ];
     }; then
-        echo "ERROR: actor (${actor_gpus}) + rollout (${ROLLOUT_NUM_GPUS}) must use all ${allocated_gpus} allocated GPUs" >&2
+        echo "ERROR: ${TMAX_TRAIN_MODE} actor (${actor_gpus}) / rollout (${ROLLOUT_NUM_GPUS}) use ${required_gpus} GPUs and must use all ${allocated_gpus} allocated GPUs" >&2
         echo "  Set TMAX_REQUIRE_FULL_GPU_ALLOCATION=0 only for an intentional under-allocation experiment." >&2
         return 1
     fi
@@ -496,6 +531,26 @@ unset -f _tmax_validate_resource_topology
 export TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS:-1800}"
 export TMAX_ENABLE_GRACEFUL_EXIT="${TMAX_ENABLE_GRACEFUL_EXIT:-1}"
 export POLAR_FULLY_ASYNC="${POLAR_FULLY_ASYNC:-true}"
+export TMAX_PROFILE_DISABLE_CHECKPOINT="${TMAX_PROFILE_DISABLE_CHECKPOINT:-0}"
+if ! [[ "${TMAX_PROFILE_DISABLE_CHECKPOINT}" =~ ^[01]$ ]]; then
+    echo "ERROR: TMAX_PROFILE_DISABLE_CHECKPOINT must be 0 or 1" >&2
+    return 1 2>/dev/null || exit 1
+fi
+if [ "${TMAX_PROFILE_DISABLE_CHECKPOINT}" = "1" ] && \
+   [ "${TMAX_ENABLE_GRACEFUL_EXIT}" != "0" ]; then
+    echo "ERROR: TMAX_PROFILE_DISABLE_CHECKPOINT=1 requires TMAX_ENABLE_GRACEFUL_EXIT=0" >&2
+    return 1 2>/dev/null || exit 1
+fi
+if [ "${TMAX_TRAIN_MODE}" = "colocate" ]; then
+    if [ "${POLAR_FULLY_ASYNC}" != "false" ]; then
+        echo "ERROR: TMAX_TRAIN_MODE=colocate requires POLAR_FULLY_ASYNC=false" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    if [ "${TMAX_ENABLE_GRACEFUL_EXIT}" != "0" ]; then
+        echo "ERROR: TMAX_TRAIN_MODE=colocate requires TMAX_ENABLE_GRACEFUL_EXIT=0; sync train.py has no graceful lifecycle support" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+fi
 export TMAX_MIN_ASYNC_LEVEL="${TMAX_MIN_ASYNC_LEVEL:-4}"
 export POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-${TMAX_MIN_ASYNC_LEVEL}}"
 if ! [[ "${TMAX_MIN_ASYNC_LEVEL}" =~ ^[1-9][0-9]*$ ]] || \
@@ -707,15 +762,21 @@ esac
 _tmax_validate_spilot_episode_admission() {
     local name value expected_qwen expected_gpt expected_agent expected_task
     local expected_request wall_seconds required_buffer_seconds required_wall_seconds
+    local runtime_gateway_count
     if [ "${TMAX_AGENT_HARNESS}" != "spilot_router" ]; then
         return 0
+    fi
+
+    runtime_gateway_count=1
+    if [ "${POLAR_MULTI_GATEWAY}" = "1" ]; then
+        runtime_gateway_count="${POLAR_GATEWAY_COUNT_OVERRIDE:-${NUM_NODES}}"
     fi
 
     # Generic/legacy SPilot entrypoints fail safe to the pre-admission
     # behavior. The canonical SPilot wrapper opts in explicitly and persists
     # the complete contract in run state.
     export SPILOT_EPISODE_ADMISSION_ENABLED="${SPILOT_EPISODE_ADMISSION_ENABLED:-false}"
-    export SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT="${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT:-${NUM_NODES}}"
+    export SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT="${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT:-${runtime_gateway_count}}"
     if ! [[ "${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
         echo "ERROR: SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT must be a positive integer" >&2
         return 1
@@ -743,8 +804,8 @@ _tmax_validate_spilot_episode_admission() {
                 echo "ERROR: SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS must be at most 86400" >&2
                 return 1
             fi
-            if [ "${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT}" -ne "${NUM_NODES}" ]; then
-                echo "ERROR: SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT must equal NUM_NODES=${NUM_NODES}" >&2
+            if [ "${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT}" -ne "${runtime_gateway_count}" ]; then
+                echo "ERROR: SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT must equal runtime gateway count ${runtime_gateway_count}" >&2
                 return 1
             fi
             if [ $((SPILOT_QWEN_MAX_ACTIVE_EPISODES % SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT)) -ne 0 ] || \
@@ -784,27 +845,32 @@ _tmax_validate_spilot_episode_admission() {
                 echo "ERROR: SPilot admission timeout formula requires agent/task/request=${expected_agent}/${expected_task}/${expected_request}" >&2
                 return 1
             fi
-            if [ "${PARTITION}" != backfill ]; then
-                echo "ERROR: canonical SPilot admission requires PARTITION=backfill because batch is limited to four hours" >&2
-                return 1
-            fi
-            # Once Slime enters its graceful window it must have enough time
-            # for the longest in-flight request plus one hour reserved for the
-            # final checkpoint and process teardown.  The allocation itself
-            # must also have room for one complete request before that window.
-            required_buffer_seconds="$((POLAR_REQUEST_TIMEOUT + 3600))"
-            if [ "${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS}" -lt "${required_buffer_seconds}" ]; then
-                echo "ERROR: SPilot TMAX_GRACEFUL_EXIT_BUFFER_SECONDS must cover POLAR_REQUEST_TIMEOUT + 3600 (${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS} < ${required_buffer_seconds})" >&2
-                return 1
-            fi
-            if ! wall_seconds="$(tmax_slurm_duration_seconds "${WALL_TIME}")"; then
-                echo "ERROR: unsupported SPilot WALL_TIME=${WALL_TIME}" >&2
-                return 1
-            fi
-            required_wall_seconds="$((TMAX_GRACEFUL_EXIT_BUFFER_SECONDS + POLAR_REQUEST_TIMEOUT))"
-            if [ "${wall_seconds}" -lt "${required_wall_seconds}" ]; then
-                echo "ERROR: SPilot WALL_TIME must cover POLAR_REQUEST_TIMEOUT + TMAX_GRACEFUL_EXIT_BUFFER_SECONDS (${wall_seconds} < ${required_wall_seconds})" >&2
-                return 1
+            if [ "${TMAX_PROFILE_DISABLE_CHECKPOINT}" = "0" ]; then
+                if [ "${PARTITION}" != backfill ]; then
+                    echo "ERROR: canonical SPilot admission requires PARTITION=backfill because batch is limited to four hours" >&2
+                    return 1
+                fi
+                # Once Slime enters its graceful window it must have enough
+                # time for the longest in-flight request plus one hour reserved
+                # for the final checkpoint and process teardown. The allocation
+                # itself must also have room for one complete request before
+                # that window.
+                required_buffer_seconds="$((POLAR_REQUEST_TIMEOUT + 3600))"
+                if [ "${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS}" -lt "${required_buffer_seconds}" ]; then
+                    echo "ERROR: SPilot TMAX_GRACEFUL_EXIT_BUFFER_SECONDS must cover POLAR_REQUEST_TIMEOUT + 3600 (${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS} < ${required_buffer_seconds})" >&2
+                    return 1
+                fi
+                if ! wall_seconds="$(tmax_slurm_duration_seconds "${WALL_TIME}")"; then
+                    echo "ERROR: unsupported SPilot WALL_TIME=${WALL_TIME}" >&2
+                    return 1
+                fi
+                required_wall_seconds="$((TMAX_GRACEFUL_EXIT_BUFFER_SECONDS + POLAR_REQUEST_TIMEOUT))"
+                if [ "${wall_seconds}" -lt "${required_wall_seconds}" ]; then
+                    echo "ERROR: SPilot WALL_TIME must cover POLAR_REQUEST_TIMEOUT + TMAX_GRACEFUL_EXIT_BUFFER_SECONDS (${wall_seconds} < ${required_wall_seconds})" >&2
+                    return 1
+                fi
+            else
+                echo "[tmax env] disposable profile: skipping durable admission wall/checkpoint reserve checks" >&2
             fi
             ;;
         false)
@@ -1204,6 +1270,6 @@ mkdir -p \
 
 echo "[tmax env] nodes=${NUM_NODES} gpus/node=${SLURM_GPUS} partition=${PARTITION} no_instance=${POLAR_APPTAINER_NO_INSTANCE} network=${POLAR_SANDBOX_NETWORK}"
 echo "[tmax env] dataset=${TMAX_DATASET_DIR} sif_dir=${APPTAINER_IMAGE_DIR} train_data=${TMAX_TRAIN_DATA}"
-echo "[tmax env] actor=${ACTOR_NUM_NODES}x${ACTOR_NUM_GPUS_PER_NODE}/tp${ACTOR_TENSOR_MODEL_PARALLEL_SIZE}/cp${CONTEXT_PARALLEL_SIZE} rollout_gpus=${ROLLOUT_NUM_GPUS}/tp${ROLLOUT_NUM_GPUS_PER_ENGINE} batch=${ROLLOUT_BATCH_SIZE}x${N_SAMPLES_PER_PROMPT}/${NUM_STEPS_PER_ROLLOUT} fully_async=${POLAR_FULLY_ASYNC}/${POLAR_MAX_ASYNC_LEVEL} active_sessions=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT * POLAR_MAX_ASYNC_LEVEL)) run_workers=${POLAR_MAX_RUN_WORKERS}"
+echo "[tmax env] mode=${TMAX_TRAIN_MODE} actor=${ACTOR_NUM_NODES}x${ACTOR_NUM_GPUS_PER_NODE}/tp${ACTOR_TENSOR_MODEL_PARALLEL_SIZE}/cp${CONTEXT_PARALLEL_SIZE} rollout_gpus=${ROLLOUT_NUM_GPUS}/tp${ROLLOUT_NUM_GPUS_PER_ENGINE} batch=${ROLLOUT_BATCH_SIZE}x${N_SAMPLES_PER_PROMPT}/${NUM_STEPS_PER_ROLLOUT} fully_async=${POLAR_FULLY_ASYNC}/${POLAR_MAX_ASYNC_LEVEL} active_sessions=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT * POLAR_MAX_ASYNC_LEVEL)) run_workers=${POLAR_MAX_RUN_WORKERS}"
 echo "[tmax env] harness=${TMAX_AGENT_HARNESS} runtime=${MINI_SWE_AGENT_RUNTIME_DIR}"
 echo "[tmax env] train_sqsh=${POLR_TRAIN_SQSH} slime=${SLIME_DIR} ref_load=${REF_LOAD} run_id=${RUN_ID} sglang_base_port=${SLIME_ROLLOUT_BASE_PORT:-allocation-scoped}"

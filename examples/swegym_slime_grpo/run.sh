@@ -247,7 +247,38 @@ slurm_allocation_proxy_bypass_hosts() {
 
 # ── External deps ──────────────────────────────────────────────────
 SLIME_DIR="${SLIME_DIR:-${PROJECT_ROOT}/slime}"
-if [ ! -f "${SLIME_DIR}/train_async.py" ]; then
+TMAX_TRAIN_MODE="${TMAX_TRAIN_MODE:-fully_async}"
+TMAX_PROFILE_DISABLE_CHECKPOINT="${TMAX_PROFILE_DISABLE_CHECKPOINT:-0}"
+TRAIN_MODE_ARGS=()
+case "${TMAX_TRAIN_MODE}" in
+    fully_async)
+        SLIME_TRAIN_ENTRYPOINT="${SLIME_DIR}/train_async.py"
+        ;;
+    colocate)
+        SLIME_TRAIN_ENTRYPOINT="${SLIME_DIR}/train.py"
+        TRAIN_MODE_ARGS=(--colocate)
+        if [ "${POLAR_FULLY_ASYNC:-false}" != "false" ]; then
+            echo "ERROR: TMAX_TRAIN_MODE=colocate requires POLAR_FULLY_ASYNC=false" >&2
+            exit 1
+        fi
+        if [ -n "${SLIME_GRACEFUL_EXIT_AT_UNIX_TIME:-}" ]; then
+            echo "ERROR: TMAX_TRAIN_MODE=colocate does not support graceful lifecycle arguments" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "ERROR: TMAX_TRAIN_MODE must be fully_async or colocate, got ${TMAX_TRAIN_MODE}" >&2
+        exit 1
+        ;;
+esac
+case "${TMAX_PROFILE_DISABLE_CHECKPOINT}" in
+    0|1) ;;
+    *)
+        echo "ERROR: TMAX_PROFILE_DISABLE_CHECKPOINT must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
+if [ ! -f "${SLIME_TRAIN_ENTRYPOINT}" ]; then
     echo "ERROR: Slime not found at ${SLIME_DIR}"
     echo "  git clone git@github.com:THUDM/slime.git ${SLIME_DIR}"
     exit 1
@@ -480,12 +511,17 @@ case "${POLAR_MULTI_GATEWAY:-0}" in
         ;;
 esac
 if [ "${POLAR_MULTI_GATEWAY}" = "1" ]; then
-    export POLAR_GATEWAY_COUNT="${RAY_NUM_NODES}"
+    export POLAR_GATEWAY_COUNT="${POLAR_GATEWAY_COUNT_OVERRIDE:-${RAY_NUM_NODES}}"
 else
-    export POLAR_GATEWAY_COUNT=1
+    export POLAR_GATEWAY_COUNT="${POLAR_GATEWAY_COUNT_OVERRIDE:-1}"
 fi
-if ! [[ "${POLAR_GATEWAY_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "ERROR: gateway count must be positive, got ${POLAR_GATEWAY_COUNT}" >&2
+if ! [[ "${POLAR_GATEWAY_COUNT}" =~ ^[1-9][0-9]*$ ]] || \
+   [ "${POLAR_GATEWAY_COUNT}" -gt "${RAY_NUM_NODES}" ]; then
+    echo "ERROR: gateway count must be in [1, RAY_NUM_NODES=${RAY_NUM_NODES}], got ${POLAR_GATEWAY_COUNT}" >&2
+    exit 1
+fi
+if [ "${POLAR_MULTI_GATEWAY}" != "1" ] && [ "${POLAR_GATEWAY_COUNT}" -ne 1 ]; then
+    echo "ERROR: POLAR_GATEWAY_COUNT_OVERRIDE>1 requires POLAR_MULTI_GATEWAY=1" >&2
     exit 1
 fi
 
@@ -722,10 +758,11 @@ if [ "${RAY_NODE_RANK}" = "0" ]; then
             exit 1
         fi
         mapfile -t _polar_gateway_hosts <<<"${_polar_gateway_host_output}"
-        if [ "${#_polar_gateway_hosts[@]}" -ne "${POLAR_GATEWAY_COUNT}" ]; then
-            echo "ERROR: Slurm hostlist expanded to ${#_polar_gateway_hosts[@]} hosts for ${POLAR_GATEWAY_COUNT} gateways" >&2
+        if [ "${#_polar_gateway_hosts[@]}" -lt "${POLAR_GATEWAY_COUNT}" ]; then
+            echo "ERROR: Slurm hostlist expanded to ${#_polar_gateway_hosts[@]} hosts, fewer than ${POLAR_GATEWAY_COUNT} gateways" >&2
             exit 1
         fi
+        _polar_gateway_hosts=("${_polar_gateway_hosts[@]:0:${POLAR_GATEWAY_COUNT}}")
         for _polar_gateway_host in "${_polar_gateway_hosts[@]}"; do
             _polar_topology_args+=(--gateway-host "${_polar_gateway_host}")
         done
@@ -1509,6 +1546,10 @@ esac
 PRETRAIN_EVAL_ARGS=()
 case "${TMAX_CONCURRENT_PRETRAIN_EVAL:-1}" in
     1|true)
+        if [ "${TMAX_TRAIN_MODE}" = "colocate" ]; then
+            echo "ERROR: TMAX_TRAIN_MODE=colocate requires TMAX_CONCURRENT_PRETRAIN_EVAL=0" >&2
+            exit 1
+        fi
         PRETRAIN_EVAL_ARGS=(--concurrent-pretrain-eval)
         PRETRAIN_EVAL_MODE=concurrent-with-rollout-0
         ;;
@@ -1638,11 +1679,14 @@ PY
         echo "Using fixed eval: ${TMAX_EVAL_DATASET_NAME} (${TMAX_EVAL_DATA}, baseline + every ${TMAX_EVAL_INTERVAL} rollout(s) + final)"
     fi
     echo "Pretrain eval scheduling: ${PRETRAIN_EVAL_MODE}"
-    if [ -n "${FINAL_EVAL_COMPLETE_MARKER:-}" ]; then
+    if [ -n "${FINAL_EVAL_COMPLETE_MARKER:-}" ] && \
+       [ "${TMAX_TRAIN_MODE}" = "fully_async" ]; then
         EVAL_ARGS+=(
             --final-eval-complete-marker "${FINAL_EVAL_COMPLETE_MARKER}"
             --final-eval-data-sha256 "${FINAL_EVAL_DATA_SHA256}"
         )
+    elif [ -n "${FINAL_EVAL_COMPLETE_MARKER:-}" ]; then
+        echo "Sync colocate mode will run eval without an async final-eval marker."
     fi
 else
     echo "Training-time eval disabled; holdout remains available for data-split and integrity checks."
@@ -1777,7 +1821,12 @@ else
 fi
 
 # ── Step 2: Polar gateway fleet (node-local CPU + UDS) ─────────────
-if [ "${POLAR_MULTI_GATEWAY}" = "1" ] || [ "${RAY_NODE_RANK}" = "0" ]; then
+_polar_gateway_rank=0
+if [ "${RAY_NODE_RANK}" = "0" ] || { \
+   [ "${POLAR_MULTI_GATEWAY}" = "1" ] && \
+   [ "${RAY_NODE_RANK}" -lt "${POLAR_GATEWAY_COUNT}" ];
+}; then
+    _polar_gateway_rank=1
     if [ "${RAY_NODE_RANK}" = "0" ]; then
         export SLIME_GATEWAY_START_UNIX_NS="$(date +%s%N)"
         export SLIME_UDS_TUNNEL_START_UNIX_NS="${SLIME_GATEWAY_START_UNIX_NS}"
@@ -1792,7 +1841,8 @@ if [ "${RAY_NODE_RANK}" = "0" ]; then
     export SLIME_UDS_TUNNEL_READY_UNIX_NS="${SLIME_GATEWAY_READY_UNIX_NS}"
     export SLIME_SERVICES_READY_UNIX_NS="${SLIME_GATEWAY_READY_UNIX_NS}"
 else
-    if [ "${POLAR_MULTI_GATEWAY}" = "1" ]; then
+    if [ "${POLAR_MULTI_GATEWAY}" = "1" ] && \
+       [ "${_polar_gateway_rank}" = "1" ]; then
         wait_for_run_done_with_sidecars
     else
         while [ ! -f "${RUN_DONE_FILE}" ]; do
@@ -1801,6 +1851,7 @@ else
     fi
     exit 0
 fi
+unset _polar_gateway_rank
 
 # ── Step 3: Slime (manages SGLang engines + training) ──────────────
 
@@ -1876,11 +1927,18 @@ RAY_JOB_ADDRESS="http://${RAY_HEAD_IP}:8265"
 RAY_JOB_SUBMISSION_ID="${RAY_JOB_SUBMISSION_ID:-polar-${SLURM_JOB_ID:-$$}}"
 TRAIN_PROGRESS_ENV_JSON="$("${PYTHON_BIN}" -c 'import json, os; print(json.dumps({"SLIME_TRAIN_PROGRESS_FILE": os.environ["SLIME_TRAIN_PROGRESS_FILE"]}))')"
 TRAINING_LIFECYCLE_ARGS=()
-if [ -n "${SLIME_GRACEFUL_EXIT_AT_UNIX_TIME:-}" ]; then
-    TRAINING_LIFECYCLE_ARGS+=(--graceful-exit-at-unix-time "${SLIME_GRACEFUL_EXIT_AT_UNIX_TIME}")
-fi
-if [ -n "${TRAINING_COMPLETE_MARKER:-}" ]; then
-    TRAINING_LIFECYCLE_ARGS+=(--training-complete-marker "${TRAINING_COMPLETE_MARKER}")
+if [ "${TMAX_TRAIN_MODE}" = "fully_async" ] && \
+   [ "${TMAX_PROFILE_DISABLE_CHECKPOINT}" = "0" ]; then
+    if [ -n "${SLIME_GRACEFUL_EXIT_AT_UNIX_TIME:-}" ]; then
+        TRAINING_LIFECYCLE_ARGS+=(--graceful-exit-at-unix-time "${SLIME_GRACEFUL_EXIT_AT_UNIX_TIME}")
+    fi
+    if [ -n "${TRAINING_COMPLETE_MARKER:-}" ]; then
+        TRAINING_LIFECYCLE_ARGS+=(--training-complete-marker "${TRAINING_COMPLETE_MARKER}")
+    fi
+elif [ "${TMAX_PROFILE_DISABLE_CHECKPOINT}" = "1" ]; then
+    echo "WARNING: profiling checkpoint writes and async lifecycle markers are disabled"
+else
+    echo "Sync colocate mode does not emit async lifecycle markers; do not use the checkpoint watcher for this run."
 fi
 SAVE_RETENTION_ARGS=()
 if [ -n "${SAVE_RETAIN_INTERVAL:-}" ]; then
@@ -1941,7 +1999,15 @@ case "${SAVE_MEGATRON:-1}" in
         exit 1
         ;;
 esac
-echo "=== Launching train_async.py (Ray submission ${RAY_JOB_SUBMISSION_ID}) ==="
+SAVE_INTERVAL_ARGS=()
+if [ "${TMAX_PROFILE_DISABLE_CHECKPOINT}" = "0" ]; then
+    SAVE_INTERVAL_ARGS=(--save-interval "${SAVE_INTERVAL:-10}")
+else
+    # Retention has no meaning without a checkpoint cadence and Slime would
+    # otherwise force a final full checkpoint at the end of a profile run.
+    SAVE_RETENTION_ARGS=()
+fi
+echo "=== Launching $(basename "${SLIME_TRAIN_ENTRYPOINT}") mode=${TMAX_TRAIN_MODE} (Ray submission ${RAY_JOB_SUBMISSION_ID}) ==="
 # The custom reward post-processor already computes prompt-local GRPO
 # advantages.  Slime's --normalize-advantages whitens them again across every
 # response token in the global batch; with dynamic-history traces that leaks
@@ -1950,9 +2016,10 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     --submission-id "${RAY_JOB_SUBMISSION_ID}" \
     --no-wait \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
-    -- "${PYTHON_BIN}" "${SLIME_DIR}/train_async.py" \
+    -- "${PYTHON_BIN}" "${SLIME_TRAIN_ENTRYPOINT}" \
     --actor-num-nodes "$ACTOR_NUM_NODES" \
     --actor-num-gpus-per-node "$ACTOR_NUM_GPUS_PER_NODE" \
+    "${TRAIN_MODE_ARGS[@]}" \
     --train-env-vars "$TRAIN_PROGRESS_ENV_JSON" \
     --rollout-num-gpus "$ROLLOUT_NUM_GPUS" \
     --rollout-num-gpus-per-engine "$ROLLOUT_NUM_GPUS_PER_ENGINE" \
@@ -1965,7 +2032,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     --dist-ckpt-strictness "${DIST_CKPT_STRICTNESS:-assume_ok_unexpected}" \
     "${OPT_PARAM_SCHEDULER_ARGS[@]}" \
     --save "$SAVE_DIR" \
-    --save-interval "${SAVE_INTERVAL:-10}" \
+    "${SAVE_INTERVAL_ARGS[@]}" \
     "${SAVE_RETENTION_ARGS[@]}" \
     "${SAVE_FORMAT_ARGS[@]}" \
     "${TRAINING_LIFECYCLE_ARGS[@]}" \
