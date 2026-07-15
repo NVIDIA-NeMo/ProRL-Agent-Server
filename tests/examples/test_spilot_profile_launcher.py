@@ -271,6 +271,9 @@ def test_shared_launcher_mode_and_no_checkpoint_hooks_are_opt_in() -> None:
     assert 'SLIME_TRAIN_ENTRYPOINT="${SLIME_DIR}/train.py"' in launcher
     assert "TRAIN_MODE_ARGS=(--colocate)" in launcher
     assert 'if [ "${TMAX_PROFILE_DISABLE_CHECKPOINT}" = "0" ]; then' in launcher
+    assert 'SAVE_PATH_ARGS=(--save "${SAVE_DIR}")' in launcher
+    assert "SAVE_PATH_ARGS=()" in launcher
+    assert '"${SAVE_PATH_ARGS[@]}"' in launcher
     assert '"${SAVE_INTERVAL_ARGS[@]}"' in launcher
     assert "TMAX_TRAIN_MODE TMAX_PROFILE_DISABLE_CHECKPOINT" in run_state
     assert "TMAX_PROFILE_ARM TMAX_PROFILE_BATCH_ID" in run_state

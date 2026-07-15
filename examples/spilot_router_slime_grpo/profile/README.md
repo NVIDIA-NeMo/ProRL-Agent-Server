@@ -122,11 +122,17 @@ directories or logical run directories and tolerates incomplete jobs:
 ```bash
 python examples/spilot_router_slime_grpo/profile/profile_summary.py \
   --warmup-steps 1 \
+  --log-root /path/to/data/logs/slurm \
+  --log-timezone America/Los_Angeles \
   --json /tmp/spilot-profile.json \
   /path/to/data/runs/spilot-prof-async-16t16r-l1-* \
   /path/to/data/runs/spilot-prof-async-16t16r-l3-* \
   /path/to/data/runs/spilot-prof-collocate-16shared-*
 ```
+
+Slime's unqualified timestamps are interpreted in the explicit IANA timezone
+and converted to UTC before they are matched to GPU `sample_time` epochs. The
+parser does not infer timezone offsets from the telemetry values.
 
 The compact table reports steady-state step time, trainer wait fraction,
 accepted sessions/s, queue-backlog slope, policy staleness, aggregate/role GPU
@@ -183,7 +189,11 @@ Two default-off hooks are shared with the production launcher:
 - `TMAX_TRAIN_MODE=fully_async|colocate` selects `train_async.py` or
   `train.py --colocate` and changes topology accounting from `actor + rollout`
   to `max(actor, rollout)` only in collocate mode;
-- `TMAX_PROFILE_DISABLE_CHECKPOINT=1` omits checkpoint cadence and async
-  lifecycle markers and requires graceful exit to be disabled.
+- `TMAX_PROFILE_DISABLE_CHECKPOINT=1` omits all model-checkpoint CLI arguments
+  (including `--save`) and async lifecycle markers, and requires graceful exit
+  to be disabled.  This avoids Megatron's `--save`/`--save-interval` invariant
+  and Slime's forced final checkpoint.  Rollout, W&B, and GPU telemetry remain
+  available; the disposable profile does not write the durable async rollout
+  metric journal under the model save directory.
 
 Production defaults remain `fully_async` and checkpointing enabled.

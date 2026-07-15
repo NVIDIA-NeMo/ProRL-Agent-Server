@@ -1936,7 +1936,7 @@ if [ "${TMAX_TRAIN_MODE}" = "fully_async" ] && \
         TRAINING_LIFECYCLE_ARGS+=(--training-complete-marker "${TRAINING_COMPLETE_MARKER}")
     fi
 elif [ "${TMAX_PROFILE_DISABLE_CHECKPOINT}" = "1" ]; then
-    echo "WARNING: profiling checkpoint writes and async lifecycle markers are disabled"
+    echo "WARNING: profiling model checkpoint arguments and async lifecycle markers are disabled"
 else
     echo "Sync colocate mode does not emit async lifecycle markers; do not use the checkpoint watcher for this run."
 fi
@@ -1999,13 +1999,18 @@ case "${SAVE_MEGATRON:-1}" in
         exit 1
         ;;
 esac
+SAVE_PATH_ARGS=(--save "${SAVE_DIR}")
 SAVE_INTERVAL_ARGS=()
 if [ "${TMAX_PROFILE_DISABLE_CHECKPOINT}" = "0" ]; then
     SAVE_INTERVAL_ARGS=(--save-interval "${SAVE_INTERVAL:-10}")
 else
-    # Retention has no meaning without a checkpoint cadence and Slime would
-    # otherwise force a final full checkpoint at the end of a profile run.
+    # Megatron requires --save-interval whenever --save is present, and Slime
+    # forces a final save even when the interval exceeds the short profile.
+    # Omit every model-checkpoint argument; rollout telemetry has independent
+    # paths and fully-async metrics fall back to the rollout manager commit.
+    SAVE_PATH_ARGS=()
     SAVE_RETENTION_ARGS=()
+    SAVE_FORMAT_ARGS=()
 fi
 echo "=== Launching $(basename "${SLIME_TRAIN_ENTRYPOINT}") mode=${TMAX_TRAIN_MODE} (Ray submission ${RAY_JOB_SUBMISSION_ID}) ==="
 # The custom reward post-processor already computes prompt-local GRPO
@@ -2031,7 +2036,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     "${LOAD_CHECKPOINT_ARGS[@]}" \
     --dist-ckpt-strictness "${DIST_CKPT_STRICTNESS:-assume_ok_unexpected}" \
     "${OPT_PARAM_SCHEDULER_ARGS[@]}" \
-    --save "$SAVE_DIR" \
+    "${SAVE_PATH_ARGS[@]}" \
     "${SAVE_INTERVAL_ARGS[@]}" \
     "${SAVE_RETENTION_ARGS[@]}" \
     "${SAVE_FORMAT_ARGS[@]}" \

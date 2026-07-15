@@ -43,6 +43,18 @@ class ProfileSummaryTest(unittest.TestCase):
                     "export ROLLOUT_NUM_GPUS=2",
                     "export RAY_NUM_NODES=2",
                     "export RAY_NUM_GPUS_PER_NODE=2",
+                    "export POLAR_AGENT_MODEL_NAME=Qwen/Qwen3.5-9B",
+                    "export TMAX_AGENT_HARNESS=spilot_router",
+                    "export LOAD_DIR=/checkpoints/qwen35-9b-release",
+                    "export TMAX_TRAIN_DATA_SHA256=abc123",
+                    "export TMAX_PRORL_GIT_COMMIT=deadbeef",
+                    "export TMAX_SLIME_GIT_COMMIT=feedface",
+                    "export TMAX_MEGATRON_GIT_COMMIT=01234567",
+                    "export GLOBAL_BATCH_SIZE=256",
+                    "export ROLLOUT_BATCH_SIZE=8",
+                    "export N_SAMPLES_PER_PROMPT=32",
+                    "export POLAR_MIN_COMPLETE_ACCEPT_FRACTION=0.5",
+                    "export POLAR_EARLY_STOP_GRACE_SESSIONS=16",
                     # This must never be retained in the report.
                     "export WANDB_API_KEY=secret-value",
                 ]
@@ -78,6 +90,7 @@ class ProfileSummaryTest(unittest.TestCase):
             "'polar/staleness/mean': 2.0, 'timing/service_time_max': 12.0, "
             "'timing/service_window': 16.0, 'polar/scheduler/completed_buffer': 3.0, "
             "'polar/scheduler/output_queue': 0.0, 'polar/scheduler/deferred_queue': 0.0}",
+            "Ray job polar-123 finished with status SUCCEEDED",
         ]
         _write(log, "\n".join(lines) + "\n")
 
@@ -118,6 +131,12 @@ class ProfileSummaryTest(unittest.TestCase):
             self.assertEqual(job["config"]["rollout_gpus"], 2)
             self.assertEqual(job["config"]["allocated_gpus"], 4)
             self.assertEqual(job["config"]["gateway_count"], 2)
+            self.assertEqual(job["config"]["min_complete_accept_fraction"], 0.5)
+            self.assertEqual(job["config"]["early_stop_grace_sessions"], 16)
+            self.assertEqual(job["job_status"], "SUCCEEDED")
+            self.assertEqual(job["comparability"]["model"], "Qwen/Qwen3.5-9B")
+            self.assertEqual(job["comparability"]["data_sha256"], "abc123")
+            self.assertEqual(len(job["comparability"]["fingerprint"]), 64)
             self.assertNotIn("secret-value", json.dumps(job))
 
             self.assertEqual(job["warmup_step_ids"], [0])
@@ -127,6 +146,10 @@ class ProfileSummaryTest(unittest.TestCase):
             self.assertAlmostEqual(metrics["wait_ratio"]["mean"], 7.0 / 12.0)
             self.assertAlmostEqual(metrics["staleness_mean"]["mean"], 1.5)
             self.assertAlmostEqual(metrics["rollout_collect_s"]["mean"], 5.0)
+            self.assertEqual(
+                job["steps"][1]["accepted_session_count_metric"],
+                "polar/candidate/accounted_sessions",
+            )
 
             throughput = job["steady_state"]["throughput"]
             self.assertAlmostEqual(throughput["accepted_groups_per_s"], 4.0 / 50.0)
@@ -169,6 +192,145 @@ class ProfileSummaryTest(unittest.TestCase):
             # Missing telemetry remains serializable and does not crash table rendering.
             json.dumps(summary)
             ps.render_table({"jobs": [summary]})
+
+    def test_external_slurm_log_and_timestamp_gpu_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run = self.make_run(root)
+            job_dir = run / "job-123"
+            for internal_log in (job_dir / "wandb" / "files").glob("*.log"):
+                internal_log.unlink()
+
+            log_root = root / "slurm"
+            _write(
+                log_root / "profile-arm-123.out",
+                "\n".join(
+                    [
+                        "[2026-07-14 00:00:10] train - perf 0: "
+                        "{'timing/train_wait_time': 8, 'timing/train_time': 2, 'timing/step_time': 10}",
+                        "[2026-07-14 00:00:11] rollout - perf 0: "
+                        "{'polar/accepted/group_count': 2, 'polar/rollout_trainable_sessions': 4}",
+                        "[2026-07-14 00:00:20] train - perf 1: "
+                        "{'timing/train_wait_time': 8, 'timing/train_time': 2, 'timing/step_time': 10}",
+                        "[2026-07-14 00:00:21] rollout - perf 1: "
+                        "{'polar/accepted/group_count': 2, 'polar/rollout_trainable_sessions': 4}",
+                        "[2026-07-14 00:00:30] train - perf 2: "
+                        "{'timing/train_wait_time': 8, 'timing/train_time': 2, 'timing/step_time': 10}",
+                        "[2026-07-14 00:00:31] rollout - perf 2: "
+                        "{'polar/accepted/group_count': 2, 'polar/rollout_trainable_sessions': 4}",
+                    ]
+                )
+                + "\n",
+            )
+            _write(
+                log_root / "profile-arm-123.err",
+                "Ray job polar-123 finished with status SUCCEEDED\n",
+            )
+            epoch = int(
+                __import__("datetime")
+                .datetime(2026, 7, 14, tzinfo=__import__("datetime").timezone.utc)
+                .timestamp()
+            )
+            _write(
+                job_dir / "gpu_monitor" / "node_0.csv",
+                "sample_time,timestamp,gpu,util_gpu_pct,memory_used_mb,memory_total_mb,train_step\n"
+                + f"{epoch + 5},2026/07/14 00:00:05.000,0,1,100,1000,99\n"
+                + f"{epoch + 15},2026/07/14 00:00:15.000,0,50,100,1000,99\n"
+                + f"{epoch + 25},2026/07/14 00:00:25.000,0,70,100,1000,99\n"
+                + f"{epoch + 35},2026/07/14 00:00:35.000,0,2,100,1000,99\n",
+            )
+
+            report = ps.build_report(
+                [run],
+                warmup_steps=1,
+                log_roots=[log_root],
+                log_timezone="UTC",
+            )
+            job = report["jobs"][0]
+            self.assertEqual(report["log_timezone"], "UTC")
+            self.assertIn(str(log_root / "profile-arm-123.out"), job["sources"]["logs"])
+            self.assertIn(str(log_root / "profile-arm-123.err"), job["sources"]["logs"])
+            self.assertEqual(job["job_status"], "SUCCEEDED")
+            self.assertEqual(job["gpu"]["steady_filter"], "perf_timestamp_window")
+            self.assertEqual(job["gpu"]["gpu_timestamp_offset_seconds"], 0)
+            self.assertAlmostEqual(job["gpu"]["steady"]["utilization_gpu_pct"]["mean"], 60.0)
+            self.assertAlmostEqual(
+                job["steady_state"]["throughput"]["weighted_train_wait_ratio"],
+                0.8,
+            )
+            self.assertAlmostEqual(
+                job["steady_state"]["throughput"]["accepted_sessions_per_s"],
+                8.0 / 20.0,
+            )
+
+    def test_pdt_perf_timestamps_align_with_gpu_epoch_without_guessing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run = self.make_run(root)
+            job_dir = run / "job-123"
+            for internal_log in (job_dir / "wandb" / "files").glob("*.log"):
+                internal_log.unlink()
+
+            log_root = root / "slurm"
+            _write(
+                log_root / "profile-arm-123.out",
+                "\n".join(
+                    [
+                        "[2026-07-14 00:00:10] train - perf 0: "
+                        "{'timing/train_wait_time': 8, 'timing/train_time': 2, 'timing/step_time': 10}",
+                        "[2026-07-14 00:00:20] train - perf 1: "
+                        "{'timing/train_wait_time': 8, 'timing/train_time': 2, 'timing/step_time': 10}",
+                        "[2026-07-14 00:00:30] train - perf 2: "
+                        "{'timing/train_wait_time': 8, 'timing/train_time': 2, 'timing/step_time': 10}",
+                    ]
+                )
+                + "\n",
+            )
+            pdt_epoch = int(
+                __import__("datetime")
+                .datetime(
+                    2026,
+                    7,
+                    14,
+                    tzinfo=__import__("zoneinfo").ZoneInfo("America/Los_Angeles"),
+                )
+                .timestamp()
+            )
+            _write(
+                job_dir / "gpu_monitor" / "node_0.csv",
+                "sample_time,timestamp,gpu,util_gpu_pct,memory_used_mb,memory_total_mb,train_step\n"
+                + f"{pdt_epoch + 5},2026/07/14 00:00:05.000,0,1,100,1000,99\n"
+                + f"{pdt_epoch + 15},2026/07/14 00:00:15.000,0,50,100,1000,99\n"
+                + f"{pdt_epoch + 25},2026/07/14 00:00:25.000,0,70,100,1000,99\n"
+                + f"{pdt_epoch + 35},2026/07/14 00:00:35.000,0,2,100,1000,99\n",
+            )
+
+            report = ps.build_report(
+                [run],
+                warmup_steps=1,
+                log_roots=[log_root],
+                log_timezone="America/Los_Angeles",
+            )
+            job = report["jobs"][0]
+            self.assertEqual(report["log_timezone"], "America/Los_Angeles")
+            self.assertEqual(job["gpu"]["steady_filter"], "perf_timestamp_window")
+            self.assertEqual(job["gpu"]["gpu_timestamp_offset_seconds"], 0)
+            self.assertAlmostEqual(
+                job["gpu"]["steady"]["utilization_gpu_pct"]["mean"],
+                60.0,
+            )
+
+            utc_report = ps.build_report(
+                [run],
+                warmup_steps=1,
+                log_roots=[log_root],
+                log_timezone="UTC",
+            )
+            utc_job = utc_report["jobs"][0]
+            # A wrong timezone cannot manufacture a timestamp match; the
+            # existing train_step fallback remains available instead.
+            self.assertEqual(utc_job["gpu"]["steady_filter"], "train_step")
+            self.assertIsNone(utc_job["gpu"]["gpu_timestamp_offset_seconds"])
 
     def test_cli_json_stdout_is_machine_readable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

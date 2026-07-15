@@ -1,5 +1,10 @@
 # TMax Slime GRPO
 
+Short GPU-allocation experiments are documented in
+[`profile/README.md`](profile/README.md). The profiler compares fully async
+train/rollout splits with collocation without touching production run state or
+writing model checkpoints.
+
 This example trains Qwen3.5-9B with Slime GRPO while Polar runs each TMax
 trajectory in its task-specific Apptainer SIF. The Harbor evaluator injects
 the task's `tests/` directory into the live sandbox and returns its 0/1 reward.

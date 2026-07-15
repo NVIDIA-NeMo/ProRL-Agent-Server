@@ -14,6 +14,7 @@ import ast
 import csv
 import datetime as dt
 import fnmatch
+import hashlib
 import json
 import math
 import os
@@ -24,11 +25,17 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+FALLBACK_LOG_TIMEZONE = "America/Los_Angeles"
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 PERF_RE = re.compile(r"\bperf\s+(-?\d+)\s*:\s*(\{.*)")
+PERF_TIMESTAMP_RE = re.compile(
+    r"\[(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)\]"
+)
 METRIC_PAIR_RE = re.compile(
     r"[\"']([^\"']+)[\"']\s*:\s*"
     r"(?:(?:np\.)?(?:float(?:16|32|64)?|int(?:16|32|64)?)\s*\(\s*)?"
@@ -37,6 +44,9 @@ METRIC_PAIR_RE = re.compile(
 EXPORT_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 JOB_ID_RE = re.compile(r"^job-(\d+)$")
 NODE_ID_RE = re.compile(r"(?:^|[_-])node[_-]?(\d+)(?:$|[_-])", re.IGNORECASE)
+RAY_TERMINAL_RE = re.compile(
+    r"Ray job\s+\S+\s+finished with status\s+(SUCCEEDED|FAILED|STOPPED)\b"
+)
 
 # Never retain or emit arbitrary environment values: submit snapshots can
 # contain credentials.  This allowlist is deliberately limited to topology and
@@ -72,6 +82,18 @@ SAFE_ENV_KEYS = {
     "GLOBAL_BATCH_SIZE",
     "ROLLOUT_BATCH_SIZE",
     "N_SAMPLES_PER_PROMPT",
+    "POLAR_AGENT_MODEL_NAME",
+    "TMAX_AGENT_HARNESS",
+    "POLAR_AGENT_HARNESS",
+    "LOAD_DIR",
+    "HF_CHECKPOINT",
+    "REF_LOAD",
+    "TMAX_TRAIN_DATA_SHA256",
+    "TMAX_PRORL_GIT_COMMIT",
+    "TMAX_SLIME_GIT_COMMIT",
+    "TMAX_MEGATRON_GIT_COMMIT",
+    "POLAR_MIN_COMPLETE_ACCEPT_FRACTION",
+    "POLAR_EARLY_STOP_GRACE_SESSIONS",
     "POLAR_SUBMITTED_JOB_ID",
     "SLURM_JOB_ID",
 }
@@ -79,9 +101,11 @@ SAFE_ENV_KEYS = {
 LOG_PATTERNS = (
     "output_pool*.log",
     "slurm*.out",
+    "slurm*.err",
     "slurm*.log",
     "train*.log",
     "stdout*.log",
+    "stderr*.log",
     "profile*.log",
 )
 
@@ -95,6 +119,34 @@ PRUNED_TELEMETRY_DIRS = {
     "startup",
     "trajectory_examples",
 }
+
+
+def _timezone_name(value: str) -> str:
+    """Validate and normalize an IANA timezone name."""
+
+    name = value.strip().removeprefix(":")
+    if not name:
+        raise ValueError("timezone must not be empty")
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as error:
+        raise ValueError(f"unknown IANA timezone: {value!r}") from error
+    return name
+
+
+def _default_log_timezone() -> str:
+    """Use a valid TZ environment value, or the cluster's local timezone."""
+
+    environment_timezone = os.environ.get("TZ")
+    if environment_timezone:
+        try:
+            return _timezone_name(environment_timezone)
+        except ValueError:
+            pass
+    return FALLBACK_LOG_TIMEZONE
+
+
+DEFAULT_LOG_TIMEZONE = _default_log_timezone()
 
 
 def _float(value: Any) -> float | None:
@@ -234,7 +286,9 @@ def discover_job_dirs(inputs: Sequence[Path]) -> list[Path]:
     return jobs
 
 
-def _load_config(job_dir: Path) -> tuple[dict[str, Any], list[str], list[str]]:
+def _load_config(
+    job_dir: Path,
+) -> tuple[dict[str, Any], dict[str, Any], list[str], list[str]]:
     warnings: list[str] = []
     sources: list[Path] = []
     job_id = _job_id(job_dir)
@@ -356,14 +410,48 @@ def _load_config(job_dir: Path) -> tuple[dict[str, Any], list[str], list[str]]:
         "global_batch_size": _int(env.get("GLOBAL_BATCH_SIZE")),
         "rollout_batch_size": _int(env.get("ROLLOUT_BATCH_SIZE")),
         "samples_per_prompt": _int(env.get("N_SAMPLES_PER_PROMPT")),
+        "min_complete_accept_fraction": _float(
+            env.get("POLAR_MIN_COMPLETE_ACCEPT_FRACTION")
+        ),
+        "early_stop_grace_sessions": _int(
+            env.get("POLAR_EARLY_STOP_GRACE_SESSIONS")
+        ),
         "gpu_monitor_node_role": env.get("GPU_MONITOR_NODE_ROLE"),
     }
-    return config, [str(path) for path in dict.fromkeys(sources)], warnings
+    comparability_payload: dict[str, Any] = {
+        "model": env.get("POLAR_AGENT_MODEL_NAME"),
+        "checkpoint": env.get("LOAD_DIR") or env.get("REF_LOAD") or env.get("HF_CHECKPOINT"),
+        "data_sha256": env.get("TMAX_TRAIN_DATA_SHA256"),
+        "global_batch_size": config["global_batch_size"],
+        "code_revision": env.get("TMAX_PRORL_GIT_COMMIT"),
+        "slime_revision": env.get("TMAX_SLIME_GIT_COMMIT"),
+        "megatron_revision": env.get("TMAX_MEGATRON_GIT_COMMIT"),
+        "harness": env.get("TMAX_AGENT_HARNESS") or env.get("POLAR_AGENT_HARNESS"),
+        "rollout_batch_size": config["rollout_batch_size"],
+        "samples_per_prompt": config["samples_per_prompt"],
+        "min_complete_accept_fraction": _float(
+            env.get("POLAR_MIN_COMPLETE_ACCEPT_FRACTION")
+        ),
+        "early_stop_grace_sessions": _int(env.get("POLAR_EARLY_STOP_GRACE_SESSIONS")),
+    }
+    fingerprint_source = json.dumps(
+        comparability_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    comparability = {
+        "fingerprint": hashlib.sha256(fingerprint_source).hexdigest(),
+        **comparability_payload,
+    }
+    return (
+        config,
+        comparability,
+        [str(path) for path in dict.fromkeys(sources)],
+        warnings,
+    )
 
 
-def _discover_logs(job_dir: Path) -> list[Path]:
-    if not job_dir.is_dir():
-        return []
+def _discover_logs(job_dir: Path, extra_roots: Sequence[Path] = ()) -> list[Path]:
     found: set[Path] = set()
 
     def collect(root_path: Path, max_depth: int) -> None:
@@ -385,15 +473,49 @@ def _discover_logs(job_dir: Path) -> list[Path]:
     # blind rglob of the job would traverse thousands of rollout task trees.
     for telemetry_root in (job_dir / "wandb", job_dir / "logs"):
         collect(telemetry_root, max_depth=6)
-    try:
-        for child in job_dir.iterdir():
-            if child.is_file() and any(fnmatch.fnmatch(child.name, pattern) for pattern in LOG_PATTERNS):
-                found.add(child)
-    except OSError:
-        pass
+    if job_dir.is_dir():
+        try:
+            for child in job_dir.iterdir():
+                if child.is_file() and any(
+                    fnmatch.fnmatch(child.name, pattern) for pattern in LOG_PATTERNS
+                ):
+                    found.add(child)
+        except OSError:
+            pass
     if not found:
         collect(job_dir, max_depth=5)
+    job_id = _job_id(job_dir)
+    if job_id:
+        for extra_root in extra_roots:
+            root = extra_root.expanduser()
+            if not root.is_dir():
+                continue
+            for pattern in (f"*{job_id}*.out", f"*{job_id}*.err", f"*{job_id}*.log"):
+                try:
+                    found.update(path for path in root.glob(pattern) if path.is_file())
+                except OSError:
+                    pass
     return sorted(found)
+
+
+def _job_status(paths: Sequence[Path]) -> tuple[str, str | None]:
+    """Return the authoritative terminal Ray status recorded by the launcher."""
+
+    last_status: str | None = None
+    last_evidence: str | None = None
+    for path in paths:
+        try:
+            handle = path.open("r", encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with handle:
+            for raw_line in handle:
+                line = ANSI_RE.sub("", raw_line).strip()
+                match = RAY_TERMINAL_RE.search(line)
+                if match:
+                    last_status = match.group(1)
+                    last_evidence = f"{path}:{line}"
+    return last_status or "UNKNOWN", last_evidence
 
 
 def _numeric_dict(text: str) -> dict[str, float]:
@@ -420,9 +542,33 @@ def _numeric_dict(text: str) -> dict[str, float]:
     return result
 
 
-def parse_perf_logs(paths: Sequence[Path]) -> tuple[dict[int, dict[str, float]], dict[int, set[str]], int]:
+def _perf_timestamp(line: str, log_timezone: ZoneInfo) -> float | None:
+    match = PERF_TIMESTAMP_RE.search(line)
+    if not match:
+        return None
+    try:
+        text = match.group(1).replace(" ", "T").replace("Z", "+00:00")
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=log_timezone)
+    return parsed.astimezone(dt.timezone.utc).timestamp()
+
+
+def parse_perf_logs(
+    paths: Sequence[Path],
+    log_timezone: str = DEFAULT_LOG_TIMEZONE,
+) -> tuple[
+    dict[int, dict[str, float]],
+    dict[int, set[str]],
+    dict[int, dict[str, float]],
+    int,
+]:
+    timezone = ZoneInfo(_timezone_name(log_timezone))
     by_step: dict[int, dict[str, float]] = defaultdict(dict)
     sources: dict[int, set[str]] = defaultdict(set)
+    timestamps: dict[int, dict[str, float]] = defaultdict(dict)
     parse_failures = 0
     for path in paths:
         try:
@@ -441,15 +587,20 @@ def parse_perf_logs(paths: Sequence[Path]) -> tuple[dict[int, dict[str, float]],
                     parse_failures += 1
                     continue
                 by_step[step].update(metrics)
+                timestamp = _perf_timestamp(line, timezone)
                 if "timing/train_wait_time" in metrics or "timing/train_time" in metrics:
                     sources[step].add("train")
+                    if timestamp is not None:
+                        timestamps[step]["train"] = timestamp
                 if any(
                     key.startswith(("polar/", "rollout/"))
                     or key in {"perf/rollout_time", "timing/service_time_max"}
                     for key in metrics
                 ):
                     sources[step].add("rollout")
-    return dict(by_step), dict(sources), parse_failures
+                    if timestamp is not None:
+                        timestamps[step]["rollout"] = timestamp
+    return dict(by_step), dict(sources), dict(timestamps), parse_failures
 
 
 def _first(metrics: Mapping[str, float], *keys: str) -> float | None:
@@ -457,6 +608,15 @@ def _first(metrics: Mapping[str, float], *keys: str) -> float | None:
         if key in metrics:
             return metrics[key]
     return None
+
+
+def _first_named(
+    metrics: Mapping[str, float], *keys: str
+) -> tuple[float | None, str | None]:
+    for key in keys:
+        if key in metrics:
+            return metrics[key], key
+    return None, None
 
 
 def _matching_metric(metrics: Mapping[str, float], fragments: Sequence[str]) -> float | None:
@@ -467,7 +627,12 @@ def _matching_metric(metrics: Mapping[str, float], fragments: Sequence[str]) -> 
     return None
 
 
-def canonical_step(step: int, metrics: Mapping[str, float], sources: set[str]) -> dict[str, Any]:
+def canonical_step(
+    step: int,
+    metrics: Mapping[str, float],
+    sources: set[str],
+    record_timestamps: Mapping[str, float] | None = None,
+) -> dict[str, Any]:
     wait = _first(metrics, "timing/train_wait_time")
     train = _first(metrics, "timing/train_time")
     step_time = _first(metrics, "timing/step_time")
@@ -483,8 +648,9 @@ def canonical_step(step: int, metrics: Mapping[str, float], sources: set[str]) -
         "polar/candidate/accepted_group_count",
         "polar/decision_window/accepted_group_count",
     )
-    accepted_sessions = _first(
+    accepted_sessions, accepted_session_metric = _first_named(
         metrics,
+        "polar/rollout_trainable_sessions",
         "polar/accepted/accounted_sessions",
         "rollout/session_reward_accounted_sessions",
         "polar/reward_accounted_sessions",
@@ -494,6 +660,7 @@ def canonical_step(step: int, metrics: Mapping[str, float], sources: set[str]) -
     )
     finished_groups = _first(
         metrics,
+        "polar/completed_groups_delta",
         "polar/completed_groups",
         "polar/completed_count",
         "polar/scheduler/completed_groups_delta",
@@ -538,12 +705,14 @@ def canonical_step(step: int, metrics: Mapping[str, float], sources: set[str]) -
     return {
         "step": step,
         "sources": sorted(sources),
+        "train_record_timestamp_unix": (record_timestamps or {}).get("train"),
+        "rollout_record_timestamp_unix": (record_timestamps or {}).get("rollout"),
         "train_wait_time_s": wait,
         "train_time_s": train,
         "step_time_s": step_time,
         "wait_ratio": wait_ratio,
         "actor_train_tokens_per_s": _first(metrics, "perf/actor_train_tok_per_s"),
-        "rollout_time_s": _first(metrics, "perf/rollout_time"),
+        "rollout_time_s": _first(metrics, "timing/rollout_time", "perf/rollout_time"),
         "service_time_max_s": _first(metrics, "timing/service_time_max"),
         "service_window_s": _first(metrics, "timing/service_window"),
         "rollout_collect_s": (
@@ -555,10 +724,36 @@ def canonical_step(step: int, metrics: Mapping[str, float], sources: set[str]) -
         "sample_age_mean": sample_age_mean,
         "sample_age_p95": sample_age_p95,
         "accepted_group_count": accepted_groups,
+        "consumed_group_count": _first(
+            metrics,
+            "polar/decision_window/consumed_window_group_count",
+        ),
         "accepted_session_count": accepted_sessions,
+        "accepted_session_count_metric": accepted_session_metric,
         "accepted_trainable_tokens_estimate": accepted_tokens,
         "finished_group_count": finished_groups,
         "finished_session_count": finished_sessions,
+        "trainable_session_fraction": _first(
+            metrics,
+            "polar/rollout_trainable_session_fraction",
+            "polar/candidate/trainable_session_fraction",
+        ),
+        "rollout_success_rate": _first(
+            metrics,
+            "polar/rollout_success_rate",
+            "polar/candidate/rollout_success_rate",
+        ),
+        "terminal_timeout_session_count": _first(
+            metrics,
+            "polar/terminal_timeout_sessions",
+            "polar/candidate/terminal_timeout_sessions",
+        ),
+        "terminal_error_session_count": _first(
+            metrics,
+            "polar/terminal_error_sessions",
+            "polar/candidate/terminal_error_sessions",
+        ),
+        "inference_e2e_ms_mean": _first(metrics, "timing/inference/e2e_ms_mean"),
         "queue_active_groups": _first(metrics, "polar/scheduler/active_groups"),
         "queue_completed_buffer": queue_completed_buffer,
         "queue_output": queue_output,
@@ -724,14 +919,51 @@ def _gpu_group(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
-def summarize_gpu(rows: Sequence[Mapping[str, Any]], steady_steps: set[int]) -> dict[str, Any]:
-    matching = [row for row in rows if row.get("train_step") in steady_steps]
-    steady_rows = matching if matching else list(rows)
+def _gpu_rows_in_time_window(
+    rows: Sequence[Mapping[str, Any]],
+    steady_window: tuple[float, float],
+) -> tuple[list[Mapping[str, Any]], int | None]:
+    start, end = steady_window
+    # ``sample_time`` is emitted as Unix epoch seconds, so it is already on
+    # the same UTC timeline as normalized perf timestamps.  Never infer an
+    # offset from the data: doing so can silently select an unrelated burst.
+    matching = [
+        row
+        for row in rows
+        if (timestamp := _float(row.get("timestamp"))) is not None
+        and start <= timestamp <= end
+    ]
+    if not matching:
+        return [], None
+    return matching, 0
+
+
+def summarize_gpu(
+    rows: Sequence[Mapping[str, Any]],
+    steady_steps: set[int],
+    steady_window: tuple[float, float] | None = None,
+) -> dict[str, Any]:
+    time_matching: list[Mapping[str, Any]] = []
+    timestamp_offset: int | None = None
+    if steady_window is not None:
+        time_matching, timestamp_offset = _gpu_rows_in_time_window(rows, steady_window)
+    step_matching = [row for row in rows if row.get("train_step") in steady_steps]
+    if time_matching:
+        steady_rows = time_matching
+        steady_filter = "perf_timestamp_window"
+    elif step_matching:
+        steady_rows = step_matching
+        steady_filter = "train_step"
+    else:
+        steady_rows = list(rows)
+        steady_filter = "all_samples"
     grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for row in steady_rows:
         grouped[str(row.get("role") or "unknown")].append(row)
     return {
-        "steady_filter": "train_step" if matching else "all_samples",
+        "steady_filter": steady_filter,
+        "steady_time_window_unix": list(steady_window) if steady_window else None,
+        "gpu_timestamp_offset_seconds": timestamp_offset,
         "all_samples": _gpu_group(rows),
         "steady": _gpu_group(steady_rows),
         "roles": {role: _gpu_group(role_rows) for role, role_rows in sorted(grouped.items())},
@@ -752,10 +984,16 @@ STEP_METRICS = (
     "sample_age_mean",
     "sample_age_p95",
     "accepted_group_count",
+    "consumed_group_count",
     "accepted_session_count",
     "accepted_trainable_tokens_estimate",
     "finished_group_count",
     "finished_session_count",
+    "trainable_session_fraction",
+    "rollout_success_rate",
+    "terminal_timeout_session_count",
+    "terminal_error_session_count",
+    "inference_e2e_ms_mean",
     "queue_active_groups",
     "queue_completed_buffer",
     "queue_output",
@@ -779,7 +1017,9 @@ def _per_step_slope(steps: Sequence[Mapping[str, Any]], key: str) -> float | Non
 def _steady_summary(steps: Sequence[Mapping[str, Any]], gpu_count: int | None) -> dict[str, Any]:
     metric_stats = {key: stats(step.get(key) for step in steps) for key in STEP_METRICS}
     elapsed = _float(metric_stats["step_time_s"]["sum"])
+    train_wait = _float(metric_stats["train_wait_time_s"]["sum"])
     accepted_groups = _float(metric_stats["accepted_group_count"]["sum"])
+    consumed_groups = _float(metric_stats["consumed_group_count"]["sum"])
     accepted_sessions = _float(metric_stats["accepted_session_count"]["sum"])
     accepted_tokens = _float(metric_stats["accepted_trainable_tokens_estimate"]["sum"])
     finished_groups = _float(metric_stats["finished_group_count"]["sum"])
@@ -792,6 +1032,9 @@ def _steady_summary(steps: Sequence[Mapping[str, Any]], gpu_count: int | None) -
     throughput = {
         "elapsed_step_time_s": elapsed,
         "train_steps_per_hour": _safe_div(len(steps) * 3600.0, elapsed),
+        "train_steps_per_gpu_hour": _safe_div(len(steps), estimated_gpu_hours),
+        "weighted_train_wait_ratio": _safe_div(train_wait, elapsed),
+        "accepted_group_fraction": _safe_div(accepted_groups, consumed_groups),
         "accepted_groups_per_s": _safe_div(accepted_groups, elapsed),
         "accepted_sessions_per_s": _safe_div(accepted_sessions, elapsed),
         "accepted_trainable_tokens_per_s": _safe_div(accepted_tokens, elapsed),
@@ -851,11 +1094,28 @@ def _discover_gpu_csv(job_dir: Path) -> list[Path]:
     return sorted(found)
 
 
-def summarize_job(job_dir: Path, warmup_steps: int = 1) -> dict[str, Any]:
-    config, env_sources, warnings = _load_config(job_dir)
-    log_paths = _discover_logs(job_dir)
-    by_step, step_sources, parse_failures = parse_perf_logs(log_paths)
-    canonical = [canonical_step(step, by_step[step], step_sources.get(step, set())) for step in sorted(by_step)]
+def summarize_job(
+    job_dir: Path,
+    warmup_steps: int = 1,
+    log_roots: Sequence[Path] = (),
+    log_timezone: str = DEFAULT_LOG_TIMEZONE,
+) -> dict[str, Any]:
+    config, comparability, env_sources, warnings = _load_config(job_dir)
+    log_paths = _discover_logs(job_dir, log_roots)
+    job_status, job_status_evidence = _job_status(log_paths)
+    by_step, step_sources, step_timestamps, parse_failures = parse_perf_logs(
+        log_paths,
+        log_timezone=log_timezone,
+    )
+    canonical = [
+        canonical_step(
+            step,
+            by_step[step],
+            step_sources.get(step, set()),
+            step_timestamps.get(step),
+        )
+        for step in sorted(by_step)
+    ]
     train_ids = [step["step"] for step in canonical if "train" in step["sources"]]
     observed_ids = train_ids or [step["step"] for step in canonical]
     warmup_ids = set(observed_ids[:warmup_steps])
@@ -864,12 +1124,38 @@ def summarize_job(job_dir: Path, warmup_steps: int = 1) -> dict[str, Any]:
     steady_steps = [step for step in canonical if step["steady"]]
     steady_ids = {int(step["step"]) for step in steady_steps}
 
+    steady_window: tuple[float, float] | None = None
+    train_records = [
+        step
+        for step in canonical
+        if "train" in step["sources"]
+        and _float(step.get("train_record_timestamp_unix")) is not None
+    ]
+    steady_train_records = [step for step in train_records if step["steady"]]
+    if steady_train_records:
+        first_index = train_records.index(steady_train_records[0])
+        end = _float(steady_train_records[-1].get("train_record_timestamp_unix"))
+        if first_index > 0:
+            start = _float(train_records[first_index - 1].get("train_record_timestamp_unix"))
+        else:
+            first_end = _float(steady_train_records[0].get("train_record_timestamp_unix"))
+            first_duration = _float(steady_train_records[0].get("step_time_s"))
+            start = first_end - first_duration if first_end is not None and first_duration else None
+        if start is not None and end is not None and end >= start:
+            steady_window = (start, end)
+
     gpu_paths = _discover_gpu_csv(job_dir)
     gpu_rows, malformed_gpu_rows = parse_gpu_csv(gpu_paths, config)
-    gpu = summarize_gpu(gpu_rows, steady_ids)
+    gpu = summarize_gpu(gpu_rows, steady_ids, steady_window)
     observed_gpu_count = _int(gpu["all_samples"].get("device_count"))
     gpu_count = _int(config.get("allocated_gpus")) or observed_gpu_count
     steady = _steady_summary(steady_steps, gpu_count)
+    expected_gpu_hours = _float(steady["throughput"].get("gpu_hours_estimate"))
+    observed_gpu_hours = _float(gpu["steady"].get("gpu_hours_observed"))
+    gpu["steady_coverage_fraction"] = _safe_div(
+        observed_gpu_hours,
+        expected_gpu_hours,
+    )
 
     if not job_dir.exists():
         warnings.append("input directory does not exist")
@@ -889,10 +1175,12 @@ def summarize_job(job_dir: Path, warmup_steps: int = 1) -> dict[str, Any]:
         warnings.append("GPU monitor CSV files contained no usable samples")
     if malformed_gpu_rows:
         warnings.append(f"{malformed_gpu_rows} malformed GPU CSV row(s) skipped")
-    if gpu_rows and gpu["steady_filter"] != "train_step":
-        warnings.append("GPU CSV has no matching train_step values; utilization includes all samples")
+    if gpu_rows and gpu["steady_filter"] == "all_samples":
+        warnings.append("GPU CSV has no matching steady time/step values; utilization includes all samples")
     if len(steady_steps) == 0:
         warnings.append("no steady-state steps remain after warmup")
+    if job_status != "SUCCEEDED":
+        warnings.append(f"Ray job terminal status is {job_status}, not SUCCEEDED")
 
     job_id = _job_id(job_dir)
     return {
@@ -900,7 +1188,10 @@ def summarize_job(job_dir: Path, warmup_steps: int = 1) -> dict[str, Any]:
         "job_id": job_id,
         "path": str(job_dir),
         "run_path": str(job_dir.parent if job_id else job_dir),
+        "job_status": job_status,
+        "job_status_evidence": job_status_evidence,
         "config": config,
+        "comparability": comparability,
         "sources": {
             "config": env_sources,
             "logs": [str(path) for path in log_paths],
@@ -916,12 +1207,27 @@ def summarize_job(job_dir: Path, warmup_steps: int = 1) -> dict[str, Any]:
     }
 
 
-def build_report(inputs: Sequence[Path], warmup_steps: int = 1) -> dict[str, Any]:
+def build_report(
+    inputs: Sequence[Path],
+    warmup_steps: int = 1,
+    log_roots: Sequence[Path] = (),
+    log_timezone: str = DEFAULT_LOG_TIMEZONE,
+) -> dict[str, Any]:
+    normalized_log_timezone = _timezone_name(log_timezone)
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "warmup_steps": warmup_steps,
-        "jobs": [summarize_job(path, warmup_steps=warmup_steps) for path in discover_job_dirs(inputs)],
+        "log_timezone": normalized_log_timezone,
+        "jobs": [
+            summarize_job(
+                path,
+                warmup_steps=warmup_steps,
+                log_roots=log_roots,
+                log_timezone=normalized_log_timezone,
+            )
+            for path in discover_job_dirs(inputs)
+        ],
     }
 
 
@@ -974,8 +1280,8 @@ def render_table(report: Mapping[str, Any]) -> str:
                 str(job.get("step_count_steady", 0)),
                 _fmt(_nested(job, "steady_state", "metrics", "step_time_s", "mean"), 1),
                 _fmt(
-                    (_nested(job, "steady_state", "metrics", "wait_ratio", "mean") or 0) * 100
-                    if _nested(job, "steady_state", "metrics", "wait_ratio", "mean") is not None
+                    (_nested(job, "steady_state", "throughput", "weighted_train_wait_ratio") or 0) * 100
+                    if _nested(job, "steady_state", "throughput", "weighted_train_wait_ratio") is not None
                     else None,
                     1,
                 ),
@@ -1035,6 +1341,24 @@ def _parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="also write the complete report as JSON; use '-' for stdout",
     )
+    parser.add_argument(
+        "--log-root",
+        action="append",
+        default=[],
+        type=Path,
+        help="also search this directory for Slurm logs containing the job id",
+    )
+    parser.add_argument(
+        "--log-timezone",
+        default=DEFAULT_LOG_TIMEZONE,
+        type=_timezone_name,
+        metavar="IANA_ZONE",
+        help=(
+            "timezone for perf log timestamps without an explicit UTC offset "
+            f"(default: TZ environment value or {FALLBACK_LOG_TIMEZONE}; "
+            f"resolved here as {DEFAULT_LOG_TIMEZONE})"
+        ),
+    )
     return parser
 
 
@@ -1042,7 +1366,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.warmup_steps < 0:
         _parser().error("--warmup-steps must be non-negative")
-    report = build_report(args.paths, warmup_steps=args.warmup_steps)
+    report = build_report(
+        args.paths,
+        warmup_steps=args.warmup_steps,
+        log_roots=args.log_root,
+        log_timezone=args.log_timezone,
+    )
     table = render_table(report)
     if args.json == "-":
         print(table, file=sys.stderr)
