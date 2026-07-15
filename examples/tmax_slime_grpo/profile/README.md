@@ -77,12 +77,12 @@ directory because job stdout is not stored inside the logical run directory:
 python examples/tmax_slime_grpo/profile/profile_summary.py \
   --warmup-steps 1 \
   --log-root /abs/data/logs/slurm \
-  --log-timezone America/Los_Angeles \
+  --log-timezone UTC \
   --json /abs/profile/summary.json \
   /abs/run-1 /abs/run-2 /abs/run-3 /abs/run-4
 ```
 
-The timezone is explicit because Slime perf lines use cluster-local wall time,
+The timezone is explicit because Slime perf lines use compute-node wall time,
 while GPU CSV `sample_time` is a UTC Unix epoch. The parser converts both onto
 one UTC timeline; it never guesses a whole-hour offset from utilization data.
 

@@ -29,7 +29,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 SCHEMA_VERSION = 2
-FALLBACK_LOG_TIMEZONE = "America/Los_Angeles"
+# Slurm compute nodes emit both Slime log timestamps and nvidia-smi telemetry
+# in UTC.  Keeping this fallback on the compute-node clock is important: a
+# login node may use America/Los_Angeles, but applying that offset to the
+# unqualified Slime timestamps shifts the GPU sampling window by seven hours.
+FALLBACK_LOG_TIMEZONE = "UTC"
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 PERF_RE = re.compile(r"\bperf\s+(-?\d+)\s*:\s*(\{.*)")
 PERF_TIMESTAMP_RE = re.compile(

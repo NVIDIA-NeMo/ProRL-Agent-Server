@@ -22,6 +22,9 @@ def _write(path: Path, contents: str) -> None:
 
 
 class ProfileSummaryTest(unittest.TestCase):
+    def test_fallback_timezone_matches_compute_node_clock(self) -> None:
+        self.assertEqual(ps.FALLBACK_LOG_TIMEZONE, "UTC")
+
     def make_run(self, root: Path) -> Path:
         run = root / "profile-run"
         job = run / "job-123"

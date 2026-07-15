@@ -146,7 +146,7 @@ directories or logical run directories and tolerates incomplete jobs:
 python examples/spilot_router_slime_grpo/profile/profile_summary.py \
   --warmup-steps 1 \
   --log-root /path/to/data/logs/slurm \
-  --log-timezone America/Los_Angeles \
+  --log-timezone UTC \
   --json /tmp/spilot-profile.json \
   /path/to/data/runs/spilot-prof-async-16t16r-l1-* \
   /path/to/data/runs/spilot-prof-async-16t16r-l3-* \
@@ -155,7 +155,10 @@ python examples/spilot_router_slime_grpo/profile/profile_summary.py \
 
 Slime's unqualified timestamps are interpreted in the explicit IANA timezone
 and converted to UTC before they are matched to GPU `sample_time` epochs. The
-parser does not infer timezone offsets from the telemetry values.
+CW-DFW compute nodes used by this launcher emit both Slime and nvidia-smi
+timestamps in UTC, even when a login shell is in `America/Los_Angeles`, so the
+profile/report launchers default to `UTC`. The parser does not infer timezone
+offsets from the telemetry values.
 
 The compact table reports steady-state step time, trainer wait fraction,
 accepted sessions/s, queue-backlog slope, policy staleness, aggregate/role GPU

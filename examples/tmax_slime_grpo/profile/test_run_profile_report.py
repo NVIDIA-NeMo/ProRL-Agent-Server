@@ -199,6 +199,24 @@ def _run_args(
     ]
 
 
+def test_report_defaults_to_compute_node_utc() -> None:
+    args = report_runner.parser().parse_args(
+        [
+            "--data-root",
+            "/data",
+            "--log-root",
+            "/logs",
+            "--spilot-manifest",
+            "/spilot.tsv",
+            "--tmax-manifest",
+            "/tmax.tsv",
+            "--output-dir",
+            "/report",
+        ]
+    )
+    assert args.log_timezone == "UTC"
+
+
 def test_complete_gate_accepts_eight_valid_directional_arms(tmp_path: Path) -> None:
     data_root, log_root, spilot_manifest, tmax_manifest = _prepare_inputs(tmp_path)
     output = tmp_path / "report"

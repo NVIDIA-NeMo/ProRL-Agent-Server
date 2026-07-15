@@ -44,7 +44,7 @@ command=(
     --output-dir "${output_dir}"
     --expected-steps "${PROFILE_EXPECTED_STEPS:-3}"
     --warmup-steps "${PROFILE_WARMUP_STEPS:-1}"
-    --log-timezone "${PROFILE_LOG_TIMEZONE:-America/Los_Angeles}"
+    --log-timezone "${PROFILE_LOG_TIMEZONE:-UTC}"
 )
 printf -v wrapped_command '%q ' "${command[@]}"
 

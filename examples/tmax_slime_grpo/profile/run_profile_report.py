@@ -507,7 +507,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--output-dir", required=True, type=Path)
     result.add_argument("--expected-steps", type=int, default=3)
     result.add_argument("--warmup-steps", type=int, default=1)
-    result.add_argument("--log-timezone", default="America/Los_Angeles")
+    result.add_argument("--log-timezone", default="UTC")
     return result
 
 
