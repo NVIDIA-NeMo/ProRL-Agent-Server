@@ -838,6 +838,81 @@ async def test_blocked_pool_upstream_keeps_episode_slot_until_request_drains(
 
 
 @pytest.mark.asyncio
+async def test_runtime_destroyed_fallback_cancels_non_streaming_pool_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upstream_started = asyncio.Event()
+    upstream_cancelled = asyncio.Event()
+
+    class Inference:
+        async def completion(self, _request: dict) -> dict:
+            upstream_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                upstream_cancelled.set()
+
+    registry = SessionRegistry()
+    registry.register("owner", registered=True, status=SessionStatus.RUNNING)
+    admission = ModelPoolEpisodeAdmission({"pool/qwen": 1})
+    first = await admission.acquire(
+        session_id="owner",
+        alias="pool/qwen",
+        attempt_id="0:solve",
+        timeout_seconds=1,
+    )
+    monkeypatch.setattr(
+        server,
+        "get_state",
+        lambda: SimpleNamespace(
+            inference=SimpleNamespace(),
+            model_pool={
+                "pool/qwen": server.ModelPoolRoute(
+                    model="upstream-qwen",
+                    inference=Inference(),  # type: ignore[arg-type]
+                    max_active_episodes=1,
+                )
+            },
+            episode_admission=admission,
+            storage=SimpleNamespace(),
+            node=SimpleNamespace(model_served="local-router-policy"),
+            transform_manager=TransformManager(),
+            session_registry=registry,
+        ),
+    )
+    request_task = asyncio.create_task(
+        server.proxy_request(
+            _request(
+                "/v1/chat/completions",
+                {"model": "pool/qwen", "messages": []},
+                authorization=f"Bearer {first.call_capability}",
+            ),
+            "v1/chat/completions",
+        )
+    )
+    await asyncio.wait_for(upstream_started.wait(), timeout=1)
+    queued = asyncio.create_task(
+        admission.acquire(
+            session_id="next",
+            alias="pool/qwen",
+            attempt_id="0:solve",
+            timeout_seconds=1,
+        )
+    )
+
+    await admission.release_after_runtime_destroyed(
+        "owner",
+        runtime_destroyed=True,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+    assert upstream_cancelled.is_set()
+    replacement = await asyncio.wait_for(queued, timeout=1)
+    await admission.release_session(replacement.session_id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "disconnect_early",
     [False, True],
@@ -963,6 +1038,111 @@ async def test_pool_stream_holds_episode_slot_until_body_closes(
         session_id="stream-two",
         lease_id=second.lease_id,
     ) is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_destroyed_fallback_cancels_stream_response_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Inference:
+        async def completion(self, _request: dict) -> dict:
+            return {
+                "id": "pool-completion",
+                "model": "upstream-qwen",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "done"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+
+    registry = SessionRegistry()
+    registry.register("stream-owner", registered=True, status=SessionStatus.RUNNING)
+    admission = ModelPoolEpisodeAdmission({"pool/qwen": 1})
+    first = await admission.acquire(
+        session_id="stream-owner",
+        alias="pool/qwen",
+        attempt_id="0:solve",
+        timeout_seconds=1,
+    )
+    monkeypatch.setattr(
+        server,
+        "get_state",
+        lambda: SimpleNamespace(
+            inference=SimpleNamespace(),
+            model_pool={
+                "pool/qwen": server.ModelPoolRoute(
+                    model="upstream-qwen",
+                    inference=Inference(),  # type: ignore[arg-type]
+                    max_active_episodes=1,
+                )
+            },
+            episode_admission=admission,
+            storage=SimpleNamespace(),
+            node=SimpleNamespace(model_served="local-router-policy"),
+            transform_manager=TransformManager(),
+            session_registry=registry,
+        ),
+    )
+
+    # Resolve the route in one task, then drive its response in another.  The
+    # response boundary must transfer admission ownership to the ASGI task.
+    route_task = asyncio.create_task(
+        server.proxy_request(
+            _request(
+                "/v1/chat/completions",
+                {"model": "pool/qwen", "messages": [], "stream": True},
+                authorization=f"Bearer {first.call_capability}",
+            ),
+            "v1/chat/completions",
+        )
+    )
+    response = await route_task
+    send_started = asyncio.Event()
+
+    async def send(_message: dict) -> None:
+        send_started.set()
+        await asyncio.Event().wait()
+
+    async def receive() -> dict:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "headers": [],
+        "client": ("sandbox", 1234),
+        "server": ("gateway", 8081),
+    }
+    response_task = asyncio.create_task(response(scope, receive, send))  # type: ignore[misc]
+    await asyncio.wait_for(send_started.wait(), timeout=1)
+    queued = asyncio.create_task(
+        admission.acquire(
+            session_id="stream-next",
+            alias="pool/qwen",
+            attempt_id="0:solve",
+            timeout_seconds=1,
+        )
+    )
+
+    await admission.release_after_runtime_destroyed(
+        "stream-owner",
+        runtime_destroyed=True,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await response_task
+    replacement = await asyncio.wait_for(queued, timeout=1)
+    await admission.release_session(replacement.session_id)
 
 
 @pytest.mark.asyncio

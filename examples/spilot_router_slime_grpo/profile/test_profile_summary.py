@@ -54,7 +54,7 @@ class ProfileSummaryTest(unittest.TestCase):
                     "export ROLLOUT_BATCH_SIZE=8",
                     "export N_SAMPLES_PER_PROMPT=32",
                     "export POLAR_MIN_COMPLETE_ACCEPT_FRACTION=0.5",
-                    "export POLAR_EARLY_STOP_GRACE_SESSIONS=16",
+                    "export POLAR_EARLY_STOP_GRACE_SESSIONS=2",
                     # This must never be retained in the report.
                     "export WANDB_API_KEY=secret-value",
                 ]
@@ -132,7 +132,7 @@ class ProfileSummaryTest(unittest.TestCase):
             self.assertEqual(job["config"]["allocated_gpus"], 4)
             self.assertEqual(job["config"]["gateway_count"], 2)
             self.assertEqual(job["config"]["min_complete_accept_fraction"], 0.5)
-            self.assertEqual(job["config"]["early_stop_grace_sessions"], 16)
+            self.assertEqual(job["config"]["early_stop_grace_sessions"], 2)
             self.assertEqual(job["job_status"], "SUCCEEDED")
             self.assertEqual(job["comparability"]["model"], "Qwen/Qwen3.5-9B")
             self.assertEqual(job["comparability"]["data_sha256"], "abc123")

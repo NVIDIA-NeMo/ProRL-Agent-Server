@@ -40,6 +40,9 @@ Useful environment overrides:
   PROFILE_TORCH_DIST_DIR=/abs/ckpt
   PROFILE_MODEL_ARGS_FILE=/abs/model_args.sh
   PROFILE_AGENT_MODEL_NAME=Qwen/Qwen3.5-9B
+  PROFILE_MAX_TOKENS_PER_GPU=32768
+  PROFILE_MIN_COMPLETE_ACCEPT_FRACTION=0.5
+  PROFILE_EARLY_STOP_GRACE_SESSIONS=2
   PROFILE_PARTITION=backfill,batch
   PROFILE_WALL_TIME=04:00:00
   PROFILE_AFTER_JOB_ID=12345      chain first arm after another suite
@@ -136,6 +139,12 @@ PROFILE_ID="${PROFILE_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 PROFILE_PARTITION="${PROFILE_PARTITION:-backfill,batch}"
 PROFILE_WALL_TIME="${PROFILE_WALL_TIME:-04:00:00}"
 PROFILE_DEPENDENCY_KIND="${PROFILE_DEPENDENCY_KIND:-afterany}"
+PROFILE_MAX_TOKENS_PER_GPU="${PROFILE_MAX_TOKENS_PER_GPU:-32768}"
+PROFILE_MIN_COMPLETE_ACCEPT_FRACTION="${PROFILE_MIN_COMPLETE_ACCEPT_FRACTION:-0.5}"
+PROFILE_EARLY_STOP_GRACE_SESSIONS="${PROFILE_EARLY_STOP_GRACE_SESSIONS:-2}"
+# The only reaper reason currently sanctioned for these profiling/debug jobs.
+# Keep this exact JSON shape in sync with the repository's operator default.
+PROFILE_SBATCH_COMMENT="${PROFILE_SBATCH_COMMENT:-{\"OccupiedIdleGPUsJobReaper\":{\"exemptIdleTimeMins\":\"240\",\"reason\":\"interactive\",\"description\":\"Interactive and debugging sessions\"}}}"
 POLAR_DATA_ROOT="${POLAR_DATA_ROOT:-${WORKSPACE_ROOT}/data}"
 export POLAR_DATA_ROOT
 
@@ -156,6 +165,18 @@ for value_name in PROFILE_STEPS PROFILE_REPEATS; do
         exit 1
     fi
 done
+if ! [[ "${PROFILE_MAX_TOKENS_PER_GPU}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: PROFILE_MAX_TOKENS_PER_GPU must be a positive integer" >&2
+    exit 1
+fi
+if ! [[ "${PROFILE_MIN_COMPLETE_ACCEPT_FRACTION}" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]; then
+    echo "ERROR: PROFILE_MIN_COMPLETE_ACCEPT_FRACTION must be between 0 and 1" >&2
+    exit 1
+fi
+if ! [[ "${PROFILE_EARLY_STOP_GRACE_SESSIONS}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: PROFILE_EARLY_STOP_GRACE_SESSIONS must be a non-negative integer" >&2
+    exit 1
+fi
 if ! [[ "${PROFILE_ID}" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "ERROR: PROFILE_ID may contain only letters, digits, dot, underscore, and dash" >&2
     exit 1
@@ -188,6 +209,17 @@ if [ -n "${PROFILE_TRAIN_DATA:-}" ]; then
         echo "ERROR: PROFILE_TRAIN_DATA must be an existing non-empty absolute file" >&2
         exit 1
     fi
+    read -r computed_train_data_sha256 _ < <(sha256sum -- "${PROFILE_TRAIN_DATA}")
+    if ! [[ "${computed_train_data_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "ERROR: failed to compute PROFILE_TRAIN_DATA SHA256" >&2
+        exit 1
+    fi
+    if [ -n "${PROFILE_TRAIN_DATA_SHA256:-}" ] && \
+       [ "${PROFILE_TRAIN_DATA_SHA256}" != "${computed_train_data_sha256}" ]; then
+        echo "ERROR: PROFILE_TRAIN_DATA_SHA256 does not match ${PROFILE_TRAIN_DATA}" >&2
+        exit 1
+    fi
+    PROFILE_TRAIN_DATA_SHA256="${computed_train_data_sha256}"
 fi
 
 # A numbered Megatron checkpoint resumes at N+1; --num-rollout is exclusive.
@@ -232,6 +264,7 @@ printf '%-23s %-12s %7s %7s %5s %8s %8s %s\n' \
 previous_job_id="${PROFILE_AFTER_JOB_ID:-}"
 manifest_dir="${POLAR_DATA_ROOT}/runs/tmax_slime_grpo/profile/${PROFILE_ID}"
 manifest_file="${manifest_dir}/manifest.tsv"
+contract_file="${manifest_dir}/profile_contract.env"
 if [ "${ACTION}" = submit ]; then
     if [ -e "${manifest_file}" ]; then
         echo "ERROR: refusing to reuse profile batch; choose a new PROFILE_ID: ${manifest_file}" >&2
@@ -248,6 +281,21 @@ if [ "${ACTION}" = submit ]; then
         done
     done
     mkdir -p "${manifest_dir}"
+    contract_tmp="${contract_file}.tmp.$$"
+    (
+        umask 077
+        {
+            printf 'export TMAX_TRAIN_DATA=%q\n' "${PROFILE_TRAIN_DATA}"
+            printf 'export TMAX_TRAIN_DATA_SHA256=%q\n' "${PROFILE_TRAIN_DATA_SHA256}"
+            printf 'export MAX_TOKENS_PER_GPU=%q\n' "${PROFILE_MAX_TOKENS_PER_GPU}"
+            printf 'export TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP=1\n'
+            printf 'export POLAR_MIN_COMPLETE_ACCEPT_FRACTION=%q\n' \
+                "${PROFILE_MIN_COMPLETE_ACCEPT_FRACTION}"
+            printf 'export POLAR_EARLY_STOP_GRACE_SESSIONS=%q\n' \
+                "${PROFILE_EARLY_STOP_GRACE_SESSIONS}"
+        } >"${contract_tmp}"
+    )
+    mv -f -- "${contract_tmp}" "${contract_file}"
     printf 'run_id\tarm\trepeat\tmode\tharness\tactor_gpus\trollout_gpus\tasync_level\tallocated_gpus\tjob_id\n' >"${manifest_file}"
 fi
 
@@ -266,6 +314,17 @@ for repeat in $(seq 1 "${PROFILE_REPEATS}"); do
         if [ "${ACTION}" != submit ]; then
             continue
         fi
+        # Re-check immediately before submission and give the common summary a
+        # stable, per-run source even though the evaluation-disabled TMax path
+        # intentionally removes its own eval-integrity environment variables.
+        read -r current_train_data_sha256 _ < <(sha256sum -- "${PROFILE_TRAIN_DATA}")
+        if [ "${current_train_data_sha256}" != "${PROFILE_TRAIN_DATA_SHA256}" ]; then
+            echo "ERROR: PROFILE_TRAIN_DATA changed after the profile contract was written" >&2
+            exit 1
+        fi
+        run_profile_env="${POLAR_DATA_ROOT}/runs/${run_id}/profile.env"
+        mkdir -p "$(dirname "${run_profile_env}")"
+        install -m 0600 "${contract_file}" "${run_profile_env}"
         dependency=""
         if [ -n "${previous_job_id}" ]; then
             dependency="${PROFILE_DEPENDENCY_KIND}:${previous_job_id}"
@@ -279,6 +338,7 @@ for repeat in $(seq 1 "${PROFILE_REPEATS}"); do
             unset POLAR_MAX_INIT_WORKERS POLAR_MAX_RUN_WORKERS POLAR_MAX_POSTRUN_WORKERS
             unset TMAX_TRAIN_DATA_SHA256 TMAX_EVAL_DATA_SHA256
             unset TMAX_EXTERNAL_EVAL_DATA_SHA256 TMAX_EVAL_BUNDLE_SHA256
+            unset TMAX_PYTORCH_ALLOC_CONF
 
             export RUN_ID="${run_id}"
             export JOB_NAME="tm-prof-${canonical_arm}-r${repeat}"
@@ -312,6 +372,10 @@ for repeat in $(seq 1 "${PROFILE_REPEATS}"); do
             export LOAD_DIR="${PROFILE_LOAD_DIR}"
             export TMAX_TRAIN_DATA="${PROFILE_TRAIN_DATA}"
             export PROMPT_DATA="${PROFILE_TRAIN_DATA}"
+            # Preserve the digest under a profile-specific name through the
+            # eval-disabled submit path; profile.env supplies the canonical
+            # TMAX_TRAIN_DATA_SHA256 key consumed by the summary/report.
+            export TMAX_PROFILE_TRAIN_DATA_SHA256="${PROFILE_TRAIN_DATA_SHA256}"
 
             export NUM_NODES="${NUM_NODES}"
             export SLURM_GPUS="${GPUS_PER_NODE}"
@@ -320,6 +384,12 @@ for repeat in $(seq 1 "${PROFILE_REPEATS}"); do
             export ACTOR_NUM_GPUS_PER_NODE="${ACTOR_GPUS_PER_NODE}"
             export ACTOR_TENSOR_MODEL_PARALLEL_SIZE="${TP}"
             export CONTEXT_PARALLEL_SIZE=1
+            # 32K bounds aggregate dynamic microbatches. A valid TMax episode
+            # may still contain a complete 67,584-token pack, so such a sample
+            # must be admitted alone rather than rejected by the topology
+            # preflight. This contract is identical for every arm.
+            export MAX_TOKENS_PER_GPU="${PROFILE_MAX_TOKENS_PER_GPU}"
+            export TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP=1
             export ROLLOUT_NUM_GPUS="${ROLLOUT_GPUS}"
             export ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_TP}"
             export TMAX_REQUIRE_FULL_GPU_ALLOCATION=1
@@ -343,8 +413,8 @@ for repeat in $(seq 1 "${PROFILE_REPEATS}"); do
             export POLAR_MAX_INIT_WORKERS="$((ROLLOUT_GPUS * 2))"
             export POLAR_MAX_RUN_WORKERS="$((ROLLOUT_GPUS * 16))"
             export POLAR_MAX_POSTRUN_WORKERS="$((ROLLOUT_GPUS * 8))"
-            export POLAR_MIN_COMPLETE_ACCEPT_FRACTION=0
-            export POLAR_EARLY_STOP_GRACE_SESSIONS=0
+            export POLAR_MIN_COMPLETE_ACCEPT_FRACTION="${PROFILE_MIN_COMPLETE_ACCEPT_FRACTION}"
+            export POLAR_EARLY_STOP_GRACE_SESSIONS="${PROFILE_EARLY_STOP_GRACE_SESSIONS}"
 
             export TMAX_EVAL_ENABLED=0
             export TMAX_TRAINING_EVAL_ENABLED=0
@@ -360,9 +430,17 @@ for repeat in $(seq 1 "${PROFILE_REPEATS}"); do
             export POLAR_ROLLOUT_EXAMPLES_WANDB=0
             export GPU_MONITOR_ENABLED=1
 
+            # Do not inherit an incompatible allocator into the colocated
+            # TorchMemorySaver path. The shared launcher also enforces this at
+            # the generated runtime-config boundary.
+            if [ "${MODE}" = colocate ]; then
+                unset PYTORCH_ALLOC_CONF PYTORCH_CUDA_ALLOC_CONF
+            fi
+
             export PARTITION="${PROFILE_PARTITION}"
             export WALL_TIME="${PROFILE_WALL_TIME}"
             export TMAX_MIN_WALL_TIME="${PROFILE_WALL_TIME}"
+            export TMAX_SBATCH_COMMENT="${PROFILE_SBATCH_COMMENT}"
             export CPUS_PER_TASK=128
             export SLURM_STEP_CPUS_PER_TASK=120
             if [ -n "${dependency}" ]; then

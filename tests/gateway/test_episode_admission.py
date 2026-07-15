@@ -249,3 +249,167 @@ async def test_release_revokes_new_calls_and_holds_cap_until_inflight_drains() -
     replacement = await queued
     assert replacement.session_id == "next"
     await admission.release_session("next")
+
+
+@pytest.mark.asyncio
+async def test_runtime_destroyed_release_cancels_request_owner_before_releasing() -> None:
+    admission = ModelPoolEpisodeAdmission({"pool/qwen": 1})
+    lease = await admission.acquire(
+        session_id="owner",
+        alias="pool/qwen",
+        attempt_id="0:solve",
+        timeout_seconds=1,
+    )
+    request_started = asyncio.Event()
+    hold_request = asyncio.Event()
+
+    async def own_request() -> None:
+        handle = await admission.begin_request(
+            call_capability=lease.call_capability,
+            alias="pool/qwen",
+        )
+        request_started.set()
+        try:
+            await hold_request.wait()
+        finally:
+            await admission.end_request(handle)
+
+    request_task = asyncio.create_task(own_request())
+    await asyncio.wait_for(request_started.wait(), timeout=1)
+    queued = asyncio.create_task(
+        admission.acquire(
+            session_id="next",
+            alias="pool/qwen",
+            attempt_id="0:solve",
+            timeout_seconds=1,
+        )
+    )
+    await asyncio.sleep(0)
+
+    await admission.release_after_runtime_destroyed(
+        "owner",
+        runtime_destroyed=True,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+    replacement = await asyncio.wait_for(queued, timeout=1)
+    assert replacement.session_id == "next"
+    await admission.release_session("next")
+
+
+@pytest.mark.asyncio
+async def test_runtime_destroyed_release_is_safe_with_repeated_cancel_and_release() -> None:
+    admission = ModelPoolEpisodeAdmission({"pool/qwen": 1})
+    lease = await admission.acquire(
+        session_id="owner",
+        alias="pool/qwen",
+        attempt_id="0:solve",
+        timeout_seconds=1,
+    )
+    request_started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    finish_cleanup = asyncio.Event()
+    cancellation_count = 0
+
+    async def own_request() -> None:
+        nonlocal cancellation_count
+        handle = await admission.begin_request(
+            call_capability=lease.call_capability,
+            alias="pool/qwen",
+        )
+        request_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_count += 1
+            cancellation_seen.set()
+            await finish_cleanup.wait()
+        finally:
+            await admission.end_request(handle)
+
+    request_task = asyncio.create_task(own_request())
+    await asyncio.wait_for(request_started.wait(), timeout=1)
+    queued = asyncio.create_task(
+        admission.acquire(
+            session_id="next",
+            alias="pool/qwen",
+            attempt_id="0:solve",
+            timeout_seconds=1,
+        )
+    )
+    normal_release = asyncio.create_task(
+        admission.release(session_id="owner", lease_id=lease.lease_id)
+    )
+    await asyncio.sleep(0)
+    cleanup_one = asyncio.create_task(
+        admission.release_after_runtime_destroyed(
+            "owner",
+            runtime_destroyed=True,
+        )
+    )
+    await asyncio.wait_for(cancellation_seen.wait(), timeout=1)
+    cleanup_two = asyncio.create_task(
+        admission.release_after_runtime_destroyed(
+            "owner",
+            runtime_destroyed=True,
+        )
+    )
+    await asyncio.sleep(0)
+    assert not queued.done()
+    assert not normal_release.done()
+
+    finish_cleanup.set()
+    await asyncio.gather(cleanup_one, cleanup_two)
+    assert await normal_release is True
+    await request_task
+    assert cancellation_count == 1
+    replacement = await asyncio.wait_for(queued, timeout=1)
+    assert replacement.session_id == "next"
+    await admission.release_session("next")
+
+
+@pytest.mark.asyncio
+async def test_runtime_destroyed_release_keeps_slot_if_owner_skips_finalizer() -> None:
+    admission = ModelPoolEpisodeAdmission({"pool/qwen": 1})
+    lease = await admission.acquire(
+        session_id="owner",
+        alias="pool/qwen",
+        attempt_id="0:solve",
+        timeout_seconds=1,
+    )
+
+    async def abandon_request():
+        return await admission.begin_request(
+            call_capability=lease.call_capability,
+            alias="pool/qwen",
+        )
+
+    handle = await asyncio.create_task(abandon_request())
+    queued = asyncio.create_task(
+        admission.acquire(
+            session_id="next",
+            alias="pool/qwen",
+            attempt_id="0:solve",
+            timeout_seconds=10,
+        )
+    )
+    await asyncio.sleep(0)
+
+    with pytest.raises(EpisodeReleaseDraining, match="did not complete"):
+        await admission.release_after_runtime_destroyed(
+            "owner",
+            runtime_destroyed=True,
+        )
+    assert (await admission.snapshot())["pool/qwen"] == {
+        "cap": 1,
+        "active": 1,
+        "queued": 1,
+    }
+    assert not queued.done()
+
+    # Test-only cleanup: production intentionally poisons the node here.
+    await admission.end_request(handle)
+    await admission.release(session_id="owner", lease_id=lease.lease_id)
+    replacement = await asyncio.wait_for(queued, timeout=1)
+    await admission.release_session(replacement.session_id)

@@ -14,6 +14,35 @@ _POLAR_EPHEMERAL_PORT_LOWER_FALLBACK=32768
 _POLAR_SGLANG_ROUTER_PORT_DEFAULT=8680
 _POLAR_UNPRIVILEGED_PORT_FLOOR=1024
 
+polar_select_pytorch_allocator_config() {
+    local train_mode="${1:-}"
+    local override="${2:-}"
+    local selected
+
+    if [ -n "${override}" ]; then
+        selected="${override}"
+    else
+        case "${train_mode}" in
+            colocate)
+                # TorchMemorySaver does not support expandable segments.
+                selected="max_split_size_mb:2048"
+                ;;
+            fully_async)
+                selected="max_split_size_mb:2048,expandable_segments:True"
+                ;;
+            *)
+                echo "ERROR: unsupported train mode for allocator selection: ${train_mode:-<empty>}" >&2
+                return 1
+                ;;
+        esac
+    fi
+    if ! [[ "${selected}" =~ ^[A-Za-z0-9_,:.+-]+$ ]]; then
+        echo "ERROR: PyTorch allocator config contains unsupported characters" >&2
+        return 1
+    fi
+    printf '%s\n' "${selected}"
+}
+
 polar_ephemeral_port_lower_bound() {
     local range_file lower _upper
 

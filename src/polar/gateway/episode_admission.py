@@ -78,6 +78,7 @@ class EpisodeRequestHandle:
     lease_id: str
     session_id: str
     alias: str
+    request_id: str
 
 
 @dataclass(slots=True)
@@ -98,6 +99,8 @@ class _ActiveLease:
     inflight: int
     closing: bool
     drained: asyncio.Event
+    request_tasks: dict[str, asyncio.Task[object]]
+    runtime_destroyed_cleanup: bool = False
     close_task: asyncio.Task[bool] | None = None
 
 
@@ -276,6 +279,7 @@ class ModelPoolEpisodeAdmission:
                     inflight=0,
                     closing=False,
                     drained=drained,
+                    request_tasks={},
                 )
                 self._pending.pop(key, None)
                 self._active_by_attempt[key] = active
@@ -385,6 +389,10 @@ class ModelPoolEpisodeAdmission:
         call_capability: str,
         alias: str,
     ) -> EpisodeRequestHandle:
+        owner_task = asyncio.current_task()
+        if owner_task is None:
+            raise RuntimeError("episode request has no owning asyncio task")
+        request_id = secrets.token_urlsafe(16)
         digest = hashlib.sha256(call_capability.encode("utf-8")).digest()
         async with self._lock:
             if self._poisoned_reason is not None or self._closed:
@@ -396,12 +404,40 @@ class ModelPoolEpisodeAdmission:
                 raise EpisodeLeaseClosing("episode lease is closing")
             active.inflight += 1
             active.drained.clear()
+            active.request_tasks[request_id] = owner_task
             grant = active.grant
             return EpisodeRequestHandle(
                 lease_id=grant.lease_id,
                 session_id=grant.session_id,
                 alias=grant.alias,
+                request_id=request_id,
             )
+
+    async def bind_request_task(self, handle: EpisodeRequestHandle) -> None:
+        """Transfer a live request handle to the current response-owner task.
+
+        Non-streaming requests remain owned by the route task that called
+        :meth:`begin_request`.  Streaming responses may be driven by a distinct
+        ASGI task after the route returns, so that task must become the owner
+        before it starts sending the body.  Runtime-destruction cleanup can
+        then cancel exactly the task whose ``finally`` calls ``end_request``.
+        """
+
+        owner_task = asyncio.current_task()
+        if owner_task is None:
+            raise RuntimeError("episode request has no owning asyncio task")
+        async with self._lock:
+            active = self._active_by_id.get(handle.lease_id)
+            if active is None:
+                raise EpisodeLeaseNotOwned("episode request lease is no longer active")
+            grant = active.grant
+            if grant.session_id != handle.session_id or grant.alias != handle.alias:
+                raise EpisodeLeaseNotOwned("episode request ownership changed")
+            if handle.request_id not in active.request_tasks:
+                raise EpisodeLeaseNotOwned("episode request is no longer active")
+            if active.runtime_destroyed_cleanup:
+                raise EpisodeLeaseClosing("episode lease is closing")
+            active.request_tasks[handle.request_id] = owner_task
 
     async def end_request(self, handle: EpisodeRequestHandle) -> None:
         async with self._lock:
@@ -411,11 +447,68 @@ class ModelPoolEpisodeAdmission:
             grant = active.grant
             if grant.session_id != handle.session_id or grant.alias != handle.alias:
                 raise EpisodeLeaseNotOwned("episode request ownership changed")
+            if active.request_tasks.pop(handle.request_id, None) is None:
+                raise EpisodeLeaseNotOwned("episode request is no longer active")
             if active.inflight <= 0:
                 raise RuntimeError("episode request inflight counter underflow")
             active.inflight -= 1
             if active.inflight == 0:
                 active.drained.set()
+
+    @staticmethod
+    def _request_task_needs_cancel(task: asyncio.Task[object]) -> bool:
+        if task.done():
+            return False
+        cancelling = getattr(task, "cancelling", None)
+        return not callable(cancelling) or cancelling() == 0
+
+    async def _cancel_requests_after_runtime_destroyed(
+        self,
+        *,
+        session_id: str,
+        lease_id: str,
+    ) -> None:
+        """Cancel request owners and wait for their normal finalizers.
+
+        This is intentionally available only from the positive runtime-
+        destruction path.  Cancelling a task is not itself a drain proof: the
+        task must finish and ``end_request`` must remove every tracked handle.
+        If either condition is not met, the lease remains active and capacity
+        stays fail-closed.
+        """
+
+        current_task = asyncio.current_task()
+        async with self._lock:
+            active = self._active_by_id.get(lease_id)
+            if active is None:
+                if self._released_by_id.get(lease_id) == session_id:
+                    return
+                raise EpisodeLeaseNotOwned("episode lease is unknown or not owned")
+            if active.grant.session_id != session_id:
+                raise EpisodeLeaseNotOwned("episode lease is unknown or not owned")
+            if not active.closing:
+                active.closing = True
+                self._active_by_call_digest.pop(active.call_digest, None)
+            active.runtime_destroyed_cleanup = True
+            request_tasks = tuple(set(active.request_tasks.values()))
+
+        for task in request_tasks:
+            if task is current_task:
+                continue
+            if self._request_task_needs_cancel(task):
+                task.cancel()
+        wait_tasks = tuple(task for task in request_tasks if task is not current_task)
+        if wait_tasks:
+            await asyncio.gather(*wait_tasks, return_exceptions=True)
+
+        async with self._lock:
+            active = self._active_by_id.get(lease_id)
+            if active is None:
+                return
+            if active.request_tasks or active.inflight != 0:
+                raise EpisodeReleaseDraining(
+                    "episode request owners did not complete their drain finalizers"
+                )
 
     async def has_active(self, *, session_id: str, alias: str) -> bool:
         if not self._caps:
@@ -490,6 +583,10 @@ class ModelPoolEpisodeAdmission:
                     lease_ids.append(lease_id)
         for lease_id in lease_ids:
             try:
+                await self._cancel_requests_after_runtime_destroyed(
+                    session_id=session_id,
+                    lease_id=lease_id,
+                )
                 await self.release(session_id=session_id, lease_id=lease_id)
             except EpisodeLeaseNotOwned:
                 pass

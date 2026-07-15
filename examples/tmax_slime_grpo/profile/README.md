@@ -51,8 +51,18 @@ batch. Each arm receives its own run state, W&B run, rollout directory, and
 GPU CSVs. Evaluation, graceful checkpointing, and all model-checkpoint CLI
 arguments are disabled. `submit` also requires an explicit checkpoint and
 prompt JSONL, clears inherited 4B/model/data variables, and pins the complete
-Qwen3.5-9B model contract for every arm. Do not use `watch_training.sh` for
-these runs.
+Qwen3.5-9B model contract for every arm. Before the first submission it hashes
+the prompt JSONL and writes a batch `profile_contract.env`; the same contract
+is copied to each run as `profile.env`, which makes the exact data SHA256
+available to the strict summary even with evaluation disabled. It rechecks the
+file before submitting every arm.
+
+All default arms use `POLAR_MIN_COMPLETE_ACCEPT_FRACTION=0.5`, grace 2, and a
+32,768-token dynamic trainer cap. Since a valid TMax trajectory can still be a
+complete 67,584-token pack, oversize individual samples are admitted alone;
+the lower cap limits aggregate microbatch pressure without truncating the task.
+The submission also carries the sanctioned four-hour idle-GPU reaper exemption.
+Do not use `watch_training.sh` for these runs.
 
 `collocate-32shared` is statically valid but has not yet been demonstrated for
 the 9B TMax workload. For a lower-risk first launch, submit it alone with

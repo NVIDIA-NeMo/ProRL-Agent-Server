@@ -185,12 +185,21 @@ async def _end_request_despite_cancellation(
 class _FinalizingStreamingResponse(StreamingResponse):
     """Own a lease/request finalizer across every ASGI send/disconnect path."""
 
-    def __init__(self, *args: Any, finalizer: _AsyncOnce, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        finalizer: _AsyncOnce,
+        task_binder: Callable[[], Awaitable[None]] | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._request_finalizer = finalizer
+        self._request_task_binder = task_binder
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         try:
+            if self._request_task_binder is not None:
+                await self._request_task_binder()
             await super().__call__(scope, receive, send)
         finally:
             # Starlette does not guarantee aclose() when response-start/body
@@ -1433,11 +1442,15 @@ async def proxy_request(request: Request, path: str):
 
         if is_streaming:
             stream_finalizer: Callable[[], Awaitable[None]] | None = None
+            stream_task_binder: Callable[[], Awaitable[None]] | None = None
             if pool_request_handle is not None:
                 request_handle = pool_request_handle
 
                 async def stream_finalizer() -> None:
                     await state.episode_admission.end_request(request_handle)
+
+                async def stream_task_binder() -> None:
+                    await state.episode_admission.bind_request_task(request_handle)
 
             response = await _handle_streaming(
                 api_type,
@@ -1452,6 +1465,7 @@ async def proxy_request(request: Request, path: str):
                 response_model_alias=original_model if pool_route is not None else None,
                 completion_role=completion_role,
                 request_finalizer=stream_finalizer,
+                request_task_binder=stream_task_binder,
             )
             if isinstance(response, StreamingResponse) and pool_request_handle is not None:
                 # The response body's async-generator now owns the lease
@@ -1602,6 +1616,7 @@ async def _handle_streaming(
     response_model_alias: str | None = None,
     completion_role: str = "policy",
     request_finalizer: Callable[[], Awaitable[None]] | None = None,
+    request_task_binder: Callable[[], Awaitable[None]] | None = None,
 ) -> StreamingResponse | JSONResponse:
     state = get_state()
     inference = inference or state.inference
@@ -1684,6 +1699,7 @@ async def _handle_streaming(
         return _FinalizingStreamingResponse(
             generate(),
             finalizer=finalizer_once,
+            task_binder=request_task_binder,
             **response_kwargs,
         )
     return StreamingResponse(generate(), **response_kwargs)

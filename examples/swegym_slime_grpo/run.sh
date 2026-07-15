@@ -271,6 +271,15 @@ case "${TMAX_TRAIN_MODE}" in
         exit 1
         ;;
 esac
+
+# TorchMemorySaver is required by Slime's colocated train/rollout path and is
+# currently incompatible with CUDA allocator expandable segments. Keep the
+# existing fully-async allocator behavior, but select a compatible allocator
+# before constructing Ray's runtime environment for colocate. An explicit
+# TMAX_PYTORCH_ALLOC_CONF remains available for controlled experiments.
+TMAX_PYTORCH_ALLOC_CONF="$(polar_select_pytorch_allocator_config \
+    "${TMAX_TRAIN_MODE}" "${TMAX_PYTORCH_ALLOC_CONF:-}")" || exit 1
+echo "Using PyTorch allocator config: ${TMAX_PYTORCH_ALLOC_CONF}"
 case "${TMAX_PROFILE_DISABLE_CHECKPOINT}" in
     0|1) ;;
     *)
@@ -1908,8 +1917,8 @@ RUNTIME_ENV_JSON="{
     \"TORCHINDUCTOR_CACHE_DIR\": \"${TORCHINDUCTOR_CACHE_DIR}\",
     \"TRITON_CACHE_DIR\": \"${TRITON_CACHE_DIR}\",
     \"LD_LIBRARY_PATH\": \"${RUNTIME_LD_LIBRARY_PATH}\",
-    \"PYTORCH_ALLOC_CONF\": \"max_split_size_mb:2048,expandable_segments:True\",
-    \"PYTORCH_CUDA_ALLOC_CONF\": \"max_split_size_mb:2048,expandable_segments:True\",
+    \"PYTORCH_ALLOC_CONF\": \"${TMAX_PYTORCH_ALLOC_CONF}\",
+    \"PYTORCH_CUDA_ALLOC_CONF\": \"${TMAX_PYTORCH_ALLOC_CONF}\",
     \"TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD\": \"${TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD:-}\",
     \"SLIME_PROFILE_CUDA_PHASES\": \"${SLIME_PROFILE_CUDA_PHASES:-0}\",
     \"SLIME_ROLLOUT_BASE_PORT\": \"${SLIME_ROLLOUT_BASE_PORT:-2048}\",

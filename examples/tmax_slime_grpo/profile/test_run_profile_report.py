@@ -29,17 +29,21 @@ def _write_run(data_root: Path, log_root: Path, run_id: str, job_id: str) -> Non
                 "export ROLLOUT_BATCH_SIZE=8",
                 "export N_SAMPLES_PER_PROMPT=32",
                 "export POLAR_MIN_COMPLETE_ACCEPT_FRACTION=0.5",
-                "export POLAR_EARLY_STOP_GRACE_SESSIONS=16",
+                "export POLAR_EARLY_STOP_GRACE_SESSIONS=2",
                 "export POLAR_AGENT_MODEL_NAME=Qwen/Qwen3.5-9B",
                 "export TMAX_AGENT_HARNESS=mini_swe_agent",
                 "export LOAD_DIR=/checkpoint/release",
-                f"export TMAX_TRAIN_DATA_SHA256={'a' * 64}",
                 f"export TMAX_PRORL_GIT_COMMIT={'b' * 40}",
                 f"export TMAX_SLIME_GIT_COMMIT={'c' * 40}",
                 f"export TMAX_MEGATRON_GIT_COMMIT={'d' * 40}",
             ]
         )
         + "\n"
+    )
+    # Evaluation-disabled profile submissions persist the data digest in the
+    # profile contract because the regular TMax submit path clears eval hashes.
+    (run / "profile.env").write_text(
+        f"export TMAX_TRAIN_DATA_SHA256={'a' * 64}\n"
     )
     lines: list[str] = []
     for step in range(3):

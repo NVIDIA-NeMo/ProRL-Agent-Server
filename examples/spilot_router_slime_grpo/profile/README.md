@@ -24,7 +24,7 @@ bash examples/spilot_router_slime_grpo/profile/submit_profile.sh plan
 Start with the smallest useful comparison:
 
 ```bash
-PROFILE_STEPS=4 \
+PROFILE_STEPS=3 \
 bash examples/spilot_router_slime_grpo/profile/submit_profile.sh submit \
   async-16t16r-l1 async-16t16r-l3 collocate-16shared
 ```
@@ -35,7 +35,7 @@ start a fifth gateway, so provider admission remains exactly `8 / 32` across
 all three arms:
 
 ```bash
-PROFILE_STEPS=4 \
+PROFILE_STEPS=3 \
 bash examples/spilot_router_slime_grpo/profile/submit_profile.sh submit \
   async-16t16r-l3 async-8t32r-l3 collocate-32shared
 ```
@@ -43,7 +43,7 @@ bash examples/spilot_router_slime_grpo/profile/submit_profile.sh submit \
 Then test the resource split only if fully async is still competitive:
 
 ```bash
-PROFILE_STEPS=4 \
+PROFILE_STEPS=3 \
 bash examples/spilot_router_slime_grpo/profile/submit_profile.sh submit \
   async-8t24r-l3 async-16t16r-l3 async-8t8r-l3
 ```
@@ -94,14 +94,18 @@ distribution.
 
 ## Use the same starting point
 
-The default is the release seed and the fixed formal training JSONL.  To
-compare from a trained policy, all arms must use the same numbered checkpoint
+The default is the original Qwen3.5-9B release seed and the fixed formal
+training JSONL. The submitter unconditionally pins the 9B HF assets, reference
+release, model arguments, agent model name, and `LOAD_DIR`, so stale Qwen4 or
+numbered-checkpoint variables in the submitting shell cannot change an arm.
+Each fresh run starts at rollout zero and has a unique save/state directory.
+To compare from a trained policy, all arms must use the same numbered checkpoint
 and its exact data-source JSONL:
 
 ```bash
 PROFILE_LOAD_DIR=/absolute/path/to/checkpoint \
 PROFILE_TRAIN_DATA=/absolute/path/to/the/exact/train.jsonl \
-PROFILE_STEPS=4 \
+PROFILE_STEPS=3 \
 bash examples/spilot_router_slime_grpo/profile/submit_profile.sh submit \
   async-16t16r-l3 collocate-16shared
 ```
@@ -113,6 +117,25 @@ seed without `PROFILE_TRAIN_DATA`.
 For a final decision rather than a directional probe, use at least six steps
 and two repetitions (`PROFILE_STEPS=6 PROFILE_REPEATS=2`).  Repetitions are
 also serialized.
+
+The fast profile defaults to `PROFILE_STEPS=3`: one warmup plus two steady
+steps, matching the strict cross-suite report contract. It also uses the same
+memory and completion policy in every arm:
+
+- `PROFILE_MAX_TOKENS_PER_GPU=32768` bounds each dynamic microbatch while
+  preserving the released sequence length and allowing one individually long
+  trajectory to occupy a batch alone;
+- `PROFILE_MIN_COMPLETE_ACCEPT_FRACTION=0.5` and
+  `PROFILE_EARLY_STOP_GRACE_SESSIONS=2` make a 32-session prompt group return
+  after 18 usable sessions. The old grace of 16 accidentally restored a
+  32/32 long-tail barrier.
+
+Early stopping deliberately sends terminal cancellation to remaining session
+runtimes. The gateway's retained-lease `fail-allocation` check remains enabled:
+it is a containment invariant, not a profiling guard to bypass. The shorter
+18-session threshold reduces exposure to naturally timed-out stragglers, but a
+real runtime-destruction or admission-release failure will still invalidate the
+arm instead of silently overbooking the model pool.
 
 ## Summarize results
 
@@ -178,7 +201,7 @@ Interpret the controlled comparisons in this order:
    overlap.  Compare both wall throughput and GPU-hour efficiency; compare it
    to `async-8t8r-l3` for a strict 16-GPU-budget decision.
 
-Four steps are a fast systems probe, not a quality verdict.  If collocate and
+Three steps are a fast systems probe, not a quality verdict.  If collocate and
 async are close, extend only the top two from the same checkpoint and compare
 held-out improvement per wall hour before changing the production topology.
 
@@ -188,7 +211,9 @@ Two default-off hooks are shared with the production launcher:
 
 - `TMAX_TRAIN_MODE=fully_async|colocate` selects `train_async.py` or
   `train.py --colocate` and changes topology accounting from `actor + rollout`
-  to `max(actor, rollout)` only in collocate mode;
+  to `max(actor, rollout)` only in collocate mode. The shared launcher also
+  removes CUDA `expandable_segments` in colocate mode because TorchMemorySaver
+  does not support it; fully async retains the existing allocator;
 - `TMAX_PROFILE_DISABLE_CHECKPOINT=1` omits all model-checkpoint CLI arguments
   (including `--save`) and async lifecycle markers, and requires graceful exit
   to be disabled.  This avoids Megatron's `--save`/`--save-interval` invariant
