@@ -121,6 +121,14 @@ present, strict trainable-session provenance exists, and the model/checkpoint/
 data/batch/code fingerprint is consistent within its suite. SPilot Router and
 TMax remain separate workload blocks; their raw rates are never pooled.
 
+`REPORT_COMPLETE` is written only when each manifest contains exactly the
+four comparison arms (SPilot async depth 3, TMax async depth 4, plus each
+suite's 32-GPU colocate arm), all eight analyzed arms are contract-valid,
+both suites have a measured or directional candidate, and every report
+artifact exists. A failed gate preserves the diagnostic bundle, writes
+`REPORT_INCOMPLETE.json` with explicit reasons, and makes the report job exit
+nonzero.
+
 With three optimizer steps, only two intervals remain after warmup. Treat the
 result as a directional systems recommendation, not a statistically
 significant training-quality result. Rank both steady steps/hour and accepted
