@@ -79,7 +79,9 @@ one UTC timeline; it never guesses a whole-hour offset from utilization data.
 ## Monitor and final report
 
 `submit_monitor.sh` creates a serialized `cpu_short` relay chain and atomically
-updates one status JSON. Pass all GPU arm IDs plus the final report job ID:
+updates one status JSON. Reaching a relay's time budget is an expected,
+successful handoff to the next segment; terminal failure in a monitored target
+still makes the segment fail. Pass all GPU arm IDs plus the final report job ID:
 
 ```bash
 bash examples/tmax_slime_grpo/profile/submit_monitor.sh \
@@ -88,6 +90,11 @@ bash examples/tmax_slime_grpo/profile/submit_monitor.sh \
   tmax-16-16=126 tmax-8-24=127 tmax-8-32=128 tmax-collocate=129 \
   report=130
 ```
+
+Set `MONITOR_ACCOUNT` for monitor relays and `REPORT_ACCOUNT` for the final
+report. Both default to `ACCOUNT`, then `SBATCH_ACCOUNT`, then `nvr_lpr_llm`.
+For example, prefix either command with `MONITOR_ACCOUNT=my_account` or
+`REPORT_ACCOUNT=my_account`.
 
 Schedule the self-contained HTML report after the last TMax arm with:
 

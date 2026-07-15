@@ -57,14 +57,19 @@ def test_tmax_profile_is_checkpoint_free_and_isolated() -> None:
 def test_profile_monitor_is_a_serial_cpu_relay() -> None:
     launcher = (PROFILE / "submit_monitor.sh").read_text()
     assert "MONITOR_PARTITION:-cpu_short" in launcher
+    assert 'MONITOR_ACCOUNT="${MONITOR_ACCOUNT:-${ACCOUNT:-${SBATCH_ACCOUNT:-nvr_lpr_llm}}}"' in launcher
+    assert '--account="${MONITOR_ACCOUNT}"' in launcher
     assert 'dependency_args=(--dependency="afterany:${previous_job_id}")' in launcher
     assert "monitor_profile.py" in launcher
     assert "--status-json" in launcher
     assert "--job" in launcher
+    assert "--handoff-on-timeout" in launcher
 
 
 def test_profile_report_is_chained_after_all_gpu_arms() -> None:
     launcher = (PROFILE / "submit_report.sh").read_text()
+    assert 'REPORT_ACCOUNT="${REPORT_ACCOUNT:-${ACCOUNT:-${SBATCH_ACCOUNT:-nvr_lpr_llm}}}"' in launcher
+    assert '--account="${REPORT_ACCOUNT}"' in launcher
     assert '--dependency="afterany:${after_job_id}"' in launcher
     assert "run_profile_report.py" in launcher
     assert "--spilot-manifest" in launcher

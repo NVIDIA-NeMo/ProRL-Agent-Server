@@ -8,6 +8,7 @@ WORKSPACE_ROOT="$(cd -- "${PROJECT_ROOT}/../.." && pwd)"
 SBATCH_BIN="${SBATCH_BIN:-/cm/shared/apps/slurm/current/bin/sbatch}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 POLAR_DATA_ROOT="${POLAR_DATA_ROOT:-${WORKSPACE_ROOT}/data}"
+REPORT_ACCOUNT="${REPORT_ACCOUNT:-${ACCOUNT:-${SBATCH_ACCOUNT:-nvr_lpr_llm}}}"
 
 if [ "$#" -ne 4 ]; then
     echo "Usage: submit_report.sh AFTER_JOB_ID SPILOT_MANIFEST TMAX_MANIFEST OUTPUT_DIR" >&2
@@ -50,6 +51,7 @@ printf -v wrapped_command '%q ' "${command[@]}"
 job_id="$(
     "${SBATCH_BIN}" \
         --parsable \
+        --account="${REPORT_ACCOUNT}" \
         --partition="${REPORT_PARTITION:-cpu_short}" \
         --time="${REPORT_WALL_TIME:-00:30:00}" \
         --nodes=1 \

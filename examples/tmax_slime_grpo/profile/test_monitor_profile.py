@@ -89,3 +89,59 @@ def test_atomic_json_replaces_complete_document(tmp_path: Path) -> None:
     assert json.loads(output.read_text()) == {"state": "RUNNING"}
     monitor.atomic_json(output, {"state": "COMPLETED"})
     assert json.loads(output.read_text()) == {"state": "COMPLETED"}
+
+
+@pytest.mark.parametrize(
+    ("handoff", "expected_return_code", "expected_reason"),
+    [
+        (False, 2, "time_budget_exhausted"),
+        (True, 0, "relay_handoff"),
+    ],
+)
+def test_timeout_can_be_an_expected_relay_handoff(
+    tmp_path: Path,
+    handoff: bool,
+    expected_return_code: int,
+    expected_reason: str,
+) -> None:
+    status_json = tmp_path / "status.json"
+    report = {
+        "generated_at": "2026-07-15T00:00:00+00:00",
+        "jobs": {
+            "11": {
+                "label": "active",
+                "state": "RUNNING",
+                "terminal": False,
+                "success": False,
+            }
+        },
+        "all_terminal": False,
+        "any_failed": False,
+        "scheduler_errors": {"squeue": "", "sacct": ""},
+    }
+    argv = [
+        "--job",
+        "active=11",
+        "--status-json",
+        str(status_json),
+        "--poll-seconds",
+        "1",
+        "--heartbeat-seconds",
+        "1",
+        "--max-seconds",
+        "0.5",
+    ]
+    if handoff:
+        argv.append("--handoff-on-timeout")
+
+    with patch.object(monitor, "snapshot", return_value=report), patch.object(
+        monitor.time,
+        "monotonic",
+        side_effect=[0.0, 1.0],
+    ):
+        return_code = monitor.main(argv)
+
+    saved = json.loads(status_json.read_text())
+    assert return_code == expected_return_code
+    assert saved["monitor_handoff"] is handoff
+    assert saved["monitor_exit_reason"] == expected_reason

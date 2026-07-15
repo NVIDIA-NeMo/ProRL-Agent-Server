@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 MONITOR_SCRIPT="${SCRIPT_DIR}/monitor_profile.py"
 SBATCH_BIN="${SBATCH_BIN:-/cm/shared/apps/slurm/current/bin/sbatch}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+MONITOR_ACCOUNT="${MONITOR_ACCOUNT:-${ACCOUNT:-${SBATCH_ACCOUNT:-nvr_lpr_llm}}}"
 
 usage() {
     cat <<'EOF'
@@ -13,6 +14,7 @@ Usage: submit_monitor.sh STATUS_JSON LABEL=JOB_ID [LABEL=JOB_ID ...]
 
 Environment:
   MONITOR_SEGMENTS=12          number of sequential cpu_short relays
+  MONITOR_ACCOUNT=nvr_lpr_llm Slurm account (then ACCOUNT/SBATCH_ACCOUNT fallback)
   MONITOR_PARTITION=cpu_short  Slurm partition
   MONITOR_WALL_TIME=01:00:00   wall time per relay
   MONITOR_MAX_SECONDS=3300     runtime per relay before handing off
@@ -60,6 +62,7 @@ command=(
     --poll-seconds "${MONITOR_POLL_SECONDS:-30}"
     --heartbeat-seconds "${MONITOR_HEARTBEAT_SECONDS:-300}"
     --max-seconds "${MONITOR_MAX_SECONDS:-3300}"
+    --handoff-on-timeout
 )
 printf -v wrapped_command '%q ' "${command[@]}"
 
@@ -73,6 +76,7 @@ for segment in $(seq 1 "${segments}"); do
     job_id="$(
         "${SBATCH_BIN}" \
             --parsable \
+            --account="${MONITOR_ACCOUNT}" \
             --partition="${MONITOR_PARTITION:-cpu_short}" \
             --time="${MONITOR_WALL_TIME:-01:00:00}" \
             --nodes=1 \

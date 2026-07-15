@@ -189,6 +189,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--poll-seconds", type=float, default=30.0)
     parser.add_argument("--heartbeat-seconds", type=float, default=300.0)
     parser.add_argument("--max-seconds", type=float, default=172800.0)
+    parser.add_argument(
+        "--handoff-on-timeout",
+        action="store_true",
+        help="exit successfully when max-seconds is reached so a relay can take over",
+    )
     parser.add_argument("--squeue", default=DEFAULT_SQUEUE)
     parser.add_argument("--sacct", default=DEFAULT_SACCT)
     return parser.parse_args(argv)
@@ -232,11 +237,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         if report["all_terminal"]:
             return 1 if report["any_failed"] else 0
         if elapsed >= args.max_seconds:
+            handoff = bool(args.handoff_on_timeout)
+            report["monitor_exit_reason"] = (
+                "relay_handoff" if handoff else "time_budget_exhausted"
+            )
+            report["monitor_handoff"] = handoff
+            atomic_json(args.status_json, report)
+            suffix = "; handing off to the next relay" if handoff else ""
             print(
-                f"[{utc_now()}] monitor time budget reached with nonterminal jobs",
+                f"[{utc_now()}] monitor time budget reached with nonterminal jobs{suffix}",
                 flush=True,
             )
-            return 2
+            return 0 if handoff else 2
         time.sleep(args.poll_seconds)
 
 
