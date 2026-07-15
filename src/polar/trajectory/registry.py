@@ -74,6 +74,7 @@ def default_evaluator_registry() -> StrategyRegistry:
     from polar.trajectory.evaluator import (
         BaseTrajectoryEvaluator,
         HarborEvaluator,
+        HarborEvaluatorWithRubric,
         SessionCompletedEvaluator,
         SwebenchHarnessEvaluator,
         TestOnOutputEvaluator,
@@ -84,6 +85,7 @@ def default_evaluator_registry() -> StrategyRegistry:
     registry.register("swebench_harness", SwebenchHarnessEvaluator)
     registry.register("test_on_output", TestOnOutputEvaluator)
     registry.register("harbor", HarborEvaluator)
+    registry.register("harbor_rubric", HarborEvaluatorWithRubric)
     return registry
 
 
