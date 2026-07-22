@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# One prompt, two trajectories, and one learner update on two interactive nodes.
+# One prompt, eight trajectories, and one learner update on two interactive nodes.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 export NUM_NODES=2
 export ACTOR_NUM_NODES=1
-export ACTOR_TENSOR_MODEL_PARALLEL_SIZE=8
+export ACTOR_TENSOR_MODEL_PARALLEL_SIZE=1
+export EXPERT_MODEL_PARALLEL_SIZE=8
 export PARTITION=interactive
 export WALL_TIME=04:00:00
 export TMAX_MIN_WALL_TIME=04:00:00
 export POLAR_GATEWAY_COUNT_OVERRIDE=2
 export ROLLOUT_BATCH_SIZE=1
-export N_SAMPLES_PER_PROMPT=2
-export GLOBAL_BATCH_SIZE=2
+export N_SAMPLES_PER_PROMPT=8
+export GLOBAL_BATCH_SIZE=8
 export TMAX_NUM_ROLLOUT=1
 export TMAX_TARGET_ITER=0
 export TMAX_OPEN_INSTRUCT_MAX_ROWS=1
