@@ -306,6 +306,52 @@ async def test_spilot_dispatch_issues_and_injects_scoped_capabilities(
         storage.close()
 
 
+@pytest.mark.asyncio
+async def test_controller_v3_dispatch_issues_router_and_pool_capabilities_only(
+    tmp_path: Path,
+) -> None:
+    registry = SessionRegistry()
+    storage = SessionStore()
+    manager = GatewayNodeManager(
+        node_id="node-test",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=storage,
+        session_registry=registry,
+        builders=SimpleNamespace(),  # type: ignore[arg-type]
+        evaluators=SimpleNamespace(),  # type: ignore[arg-type]
+        session_base_dir=str(tmp_path),
+    )
+    enqueue = AsyncMock()
+    manager._dispatcher.enqueue = enqueue
+    request = SessionDispatchRequest(
+        session_id="controller-session-id",
+        task_id="task-id",
+        instruction="Fix it",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(image="task.sif"),
+        agent=AgentSpec(harness="controller_v3"),
+    )
+    try:
+        await manager.dispatch(request)
+        managed = enqueue.await_args.args[0]
+        assert managed.router_capability not in (None, request.session_id)
+        assert managed.model_pool_capability not in (None, request.session_id)
+        assert managed.model_pool_admission_capability is None
+
+        managed.stage = SessionStage.RUNNING
+        registry.set_status(request.session_id, SessionStatus.RUNNING)
+        environment = manager._runtime_env(request, managed, include_agent_env=True)
+        assert environment[ROUTER_CAPABILITY_ENV] == managed.router_capability
+        assert environment[MODEL_POOL_CAPABILITY_ENV] == managed.model_pool_capability
+        assert MODEL_POOL_ADMISSION_CAPABILITY_ENV not in environment
+    finally:
+        await manager._client.aclose()
+        storage.close()
+
+
 def test_runtime_prepare_retries_configured_transient_exec_failure(tmp_path) -> None:
     manager = object.__new__(GatewayNodeManager)
     manager._runtime_env = lambda *_args, **_kwargs: {}  # type: ignore[method-assign]

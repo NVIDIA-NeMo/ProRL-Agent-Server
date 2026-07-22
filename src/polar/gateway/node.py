@@ -269,7 +269,7 @@ class GatewayNodeManager:
             router_capability: str | None = None
             model_pool_capability: str | None = None
             model_pool_admission_capability: str | None = None
-            if request.agent.harness == "spilot_router":
+            if request.agent.harness in {"spilot_router", "controller_v3"}:
                 router_capability = self.session_registry.issue_capability(
                     session_id,
                     scope=ROUTER_CAPABILITY_SCOPE,
@@ -281,10 +281,11 @@ class GatewayNodeManager:
                     session_id,
                     scope=MODEL_POOL_CAPABILITY_SCOPE,
                 )
-                model_pool_admission_capability = self.session_registry.issue_capability(
-                    session_id,
-                    scope=MODEL_POOL_ADMISSION_CAPABILITY_SCOPE,
-                )
+                if request.agent.harness == "spilot_router":
+                    model_pool_admission_capability = self.session_registry.issue_capability(
+                        session_id,
+                        scope=MODEL_POOL_ADMISSION_CAPABILITY_SCOPE,
+                    )
             await self._dispatcher.enqueue(
                 ManagedSession(
                     request=request,
