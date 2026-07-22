@@ -305,6 +305,13 @@ export SPILOT_SLOT_LABEL_MODE="${SPILOT_SLOT_LABEL_MODE:-real_names}"
 # saturates to the reward floor on every gpt-heavy success.
 export SPILOT_ROUTING_MODE="${SPILOT_ROUTING_MODE:-task_level}"
 export SPILOT_MAX_POOL_CALLS="${SPILOT_MAX_POOL_CALLS:-2}"
+# turn_level only: how the shared conversation is presented to a newly routed
+# candidate.  "shared" (default) keeps the historical raw transcript;
+# "switch_notice" appends one attribution notice per model switch;
+# "model_tagged" prefixes every assistant turn with the producing slot label;
+# "reset_context" collapses history into a bounded executed-step digest at
+# each switch.  Non-shared values are rejected under task_level.
+export SPILOT_CONTEXT_HANDOFF="${SPILOT_CONTEXT_HANDOFF:-shared}"
 # Per-step digest budget for the Router's own trajectory under turn_level
 # (chars of executed-step output shown to the Router between decisions; the
 # executing pool models still see full Vanillux2 observations).

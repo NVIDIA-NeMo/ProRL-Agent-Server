@@ -47,6 +47,29 @@ calls share task files but receive separate persistent-shell state directories.
   `cost_weight` per STEP (all-gpt worst case 64 x 15 = 960 at the lambda02
   weights), so `SPILOT_COST_NORMALIZER` must be re-derived for turn_level
   lanes before reusing task_level lambda settings.
+## Context handoff (`SPILOT_CONTEXT_HANDOFF`, turn_level only)
+
+When the Router switches the executing candidate mid-episode, the shared
+Vanillux2 conversation can be presented to the newly routed model in four
+ways:
+
+- `shared` (default): the historical raw transcript — the new model sees the
+  prior model's turns as ordinary assistant messages with no attribution.
+- `switch_notice`: one user-role attribution notice is appended at every
+  model switch, naming the previous and the new candidate.
+- `model_tagged`: every assistant turn is prefixed with
+  `[agent-model: <slot>]` as it is appended, so all history carries
+  attribution regardless of switches. Tags are applied after
+  command/observation extraction, so step digests and result artifacts stay
+  tag-free.
+- `reset_context`: at every switch the history after the seeded system +
+  task messages is collapsed into one bounded executed-step digest
+  (commands, exit codes, bounded output excerpts, and prior handoff
+  notices; newest entries are kept when the budget truncates).
+
+Non-`shared` values are rejected under `task_level`. The knob is persisted
+in the run state, so watcher relaunches keep the lane's handoff protocol.
+
 In-training holdout evaluation is disabled (`TMAX_TRAINING_EVAL_ENABLED=0`) to
 match the no-eval reference run. Frozen-candidate calibration and any final
 holdout evaluation are separate experiments and cannot perturb the optimizer

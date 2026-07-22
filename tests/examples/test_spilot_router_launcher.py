@@ -113,6 +113,7 @@ def test_spilot_agent_template_builds_registered_harness() -> None:
     text = text.replace("${SPILOT_MAX_POOL_CALLS}", "2")
     text = text.replace("${SPILOT_SLOT_LABEL_MODE}", "real_names")
     text = text.replace("${SPILOT_ROUTING_MODE}", "task_level")
+    text = text.replace("${SPILOT_CONTEXT_HANDOFF}", "shared")
     text = text.replace("${SPILOT_ROUTER_OBS_MAX_CHARS}", "1500")
     document = yaml.safe_load(text)
     template = document["polar_task_template"]
@@ -158,6 +159,7 @@ def test_spilot_fixed_eval_payload_normalizes_generic_overrides() -> None:
     text = text.replace("${SPILOT_MAX_POOL_CALLS}", "2")
     text = text.replace("${SPILOT_SLOT_LABEL_MODE}", "real_names")
     text = text.replace("${SPILOT_ROUTING_MODE}", "task_level")
+    text = text.replace("${SPILOT_CONTEXT_HANDOFF}", "shared")
     text = text.replace("${SPILOT_ROUTER_OBS_MAX_CHARS}", "1500")
     document = yaml.safe_load(text)
     agent = deepcopy(document["polar_task_template"]["agent"])

@@ -106,6 +106,18 @@ _STEP_COMMAND_ARTIFACT_CHARS = 200
 _STEP_ERROR_ARTIFACT_CHARS = 150
 _TURN_LEVEL_MAX_STEP_LIMIT = 128
 _DEFAULT_ROUTER_OBSERVATION_CHARS = 1500
+# turn_level context handoff between routed candidates sharing one
+# conversation.  "shared" is the byte-identical historical behaviour: the
+# newly routed model sees the raw transcript with no attribution.
+_CONTEXT_HANDOFF_POLICIES = (
+    "shared",
+    "switch_notice",
+    "model_tagged",
+    "reset_context",
+)
+_HANDOFF_NOTICE_PREFIX = "[SPilot handoff]"
+_HANDOFF_DIGEST_MAX_CHARS = 6_000
+_HANDOFF_DIGEST_STEP_OUTPUT_CHARS = 400
 _MAX_CARD_CHARS = 4_000
 _GIT_COMMAND_TIMEOUT_SECONDS = 10.0
 _PROCESS_SCOPE_TERM_TIMEOUT_SECONDS = 5.0
@@ -1123,6 +1135,10 @@ class VanilluxStepExecutor:
         self.trajectory_path = self.log_dir / "spilot-steps-trajectory.json"
         self._components: Any | None = None
         self._gateway_client: Any | None = None
+        # Slot whose context-handoff treatment was last applied.  Updated
+        # before step() so a transport-retried step with the same slot cannot
+        # duplicate a handoff message.
+        self._last_served_slot: str | None = None
 
     def close(self) -> None:
         client = self._gateway_client
@@ -1167,6 +1183,8 @@ class VanilluxStepExecutor:
             max(1, min(int(self.config["pool_command_timeout"]), step_budget_seconds))
         )
         agent.model = model
+        handoff_policy = str(self.config.get("context_handoff", "shared"))
+        self._apply_context_handoff(agent, candidate, handoff_policy)
 
         started = time.monotonic()
         status = "completed"
@@ -1220,6 +1238,16 @@ class VanilluxStepExecutor:
             return_code = _observation_return_code(
                 agent.messages[transcript_index:], default=return_code
             )
+        if handoff_policy == "model_tagged":
+            # Attribute this step's completions in the persistent transcript
+            # AFTER command/observation extraction so digests and the result
+            # artifact stay tag-free; only future model prompts see the tag.
+            for message in agent.messages[transcript_index:]:
+                content = message.get("content")
+                if message.get("role") == "assistant" and isinstance(content, str):
+                    message["content"] = (
+                        f"[agent-model: {candidate.slot}]\n{content}"
+                    )
         duration_ms = max(0, int((time.monotonic() - started) * 1000))
         git_status, git_diff_stat, fingerprint = _workspace_summary(self.cwd)
         excerpt_chars = int(
@@ -1248,6 +1276,64 @@ class VanilluxStepExecutor:
             agent_exit_status=agent_exit_status,
             usage_prompt_tokens=usage.get("prompt_tokens"),
             usage_completion_tokens=usage.get("completion_tokens"),
+        )
+
+    def _apply_context_handoff(
+        self, agent: Any, candidate: Candidate, policy: str
+    ) -> None:
+        """Present the shared history to the newly routed candidate.
+
+        ``shared`` and ``model_tagged`` never rewrite history here (the
+        latter tags messages at append time in ``run``).  ``switch_notice``
+        appends one attribution notice when the serving slot changes.
+        ``reset_context`` collapses everything after the seeded system +
+        task messages into one bounded executed-step digest, so the new
+        model starts from a fresh context that still names the prior
+        model and preserves what was run.  The notice/digest is applied
+        before the step's transcript index is captured, and the tracked
+        slot updates immediately, so a same-slot retry cannot duplicate it.
+        """
+
+        previous_slot = self._last_served_slot
+        self._last_served_slot = candidate.slot
+        if policy in ("shared", "model_tagged"):
+            return
+        if previous_slot is None or previous_slot == candidate.slot:
+            return
+        if policy == "switch_notice":
+            agent.add_messages(
+                {
+                    "role": "user",
+                    "content": (
+                        f"{_HANDOFF_NOTICE_PREFIX} The assistant turns above "
+                        f"were produced by agent model '{previous_slot}'. From "
+                        f"this turn on, '{candidate.slot}' continues the same "
+                        "task in the same workspace and shared conversation. "
+                        "Re-check the current workspace state before acting."
+                    ),
+                }
+            )
+            return
+        if policy == "reset_context":
+            digest = _handoff_digest(
+                agent.messages[2:], max_chars=_HANDOFF_DIGEST_MAX_CHARS
+            )
+            agent.messages[2:] = [
+                {
+                    "role": "user",
+                    "content": (
+                        f"{_HANDOFF_NOTICE_PREFIX} You are agent model "
+                        f"'{candidate.slot}', taking over this task from "
+                        f"'{previous_slot}'. The prior conversation was "
+                        "removed; the workspace keeps every executed change.\n"
+                        f"EXECUTED STEP DIGEST:\n{digest}\n"
+                        "Continue the task from the current workspace state."
+                    ),
+                }
+            ]
+            return
+        raise PoolInfrastructureError(
+            f"unknown context_handoff policy: {policy!r}"
         )
 
     def deadline_result(
@@ -1488,6 +1574,51 @@ def _summarize_step_messages(
             if isinstance(content, str):
                 observation = content
     return command, observation, usage
+
+
+def _handoff_digest(messages: list[dict[str, Any]], *, max_chars: int) -> str:
+    """Bounded digest of executed steps for a reset_context handoff.
+
+    Keeps commands, exit codes with bounded output excerpts, and any prior
+    handoff notices (which carry earlier collapses' digests).  When the
+    budget is exceeded the OLDEST entries are dropped first, so the new
+    model always sees the most recent execution state.
+    """
+
+    entries: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.startswith(_HANDOFF_NOTICE_PREFIX):
+            entries.append(content)
+            continue
+        extra = message.get("extra")
+        if not isinstance(extra, dict):
+            continue
+        actions = extra.get("actions")
+        if isinstance(actions, list) and actions and isinstance(actions[0], dict):
+            entries.append(f"$ {actions[0].get('command', '')}")
+        if "returncode" in extra and isinstance(content, str):
+            entries.append(
+                f"-> exit {extra.get('returncode')}: "
+                f"{_bounded_text(content, _HANDOFF_DIGEST_STEP_OUTPUT_CHARS)}"
+            )
+    if not entries:
+        return "(no executed steps were recorded)"
+    kept: list[str] = []
+    used = 0
+    for entry in reversed(entries):
+        if len(entry) + 1 > max_chars:
+            entry = _bounded_text(entry, max_chars)
+        if used + len(entry) + 1 > max_chars and kept:
+            break
+        kept.append(entry)
+        used += len(entry) + 1
+    omitted = len(entries) - len(kept)
+    kept.reverse()
+    prefix = f"(... {omitted} earlier entries omitted ...)\n" if omitted else ""
+    return prefix + "\n".join(kept)
 
 
 def _observation_return_code(
@@ -2362,6 +2493,17 @@ def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
             )
     elif config["max_pool_calls"] not in (1, 2):
         raise ValueError("task_level max_pool_calls must be 1 or 2")
+    context_handoff = config.get("context_handoff", "shared")
+    if context_handoff not in _CONTEXT_HANDOFF_POLICIES:
+        raise ValueError(
+            "context_handoff must be one of "
+            f"{', '.join(_CONTEXT_HANDOFF_POLICIES)}; got {context_handoff!r}"
+        )
+    if context_handoff != "shared" and routing_mode != "turn_level":
+        raise ValueError(
+            "context_handoff variants require routing_mode=turn_level; "
+            "task_level has no shared conversation to hand off"
+        )
     observation_chars = config.get(
         "router_observation_max_chars", _DEFAULT_ROUTER_OBSERVATION_CHARS
     )

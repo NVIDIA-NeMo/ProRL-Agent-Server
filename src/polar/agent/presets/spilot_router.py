@@ -227,6 +227,16 @@ def _build_runner_config(agent_spec: AgentSpec) -> dict[str, Any]:
         # re-decides (ROUTE any candidate or SUBMIT) after every step, bounded
         # by pool_step_limit.
         "routing_mode": routing_mode_setting,
+        # turn_level only: how the shared conversation is presented to a
+        # newly routed candidate.  "shared" (default) is the historical
+        # raw-transcript behaviour; "switch_notice" appends an attribution
+        # notice on every model switch; "model_tagged" prefixes each
+        # assistant turn with the producing model's slot label;
+        # "reset_context" collapses history into a bounded executed-step
+        # digest at every switch.
+        "context_handoff": _context_handoff(
+            settings.pop("context_handoff", "shared"), routing_mode_setting
+        ),
         "shuffle_seed": _bounded_int(
             settings.pop("shuffle_seed", 0),
             name="shuffle_seed",
@@ -476,6 +486,20 @@ def _routing_mode(value: object) -> str:
         raise ValueError(
             "spilot_router routing_mode must be 'task_level' or 'turn_level'; "
             f"got {value!r}"
+        )
+    return str(value)
+
+
+def _context_handoff(value: object, routing_mode: str) -> str:
+    if value not in ("shared", "switch_notice", "model_tagged", "reset_context"):
+        raise ValueError(
+            "spilot_router context_handoff must be one of 'shared', "
+            f"'switch_notice', 'model_tagged', 'reset_context'; got {value!r}"
+        )
+    if value != "shared" and routing_mode != "turn_level":
+        raise ValueError(
+            "spilot_router context_handoff variants require "
+            "routing_mode='turn_level'"
         )
     return str(value)
 

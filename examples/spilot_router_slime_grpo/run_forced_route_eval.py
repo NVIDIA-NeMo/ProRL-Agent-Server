@@ -1129,8 +1129,9 @@ def render_polar_config(
         "SPILOT_ROUTING_MODE": "task_level",
         "SPILOT_MAX_POOL_CALLS": "2",
         # Unused under task_level; rendered because the shared template
-        # declares it for turn_level lanes.
+        # declares them for turn_level lanes.
         "SPILOT_ROUTER_OBS_MAX_CHARS": "1500",
+        "SPILOT_CONTEXT_HANDOFF": "shared",
     }
     template = (template_path or EXAMPLE_DIR / "polar_config.yaml").read_text(encoding="utf-8")
     missing = sorted(set(TEMPLATE_VARIABLE_RE.findall(template)) - values.keys())

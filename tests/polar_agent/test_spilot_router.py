@@ -1890,9 +1890,15 @@ class _FakeStepComponents:
         return self._models[candidate.slot]
 
 
-def _step_executor(tmp_path: Path, agent, models) -> spilot_router_runner.VanilluxStepExecutor:
+def _step_executor(
+    tmp_path: Path, agent, models, **config_overrides
+) -> spilot_router_runner.VanilluxStepExecutor:
     executor = spilot_router_runner.VanilluxStepExecutor(
-        _runner_config(routing_mode="turn_level", agent_log_dir=str(tmp_path / "logs")),
+        _runner_config(
+            routing_mode="turn_level",
+            agent_log_dir=str(tmp_path / "logs"),
+            **config_overrides,
+        ),
         task="Task",
         cwd=tmp_path,
     )
@@ -1902,6 +1908,10 @@ def _step_executor(tmp_path: Path, agent, models) -> spilot_router_runner.Vanill
 
 def _step_candidate() -> Candidate:
     return Candidate(slot="qwen3.6-27b", model="pool/qwen3.6-27b", card={}, cost_weight=1.0)
+
+
+def _step_candidate_gpt() -> Candidate:
+    return Candidate(slot="gpt-5.5", model="pool/gpt-5.5", card={}, cost_weight=15.0)
 
 
 def test_step_executor_extracts_command_observation_and_usage(tmp_path: Path) -> None:
@@ -2107,6 +2117,209 @@ def test_step_digest_truncation_preserves_scalar_fields() -> None:
     assert payload["status"] == "completed"
     assert payload["command"] == "grep -r needle ."
     assert payload["output_excerpt"].endswith("...")
+
+
+def _successful_step_behavior(command: str, output: str, *, rc: int = 0):
+    def behavior(agent: _FakeStepAgent) -> None:
+        agent.add_messages(
+            {
+                "role": "assistant",
+                "content": f"THOUGHT: run\n```bash\n{command}\n```",
+                "extra": {
+                    "actions": [{"command": command}],
+                    "response": {"usage": {"prompt_tokens": 100, "completion_tokens": 10}},
+                },
+            },
+            {"role": "tool", "content": output, "extra": {"returncode": rc}},
+        )
+
+    return behavior
+
+
+def _seeded_step_agent(*behaviors) -> _FakeStepAgent:
+    agent = _FakeStepAgent(*behaviors)
+    agent.messages = [
+        {"role": "system", "content": "vanillux2 system"},
+        {"role": "user", "content": "TASK: fix the bug"},
+    ]
+    return agent
+
+
+def _run_step(executor, candidate) -> object:
+    return executor.run(
+        candidate=candidate,
+        task="Task",
+        role="continue",
+        call_index=0,
+        timeout_seconds=30.0,
+        model_call_capability="lease-capability",
+    )
+
+
+def test_step_executor_shared_handoff_never_rewrites_history(tmp_path: Path) -> None:
+    agent = _seeded_step_agent(
+        _successful_step_behavior("ls", "ok"),
+        _successful_step_behavior("pwd", "/repo"),
+    )
+    models = {"qwen3.6-27b": _FakeStepModel(), "gpt-5.5": _FakeStepModel()}
+    executor = _step_executor(tmp_path, agent, models)
+
+    _run_step(executor, _step_candidate())
+    _run_step(executor, _step_candidate_gpt())
+
+    assert len(agent.messages) == 6  # 2 seeded + 2 messages per step
+    assert not any(
+        "[SPilot handoff]" in str(message.get("content", ""))
+        or str(message.get("content", "")).startswith("[agent-model:")
+        for message in agent.messages
+    )
+
+
+def test_step_executor_switch_notice_inserts_one_attribution_notice(
+    tmp_path: Path,
+) -> None:
+    agent = _seeded_step_agent(
+        _successful_step_behavior("ls", "ok"),
+        _successful_step_behavior("pwd", "/repo"),
+        _successful_step_behavior("cat x", "data"),
+    )
+    models = {"qwen3.6-27b": _FakeStepModel(), "gpt-5.5": _FakeStepModel()}
+    executor = _step_executor(tmp_path, agent, models, context_handoff="switch_notice")
+
+    _run_step(executor, _step_candidate())
+    notices = [
+        m for m in agent.messages if "[SPilot handoff]" in str(m.get("content", ""))
+    ]
+    assert notices == []  # first routed model gets no notice
+
+    _run_step(executor, _step_candidate_gpt())
+    notices = [
+        m for m in agent.messages if "[SPilot handoff]" in str(m.get("content", ""))
+    ]
+    assert len(notices) == 1
+    assert notices[0]["role"] == "user"
+    assert "qwen3.6-27b" in notices[0]["content"]
+    assert "gpt-5.5" in notices[0]["content"]
+    # The notice lands before the switched-to model's own step messages.
+    assert agent.messages.index(notices[0]) == 4
+
+    _run_step(executor, _step_candidate_gpt())
+    notices = [
+        m for m in agent.messages if "[SPilot handoff]" in str(m.get("content", ""))
+    ]
+    assert len(notices) == 1  # same-slot continuation adds nothing
+
+
+def test_step_executor_model_tagged_attributes_assistant_turns_only(
+    tmp_path: Path,
+) -> None:
+    agent = _seeded_step_agent(_successful_step_behavior("ls -la", "total 4"))
+    executor = _step_executor(
+        tmp_path,
+        agent,
+        {"qwen3.6-27b": _FakeStepModel()},
+        context_handoff="model_tagged",
+    )
+
+    result = _run_step(executor, _step_candidate())
+
+    assistant = agent.messages[2]
+    assert assistant["role"] == "assistant"
+    assert assistant["content"].startswith("[agent-model: qwen3.6-27b]\n")
+    tool = agent.messages[3]
+    assert not str(tool["content"]).startswith("[agent-model:")
+    # The result artifact and observation stay tag-free: tags are applied
+    # after command/observation extraction.
+    assert result.command == "ls -la"
+    assert result.observation_excerpt == "total 4"
+    # Seeded system/task messages are never rewritten.
+    assert agent.messages[0]["content"] == "vanillux2 system"
+
+
+def test_step_executor_reset_context_collapses_history_on_switch(
+    tmp_path: Path,
+) -> None:
+    agent = _seeded_step_agent(
+        _successful_step_behavior("make build", "build ok"),
+        _successful_step_behavior("make test", "1 passed"),
+    )
+    models = {"qwen3.6-27b": _FakeStepModel(), "gpt-5.5": _FakeStepModel()}
+    executor = _step_executor(tmp_path, agent, models, context_handoff="reset_context")
+
+    _run_step(executor, _step_candidate())
+    assert len(agent.messages) == 4
+
+    _run_step(executor, _step_candidate_gpt())
+
+    # system + task survive; the first model's raw turns are replaced by one
+    # bounded digest handoff, followed by the new model's step messages.
+    assert agent.messages[0]["content"] == "vanillux2 system"
+    assert agent.messages[1]["content"] == "TASK: fix the bug"
+    handoff = agent.messages[2]
+    assert handoff["role"] == "user"
+    assert handoff["content"].startswith("[SPilot handoff]")
+    assert "gpt-5.5" in handoff["content"]
+    assert "qwen3.6-27b" in handoff["content"]
+    assert "$ make build" in handoff["content"]
+    assert "-> exit 0: build ok" in handoff["content"]
+    assert not any(
+        "THOUGHT: run" in str(m.get("content", "")) for m in agent.messages[:3]
+    )
+    # The switched-to model's own step appended normally after the handoff.
+    assert agent.messages[3]["extra"]["actions"][0]["command"] == "make test"
+    assert len(agent.messages) == 5
+
+
+def test_handoff_digest_keeps_newest_entries_within_budget() -> None:
+    messages = []
+    for index in range(40):
+        messages.append(
+            {
+                "role": "assistant",
+                "content": f"THOUGHT {index}",
+                "extra": {"actions": [{"command": f"cmd-{index:03d}"}]},
+            }
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "content": f"output-{index:03d} " + "x" * 100,
+                "extra": {"returncode": index % 2},
+            }
+        )
+    digest = spilot_router_runner._handoff_digest(messages, max_chars=800)
+
+    assert len(digest) <= 800 + 60  # omission marker line rides above the budget
+    assert "earlier entries omitted" in digest
+    assert "cmd-039" in digest  # newest command survives
+    assert "cmd-000" not in digest  # oldest dropped first
+    # A prior handoff notice is carried into the next digest.
+    carried = spilot_router_runner._handoff_digest(
+        [{"role": "user", "content": "[SPilot handoff] earlier digest"}],
+        max_chars=400,
+    )
+    assert "[SPilot handoff] earlier digest" in carried
+
+
+def test_context_handoff_validation_rejects_bad_values() -> None:
+    with pytest.raises(ValueError, match="context_handoff"):
+        SpilotOrchestrator(
+            config=_runner_config(
+                routing_mode="turn_level", context_handoff="mystery"
+            ),
+            task="Task",
+            router=FakeRouter('{"action":"SUBMIT"}'),
+            pool=FakePool(),
+            model_pool_capability="session-pool-capability",
+        )
+    with pytest.raises(ValueError, match="turn_level"):
+        SpilotOrchestrator(
+            config=_runner_config(context_handoff="switch_notice"),
+            task="Task",
+            router=FakeRouter('{"action":"SUBMIT"}'),
+            pool=FakePool(),
+            model_pool_capability="session-pool-capability",
+        )
 
 
 def test_turn_level_rejects_positive_pool_cost_limit() -> None:

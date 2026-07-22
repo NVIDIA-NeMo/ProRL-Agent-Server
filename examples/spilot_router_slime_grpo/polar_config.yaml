@@ -99,6 +99,7 @@ ${POLAR_INTERNET_RUNTIME_VOLUME}
       shuffle_seed: 0
       slot_label_mode: ${SPILOT_SLOT_LABEL_MODE}
       routing_mode: ${SPILOT_ROUTING_MODE}
+      context_handoff: ${SPILOT_CONTEXT_HANDOFF}
       router_observation_max_chars: ${SPILOT_ROUTER_OBS_MAX_CHARS}
       router_max_tokens: 192
       router_timeout_seconds: 180
