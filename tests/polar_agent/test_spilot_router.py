@@ -213,7 +213,7 @@ def test_strict_action_parser_rejects_repairs_extra_keys_and_unknown_slots(text:
 
 def test_route_then_submit_records_router_contract_and_bounded_observation() -> None:
     router = FakeRouter(
-        '{"action":"ROUTE","model_slot":"M0"}',
+        '{"action":"ROUTE","model_slot":"qwen3.6-27b"}',
         '{"action":"SUBMIT"}',
     )
     pool = FakePool(status="failed")
@@ -242,8 +242,8 @@ def test_route_then_submit_records_router_contract_and_bounded_observation() -> 
 
 def test_verify_runs_fresh_agent_on_same_mutable_workspace(tmp_path: Path) -> None:
     router = FakeRouter(
-        '{"action":"ROUTE","model_slot":"M0"}',
-        '{"action":"VERIFY","model_slot":"M1"}',
+        '{"action":"ROUTE","model_slot":"qwen3.6-27b"}',
+        '{"action":"VERIFY","model_slot":"gpt-5.5"}',
     )
     pool = FakePool(workspace=tmp_path)
     result = SpilotOrchestrator(
@@ -254,7 +254,7 @@ def test_verify_runs_fresh_agent_on_same_mutable_workspace(tmp_path: Path) -> No
         model_pool_capability="session-pool-capability",
     ).run()
 
-    assert pool.calls == [("M0", "solve"), ("M1", "verify")]
+    assert pool.calls == [("qwen3.6-27b", "solve"), ("gpt-5.5", "verify")]
     assert pool.capabilities == [
         "session-pool-capability",
         "session-pool-capability",
@@ -305,8 +305,8 @@ def test_episode_admission_wraps_each_selected_candidate_before_pool_run() -> No
             return None
 
     router = EventRouter(
-        '{"action":"ROUTE","model_slot":"M0"}',
-        '{"action":"VERIFY","model_slot":"M1"}',
+        '{"action":"ROUTE","model_slot":"qwen3.6-27b"}',
+        '{"action":"VERIFY","model_slot":"gpt-5.5"}',
     )
     pool = EventPool()
     result = SpilotOrchestrator(
@@ -359,7 +359,7 @@ def test_episode_admission_timeout_records_local_wait_without_candidate_outcome(
             pool_episode_admission_wait_budget_seconds=10.0,
         ),
         task="Task",
-        router=FakeRouter('{"action":"ROUTE","model_slot":"M0"}'),
+        router=FakeRouter('{"action":"ROUTE","model_slot":"qwen3.6-27b"}'),
         pool=FakePool(),
         admission=TimeoutAdmission(),
         clock=lambda: now[0],
@@ -413,7 +413,7 @@ def test_unreaped_pool_process_leaves_lease_for_gateway_fatal_retention() -> Non
             pool_episode_admission_wait_budget_seconds=10.0,
         ),
         task="Task",
-        router=FakeRouter('{"action":"ROUTE","model_slot":"M0"}'),
+        router=FakeRouter('{"action":"ROUTE","model_slot":"qwen3.6-27b"}'),
         pool=UnreapedPool(),
         admission=Admission(),
     )
@@ -472,7 +472,7 @@ def test_process_scope_proof_error_retains_episode_lease(
             pool_episode_admission_wait_budget_seconds=10.0,
         ),
         task="Task",
-        router=FakeRouter('{"action":"ROUTE","model_slot":"M0"}'),
+        router=FakeRouter('{"action":"ROUTE","model_slot":"qwen3.6-27b"}'),
         pool=pool,
         admission=Admission(),
     )
@@ -586,7 +586,7 @@ while True:
             pool_episode_admission_wait_budget_seconds=10.0,
         ),
         task="Task",
-        router=FakeRouter('{"action":"ROUTE","model_slot":"M0"}'),
+        router=FakeRouter('{"action":"ROUTE","model_slot":"qwen3.6-27b"}'),
         pool=pool,
         admission=Admission(),
     )
@@ -654,7 +654,7 @@ def test_invalid_router_action_is_trainable_policy_failure_not_pool_failure() ->
 
 
 def test_m0_routes_once_then_auto_submits() -> None:
-    router = FakeRouter('{"action":"ROUTE","model_slot":"M1"}')
+    router = FakeRouter('{"action":"ROUTE","model_slot":"gpt-5.5"}')
     pool = FakePool()
     result = SpilotOrchestrator(
         config=_runner_config(max_pool_calls=1),
@@ -665,7 +665,7 @@ def test_m0_routes_once_then_auto_submits() -> None:
     ).run()
 
     assert len(router.requests) == 1
-    assert pool.calls == [("M1", "solve")]
+    assert pool.calls == [("gpt-5.5", "solve")]
     assert pool.capabilities == ["session-pool-capability"]
     assert result["submitted"] is True
     assert result["termination_reason"] == "m0_auto_submit"
@@ -675,7 +675,7 @@ def test_uncapped_pool_call_without_session_capability_fails_closed() -> None:
     orchestrator = SpilotOrchestrator(
         config=_runner_config(max_pool_calls=1),
         task="Task",
-        router=FakeRouter('{"action":"ROUTE","model_slot":"M0"}'),
+        router=FakeRouter('{"action":"ROUTE","model_slot":"qwen3.6-27b"}'),
         pool=FakePool(),
     )
 
@@ -1277,14 +1277,14 @@ def test_fixed_eval_seed_makes_slot_mapping_independent_of_session_id(
     baseline = SpilotOrchestrator(
         config=config,
         task="Task",
-        router=FakeRouter('{"action":"ROUTE","model_slot":"M0"}'),
+        router=FakeRouter('{"action":"ROUTE","model_slot":"qwen3.6-27b"}'),
         pool=FakePool(),
     )
     monkeypatch.setenv("SESSION_ID", "final-session")
     final = SpilotOrchestrator(
         config=config,
         task="Task",
-        router=FakeRouter('{"action":"ROUTE","model_slot":"M0"}'),
+        router=FakeRouter('{"action":"ROUTE","model_slot":"qwen3.6-27b"}'),
         pool=FakePool(),
     )
 
@@ -1329,7 +1329,7 @@ def test_candidate_request_kwargs_reject_credentials() -> None:
         SpilotOrchestrator(
             config=config,
             task="Task",
-            router=FakeRouter('{"action":"ROUTE","model_slot":"M0"}'),
+            router=FakeRouter('{"action":"ROUTE","model_slot":"qwen3.6-27b"}'),
             pool=FakePool(),
         )
 
@@ -1424,7 +1424,7 @@ def test_main_returns_success_for_pool_model_failure_and_writes_result(
     class MainRouter(FakeRouter):
         def __init__(self) -> None:
             super().__init__(
-                '{"action":"ROUTE","model_slot":"M0"}',
+                '{"action":"ROUTE","model_slot":"qwen3.6-27b"}',
                 '{"action":"SUBMIT"}',
             )
 
@@ -1455,3 +1455,715 @@ def test_main_returns_success_for_pool_model_failure_and_writes_result(
     assert payload["action_valid"] is True
     assert payload["calls"][0]["status"] == "failed"
     assert payload["submitted"] is True
+
+
+def test_real_names_mode_labels_candidates_with_pool_model_names() -> None:
+    candidates = spilot_router_runner._assign_slots(
+        _runner_config()["model_pool"],
+        shuffle=False,
+        seed=0,
+        stable_seed=None,
+        session_id="s",
+        task_id="t",
+        label_mode="real_names",
+    )
+    assert [candidate.slot for candidate in candidates] == ["qwen3.6-27b", "gpt-5.5"]
+    assert [candidate.model for candidate in candidates] == ["pool/qwen3.6-27b", "pool/gpt-5.5"]
+
+
+def test_real_names_labels_follow_models_through_the_shuffle() -> None:
+    pool = _runner_config()["model_pool"]
+    for task_id in ("task-a", "task-b", "task-c", "task-d"):
+        candidates = spilot_router_runner._assign_slots(
+            pool,
+            shuffle=True,
+            seed=0,
+            stable_seed=None,
+            session_id="tb21-router-eval-20260710",
+            task_id=task_id,
+            label_mode="real_names",
+        )
+        for candidate in candidates:
+            assert candidate.slot == candidate.model.split("/")[-1]
+
+
+def test_real_names_prompt_has_no_m0_token_and_generic_instruction() -> None:
+    candidates = spilot_router_runner._assign_slots(
+        _runner_config()["model_pool"],
+        shuffle=False,
+        seed=0,
+        stable_seed=None,
+        session_id="s",
+        task_id="t",
+        label_mode="real_names",
+    )
+    messages = spilot_router_runner.build_initial_router_messages(
+        "Task", candidates, label_mode="real_names"
+    )
+    user = messages[1]["content"]
+    assert '"model_slot": "qwen3.6-27b"' in user
+    assert '"model_slot": "gpt-5.5"' in user
+    assert "M0" not in user
+    assert "copied exactly" in user
+
+
+def test_anonymous_mode_prompt_is_byte_identical_to_the_historical_protocol() -> None:
+    candidates = spilot_router_runner._assign_slots(
+        _runner_config()["model_pool"],
+        shuffle=False,
+        seed=0,
+        stable_seed=None,
+        session_id="s",
+        task_id="t",
+        label_mode="anonymous",
+    )
+    explicit = spilot_router_runner.build_initial_router_messages(
+        "Task", candidates, label_mode="anonymous"
+    )
+    assert '{"action":"ROUTE","model_slot":"M0"}' in explicit[1]["content"]
+    assert "AVAILABLE MODEL SLOTS:\n" in explicit[1]["content"]
+    # Byte-exact template contract. Every checkpoint trained before the
+    # real_names switch was trained on these exact bytes, and replay tooling
+    # (route_tb21.py) replicates them verbatim; changing this hash silently
+    # breaks train/eval prompt parity for all pre-switch lineages.  Do NOT
+    # update the constant to make a template edit pass — fork a new
+    # label_mode instead.
+    blob = json.dumps(explicit, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    assert (
+        hashlib.sha256(blob).hexdigest()
+        == "cade1faf6b721b2f637c0abad1c5d3905abd24719aab605f73721b01a91f3ca7"
+    )
+
+
+def test_real_names_is_the_default_label_mode() -> None:
+    default_candidates = spilot_router_runner._assign_slots(
+        _runner_config()["model_pool"],
+        shuffle=False,
+        seed=0,
+        stable_seed=None,
+        session_id="s",
+        task_id="t",
+    )
+    assert [candidate.slot for candidate in default_candidates] == ["qwen3.6-27b", "gpt-5.5"]
+    default_messages = spilot_router_runner.build_initial_router_messages(
+        "Task", default_candidates
+    )
+    explicit_messages = spilot_router_runner.build_initial_router_messages(
+        "Task", default_candidates, label_mode="real_names"
+    )
+    assert default_messages == explicit_messages
+    assert "M0" not in default_messages[1]["content"]
+
+
+def test_real_names_route_action_round_trips_through_the_orchestrator() -> None:
+    router = FakeRouter('{"action":"ROUTE","model_slot":"gpt-5.5"}')
+    pool = FakePool()
+    result = SpilotOrchestrator(
+        config=_runner_config(max_pool_calls=1, slot_label_mode="real_names"),
+        task="Task",
+        router=router,
+        pool=pool,
+        model_pool_capability="session-pool-capability",
+    ).run()
+
+    assert pool.calls == [("gpt-5.5", "solve")]
+    assert result["submitted"] is True
+    prompt = router.requests[0]["messages"][1]["content"]
+    assert "M0" not in prompt
+
+
+def test_real_names_rejects_duplicate_label_derivations() -> None:
+    pool = {
+        "M0": {"model": "pool/dup", "card": {}, "cost_weight": 1.0, "model_kwargs": {}},
+        "M1": {"model": "other/dup", "card": {}, "cost_weight": 1.0, "model_kwargs": {}},
+    }
+    with pytest.raises(ValueError, match="unique"):
+        spilot_router_runner._assign_slots(
+            pool,
+            shuffle=False,
+            seed=0,
+            stable_seed=None,
+            session_id="s",
+            task_id="t",
+            label_mode="real_names",
+        )
+
+
+@pytest.mark.parametrize(
+    ("text", "result"),
+    [
+        ('{"action":"SUBMIT"}', "SUBMIT"),
+        ('{"action":"ROUTE","model_slot":"M0"}', "ROUTE"),
+    ],
+)
+def test_continue_grammar_accepts_submit_or_route(text: str, result: str) -> None:
+    action = parse_router_action(text, expected="CONTINUE", allowed_slots={"M0", "M1"})
+    assert action["action"] == result
+
+
+def test_continue_grammar_rejects_verify() -> None:
+    with pytest.raises(RouterProtocolError):
+        parse_router_action(
+            '{"action":"VERIFY","model_slot":"M0"}',
+            expected="CONTINUE",
+            allowed_slots={"M0", "M1"},
+        )
+
+
+class FakeStepPool:
+    """Scripted per-step executor: one entry per executed agent step."""
+
+    def __init__(self, *steps: dict[str, object]) -> None:
+        self.steps = list(steps)
+        self.calls: list[tuple[str, str]] = []
+        self.capabilities: list[str] = []
+
+    def run(
+        self,
+        *,
+        candidate: Candidate,
+        task: str,
+        role: str,
+        call_index: int,
+        timeout_seconds: float,
+        model_call_capability: str = "",
+    ) -> PoolCallResult:
+        assert timeout_seconds > 0
+        self.calls.append((candidate.slot, role))
+        self.capabilities.append(model_call_capability)
+        overrides = dict(self.steps.pop(0)) if self.steps else {}
+        status = str(overrides.pop("status", "completed"))
+        base = _call_result(candidate, role, call_index, status=status)
+        return PoolCallResult(
+            **{
+                **base.__dict__,
+                "command": f"echo step-{call_index}",
+                "observation_excerpt": f"output of step {call_index}",
+                **overrides,
+            }
+        )
+
+
+def test_turn_level_routes_each_step_until_step_budget_exhausts() -> None:
+    router = FakeRouter(
+        '{"action":"ROUTE","model_slot":"qwen3.6-27b"}',
+        '{"action":"ROUTE","model_slot":"gpt-5.5"}',
+        '{"action":"ROUTE","model_slot":"qwen3.6-27b"}',
+    )
+    pool = FakeStepPool({}, {}, {})
+    result = SpilotOrchestrator(
+        config=_runner_config(routing_mode="turn_level", pool_step_limit=3),
+        task="Task",
+        router=router,
+        pool=pool,
+        model_pool_capability="session-pool-capability",
+    ).run()
+
+    assert pool.calls == [
+        ("qwen3.6-27b", "solve"),
+        ("gpt-5.5", "continue"),
+        ("qwen3.6-27b", "continue"),
+    ]
+    assert result["submitted"] is True
+    assert result["termination_reason"] == "step_budget_exhausted_auto_submit"
+    assert result["routing_mode"] == "turn_level"
+    # No router decision follows the final budgeted step.
+    assert len(router.requests) == 3
+    system_text = router.requests[0]["messages"][0]["content"]
+    assert "re-route" in system_text
+    step_prompt = router.requests[1]["messages"][-1]["content"]
+    assert "STEP RESULT:" in step_prompt
+    assert '"command": "echo step-0"' in step_prompt
+    assert '"steps_remaining": 2' in step_prompt
+    assert result["total_cost"] == pytest.approx(1.0 + 2.0 + 1.0)
+
+
+def test_turn_level_agent_submit_ends_the_episode() -> None:
+    router = FakeRouter('{"action":"ROUTE","model_slot":"qwen3.6-27b"}')
+    pool = FakeStepPool({"agent_exit_status": "Submitted"})
+    result = SpilotOrchestrator(
+        config=_runner_config(routing_mode="turn_level", pool_step_limit=5),
+        task="Task",
+        router=router,
+        pool=pool,
+        model_pool_capability="session-pool-capability",
+    ).run()
+
+    assert pool.calls == [("qwen3.6-27b", "solve")]
+    assert result["submitted"] is True
+    assert result["termination_reason"] == "agent_submit"
+    assert len(router.requests) == 1
+
+
+def test_turn_level_format_error_streak_auto_submits() -> None:
+    router = FakeRouter(
+        '{"action":"ROUTE","model_slot":"qwen3.6-27b"}',
+        '{"action":"ROUTE","model_slot":"gpt-5.5"}',
+    )
+    format_error_step = {"status": "failed", "agent_exit_status": "FormatError"}
+    pool = FakeStepPool(dict(format_error_step), dict(format_error_step))
+    result = SpilotOrchestrator(
+        config=_runner_config(
+            routing_mode="turn_level",
+            pool_step_limit=6,
+            pool_max_format_errors=2,
+        ),
+        task="Task",
+        router=router,
+        pool=pool,
+        model_pool_capability="session-pool-capability",
+    ).run()
+
+    assert [role for _, role in pool.calls] == ["solve", "continue"]
+    assert result["submitted"] is True
+    assert result["termination_reason"] == "format_errors_auto_submit"
+
+
+def test_turn_level_shared_response_budget_auto_submits() -> None:
+    router = FakeRouter(
+        '{"action":"ROUTE","model_slot":"qwen3.6-27b"}',
+        '{"action":"ROUTE","model_slot":"gpt-5.5"}',
+    )
+    pool = FakeStepPool(
+        {"usage_prompt_tokens": 1000, "usage_completion_tokens": 200},
+        # Prompt growth since the first step (5800 - 1000) plus this step's
+        # completion (400) crosses the 5000-token episode budget.
+        {"usage_prompt_tokens": 5800, "usage_completion_tokens": 400},
+    )
+    result = SpilotOrchestrator(
+        config=_runner_config(
+            routing_mode="turn_level",
+            pool_step_limit=8,
+            pool_response_token_budget=5000,
+        ),
+        task="Task",
+        router=router,
+        pool=pool,
+        model_pool_capability="session-pool-capability",
+    ).run()
+
+    assert [role for _, role in pool.calls] == ["solve", "continue"]
+    assert result["submitted"] is True
+    assert result["termination_reason"] == "response_budget_exhausted_auto_submit"
+
+
+def test_turn_level_agent_limits_auto_submit() -> None:
+    router = FakeRouter('{"action":"ROUTE","model_slot":"qwen3.6-27b"}')
+    pool = FakeStepPool({"status": "failed", "agent_exit_status": "LimitsExceeded"})
+    result = SpilotOrchestrator(
+        config=_runner_config(routing_mode="turn_level", pool_step_limit=5),
+        task="Task",
+        router=router,
+        pool=pool,
+        model_pool_capability="session-pool-capability",
+    ).run()
+
+    assert result["submitted"] is True
+    assert result["termination_reason"] == "agent_limits_auto_submit"
+
+
+def test_turn_level_transport_failure_is_an_observation_not_terminal() -> None:
+    router = FakeRouter(
+        '{"action":"ROUTE","model_slot":"qwen3.6-27b"}',
+        '{"action":"ROUTE","model_slot":"gpt-5.5"}',
+        '{"action":"SUBMIT"}',
+    )
+    pool = FakeStepPool(
+        {"status": "failed", "agent_exit_status": "APIError", "error": "boom"},
+        {},
+    )
+    result = SpilotOrchestrator(
+        config=_runner_config(routing_mode="turn_level", pool_step_limit=6),
+        task="Task",
+        router=router,
+        pool=pool,
+        model_pool_capability="session-pool-capability",
+    ).run()
+
+    # The failed step is surfaced to the Router, which re-routes to the other
+    # candidate and then submits.
+    assert pool.calls == [("qwen3.6-27b", "solve"), ("gpt-5.5", "continue")]
+    assert result["submitted"] is True
+    assert result["termination_reason"] == "router_submit"
+    failed_step_prompt = router.requests[1]["messages"][-1]["content"]
+    assert '"agent_exit_status": "APIError"' in failed_step_prompt
+
+
+def test_turn_level_router_submit_ends_the_episode_early() -> None:
+    router = FakeRouter(
+        '{"action":"ROUTE","model_slot":"gpt-5.5"}',
+        '{"action":"SUBMIT"}',
+    )
+    pool = FakePool()
+    result = SpilotOrchestrator(
+        config=_runner_config(routing_mode="turn_level", max_pool_calls=4),
+        task="Task",
+        router=router,
+        pool=pool,
+        model_pool_capability="session-pool-capability",
+    ).run()
+
+    assert pool.calls == [("gpt-5.5", "solve")]
+    assert result["submitted"] is True
+    assert result["termination_reason"] == "router_submit"
+
+
+def test_turn_level_invalid_turn_action_is_trainable_policy_failure() -> None:
+    router = FakeRouter(
+        '{"action":"ROUTE","model_slot":"qwen3.6-27b"}',
+        '{"action":"VERIFY","model_slot":"gpt-5.5"}',
+    )
+    pool = FakePool()
+    result = SpilotOrchestrator(
+        config=_runner_config(routing_mode="turn_level", max_pool_calls=3),
+        task="Task",
+        router=router,
+        pool=pool,
+        model_pool_capability="session-pool-capability",
+    ).run()
+
+    assert pool.calls == [("qwen3.6-27b", "solve")]
+    assert result["action_valid"] is False
+    assert result["submitted"] is False
+    assert result["termination_reason"] == "invalid_action_step_1"
+
+
+class _FakeStepInterrupt(Exception):
+    def __init__(self, *messages: dict) -> None:
+        self.messages = messages
+
+
+class _FakeStepFormatError(_FakeStepInterrupt):
+    pass
+
+
+class _FakeStepSubmitted(_FakeStepInterrupt):
+    pass
+
+
+class _FakeStepAgent:
+    def __init__(self, *behaviors) -> None:
+        self.messages: list[dict] = []
+        self.model = None
+        self.config = SimpleNamespace(output_path=None)
+        self.saves = 0
+        self._behaviors = list(behaviors)
+
+    def step(self) -> None:
+        behavior = self._behaviors.pop(0)
+        behavior(self)
+
+    def add_messages(self, *messages: dict) -> None:
+        self.messages.extend(messages)
+
+    def save(self, path) -> None:
+        self.saves += 1
+
+
+class _FakeStepModel:
+    def __init__(self) -> None:
+        self._pool_call_capability = None
+        self.config = SimpleNamespace(model_kwargs={})
+
+
+class _FakeStepComponents:
+    format_error_type = _FakeStepFormatError
+    submitted_type = _FakeStepSubmitted
+    interrupt_type = _FakeStepInterrupt
+
+    def __init__(self, agent, models) -> None:
+        self._agent = agent
+        self._models = models
+        self._model_built = False
+        self.environment = SimpleNamespace(config=SimpleNamespace(timeout=120))
+
+    @property
+    def agent(self):
+        # Mirrors the real _Components contract: the shared agent only exists
+        # after model_for() has built the first per-slot model.
+        if not self._model_built:
+            raise KeyError("agent")
+        return self._agent
+
+    def model_for(self, candidate):
+        self._model_built = True
+        return self._models[candidate.slot]
+
+
+def _step_executor(tmp_path: Path, agent, models) -> spilot_router_runner.VanilluxStepExecutor:
+    executor = spilot_router_runner.VanilluxStepExecutor(
+        _runner_config(routing_mode="turn_level", agent_log_dir=str(tmp_path / "logs")),
+        task="Task",
+        cwd=tmp_path,
+    )
+    executor._components = _FakeStepComponents(agent, models)
+    return executor
+
+
+def _step_candidate() -> Candidate:
+    return Candidate(slot="qwen3.6-27b", model="pool/qwen3.6-27b", card={}, cost_weight=1.0)
+
+
+def test_step_executor_extracts_command_observation_and_usage(tmp_path: Path) -> None:
+    def successful_step(agent: _FakeStepAgent) -> None:
+        agent.add_messages(
+            {
+                "role": "assistant",
+                "content": "THOUGHT: run it",
+                "extra": {
+                    "actions": [{"command": "ls -la"}],
+                    "response": {"usage": {"prompt_tokens": 640, "completion_tokens": 55}},
+                },
+            },
+            {
+                "role": "tool",
+                "content": "total 4\n(exit_code=0)",
+                "extra": {"returncode": 0},
+            },
+        )
+
+    agent = _FakeStepAgent(successful_step)
+    model = _FakeStepModel()
+    executor = _step_executor(tmp_path, agent, {"qwen3.6-27b": model})
+    result = executor.run(
+        candidate=_step_candidate(),
+        task="Task",
+        role="solve",
+        call_index=0,
+        timeout_seconds=30.0,
+        model_call_capability="lease-capability",
+    )
+
+    assert result.status == "completed"
+    assert result.command == "ls -la"
+    assert result.observation_excerpt == "total 4\n(exit_code=0)"
+    assert result.return_code == 0
+    assert result.usage_prompt_tokens == 640
+    assert result.usage_completion_tokens == 55
+    assert result.agent_exit_status is None
+    assert model._pool_call_capability == "lease-capability"
+    assert model.config.model_kwargs["timeout"] == 30.0
+    assert agent.model is model
+    assert agent.saves == 1
+
+
+def test_step_executor_format_error_appends_correction_and_reports(tmp_path: Path) -> None:
+    correction = {
+        "role": "user",
+        "content": "Format error: expected one bash call",
+        "extra": {
+            "interrupt_type": "FormatError",
+            "response": {"usage": {"prompt_tokens": 900, "completion_tokens": 16_000}},
+        },
+    }
+
+    def format_error_step(agent: _FakeStepAgent) -> None:
+        raise _FakeStepFormatError(correction)
+
+    agent = _FakeStepAgent(format_error_step)
+    executor = _step_executor(tmp_path, agent, {"qwen3.6-27b": _FakeStepModel()})
+    result = executor.run(
+        candidate=_step_candidate(),
+        task="Task",
+        role="continue",
+        call_index=3,
+        timeout_seconds=30.0,
+        model_call_capability="lease-capability",
+    )
+
+    assert result.status == "failed"
+    assert result.agent_exit_status == "FormatError"
+    assert "Format error" in (result.observation_excerpt or "")
+    assert agent.messages[-1] == correction
+    # The malformed completion's tokens must feed the shared episode budget.
+    assert result.usage_prompt_tokens == 900
+    assert result.usage_completion_tokens == 16_000
+
+
+def test_step_executor_submitted_is_terminal_success(tmp_path: Path) -> None:
+    def submitted_step(agent: _FakeStepAgent) -> None:
+        raise _FakeStepSubmitted(
+            {
+                "role": "exit",
+                "content": "final summary",
+                "extra": {"exit_status": "Submitted", "submission": "final summary"},
+            }
+        )
+
+    agent = _FakeStepAgent(submitted_step)
+    executor = _step_executor(tmp_path, agent, {"qwen3.6-27b": _FakeStepModel()})
+    result = executor.run(
+        candidate=_step_candidate(),
+        task="Task",
+        role="continue",
+        call_index=5,
+        timeout_seconds=30.0,
+        model_call_capability="lease-capability",
+    )
+
+    assert result.status == "completed"
+    assert result.agent_exit_status == "Submitted"
+    assert result.observation_excerpt == "final summary"
+
+
+def test_step_executor_transport_failure_is_bounded_observation(tmp_path: Path) -> None:
+    def transport_failure(agent: _FakeStepAgent) -> None:
+        raise RuntimeError("gateway unreachable")
+
+    agent = _FakeStepAgent(transport_failure)
+    executor = _step_executor(tmp_path, agent, {"qwen3.6-27b": _FakeStepModel()})
+    result = executor.run(
+        candidate=_step_candidate(),
+        task="Task",
+        role="continue",
+        call_index=2,
+        timeout_seconds=30.0,
+        model_call_capability="lease-capability",
+    )
+
+    assert result.status == "failed"
+    assert result.agent_exit_status == "RuntimeError"
+    assert "gateway unreachable" in (result.error or "")
+    # No action executed: the shared transcript gained no messages.
+    assert agent.messages == []
+
+
+def test_step_executor_clamps_command_timeout_to_step_budget(tmp_path: Path) -> None:
+    def noop_step(agent: _FakeStepAgent) -> None:
+        agent.add_messages({"role": "tool", "content": "ok", "extra": {"returncode": 0}})
+
+    agent = _FakeStepAgent(noop_step)
+    executor = _step_executor(tmp_path, agent, {"qwen3.6-27b": _FakeStepModel()})
+    executor.run(
+        candidate=_step_candidate(),
+        task="Task",
+        role="solve",
+        call_index=0,
+        timeout_seconds=17.0,
+        model_call_capability="lease-capability",
+    )
+
+    assert executor._components.environment.config.timeout == 17
+
+
+def test_turn_level_deadline_skipped_step_auto_submits() -> None:
+    router = FakeRouter('{"action":"ROUTE","model_slot":"qwen3.6-27b"}')
+
+    class DeadlinePool(FakeStepPool):
+        def run(self, *, candidate, task, role, call_index, timeout_seconds, model_call_capability=""):
+            result = super().run(
+                candidate=candidate,
+                task=task,
+                role=role,
+                call_index=call_index,
+                timeout_seconds=timeout_seconds,
+                model_call_capability=model_call_capability,
+            )
+            result.attempted = False
+            result.status = "timeout"
+            result.timed_out = True
+            return result
+
+    result = SpilotOrchestrator(
+        config=_runner_config(routing_mode="turn_level", pool_step_limit=6),
+        task="Task",
+        router=router,
+        pool=DeadlinePool({}),
+        model_pool_capability="session-pool-capability",
+    ).run()
+
+    assert result["submitted"] is True
+    assert result["termination_reason"] == "deadline_exhausted_auto_submit"
+    # The skipped step must not bill its candidate.
+    assert result["total_cost"] == 0.0
+    assert len(router.requests) == 1
+
+
+def test_step_digest_truncation_preserves_scalar_fields() -> None:
+    call = PoolCallResult(
+        slot="qwen3.6-27b",
+        model="pool/qwen3.6-27b",
+        role="continue",
+        status="completed",
+        return_code=0,
+        duration_ms=1200,
+        attempted=True,
+        timed_out=False,
+        log_file="/logs/steps.json",
+        log_tail="",
+        git_status="",
+        git_diff_stat="",
+        workspace_fingerprint="f" * 64,
+        command="grep -r needle .",
+        observation_excerpt="x\n" * 4000,
+        agent_exit_status=None,
+    )
+    digest = call.step_digest(step=7, steps_remaining=56, max_chars=800)
+
+    assert len(digest) <= 800
+    payload = json.loads(digest)
+    assert payload["step"] == 7
+    assert payload["steps_remaining"] == 56
+    assert payload["status"] == "completed"
+    assert payload["command"] == "grep -r needle ."
+    assert payload["output_excerpt"].endswith("...")
+
+
+def test_turn_level_rejects_positive_pool_cost_limit() -> None:
+    with pytest.raises(ValueError, match="pool_cost_limit"):
+        SpilotOrchestrator(
+            config=_runner_config(
+                routing_mode="turn_level", pool_step_limit=8, pool_cost_limit=1.5
+            ),
+            task="Task",
+            router=FakeRouter('{"action":"SUBMIT"}'),
+            pool=FakePool(),
+            model_pool_capability="session-pool-capability",
+        )
+
+
+def test_turn_level_step_error_is_rebounded_in_the_artifact() -> None:
+    router = FakeRouter('{"action":"ROUTE","model_slot":"qwen3.6-27b"}')
+    pool = FakeStepPool(
+        {"status": "failed", "agent_exit_status": "LimitsExceeded", "error": "E" * 400}
+    )
+    result = SpilotOrchestrator(
+        config=_runner_config(routing_mode="turn_level", pool_step_limit=4),
+        task="Task",
+        router=router,
+        pool=pool,
+        model_pool_capability="session-pool-capability",
+    ).run()
+
+    assert len(result["calls"][0]["error"]) <= 150
+
+
+def test_turn_level_step_limit_is_bounded_for_the_result_artifact() -> None:
+    with pytest.raises(ValueError, match="pool_step_limit"):
+        SpilotOrchestrator(
+            config=_runner_config(routing_mode="turn_level", pool_step_limit=257),
+            task="Task",
+            router=FakeRouter('{"action":"SUBMIT"}'),
+            pool=FakePool(),
+            model_pool_capability="session-pool-capability",
+        )
+
+
+def test_task_level_remains_the_default_routing_mode() -> None:
+    router = FakeRouter(
+        '{"action":"ROUTE","model_slot":"qwen3.6-27b"}',
+        '{"action":"SUBMIT"}',
+    )
+    pool = FakePool()
+    result = SpilotOrchestrator(
+        config=_runner_config(),
+        task="Task",
+        router=router,
+        pool=pool,
+        model_pool_capability="session-pool-capability",
+    ).run()
+
+    assert result["routing_mode"] == "task_level"
+    assert result["termination_reason"] == "router_submit"
+    final_prompt = router.requests[1]["messages"][-1]["content"]
+    assert "VERIFY" in final_prompt

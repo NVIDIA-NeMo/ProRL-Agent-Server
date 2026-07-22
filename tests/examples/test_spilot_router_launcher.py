@@ -110,6 +110,10 @@ def test_spilot_agent_template_builds_registered_harness() -> None:
     text = text.replace("${SPILOT_GPT_COST_WEIGHT}", "1.0")
     text = text.replace("${SPILOT_COST_PENALTY_LAMBDA}", "0.0")
     text = text.replace("${SPILOT_COST_NORMALIZER}", "1.0")
+    text = text.replace("${SPILOT_MAX_POOL_CALLS}", "2")
+    text = text.replace("${SPILOT_SLOT_LABEL_MODE}", "real_names")
+    text = text.replace("${SPILOT_ROUTING_MODE}", "task_level")
+    text = text.replace("${SPILOT_ROUTER_OBS_MAX_CHARS}", "1500")
     document = yaml.safe_load(text)
     template = document["polar_task_template"]
     harness = create_harness(AgentSpec.model_validate(template["agent"]))
@@ -151,6 +155,10 @@ def test_spilot_fixed_eval_payload_normalizes_generic_overrides() -> None:
     )
     text = text.replace("${SPILOT_QWEN_COST_WEIGHT}", "1.0")
     text = text.replace("${SPILOT_GPT_COST_WEIGHT}", "1.0")
+    text = text.replace("${SPILOT_MAX_POOL_CALLS}", "2")
+    text = text.replace("${SPILOT_SLOT_LABEL_MODE}", "real_names")
+    text = text.replace("${SPILOT_ROUTING_MODE}", "task_level")
+    text = text.replace("${SPILOT_ROUTER_OBS_MAX_CHARS}", "1500")
     document = yaml.safe_load(text)
     agent = deepcopy(document["polar_task_template"]["agent"])
     agent["model_name"] = "Qwen/Qwen3.5-9B"

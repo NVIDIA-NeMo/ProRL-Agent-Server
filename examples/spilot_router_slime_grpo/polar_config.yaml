@@ -93,10 +93,13 @@ ${POLAR_INTERNET_RUNTIME_VOLUME}
           cost_weight: ${SPILOT_GPT_COST_WEIGHT}
           model_kwargs:
             max_completion_tokens: 16384
-      max_pool_calls: 2
+      max_pool_calls: ${SPILOT_MAX_POOL_CALLS}
       router_request_model: router/policy
       shuffle_slots: true
       shuffle_seed: 0
+      slot_label_mode: ${SPILOT_SLOT_LABEL_MODE}
+      routing_mode: ${SPILOT_ROUTING_MODE}
+      router_observation_max_chars: ${SPILOT_ROUTER_OBS_MAX_CHARS}
       router_max_tokens: 192
       router_timeout_seconds: 180
       pool_timeout_seconds: 1200
@@ -131,5 +134,7 @@ ${POLAR_INTERNET_RUNTIME_VOLUME}
       require_valid_action: true
       cost_penalty_lambda: ${SPILOT_COST_PENALTY_LAMBDA}
       cost_normalizer: ${SPILOT_COST_NORMALIZER}
+      latency_penalty_lambda: ${SPILOT_LATENCY_PENALTY_LAMBDA}
+      latency_normalizer: ${SPILOT_LATENCY_NORMALIZER}
 
 polar_task_id_template: "polar-spilot-router-{rollout_id}-{sample.group_index}"

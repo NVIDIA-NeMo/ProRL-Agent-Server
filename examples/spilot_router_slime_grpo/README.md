@@ -25,6 +25,28 @@ Qwen reference: 64 agent steps, a 65,536-token cumulative response budget,
 120-second shell commands, 64 consecutive format errors, 10,000-character
 head/tail observations, and five transient model attempts. Solve and verify
 calls share task files but receive separate persistent-shell state directories.
+
+## Routing granularity (`SPILOT_ROUTING_MODE`)
+
+- `task_level` (default, the historical protocol): the Router issues one
+  `ROUTE` that assigns the whole attempt to one frozen candidate, then after
+  the pool agent finishes chooses `SUBMIT` or one full-price `VERIFY` repair
+  call (`SPILOT_MAX_POOL_CALLS`, at most 2).
+- `turn_level`: per-STEP routing. One turn is one `step()` — a single
+  pool-model completion plus the execution of the one bash action it emitted —
+  inside ONE shared Vanillux2 conversation that both candidates continue.
+  After every step the Router sees a bounded step digest
+  (`SPILOT_ROUTER_OBS_MAX_CHARS`) and either re-`ROUTE`s the next step (any
+  candidate) or `SUBMIT`s. The episode budget is the 64-step Vanillux2 limit
+  (`pool_step_limit`, capped at 128 for the bounded result artifact); the
+  cumulative 65,536-token response budget is enforced across the whole shared
+  conversation from returned usage; the executing model can also end the
+  episode itself with `COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`. Every terminal
+  path auto-submits the workspace, matching the evaluator's terminal-workspace
+  scoring. COST WARNING: `total_cost` accrues the routed candidate's
+  `cost_weight` per STEP (all-gpt worst case 64 x 15 = 960 at the lambda02
+  weights), so `SPILOT_COST_NORMALIZER` must be re-derived for turn_level
+  lanes before reusing task_level lambda settings.
 In-training holdout evaluation is disabled (`TMAX_TRAINING_EVAL_ENABLED=0`) to
 match the no-eval reference run. Frozen-candidate calibration and any final
 holdout evaluation are separate experiments and cannot perturb the optimizer
@@ -158,6 +180,15 @@ candidate alias/model/base URL and admission caps, tokenizer content,
 mini-SWE and `agent_cli` runtimes, container/executable identities, and Python
 dependency versions. It is verified before evaluation, before formal metrics,
 and after clean service teardown.
+
+The forced runner receives its short-lived model-pool capability through
+`exec_protected`, which requires the persistent direct-exec broker. Therefore
+`POLAR_APPTAINER_PERSISTENT_BROKER=1` is part of the same exact-value runtime
+contract as the namespace, mount, and clean-environment controls. Both the
+shell entrypoint and Python launcher reject an explicit/inherited `0` before
+credentials are read, services start, or a paid model call can occur. The
+contract is recorded in `launcher.json` and the semantic identity, so a resume
+cannot silently switch execution backends.
 
 For example, compare 32 paired holdout tasks on cw-dfw. A new benchmark requires
 a fresh run id and output/service/submit paths; an explicit `--resume` keeps the
@@ -304,3 +335,69 @@ dataset slice, seed, candidates, concurrency and output directory, adding
 `--resume`. The wrapper generates a fresh service directory automatically; any
 semantic config, implementation, SIF, verifier, or row-content change fails
 closed before a result can be reused.
+
+## Matched learned-Router outcome replay
+
+`matched_router_replay_eval.py` adds the learned policy as a third arm without
+paying for a second stochastic coding-agent execution. It first queries one
+frozen Router checkpoint for the initial `ROUTE` action, using the production
+prompt helper and the same per-cell seed as the forced candidate matrix. For
+every cell it makes two policy queries: the production slot assignment and the
+exact counterfactual slot swap. It later replays the selected GPT or Qwen
+potential outcome from the complete paired forced ledger.
+
+This is deliberately a one-call policy estimand. It evaluates the learned
+first routing decision with an exact matched outcome, but it does not run or
+score SPilot's optional second `SUBMIT`/`VERIFY` action. The summary labels that
+limitation and reports only descriptive deltas; it does not claim statistical
+superiority.
+
+Keep the two evaluation tiers physically separate from training. Serve the
+frozen checkpoint on a standalone `src/eval` SGLang GPU allocation and never
+point this diagnostic at a training actor endpoint or training node. Run the
+paired potential outcomes through `submit_forced_route_eval.sh`, whose default
+is a separate one-node, 32-CPU, zero-GPU allocation (`FORCED_EVAL_GPUS=0`) and
+whose bounded `--max-concurrency` fans out the large task-by-candidate-by-seed
+matrix. Thus only the standalone model host consumes evaluation GPUs; Harbor,
+verification, ledger construction, and replay use parallel CPU resources and
+cannot take GPUs from an active training job.
+
+Collect the Router decisions while the standalone evaluation host for the
+frozen checkpoint is live. The API-key file is read only for the request and is
+never copied, hashed, or named in the output:
+
+```bash
+python examples/spilot_router_slime_grpo/matched_router_replay_eval.py collect \
+  --data /abs/path/tmax_holdout-eval.jsonl \
+  --policy-config /abs/path/training-run/job-N/polar_config.yaml \
+  --router-ready-json /abs/path/sglang-run/ready.json \
+  --router-api-key-file /abs/path/sglang-run/api-key \
+  --checkpoint-manifest /abs/path/export/.export_complete.json \
+  --output-dir /abs/path/matched-router-replay \
+  --start-index 0 --max-tasks 32 --replicates 5 --seed 20260715 \
+  --acknowledge-one-call-replay
+```
+
+Run the paired forced evaluation over the identical range, replicate count and
+base seed, with exactly the two training candidates and
+`--forward-seed-to-pool`. After its `summary.json` reaches
+`final_metrics_status=published`, join it to the Router decisions:
+
+```bash
+python examples/spilot_router_slime_grpo/matched_router_replay_eval.py finalize \
+  --output-dir /abs/path/matched-router-replay \
+  --forced-output-dir /abs/path/published-forced-qwen-gpt \
+  --data /abs/path/tmax_holdout-eval.jsonl \
+  --policy-config /abs/path/training-run/job-N/polar_config.yaml \
+  --acknowledge-one-call-replay
+```
+
+Finalization fails closed on any invalid Router action, missing cell, duplicate,
+row/seed mismatch, changed checkpoint/server/config/data identity, unverified
+service teardown, failed candidate call, or unpublished forced metric. A valid
+output contains immutable `collection_manifest.json`, raw audited
+`decisions.jsonl`, joined `replay_rows.jsonl`, and a final `summary.json` with
+separate `accuracy_outcome`, `cost`, cost-penalty delta, and cost-adjusted
+`reward` for forced Qwen, forced GPT, and the learned Router replay. The slot
+diagnostic reports semantic-selection and presented-slot agreement under the
+swap.

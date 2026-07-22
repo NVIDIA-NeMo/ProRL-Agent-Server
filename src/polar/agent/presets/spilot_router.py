@@ -192,11 +192,16 @@ def _build_runner_config(agent_spec: AgentSpec) -> dict[str, Any]:
     if sampling_seed is not None:
         router_model_kwargs["seed"] = sampling_seed
 
+    routing_mode_setting = _routing_mode(settings.pop("routing_mode", "task_level"))
     max_pool_calls = _bounded_int(
         settings.pop("max_pool_calls", 2),
         name="max_pool_calls",
         minimum=1,
-        maximum=2,
+        # Task-level routing is ROUTE + optional VERIFY.  Turn-level routes
+        # every agent STEP and budgets by pool_step_limit; max_pool_calls is
+        # accepted there only so shared lane configs keep rendering, and is
+        # otherwise unused.
+        maximum=2 if routing_mode_setting == "task_level" else 1000,
     )
     config: dict[str, Any] = {
         "schema_version": 1,
@@ -210,6 +215,18 @@ def _build_runner_config(agent_spec: AgentSpec) -> dict[str, Any]:
         "model_pool": model_pool,
         "max_pool_calls": max_pool_calls,
         "shuffle_slots": _strict_bool(settings.pop("shuffle_slots", True), "shuffle_slots"),
+        # "real_names" (default since 2026-07-21) labels candidates with their
+        # actual pool model names; "anonymous" is the historical M0/M1 protocol
+        # (TB2.1 decision probes proved an M0 token anchor under it) and must be
+        # requested explicitly when resuming pre-switch checkpoints.
+        "slot_label_mode": _slot_label_mode(settings.pop("slot_label_mode", "real_names")),
+        # "task_level" = one ROUTE assigns the whole attempt (+ optional final
+        # VERIFY); "turn_level" = per-STEP routing: one turn is one step() —
+        # a single pool-model completion plus the execution of the one action
+        # it emitted, inside a shared Vanillux2 conversation — and the router
+        # re-decides (ROUTE any candidate or SUBMIT) after every step, bounded
+        # by pool_step_limit.
+        "routing_mode": routing_mode_setting,
         "shuffle_seed": _bounded_int(
             settings.pop("shuffle_seed", 0),
             name="shuffle_seed",
@@ -252,7 +269,15 @@ def _build_runner_config(agent_spec: AgentSpec) -> dict[str, Any]:
             else configured_pool_step_limit,
             name="pool_step_limit",
             minimum=1,
-            maximum=1000,
+            # turn_level records one call per step; the artifact validator's
+            # bounded-entry cap requires the tighter step budget there.
+            maximum=1000 if routing_mode_setting == "task_level" else 128,
+        ),
+        "router_observation_max_chars": _bounded_int(
+            settings.pop("router_observation_max_chars", 1500),
+            name="router_observation_max_chars",
+            minimum=256,
+            maximum=10_000,
         ),
         "pool_cost_limit": _nonnegative_number(
             settings.pop("pool_cost_limit", 0), "pool_cost_limit"
@@ -437,6 +462,24 @@ def _strict_bool(value: object, name: str) -> bool:
     return value
 
 
+def _slot_label_mode(value: object) -> str:
+    if value not in ("anonymous", "real_names"):
+        raise ValueError(
+            "spilot_router slot_label_mode must be 'anonymous' or 'real_names'; "
+            f"got {value!r}"
+        )
+    return str(value)
+
+
+def _routing_mode(value: object) -> str:
+    if value not in ("task_level", "turn_level"):
+        raise ValueError(
+            "spilot_router routing_mode must be 'task_level' or 'turn_level'; "
+            f"got {value!r}"
+        )
+    return str(value)
+
+
 def _bounded_int(value: object, *, name: str, minimum: int, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"spilot_router {name} must be an integer")
@@ -484,10 +527,14 @@ def _validate_result_metadata(payload: object) -> dict[str, Any]:
         raise ValueError("router result action_valid must be boolean")
     if not isinstance(payload.get("submitted"), bool):
         raise ValueError("router result submitted must be boolean")
-    if not isinstance(payload.get("actions"), list) or len(payload["actions"]) > 2:
-        raise ValueError("router result actions must contain at most two entries")
-    if not isinstance(payload.get("calls"), list) or len(payload["calls"]) > 2:
-        raise ValueError("router result calls must contain at most two entries")
+    # task_level episodes record at most 2 decisions/calls; turn_level records
+    # one call per agent step (step budget capped at 128) plus up to one more
+    # router decision than executed steps.  The 128 KiB encoded cap below is
+    # the real payload bound; these entry caps just reject unbounded lists.
+    if not isinstance(payload.get("actions"), list) or len(payload["actions"]) > 129:
+        raise ValueError("router result actions must contain at most 129 entries")
+    if not isinstance(payload.get("calls"), list) or len(payload["calls"]) > 128:
+        raise ValueError("router result calls must contain at most 128 entries")
     if not isinstance(payload.get("slot_mapping"), dict):
         raise ValueError("router result slot_mapping must be an object")
     total_cost = payload.get("total_cost")

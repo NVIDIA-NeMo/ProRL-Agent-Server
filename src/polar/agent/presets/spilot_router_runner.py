@@ -4,14 +4,18 @@ This file is uploaded into each task runtime by :mod:`spilot_router`.  Keep it
 free of Polar imports: the portable mini-SWE Python environment contains only
 mini-SWE-agent and its dependencies.
 
-The state machine is intentionally small::
+The state machines are intentionally small::
 
-    ROUTE(slot) -> pool solve -> [SUBMIT | VERIFY(slot) -> pool repair] -> submit
+    task_level: ROUTE(slot) -> pool solve -> [SUBMIT | VERIFY(slot) -> pool repair] -> submit
+    turn_level: ROUTE(slot) -> agent step -> [SUBMIT | ROUTE(slot) -> agent step -> ...] -> submit
 
-Pool agents share the current working directory, but each starts with a fresh
-conversation.  Pool failures and timeouts are observations for the second
-router decision; malformed router actions and control-plane failures are kept
-separate so training can zero-reward the former and mask the latter.
+task_level pool agents share the current working directory, but each starts
+with a fresh conversation.  turn_level is per-STEP routing: one turn is one
+step() — a single pool-model completion plus the execution of the one action
+it emitted — inside ONE shared Vanillux2 conversation, and the Router
+re-decides after every step.  Pool failures and timeouts are observations for
+the next router decision; malformed router actions and control-plane failures
+are kept separate so training can zero-reward the former and mask the latter.
 """
 
 from __future__ import annotations
@@ -34,7 +38,7 @@ import struct
 import subprocess
 import sys
 import time
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 
 _CONFIG_ENV = "SPILOT_ROUTER_CONFIG_B64"
@@ -94,6 +98,14 @@ _VANILLUX2_MODEL_CLASS = "polar_mini_swe_vanillux.Vanillux2LitellmModel"
 _VANILLUX2_ENVIRONMENT_CLASS = "polar_mini_swe_timing.Vanillux2TimedLocalEnvironment"
 _SLOT_RE = re.compile(r"^M(?:0|[1-9][0-9]*)$")
 _MAX_ERROR_CHARS = 500
+# Per-step command excerpt kept in the result artifact.  With turn_level's
+# step budget capped at 128 the artifact must stay under the 128 KiB
+# postprocess bound (~500 B/call record + ~200 B/action record worst case),
+# so per-step records carry short excerpts only.
+_STEP_COMMAND_ARTIFACT_CHARS = 200
+_STEP_ERROR_ARTIFACT_CHARS = 150
+_TURN_LEVEL_MAX_STEP_LIMIT = 128
+_DEFAULT_ROUTER_OBSERVATION_CHARS = 1500
 _MAX_CARD_CHARS = 4_000
 _GIT_COMMAND_TIMEOUT_SECONDS = 10.0
 _PROCESS_SCOPE_TERM_TIMEOUT_SECONDS = 5.0
@@ -202,6 +214,15 @@ class PoolCallResult:
     signal_name: str | None = None
     admission_wait_ms: int = 0
     admission_local_cap: int | None = None
+    # Step-level routing extensions.  A turn_level "call" is one agent step
+    # (one pool-model completion plus the single action it emitted) inside the
+    # shared Vanillux2 conversation, so its record carries the step's command
+    # and a bounded output excerpt instead of a whole-subprocess log.
+    command: str | None = None
+    observation_excerpt: str | None = None
+    agent_exit_status: str | None = None
+    usage_prompt_tokens: int | None = None
+    usage_completion_tokens: int | None = None
 
     def metadata(self, *, index: int, cost: float) -> dict[str, object]:
         result: dict[str, object] = {
@@ -229,7 +250,50 @@ class PoolCallResult:
             result["signal_number"] = self.signal_number
         if self.signal_name is not None:
             result["signal_name"] = self.signal_name
+        if self.command is not None:
+            result["command"] = _bounded_text(self.command, _STEP_COMMAND_ARTIFACT_CHARS)
+        if self.agent_exit_status is not None:
+            result["agent_exit_status"] = self.agent_exit_status
         return result
+
+    def step_digest(self, *, step: int, steps_remaining: int, max_chars: int) -> str:
+        """Bounded per-step summary shown to the Router between decisions.
+
+        Unlike ``observation()`` (one whole pool-agent conversation), this
+        digest covers a single executed step, so it exposes the command and a
+        short output excerpt rather than git summaries and log tails; the
+        Router's own trajectory must stay well under the training pack budget
+        across up to ``pool_step_limit`` turns.
+        """
+
+        payload = {
+            "step": step,
+            "model_slot": self.slot,
+            "status": self.status,
+            "exit_code": self.return_code,
+            "command": _bounded_text(self.command or "", _STEP_COMMAND_ARTIFACT_CHARS),
+            "output_excerpt": "",
+            "agent_exit_status": self.agent_exit_status,
+            "error": self.error,
+            "steps_remaining": steps_remaining,
+        }
+        # Fit the excerpt into whatever budget the scalar fields leave, so a
+        # long command output can never truncate status/step/steps_remaining
+        # out of the sorted-key JSON.  Shrinking accounts for JSON escaping
+        # (newlines/quotes inflate the encoded length).
+        excerpt = self.observation_excerpt or ""
+        while True:
+            payload["output_excerpt"] = excerpt
+            text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            overshoot = len(text) - max_chars
+            if overshoot <= 0 or not excerpt:
+                break
+            # Removing N raw chars removes at least N encoded chars but JSON
+            # escaping can inflate up to 2x, so shrink by half the overshoot
+            # per round to converge without over-trimming to empty.
+            keep = max(0, len(excerpt) - max(1, overshoot // 2) - 3)
+            excerpt = (excerpt[:keep] + "...") if keep else ""
+        return _bounded_text(text, max_chars)
 
     def observation(self, max_chars: int) -> str:
         payload = {
@@ -731,7 +795,12 @@ class MiniSwePoolExecutor:
         # verifier is a fresh agent sharing only the mutable task workspace,
         # so every pool call needs an isolated protocol-state directory.
         state_dir = self.log_dir / f"spilot-pool-{call_index:02d}-state"
-        instruction = task if role == "solve" else _verification_instruction(task)
+        if role == "solve":
+            instruction = task
+        elif role == "continue":
+            instruction = _continuation_instruction(task)
+        else:
+            instruction = _verification_instruction(task)
         model_kwargs = dict(self.config.get("pool_model_kwargs", {}))
         model_kwargs.update(candidate.model_kwargs)
         args = self._command(
@@ -1011,6 +1080,509 @@ def _deliver_pool_call_capability(
         view = view[written:]
 
 
+class VanilluxStepExecutor:
+    """Execute one Vanillux2 agent step per routed candidate (turn_level).
+
+    Unlike :class:`MiniSwePoolExecutor`, which launches one mini-SWE
+    subprocess per complete pool-agent conversation, this executor drives a
+    SINGLE shared Vanillux2 conversation in-process: whichever candidate the
+    Router selects generates the next step (one model completion plus the one
+    bash action it emitted), and the transcript — including steps produced by
+    the other candidate — is what the next routed model continues from.
+
+    The runner already executes inside the portable mini-SWE environment
+    (module docstring contract), so the exact classes the task_level
+    subprocess uses are imported lazily here: the Vanillux2 persistent-shell
+    environment, the Vanillux2 LiteLLM model adapter, and mini-SWE's
+    DefaultAgent step/format-error semantics.  Protocol parity notes:
+
+    - Shell commands run with the same sanitized env the subprocess protocol
+      forces (``PYTHONPATH=""``); the SPilot config/task envelope is popped
+      from ``os.environ`` before the first step because LocalEnvironment
+      merges the process env into every command.
+    - The per-model response_token_budget clamp is DISABLED per instance
+      (budget=0).  Budget across model switches is tokenizer-ambiguous, so
+      the orchestrator enforces one shared episode budget from returned
+      usage instead; see ``_run_turn_level``.
+    - Auth matches the subprocess flow: the lease/session pool capability is
+      installed as the model's one-shot capability before every query.
+    """
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+        *,
+        task: str,
+        cwd: Path | None = None,
+    ) -> None:
+        self.config = config
+        self.task = task
+        self.cwd = cwd or Path.cwd()
+        self.log_dir = Path(str(config["agent_log_dir"]))
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.trajectory_path = self.log_dir / "spilot-steps-trajectory.json"
+        self._components: Any | None = None
+        self._gateway_client: Any | None = None
+
+    def close(self) -> None:
+        client = self._gateway_client
+        self._gateway_client = None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
+
+    def run(
+        self,
+        *,
+        candidate: Candidate,
+        task: str,
+        role: str,
+        call_index: int,
+        timeout_seconds: float,
+        model_call_capability: str,
+    ) -> PoolCallResult:
+        del task  # bound at construction; one shared conversation per episode
+        if not model_call_capability:
+            raise PoolInfrastructureError("lease-scoped pool-call capability is missing")
+        components = self._ensure_components()
+        # model_for() lazily builds the shared agent alongside the first
+        # model, so it must run before the agent is read.
+        model = components.model_for(candidate)
+        agent = components.agent
+        # Same auth path as the subprocess flow (_temporary_api_key around
+        # every query); refreshed per step because admission leases mint a new
+        # capability per acquire.
+        model._pool_call_capability = model_call_capability
+        step_budget_seconds = max(
+            1.0,
+            min(float(self.config["pool_timeout_seconds"]), float(timeout_seconds)),
+        )
+        model.config.model_kwargs["timeout"] = step_budget_seconds
+        # The shared environment's command timeout must also respect the
+        # remaining episode budget; task_level gets this for free from the
+        # subprocess wait(deadline).
+        components.environment.config.timeout = int(
+            max(1, min(int(self.config["pool_command_timeout"]), step_budget_seconds))
+        )
+        agent.model = model
+
+        started = time.monotonic()
+        status = "completed"
+        return_code = 0
+        error: str | None = None
+        agent_exit_status: str | None = None
+        excerpt_source: str | None = None
+        transcript_index = len(agent.messages)
+        try:
+            agent.step()
+        except components.format_error_type as exc:
+            agent.add_messages(*exc.messages)
+            status = "failed"
+            return_code = 1
+            agent_exit_status = "FormatError"
+            error = "pool model response was not exactly one bash tool call"
+            excerpt_source = _first_message_content(exc.messages)
+        except components.submitted_type as exc:
+            agent.add_messages(*exc.messages)
+            agent_exit_status = "Submitted"
+            excerpt_source = _first_message_content(exc.messages)
+        except components.interrupt_type as exc:
+            # LimitsExceeded and any other cooperative interrupt: terminal for
+            # the episode, but still a sampled outcome rather than an
+            # infrastructure failure.
+            agent.add_messages(*exc.messages)
+            status = "failed"
+            return_code = 1
+            agent_exit_status = _interrupt_exit_status(exc)
+            error = agent_exit_status
+            excerpt_source = _first_message_content(exc.messages)
+        except Exception as exc:
+            # Model transport failure after transport-level retries.  The
+            # step produced no action; the bounded error is the Router's
+            # observation and the shared transcript is left unchanged.
+            status = "failed"
+            return_code = 1
+            agent_exit_status = type(exc).__name__
+            error = _bounded_text(f"{type(exc).__name__}: {exc}", _MAX_ERROR_CHARS)
+        finally:
+            try:
+                agent.save(agent.config.output_path)
+            except Exception:  # pragma: no cover - trajectory dump is advisory
+                pass
+
+        command, observation_text, usage = _summarize_step_messages(
+            agent.messages[transcript_index:]
+        )
+        if observation_text is not None:
+            excerpt_source = observation_text
+            return_code = _observation_return_code(
+                agent.messages[transcript_index:], default=return_code
+            )
+        duration_ms = max(0, int((time.monotonic() - started) * 1000))
+        git_status, git_diff_stat, fingerprint = _workspace_summary(self.cwd)
+        excerpt_chars = int(
+            self.config.get(
+                "router_observation_max_chars", _DEFAULT_ROUTER_OBSERVATION_CHARS
+            )
+        )
+        return PoolCallResult(
+            slot=candidate.slot,
+            model=candidate.model,
+            role=role,
+            status=status,
+            return_code=return_code,
+            duration_ms=duration_ms,
+            attempted=True,
+            timed_out=False,
+            log_file=str(self.trajectory_path),
+            log_tail="",
+            git_status=git_status,
+            git_diff_stat=git_diff_stat,
+            workspace_fingerprint=fingerprint,
+            error=error,
+            failure_kind=None if status == "completed" else "step",
+            command=command,
+            observation_excerpt=_bounded_text(excerpt_source or "", excerpt_chars),
+            agent_exit_status=agent_exit_status,
+            usage_prompt_tokens=usage.get("prompt_tokens"),
+            usage_completion_tokens=usage.get("completion_tokens"),
+        )
+
+    def deadline_result(
+        self,
+        *,
+        candidate: Candidate,
+        role: str,
+        call_index: int,
+    ) -> PoolCallResult:
+        git_status, git_diff_stat, fingerprint = _workspace_summary(self.cwd)
+        return PoolCallResult(
+            slot=candidate.slot,
+            model=candidate.model,
+            role=role,
+            status="timeout",
+            return_code=-1,
+            duration_ms=0,
+            attempted=False,
+            timed_out=True,
+            log_file=str(self.trajectory_path),
+            log_tail="",
+            git_status=git_status,
+            git_diff_stat=git_diff_stat,
+            workspace_fingerprint=fingerprint,
+            error="agent step skipped because the episode deadline was exhausted",
+            failure_kind="timeout",
+        )
+
+    def _ensure_components(self) -> Any:
+        if self._components is None:
+            self._components = self._create_components()
+        return self._components
+
+    def _create_components(self) -> Any:
+        """Assemble the shared Vanillux2 conversation from the portable stack.
+
+        Mirrors the process-level side effects of ``polar_mini_swe_runner``
+        (gateway UDS transport for LiteLLM, fail-fast HTTP-400 retry policy,
+        MSWEA env contract) and the ``-c`` overrides MiniSwePoolExecutor
+        passes to the CLI, so a turn_level step executes byte-equivalent
+        protocol semantics to one task_level pool-agent turn.
+        """
+
+        import yaml as _yaml
+
+        import polar_mini_swe_runner as _portable_runner
+        from minisweagent import exceptions as _mini_exceptions
+        from minisweagent.agents.default import DefaultAgent as _DefaultAgent
+        from minisweagent.utils.serialize import recursive_merge as _recursive_merge
+        from polar_mini_swe_timing import Vanillux2TimedLocalEnvironment as _Environment
+        from polar_mini_swe_vanillux import Vanillux2LitellmModel as _Model
+
+        self._gateway_client = _portable_runner._configure_litellm_gateway()
+        _portable_runner._configure_model_retry_policy()
+        # LocalEnvironment merges the WHOLE process env into every shell
+        # command, so untrusted task commands would see everything the runner
+        # sees (session credentials, protocol envelope, broker rendezvous).
+        # Prune os.environ to the same allowlist policy the task_level
+        # subprocess enforces before any step executes; slot assignment
+        # already consumed SESSION_ID/TASK_ID at orchestrator construction,
+        # and both capabilities live in memory, not the environment.
+        allowed_env = {
+            key: value
+            for key, value in os.environ.items()
+            if key in _POOL_CHILD_ENV_ALLOWLIST or key.startswith("LC_")
+        }
+        os.environ.clear()
+        os.environ.update(allowed_env)
+        os.environ["MSWEA_CONFIGURED"] = "true"
+        os.environ["MSWEA_COST_TRACKING"] = "ignore_errors"
+        os.environ["MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT"] = str(
+            self.config["pool_model_retry_attempts"]
+        )
+        os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+        base_url = os.environ.get("OPENAI_BASE_URL", "").strip()
+        if base_url:
+            os.environ["OPENAI_API_BASE"] = base_url
+
+        protocol = _yaml.safe_load(
+            Path(_VANILLUX2_CONFIG_PATH).read_text(encoding="utf-8")
+        )
+        if not isinstance(protocol, dict):
+            raise PoolInfrastructureError("vanillux2 protocol config is not a mapping")
+
+        environment_section = dict(protocol.get("environment") or {})
+        shell_env = dict(environment_section.get("env") or {})
+        # Match the subprocess protocol's explicit `environment.env.PYTHONPATH=`.
+        shell_env["PYTHONPATH"] = ""
+        environment_section.update(
+            {
+                "timeout": int(self.config["pool_command_timeout"]),
+                "max_output_chars": int(self.config["observation_max_chars"]),
+                "state_dir": str(self.log_dir / "spilot-steps-state"),
+                "timing_path": str(self.log_dir / "spilot-steps-timing.jsonl"),
+                "env": shell_env,
+            }
+        )
+        environment = _Environment(**environment_section)
+
+        model_section = dict(protocol.get("model") or {})
+        protocol_model_kwargs = dict(model_section.pop("model_kwargs", {}) or {})
+        model_section.pop("response_token_budget", None)
+        model_section.pop("model_class", None)
+
+        agent_section = dict(protocol.get("agent") or {})
+        # The orchestrator owns step budget, format-error budget, and
+        # termination; DefaultAgent limits are disabled so it cannot end the
+        # episode on its own.
+        agent_section.update(
+            {
+                "step_limit": 0,
+                "cost_limit": 0.0,
+                "max_consecutive_format_errors": 0,
+                "output_path": self.trajectory_path,
+            }
+        )
+
+        pool_model_kwargs = dict(self.config.get("pool_model_kwargs", {}))
+        models: dict[str, Any] = {}
+        agent_holder: dict[str, Any] = {}
+        executor = self
+
+        class _Components:
+            format_error_type = _mini_exceptions.FormatError
+            submitted_type = _mini_exceptions.Submitted
+            interrupt_type = _mini_exceptions.InterruptAgentFlow
+            environment = None  # assigned below; per-step timeout is clamped on it
+
+            @property
+            def agent(self) -> Any:
+                return agent_holder["agent"]
+
+            def model_for(self, candidate: Candidate) -> Any:
+                model = models.get(candidate.slot)
+                if model is None:
+                    # Match the subprocess `-c model.model_kwargs=` semantics:
+                    # pool-level and candidate kwargs combine SHALLOWLY (the
+                    # candidate's nested dicts replace, not merge), and only
+                    # the protocol YAML defaults deep-merge underneath.
+                    override_kwargs = dict(pool_model_kwargs)
+                    override_kwargs.update(dict(candidate.model_kwargs))
+                    merged_kwargs = _recursive_merge(
+                        protocol_model_kwargs,
+                        override_kwargs,
+                    )
+                    merged_kwargs.setdefault(
+                        "timeout", float(executor.config["pool_timeout_seconds"])
+                    )
+                    model_id = (
+                        candidate.model
+                        if candidate.model.startswith("openai/")
+                        else f"openai/{candidate.model}"
+                    )
+                    model = _Model(
+                        model_name=model_id,
+                        response_token_budget=0,
+                        model_kwargs=merged_kwargs,
+                        **model_section,
+                    )
+                    models[candidate.slot] = model
+                    if "agent" not in agent_holder:
+                        agent = _DefaultAgent(model, environment, **agent_section)
+                        # Replicate DefaultAgent.run()'s conversation setup
+                        # without its internal loop: the Router interleaves
+                        # between steps.
+                        agent.extra_template_vars |= {"task": executor.task}
+                        agent.messages = []
+                        agent.add_messages(
+                            model.format_message(
+                                role="system",
+                                content=agent._render_template(
+                                    agent.config.system_template
+                                ),
+                            ),
+                            model.format_message(
+                                role="user",
+                                content=agent._render_template(
+                                    agent.config.instance_template
+                                ),
+                            ),
+                        )
+                        agent_holder["agent"] = agent
+                return model
+
+        components = _Components()
+        components.environment = environment
+        return components
+
+
+def _first_message_content(messages: Iterable[dict[str, Any]]) -> str | None:
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            return content
+    return None
+
+
+def _interrupt_exit_status(exc: BaseException) -> str:
+    messages = getattr(exc, "messages", None) or ()
+    for message in messages:
+        extra = message.get("extra") if isinstance(message, dict) else None
+        if isinstance(extra, dict):
+            exit_status = extra.get("exit_status")
+            if isinstance(exit_status, str) and exit_status:
+                return exit_status
+    return type(exc).__name__
+
+
+def _summarize_step_messages(
+    messages: list[dict[str, Any]],
+) -> tuple[str | None, str | None, dict[str, int]]:
+    """Extract (command, observation text, usage) from one step's messages."""
+
+    command: str | None = None
+    observation: str | None = None
+    usage: dict[str, int] = {}
+    for message in messages:
+        extra = message.get("extra") if isinstance(message, dict) else None
+        if not isinstance(extra, dict):
+            continue
+        actions = extra.get("actions")
+        if isinstance(actions, list) and actions:
+            first = actions[0]
+            if isinstance(first, dict):
+                command = str(first.get("command", ""))
+        # Usage is read from ANY message that persisted the raw completion,
+        # not just action-bearing ones: FormatError correction messages carry
+        # the malformed response's usage, and those tokens must still count
+        # against the shared episode budget.
+        raw_usage = (extra.get("response") or {}).get("usage")
+        if isinstance(raw_usage, dict):
+            for key in ("prompt_tokens", "completion_tokens"):
+                value = raw_usage.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    usage[key] = value
+        if "returncode" in extra:
+            content = message.get("content")
+            if isinstance(content, str):
+                observation = content
+    return command, observation, usage
+
+
+def _observation_return_code(
+    messages: list[dict[str, Any]], *, default: int
+) -> int:
+    for message in messages:
+        extra = message.get("extra") if isinstance(message, dict) else None
+        if isinstance(extra, dict) and "returncode" in extra:
+            value = extra.get("returncode")
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+    return default
+
+
+def build_initial_router_messages(
+    task: str,
+    candidates: Iterable[Candidate],
+    *,
+    label_mode: str = "real_names",
+    routing_mode: str = "task_level",
+) -> list[dict[str, str]]:
+    """Build the canonical first-action prompt used by SPilot.
+
+    This is intentionally a public, side-effect-free helper so frozen-policy
+    evaluators can prove that they queried the checkpoint with the production
+    prompt instead of maintaining a second, potentially drifting template.
+
+    ``label_mode="real_names"`` (the default since 2026-07-21) presents each
+    candidate under its actual pool model name, keeps the candidate list in
+    its (episode-shuffled) assignment order, and states the schema without a
+    concrete example so no label is privileged by the instruction itself.
+    ``label_mode="anonymous"`` is the historical M0/M1 protocol (fixed slot
+    order, concrete M0 action example); TB2.1 decision probes proved trained
+    policies anchor on the literal "M0" token under it.  Replay tooling for
+    checkpoints trained before the switch must request it explicitly.
+    """
+
+    if not isinstance(task, str) or not task:
+        raise ValueError("task must be a non-empty string")
+    cards = [
+        {"model_slot": candidate.slot, "model_card": candidate.card}
+        for candidate in candidates
+    ]
+    if not cards:
+        raise ValueError("at least one candidate is required")
+    if label_mode == "real_names":
+        action_instruction = (
+            "Choose one entry from its task-relevant model-card semantics. Return "
+            "exactly two JSON fields: action must be ROUTE, and model_slot must be "
+            "copied exactly from the chosen entry's model_slot value. There is no "
+            "default choice. Output only the JSON object."
+        )
+    elif label_mode == "anonymous":
+        action_instruction = (
+            "Choose the first action using exactly this schema:\n"
+            '{"action":"ROUTE","model_slot":"M0"}\n'
+            "Replace M0 with one available slot. Output only the JSON object."
+        )
+    else:
+        raise ValueError(f"unknown slot label mode: {label_mode!r}")
+    if routing_mode == "turn_level":
+        system_text = (
+            "You are SPilot, a routing policy for software-engineering agents. "
+            "Do not solve the task yourself. The task is completed over a bounded "
+            "sequence of coding-agent turns sharing one workspace; before each turn "
+            "you select which candidate runs it, and between turns you may re-route "
+            "to a different candidate or submit. Your response must be exactly one "
+            "JSON object, with no markdown, commentary, or extra keys."
+        )
+    elif routing_mode == "task_level":
+        system_text = (
+            "You are SPilot, a routing policy for software-engineering agents. "
+            "Do not solve the task yourself. Select one candidate to run a full "
+            "coding-agent attempt. Your response must be exactly one JSON object, "
+            "with no markdown, commentary, or extra keys."
+        )
+    else:
+        raise ValueError(f"unknown routing mode: {routing_mode!r}")
+    return [
+        {
+            "role": "system",
+            "content": system_text,
+        },
+        {
+            "role": "user",
+            "content": (
+                f"TASK:\n{task}\n\n"
+                "AVAILABLE MODEL SLOTS:\n"
+                f"{json.dumps(cards, ensure_ascii=False, sort_keys=True)}\n\n"
+                f"{action_instruction}"
+            ),
+        },
+    ]
+
+
 class SpilotOrchestrator:
     """Execute and record one bounded SPilot routing episode."""
 
@@ -1039,12 +1611,14 @@ class SpilotOrchestrator:
             stable_seed=self.config.get("slot_assignment_seed"),
             session_id=os.environ.get("SESSION_ID", ""),
             task_id=os.environ.get("TASK_ID", ""),
+            label_mode=str(self.config.get("slot_label_mode", "real_names")),
         )
         self.candidate_by_slot = {candidate.slot: candidate for candidate in self.candidates}
         mapping = {candidate.slot: candidate.public_metadata() for candidate in self.candidates}
         mapping_json = json.dumps(mapping, separators=(",", ":"), sort_keys=True)
         self.result: dict[str, Any] = {
             "schema_version": 1,
+            "routing_mode": str(self.config.get("routing_mode", "task_level")),
             "action_valid": True,
             "actions": [],
             "calls": [],
@@ -1077,6 +1651,179 @@ class SpilotOrchestrator:
         return int(round(waited_seconds * 1000))
 
     def run(self) -> dict[str, Any]:
+        if str(self.config.get("routing_mode", "task_level")) == "turn_level":
+            return self._run_turn_level()
+        return self._run_task_level()
+
+    def _pool_call_budget(self) -> int:
+        """Maximum executed pool calls this episode (mode-dependent).
+
+        task_level: max_pool_calls (1 or 2).  turn_level: the step budget —
+        max_pool_calls is accepted for config compatibility but has no
+        semantic role once every call is a single agent step.
+        """
+
+        if str(self.config.get("routing_mode", "task_level")) == "turn_level":
+            return int(self.config["pool_step_limit"])
+        return int(self.config["max_pool_calls"])
+
+    def _run_turn_level(self) -> dict[str, Any]:
+        """Route every agent STEP: ROUTE(slot) -> step -> [SUBMIT | ROUTE(slot) -> ...].
+
+        One turn is one step(): a single pool-model completion plus the
+        execution of the one action it emitted, inside a shared Vanillux2
+        conversation.  Control returns to the Router after every step.
+        Bounded by pool_step_limit; every terminal path auto-submits the
+        workspace so the episode always ends with a deliverable, matching the
+        evaluator's "score the terminal workspace" semantics.
+        """
+
+        step_budget = int(self.config["pool_step_limit"])
+        response_budget = int(self.config["pool_response_token_budget"])
+        max_format_errors = int(self.config["pool_max_format_errors"])
+        digest_chars = int(
+            self.config.get(
+                "router_observation_max_chars", _DEFAULT_ROUTER_OBSERVATION_CHARS
+            )
+        )
+        messages = self._initial_messages()
+        completion = self._router_completion(messages)
+        action = self._record_action(completion, expected="ROUTE", step=0)
+        if action is None:
+            return self.result
+
+        consecutive_format_errors = 0
+        baseline_prompt_tokens: int | None = None
+        used_response_tokens = 0
+        last_call: PoolCallResult | None = None
+        for step_index in range(step_budget):
+            candidate = self.candidate_by_slot[action["model_slot"]]
+            role = "solve" if step_index == 0 else "continue"
+            last_call = self._pool_call(candidate, role=role, call_index=step_index)
+            self._record_call(last_call, candidate)
+
+            if last_call.usage_prompt_tokens is not None:
+                if baseline_prompt_tokens is None:
+                    baseline_prompt_tokens = last_call.usage_prompt_tokens
+                used_response_tokens = max(
+                    used_response_tokens,
+                    last_call.usage_prompt_tokens
+                    - baseline_prompt_tokens
+                    + (last_call.usage_completion_tokens or 0),
+                )
+
+            if last_call.agent_exit_status == "FormatError":
+                consecutive_format_errors += 1
+            elif last_call.status == "completed":
+                consecutive_format_errors = 0
+
+            terminal_reason = self._turn_level_terminal_reason(
+                last_call,
+                step_index=step_index,
+                step_budget=step_budget,
+                consecutive_format_errors=consecutive_format_errors,
+                max_format_errors=max_format_errors,
+                used_response_tokens=used_response_tokens,
+                response_budget=response_budget,
+            )
+            if terminal_reason is not None:
+                self.result["submitted"] = True
+                self.result["termination_reason"] = terminal_reason
+                self.result["final_workspace_fingerprint"] = last_call.workspace_fingerprint
+                return self.result
+
+            if self.deadline - self.clock() <= float(self.config["deadline_margin_seconds"]):
+                # A step that overshot its clamp (e.g. transport retries) can
+                # leave less than the margin; auto-submit the workspace rather
+                # than letting the next router call raise an infra error.
+                self.result["submitted"] = True
+                self.result["termination_reason"] = "deadline_auto_submit"
+                self.result["final_workspace_fingerprint"] = last_call.workspace_fingerprint
+                return self.result
+
+            digest = last_call.step_digest(
+                step=step_index,
+                steps_remaining=step_budget - step_index - 1,
+                max_chars=digest_chars,
+            )
+            messages = [
+                *messages,
+                {"role": "assistant", "content": completion.content},
+                {
+                    "role": "user",
+                    "content": (
+                        "The routed agent step has executed. This digest contains "
+                        "only public execution state; hidden evaluator tests have "
+                        "not run.\n"
+                        f"STEP RESULT:\n{digest}\n\n"
+                        f"{self._turn_level_instruction()}"
+                    ),
+                },
+            ]
+            completion = self._router_completion(messages)
+            action = self._record_action(completion, expected="CONTINUE", step=step_index + 1)
+            if action is None:
+                self.result["final_workspace_fingerprint"] = last_call.workspace_fingerprint
+                return self.result
+            if action["action"] == "SUBMIT":
+                self.result["submitted"] = True
+                self.result["termination_reason"] = "router_submit"
+                self.result["final_workspace_fingerprint"] = last_call.workspace_fingerprint
+                return self.result
+        raise AssertionError("unreachable: step budget loop must terminate")  # pragma: no cover
+
+    def _turn_level_terminal_reason(
+        self,
+        call: PoolCallResult,
+        *,
+        step_index: int,
+        step_budget: int,
+        consecutive_format_errors: int,
+        max_format_errors: int,
+        used_response_tokens: int,
+        response_budget: int,
+    ) -> str | None:
+        if not call.attempted:
+            # _pool_call skipped the step because the episode deadline is
+            # exhausted; auto-submit the existing workspace instead of
+            # spinning the Router into an infrastructure error.
+            return "deadline_exhausted_auto_submit"
+        if call.agent_exit_status == "Submitted":
+            return "agent_submit"
+        if call.agent_exit_status not in (None, "FormatError") and call.status != "completed":
+            # Cooperative interrupts from the shared conversation (e.g.
+            # LimitsExceeded) end the episode; transport failures do not —
+            # they are observations the Router can respond to by re-routing.
+            if call.agent_exit_status in ("LimitsExceeded", "TimeExceeded", "RepeatedFormatError"):
+                return "agent_limits_auto_submit"
+        if consecutive_format_errors >= max_format_errors:
+            return "format_errors_auto_submit"
+        if response_budget > 0 and used_response_tokens >= response_budget:
+            return "response_budget_exhausted_auto_submit"
+        if step_index == step_budget - 1:
+            return "step_budget_exhausted_auto_submit"
+        return None
+
+    def _turn_level_instruction(self) -> str:
+        if str(self.config.get("slot_label_mode", "real_names")) == "real_names":
+            return (
+                "Choose exactly one next action. Either submit the current workspace:\n"
+                '{"action":"SUBMIT"}\n'
+                "or route the next agent step (one model turn continuing this shared "
+                "conversation and workspace) by returning exactly two JSON fields: "
+                "action with value ROUTE, and model_slot copied exactly from one "
+                "available entry's model_slot value. Output only the JSON object."
+            )
+        return (
+            "Choose exactly one next action. Either submit the current workspace:\n"
+            '{"action":"SUBMIT"}\n'
+            "or route the next agent step (one model turn continuing this shared "
+            "conversation and workspace):\n"
+            '{"action":"ROUTE","model_slot":"M0"}\n'
+            "Use one available slot and output only the JSON object."
+        )
+
+    def _run_task_level(self) -> dict[str, Any]:
         initial_messages = self._initial_messages()
         first = self._router_completion(initial_messages)
         first_action = self._record_action(first, expected="ROUTE", step=0)
@@ -1094,6 +1841,23 @@ class SpilotOrchestrator:
             return self.result
 
         observation = first_call.observation(int(self.config["observation_max_chars"]))
+        if str(self.config.get("slot_label_mode", "real_names")) == "real_names":
+            final_instruction = (
+                "Choose exactly one next action. Either submit the current workspace:\n"
+                '{"action":"SUBMIT"}\n'
+                "or spend the final pool call on a fresh verifier/repair agent by "
+                "returning exactly two JSON fields: action with value VERIFY, and "
+                "model_slot copied exactly from one available entry's model_slot "
+                "value. Output only the JSON object."
+            )
+        else:
+            final_instruction = (
+                "Choose exactly one next action. Either submit the current workspace:\n"
+                '{"action":"SUBMIT"}\n'
+                "or spend the final pool call on a fresh verifier/repair agent:\n"
+                '{"action":"VERIFY","model_slot":"M0"}\n'
+                "Use one available slot and output only the JSON object."
+            )
         followup_messages = [
             *initial_messages,
             {"role": "assistant", "content": first.content},
@@ -1103,11 +1867,7 @@ class SpilotOrchestrator:
                     "The selected coding agent has finished. This observation contains "
                     "only public execution state; hidden evaluator tests have not run.\n"
                     f"OBSERVATION:\n{observation}\n\n"
-                    "Choose exactly one next action. Either submit the current workspace:\n"
-                    '{"action":"SUBMIT"}\n'
-                    "or spend the final pool call on a fresh verifier/repair agent:\n"
-                    '{"action":"VERIFY","model_slot":"M0"}\n'
-                    "Use one available slot and output only the JSON object."
+                    f"{final_instruction}"
                 ),
             },
         ]
@@ -1138,32 +1898,12 @@ class SpilotOrchestrator:
         self.result["infrastructure_error"] = _bounded_text(str(exc), _MAX_ERROR_CHARS)
 
     def _initial_messages(self) -> list[dict[str, str]]:
-        cards = [
-            {"model_slot": candidate.slot, "model_card": candidate.card}
-            for candidate in self.candidates
-        ]
-        return [
-            {
-                "role": "system",
-                "content": (
-                    "You are SPilot, a routing policy for software-engineering agents. "
-                    "Do not solve the task yourself. Select one candidate to run a full "
-                    "coding-agent attempt. Your response must be exactly one JSON object, "
-                    "with no markdown, commentary, or extra keys."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"TASK:\n{self.task}\n\n"
-                    "AVAILABLE MODEL SLOTS:\n"
-                    f"{json.dumps(cards, ensure_ascii=False, sort_keys=True)}\n\n"
-                    "Choose the first action using exactly this schema:\n"
-                    '{"action":"ROUTE","model_slot":"M0"}\n'
-                    "Replace M0 with one available slot. Output only the JSON object."
-                ),
-            },
-        ]
+        return build_initial_router_messages(
+            self.task,
+            self.candidates,
+            label_mode=str(self.config.get("slot_label_mode", "real_names")),
+            routing_mode=str(self.config.get("routing_mode", "task_level")),
+        )
 
     def _router_completion(self, messages: list[dict[str, str]]) -> RouterCompletion:
         remaining = self.deadline - self.clock()
@@ -1229,7 +1969,12 @@ class SpilotOrchestrator:
         remaining = self.deadline - self.clock()
         margin = float(self.config["deadline_margin_seconds"])
         reserve = margin
-        if call_index == 0 and int(self.config["max_pool_calls"]) > 1:
+        # Any non-final pool call may be followed by another router decision;
+        # reserve one router completion so the decision cannot be starved.
+        # (Task-level routing has max_pool_calls=2, reproducing the historical
+        # "reserve only after the first call" behaviour exactly; turn_level's
+        # budget is the step limit.)
+        if call_index < self._pool_call_budget() - 1:
             reserve += float(self.config["router_timeout_seconds"])
         available = remaining - reserve
         if available <= 0:
@@ -1365,7 +2110,13 @@ class SpilotOrchestrator:
     def _record_call(self, call: PoolCallResult, candidate: Candidate) -> None:
         cost = candidate.cost_weight if call.attempted else 0.0
         self.result["total_cost"] = float(self.result["total_cost"]) + cost
-        self.result["calls"].append(call.metadata(index=len(self.result["calls"]), cost=cost))
+        entry = call.metadata(index=len(self.result["calls"]), cost=cost)
+        if str(self.config.get("routing_mode", "task_level")) == "turn_level":
+            # Up to 128 per-step records must fit the 128 KiB artifact cap;
+            # 500-char errors are the dominant overflow driver.
+            if "error" in entry:
+                entry["error"] = _bounded_text(str(entry["error"]), _STEP_ERROR_ARTIFACT_CHARS)
+        self.result["calls"].append(entry)
 
 
 def parse_router_action(
@@ -1412,6 +2163,17 @@ def parse_router_action(
             raise RouterProtocolError(
                 "second action must be exactly SUBMIT or VERIFY with model_slot"
             )
+    elif expected == "CONTINUE":
+        # Turn-level routing: between pool calls the router either submits the
+        # workspace or routes the next turn to any candidate.
+        if action == "SUBMIT":
+            if set(value) != {"action"}:
+                raise RouterProtocolError("SUBMIT must not contain extra fields")
+            return {"action": "SUBMIT"}
+        if set(value) != {"action", "model_slot"} or action != "ROUTE":
+            raise RouterProtocolError(
+                "turn action must be exactly SUBMIT or ROUTE with model_slot"
+            )
     else:  # pragma: no cover - internal programming error
         raise ValueError(f"unknown expected action phase: {expected}")
 
@@ -1419,6 +2181,19 @@ def parse_router_action(
     if not isinstance(slot, str) or slot not in allowed_slots:
         raise RouterProtocolError(f"model_slot must be one of {sorted(allowed_slots)}")
     return {"action": str(action), "model_slot": slot}
+
+
+def _real_name_label(model: str) -> str:
+    """Derive the human-facing label for a candidate from its pool alias.
+
+    "pool/qwen3.6-27b" -> "qwen3.6-27b"; the alias tail is the model's public
+    name and is what the router should reason about under real-name labels.
+    """
+
+    label = model.strip().split("/")[-1]
+    if not label:
+        raise ValueError(f"cannot derive a real-name label from model alias {model!r}")
+    return label
 
 
 def _assign_slots(
@@ -1429,6 +2204,7 @@ def _assign_slots(
     stable_seed: int | None,
     session_id: str,
     task_id: str,
+    label_mode: str = "real_names",
 ) -> list[Candidate]:
     if isinstance(raw_pool, list):
         labels = [f"M{index}" for index in range(len(raw_pool))]
@@ -1454,6 +2230,18 @@ def _assign_slots(
         else:
             derived_seed = int(stable_seed)
         random.Random(derived_seed).shuffle(parsed)
+    if label_mode == "real_names":
+        # Labels follow the models: identity is carried by the real name, and
+        # the shuffled list order doubles as a randomized serialization order
+        # so no position is privileged either.
+        labels = [_real_name_label(item["model"]) for item in parsed]
+        if len(set(labels)) != len(labels):
+            raise ValueError(
+                "real-name slot labels must be unique across the model pool; "
+                f"got {labels!r}"
+            )
+    elif label_mode != "anonymous":
+        raise ValueError(f"unknown slot label mode: {label_mode!r}")
     return [
         Candidate(
             slot=slot,
@@ -1545,8 +2333,46 @@ def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
     missing = required.difference(config)
     if missing:
         raise ValueError(f"runner config missing fields: {', '.join(sorted(missing))}")
-    if config["max_pool_calls"] not in (1, 2):
-        raise ValueError("max_pool_calls must be 1 or 2")
+    routing_mode = config.get("routing_mode", "task_level")
+    if routing_mode == "turn_level":
+        # max_pool_calls is accepted (shared lane configs set it for
+        # task_level) but unused: the per-step budget is pool_step_limit.
+        max_calls = config["max_pool_calls"]
+        if not isinstance(max_calls, int) or isinstance(max_calls, bool) or max_calls < 1:
+            raise ValueError("turn_level max_pool_calls must be a positive integer")
+        step_limit = config["pool_step_limit"]
+        if (
+            not isinstance(step_limit, int)
+            or isinstance(step_limit, bool)
+            or not 1 <= step_limit <= _TURN_LEVEL_MAX_STEP_LIMIT
+        ):
+            raise ValueError(
+                "turn_level pool_step_limit must be an integer in "
+                f"[1, {_TURN_LEVEL_MAX_STEP_LIMIT}] so per-step call records fit "
+                "the bounded result artifact"
+            )
+        cost_limit = config["pool_cost_limit"]
+        if isinstance(cost_limit, (int, float)) and float(cost_limit) > 0:
+            # DefaultAgent's dollar-based stop is disabled for the shared
+            # in-process conversation; budgets are pool_step_limit and
+            # pool_response_token_budget.  Reject rather than silently ignore.
+            raise ValueError(
+                "turn_level does not support pool_cost_limit; bound episodes "
+                "with pool_step_limit and pool_response_token_budget"
+            )
+    elif config["max_pool_calls"] not in (1, 2):
+        raise ValueError("task_level max_pool_calls must be 1 or 2")
+    observation_chars = config.get(
+        "router_observation_max_chars", _DEFAULT_ROUTER_OBSERVATION_CHARS
+    )
+    if (
+        not isinstance(observation_chars, int)
+        or isinstance(observation_chars, bool)
+        or not 256 <= observation_chars <= 10_000
+    ):
+        raise ValueError(
+            "router_observation_max_chars must be an integer in [256, 10000]"
+        )
     admission_enabled = config["pool_episode_admission_enabled"]
     if not isinstance(admission_enabled, bool):
         raise ValueError("pool_episode_admission_enabled must be boolean")
@@ -1611,6 +2437,17 @@ def _verification_instruction(task: str) -> str:
         "files and diff, run relevant public tests, preserve correct work, and fix "
         "any remaining issue. Hidden evaluator tests are unavailable. Complete the "
         "implementation rather than only reviewing it.\n\nORIGINAL TASK:\n"
+        f"{task}"
+    )
+
+
+def _continuation_instruction(task: str) -> str:
+    return (
+        "You are continuing work started by a previous coding agent in this same "
+        "workspace. Inspect the current files and diff to understand what has been "
+        "done, preserve correct work, and continue until the task is complete. Run "
+        "relevant public tests where available; hidden evaluator tests are "
+        "unavailable.\n\nORIGINAL TASK:\n"
         f"{task}"
     )
 
@@ -2030,7 +2867,11 @@ def main() -> int:
             model_pool_capability = _read_protected_capability(
                 _MODEL_POOL_CAPABILITY_ENV
             )
-        pool = MiniSwePoolExecutor(config_obj)
+        pool: MiniSwePoolExecutor | VanilluxStepExecutor
+        if str(config_obj.get("routing_mode", "task_level")) == "turn_level":
+            pool = VanilluxStepExecutor(config_obj, task=task)
+        else:
+            pool = MiniSwePoolExecutor(config_obj)
         orchestrator = SpilotOrchestrator(
             config=config_obj,
             task=task,
@@ -2039,7 +2880,12 @@ def main() -> int:
             admission=admission,
             model_pool_capability=model_pool_capability,
         )
-        result = orchestrator.run()
+        try:
+            result = orchestrator.run()
+        finally:
+            close = getattr(pool, "close", None)
+            if callable(close):
+                close()
         _write_result(result_path, result)
         # Invalid actions and pool model failures are sampled-policy outcomes,
         # not process failures.  Their metadata lets the evaluator force zero

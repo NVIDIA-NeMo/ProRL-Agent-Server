@@ -277,3 +277,35 @@ export SPILOT_QWEN_COST_WEIGHT="${SPILOT_QWEN_COST_WEIGHT:-1.0}"
 export SPILOT_GPT_COST_WEIGHT="${SPILOT_GPT_COST_WEIGHT:-1.0}"
 export SPILOT_COST_PENALTY_LAMBDA="${SPILOT_COST_PENALTY_LAMBDA:-0.0}"
 export SPILOT_COST_NORMALIZER="${SPILOT_COST_NORMALIZER:-1.0}"
+# Latency shaping (paper lambda_ell term). Disabled by default; normalizer in
+# seconds (1800 s = a 30-minute session takes the full unit penalty at lambda=1).
+export SPILOT_LATENCY_PENALTY_LAMBDA="${SPILOT_LATENCY_PENALTY_LAMBDA:-0.0}"
+export SPILOT_LATENCY_NORMALIZER="${SPILOT_LATENCY_NORMALIZER:-1800}"
+
+# Candidate labelling: "real_names" (default since 2026-07-21) presents
+# candidates under their actual pool model names; "anonymous" is the
+# historical M0/M1 protocol (the TB2.1 decision probes proved the trained
+# policy anchors on the literal "M0" token instead of task semantics) and is
+# only for resuming pre-switch lineages.
+export SPILOT_SLOT_LABEL_MODE="${SPILOT_SLOT_LABEL_MODE:-real_names}"
+
+# Routing granularity: "task_level" = one ROUTE assigns the whole attempt plus
+# an optional final VERIFY (the historical protocol, bounded by
+# SPILOT_MAX_POOL_CALLS); "turn_level" = per-STEP routing: one turn is one
+# step() — a single pool-model completion plus the execution of the one bash
+# action it emitted, inside a shared Vanillux2 conversation — and the router
+# re-decides (ROUTE any candidate or SUBMIT) after every step, bounded by the
+# pool_step_limit (64). Budget exhaustion always auto-submits the workspace.
+#
+# COST CALIBRATION WARNING for turn_level lanes: total_cost sums the routed
+# candidate's cost_weight PER STEP, so an all-gpt 64-step episode costs up to
+# 64 x SPILOT_GPT_COST_WEIGHT (=960 at the lambda02 weights) instead of the
+# task_level maximum of 2 calls (=30). Re-derive SPILOT_COST_NORMALIZER for
+# turn_level (e.g. scale by the expected step count) or the cost penalty
+# saturates to the reward floor on every gpt-heavy success.
+export SPILOT_ROUTING_MODE="${SPILOT_ROUTING_MODE:-task_level}"
+export SPILOT_MAX_POOL_CALLS="${SPILOT_MAX_POOL_CALLS:-2}"
+# Per-step digest budget for the Router's own trajectory under turn_level
+# (chars of executed-step output shown to the Router between decisions; the
+# executing pool models still see full Vanillux2 observations).
+export SPILOT_ROUTER_OBS_MAX_CHARS="${SPILOT_ROUTER_OBS_MAX_CHARS:-1500}"
