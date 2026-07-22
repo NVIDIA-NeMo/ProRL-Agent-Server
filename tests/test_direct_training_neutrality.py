@@ -11,11 +11,29 @@ real portable runtime), or directly: ``pytest tests/test_direct_training_neutral
 from __future__ import annotations
 
 import math
+import re
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from slime_bridge.reward_post_process import post_process_rewards
+
+_EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
+
+
+def _load_task_template(config_relpath: str) -> dict:
+    """Load a launcher polar_config's task template with placeholders neutralized."""
+    text = (_EXAMPLES / config_relpath).read_text()
+    # The two runtime-volume placeholders occupy bare lines (rendered to real
+    # volume entries or empty at submit time); drop them. Every other ${VAR}
+    # sits inside a quoted string, so replacing it with a scalar is harmless
+    # and never touches the literal strategy fields under test.
+    text = text.replace("${POLAR_AGENT_RUNTIME_VOLUME}", "")
+    text = text.replace("${POLAR_INTERNET_RUNTIME_VOLUME}", "")
+    text = re.sub(r"\$\{[^}]+\}", "x", text)
+    return yaml.safe_load(text)["polar_task_template"]
 
 
 def _sample(group_index: int, rollout_id: int, reward: object) -> SimpleNamespace:
@@ -94,21 +112,22 @@ def test_non_grpo_estimator_leaves_rewards_untouched() -> None:
     assert raw == adv == [1.0, 1.0, 0.0, 0.0, 0.5, 0.5]
 
 
-def test_router_trajectory_and_evaluator_strategies_are_opt_in() -> None:
-    # The direct path selects the 'harbor' evaluator and merging builders; the
-    # router strategies are additional registrations, never the default, so a
-    # direct topology cannot accidentally pull in router reward shaping.
-    from polar.trajectory.registry import (
-        default_builder_registry,
-        default_evaluator_registry,
-    )
+def test_direct_launcher_selects_non_router_strategies() -> None:
+    # The load-bearing check: the DIRECT tmax launcher must actually SELECT the
+    # non-router builder/evaluator, so router reward shaping (spilot_harbor) and
+    # the router-policy trajectory builder cannot enter a direct run. A config
+    # edit that pointed the direct path at the router strategies trips this.
+    direct = _load_task_template("tmax_slime_grpo/polar_config.yaml")
+    assert direct["builder"]["strategy"] == "prefix_merging"
+    assert direct["evaluator"]["strategy"] == "harbor"
+    assert direct["builder"]["strategy"] != "router_policy"
+    assert direct["evaluator"]["strategy"] != "spilot_harbor"
 
-    builders = default_builder_registry().list_strategies()
-    evaluators = default_evaluator_registry().list_strategies()
-    # Direct-path strategies still registered.
-    assert "prefix_merging" in builders
-    assert "harbor" in evaluators
-    # Router strategies exist but under separate names (opt-in via topology);
-    # a direct topology never names them, so router reward shaping cannot leak.
-    assert "router_policy" in builders and "router_policy" != "prefix_merging"
-    assert "spilot_harbor" in evaluators and "spilot_harbor" != "harbor"
+
+def test_router_launcher_confines_router_strategies_to_the_router_config() -> None:
+    # The router strategies are selected ONLY by the router launcher — proving
+    # they are opt-in and confined, not a shared default the direct path shares.
+    router = _load_task_template("spilot_router_slime_grpo/polar_config.yaml")
+    assert router["builder"]["strategy"] == "router_policy"
+    assert router["evaluator"]["strategy"] == "spilot_harbor"
+    assert router["agent"]["harness"] == "spilot_router"
