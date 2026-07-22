@@ -36,6 +36,7 @@ SMALL_ROUTER_PORT="${CONTROLLER_V3_SMALL_ROUTER_PORT:-19090}"
 export CONTROLLER_V3_SMALL_ROUTER_BASE_URL="http://${SMALL_NODE}:${SMALL_ROUTER_PORT}/v1"
 READY_FILE="${RUN_DIR}/startup/controller-v3-small-ready"
 PYTHON_BIN="${POLR_TRAIN_VENV}/bin/python3"
+LOCAL_NO_PROXY="0.0.0.0,127.0.0.1,localhost"
 PIDS=()
 
 cleanup_small_workers() {
@@ -99,7 +100,7 @@ if [ "${SLURM_NODEID}" = "${SMALL_NODE_RANK}" ]; then
         first_gpu=$((2 + replica * 2))
         second_gpu=$((first_gpu + 1))
         port=$((SMALL_ROUTER_PORT + 1 + replica))
-        start_group "${RUN_DIR}/controller-v3-small/replica-${replica}.log"             env CUDA_VISIBLE_DEVICES="${first_gpu},${second_gpu}"             PYTHONPATH="${SGLANG_DIR}/python:${PYTHONPATH:-}"             "${PYTHON_BIN}" "${server_args[@]}" --port "${port}"
+        start_group "${RUN_DIR}/controller-v3-small/replica-${replica}.log"             env CUDA_VISIBLE_DEVICES="${first_gpu},${second_gpu}"             NO_PROXY="${LOCAL_NO_PROXY}" no_proxy="${LOCAL_NO_PROXY}"             PYTHONPATH="${SGLANG_DIR}/python:${PYTHONPATH:-}"             "${PYTHON_BIN}" "${server_args[@]}" --port "${port}"
         eval "replica_${replica}_pid=${LAST_PID}"
     done
 
@@ -107,7 +108,7 @@ if [ "${SLURM_NODEID}" = "${SMALL_NODE_RANK}" ]; then
     wait_http "http://127.0.0.1:$((SMALL_ROUTER_PORT + 2))/health_generate"         "small worker 1" "${replica_1_pid}"
     wait_http "http://127.0.0.1:$((SMALL_ROUTER_PORT + 3))/health_generate"         "small worker 2" "${replica_2_pid}"
 
-    start_group "${RUN_DIR}/controller-v3-small/router.log"         env PYTHONPATH="${SGLANG_DIR}/python:${PYTHONPATH:-}"         "${PYTHON_BIN}" -m sglang_router.launch_router         --host 0.0.0.0 --port "${SMALL_ROUTER_PORT}"         --worker-urls         "http://127.0.0.1:$((SMALL_ROUTER_PORT + 1))"         "http://127.0.0.1:$((SMALL_ROUTER_PORT + 2))"         "http://127.0.0.1:$((SMALL_ROUTER_PORT + 3))"         --policy power_of_two         --max-concurrent-requests 48         --queue-size 512         --queue-timeout-secs 600
+    start_group "${RUN_DIR}/controller-v3-small/router.log"         env NO_PROXY="${LOCAL_NO_PROXY}" no_proxy="${LOCAL_NO_PROXY}"         PYTHONPATH="${SGLANG_DIR}/python:${PYTHONPATH:-}"         "${PYTHON_BIN}" -m sglang_router.launch_router         --host 0.0.0.0 --port "${SMALL_ROUTER_PORT}"         --worker-urls         "http://127.0.0.1:$((SMALL_ROUTER_PORT + 1))"         "http://127.0.0.1:$((SMALL_ROUTER_PORT + 2))"         "http://127.0.0.1:$((SMALL_ROUTER_PORT + 3))"         --policy power_of_two         --max-concurrent-requests 48         --queue-size 512         --queue-timeout-secs 600
     router_pid="${LAST_PID}"
     wait_http "http://127.0.0.1:${SMALL_ROUTER_PORT}/health"         "small-worker router" "${router_pid}"
     printf 'ready\n' >"${READY_FILE}.tmp"
