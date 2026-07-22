@@ -113,15 +113,30 @@ def test_non_grpo_estimator_leaves_rewards_untouched() -> None:
 
 
 def test_direct_launcher_selects_non_router_strategies() -> None:
-    # The load-bearing check: the DIRECT tmax launcher must actually SELECT the
-    # non-router builder/evaluator, so router reward shaping (spilot_harbor) and
-    # the router-policy trajectory builder cannot enter a direct run. A config
-    # edit that pointed the direct path at the router strategies trips this.
+    # The load-bearing check, tested along the FULL selection chain: the DIRECT
+    # tmax launcher config picks a strategy NAME, that name resolves through the
+    # real registry to a CLASS, and the class must be the non-router one. This
+    # catches both a config edit (name -> router strategy) and a registry edit
+    # (name -> router class) that would let router reward shaping / the
+    # router-policy builder enter a direct run.
+    from polar.trajectory.registry import (
+        default_builder_registry,
+        default_evaluator_registry,
+    )
+
     direct = _load_task_template("tmax_slime_grpo/polar_config.yaml")
-    assert direct["builder"]["strategy"] == "prefix_merging"
-    assert direct["evaluator"]["strategy"] == "harbor"
-    assert direct["builder"]["strategy"] != "router_policy"
-    assert direct["evaluator"]["strategy"] != "spilot_harbor"
+    builder_name = direct["builder"]["strategy"]
+    evaluator_name = direct["evaluator"]["strategy"]
+    assert builder_name == "prefix_merging"
+    assert evaluator_name == "harbor"
+
+    builder_cls = default_builder_registry()._resolve(builder_name)
+    evaluator_cls = default_evaluator_registry()._resolve(evaluator_name)
+    assert builder_cls.__name__ == "PrefixMergingBuilder"
+    assert evaluator_cls.__name__ == "HarborEvaluator"
+    # Never the router classes.
+    assert builder_cls.__name__ != "RouterPolicyBuilder"
+    assert evaluator_cls.__name__ != "SpilotHarborEvaluator"
 
 
 def test_router_launcher_confines_router_strategies_to_the_router_config() -> None:
