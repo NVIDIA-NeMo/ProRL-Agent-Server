@@ -2789,6 +2789,9 @@ _CANDIDATE_DECOMPOSED_METRICS = {
         "cost_penalty_fraction",
         "cost_penalty_reward_delta",
         "cost_adjusted_reward",
+        "total_latency_seconds",
+        "latency_penalty_fraction",
+        "latency_penalty_reward_delta",
     )
 }
 
@@ -2971,6 +2974,7 @@ class _CandidatePoolHealthAccumulator:
             if actions is not None and not isinstance(actions, list):
                 globally_invalid_sessions.add(session_id)
                 actions = []
+            route_actions_seen = 0
             for action in actions or []:
                 if not isinstance(action, dict) or action.get("valid") is not True:
                     continue
@@ -2983,7 +2987,14 @@ class _CandidatePoolHealthAccumulator:
                     globally_invalid_sessions.add(session_id)
                     unattributed_observation_sessions.add(session_id)
                     continue
-                role = "solve" if action_name == "ROUTE" else "verify"
+                if action_name == "ROUTE":
+                    # Task-level episodes have one ROUTE ("solve"); turn-level
+                    # episodes route every pool call, and every ROUTE after the
+                    # first runs a continuation agent.
+                    role = "solve" if route_actions_seen == 0 else "continue"
+                    route_actions_seen += 1
+                else:
+                    role = "verify"
                 expected_action_calls.append((role, action_slot, action_alias))
 
             evidence: dict[str, dict[str, bool]] = {
@@ -3031,7 +3042,7 @@ class _CandidatePoolHealthAccumulator:
 
                 observed_session_ids.add(session_id)
                 role = str(call.get("role") or "").lower()
-                if role in {"solve", "verify"}:
+                if role in {"solve", "verify", "continue"}:
                     covered_action_keys.add((role, call_slot))
                 else:
                     globally_invalid_sessions.add(session_id)
@@ -4138,6 +4149,18 @@ def generate_rollout_polar_async(
             "polar/spilot_router/cost_adjusted_reward_mean",
             "cost_adjusted_reward_mean",
         ),
+        (
+            "polar/spilot_router/total_latency_seconds_mean",
+            "total_latency_seconds_mean",
+        ),
+        (
+            "polar/spilot_router/latency_penalty_fraction_mean",
+            "latency_penalty_fraction_mean",
+        ),
+        (
+            "polar/spilot_router/latency_penalty_reward_delta_mean",
+            "latency_penalty_reward_delta_mean",
+        ),
     ):
         if source in accepted_quality:
             metrics[f"polar/accepted/{suffix}"] = accepted_quality[source]
@@ -4165,6 +4188,18 @@ def generate_rollout_polar_async(
         (
             "polar/spilot_router/cost_adjusted_reward_mean",
             "rollout/cost_adjusted_reward_mean",
+        ),
+        (
+            "polar/spilot_router/total_latency_seconds_mean",
+            "rollout/total_latency_seconds_mean",
+        ),
+        (
+            "polar/spilot_router/latency_penalty_fraction_mean",
+            "rollout/latency_penalty_fraction_mean",
+        ),
+        (
+            "polar/spilot_router/latency_penalty_reward_delta_mean",
+            "rollout/latency_penalty_reward_delta_mean",
         ),
     ):
         if source in accepted_quality:
@@ -4928,7 +4963,7 @@ def _spilot_router_metrics(
     }
     pool_costs: list[float] = []
     pool_costs_by_candidate: dict[str, list[float]] = {"C0": [], "C1": []}
-    pool_costs_by_role: dict[str, list[float]] = {"solve": [], "verify": []}
+    pool_costs_by_role: dict[str, list[float]] = {"solve": [], "verify": [], "continue": []}
     pool_unattributed_cost = 0.0
     admission_wait_ms_by_candidate: dict[str, list[float]] = {
         "C0": [],
@@ -4954,6 +4989,9 @@ def _spilot_router_metrics(
     total_cost_by_session: dict[str, float] = {}
     cost_penalty_fraction_by_session: dict[str, float] = {}
     cost_penalty_reward_delta_by_session: dict[str, float] = {}
+    total_latency_seconds_by_session: dict[str, float] = {}
+    latency_penalty_fraction_by_session: dict[str, float] = {}
+    latency_penalty_reward_delta_by_session: dict[str, float] = {}
 
     for session_id, metadata in sessions.items():
         admission_enabled = metadata.get("admission_enabled") is True
@@ -5004,6 +5042,22 @@ def _spilot_router_metrics(
             if accuracy_outcome is not None and cost_penalty_fraction is not None:
                 cost_penalty_reward_delta_by_session[session_id] = (
                     accuracy_outcome * cost_penalty_fraction
+                )
+            total_latency_seconds = _optional_nonnegative_finite_float(
+                evaluation.get("total_latency_seconds")
+            )
+            if total_latency_seconds is not None:
+                total_latency_seconds_by_session[session_id] = total_latency_seconds
+            latency_penalty_fraction = _optional_unit_interval_float(
+                evaluation.get("applied_latency_penalty")
+            )
+            if latency_penalty_fraction is not None:
+                latency_penalty_fraction_by_session[session_id] = (
+                    latency_penalty_fraction
+                )
+            if accuracy_outcome is not None and latency_penalty_fraction is not None:
+                latency_penalty_reward_delta_by_session[session_id] = (
+                    accuracy_outcome * latency_penalty_fraction
                 )
 
         candidate_by_slot: dict[str, str] = {}
@@ -5215,6 +5269,9 @@ def _spilot_router_metrics(
         "cost_penalty_fraction": cost_penalty_fraction_by_session,
         "cost_penalty_reward_delta": cost_penalty_reward_delta_by_session,
         "cost_adjusted_reward": session_rewards,
+        "total_latency_seconds": total_latency_seconds_by_session,
+        "latency_penalty_fraction": latency_penalty_fraction_by_session,
+        "latency_penalty_reward_delta": latency_penalty_reward_delta_by_session,
     }
     for metric_name, values_by_session in decomposed_metrics.items():
         values = [

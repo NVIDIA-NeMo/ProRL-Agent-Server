@@ -17,14 +17,18 @@ class SpilotHarborEvaluator(HarborEvaluator):
     explicit harness-validated ``agent_result.metadata.spilot_router.action_valid=true``
     and ``submitted=true`` can retain the verifier reward.
 
-    Cost shaping is disabled by default.  With a positive lambda the reward is
-    success gated::
+    Cost and latency shaping are disabled by default.  With positive lambdas
+    the reward is success gated with a bounded additive penalty::
 
-        shaped = harbor_reward * max(0, 1 - lambda * total_cost / normalizer)
+        cost_frac    = min(1, lambda_c * total_cost / cost_normalizer)
+        latency_frac = min(1, lambda_l * total_latency_s / latency_normalizer)
+        shaped = harbor_reward * (1 - min(1, cost_frac + latency_frac))
 
-    Thus a cheaper failed rollout never outranks a more expensive failed one.
-    Missing or malformed cost metadata fails closed to reward zero only when
-    cost shaping is enabled.
+    Thus a cheaper/faster failed rollout never outranks a more expensive or
+    slower failed one.  Total latency is the sum of ``calls[].duration_ms``
+    from the router metadata, in seconds.  Missing or malformed cost/latency
+    metadata fails closed to reward zero only when the respective shaping
+    term is enabled.
     """
 
     MODE = "spilot_harbor"
@@ -35,6 +39,8 @@ class SpilotHarborEvaluator(HarborEvaluator):
         require_valid_action: bool = True,
         cost_penalty_lambda: float = 0.0,
         cost_normalizer: float = 1.0,
+        latency_penalty_lambda: float = 0.0,
+        latency_normalizer: float = 1.0,
         **harbor_config: Any,
     ) -> None:
         if not isinstance(require_valid_action, bool):
@@ -42,10 +48,19 @@ class SpilotHarborEvaluator(HarborEvaluator):
         self.require_valid_action = require_valid_action
         self.cost_penalty_lambda = float(cost_penalty_lambda)
         self.cost_normalizer = float(cost_normalizer)
+        self.latency_penalty_lambda = float(latency_penalty_lambda)
+        self.latency_normalizer = float(latency_normalizer)
         if not math.isfinite(self.cost_penalty_lambda) or self.cost_penalty_lambda < 0:
             raise ValueError("cost_penalty_lambda must be finite and non-negative")
         if not math.isfinite(self.cost_normalizer) or self.cost_normalizer <= 0:
             raise ValueError("cost_normalizer must be finite and greater than zero")
+        if (
+            not math.isfinite(self.latency_penalty_lambda)
+            or self.latency_penalty_lambda < 0
+        ):
+            raise ValueError("latency_penalty_lambda must be finite and non-negative")
+        if not math.isfinite(self.latency_normalizer) or self.latency_normalizer <= 0:
+            raise ValueError("latency_normalizer must be finite and greater than zero")
         super().__init__(**harbor_config)
 
     async def evaluate(self, trajectory: Trajectory, **runtime: Any) -> EvalResult:
@@ -74,7 +89,11 @@ class SpilotHarborEvaluator(HarborEvaluator):
         total_cost, cost_valid = _nonnegative_finite_float(
             router_metadata.get("total_cost")
         )
+        total_latency_seconds, latency_valid = _total_call_latency_seconds(
+            router_metadata.get("calls")
+        )
         applied_cost_penalty = 0.0
+        applied_latency_penalty = 0.0
         if shaped_reward > 0.0 and self.cost_penalty_lambda > 0.0:
             if not cost_valid:
                 shaped_reward = 0.0
@@ -84,7 +103,22 @@ class SpilotHarborEvaluator(HarborEvaluator):
                     1.0,
                     self.cost_penalty_lambda * total_cost / self.cost_normalizer,
                 )
-                shaped_reward *= 1.0 - applied_cost_penalty
+        if shaped_reward > 0.0 and self.latency_penalty_lambda > 0.0:
+            if not latency_valid:
+                shaped_reward = 0.0
+                invalid_reason = "missing_or_invalid_total_latency"
+            else:
+                applied_latency_penalty = min(
+                    1.0,
+                    self.latency_penalty_lambda
+                    * total_latency_seconds
+                    / self.latency_normalizer,
+                )
+        applied_total_penalty = min(
+            1.0, applied_cost_penalty + applied_latency_penalty
+        )
+        if shaped_reward > 0.0 and applied_total_penalty > 0.0:
+            shaped_reward *= 1.0 - applied_total_penalty
 
         metadata = dict(harbor_result.metadata)
         metadata.update(
@@ -108,6 +142,14 @@ class SpilotHarborEvaluator(HarborEvaluator):
                 "total_cost": total_cost if cost_valid else None,
                 "total_cost_valid": cost_valid,
                 "applied_cost_penalty": applied_cost_penalty,
+                "latency_penalty_lambda": self.latency_penalty_lambda,
+                "latency_normalizer": self.latency_normalizer,
+                "total_latency_seconds": (
+                    total_latency_seconds if latency_valid else None
+                ),
+                "total_latency_valid": latency_valid,
+                "applied_latency_penalty": applied_latency_penalty,
+                "applied_total_penalty": applied_total_penalty,
             }
         )
         if invalid_reason is not None:
@@ -130,6 +172,26 @@ def _router_metadata(agent_result: Any) -> dict[str, Any]:
         return {}
     router_metadata = agent_metadata.get("spilot_router")
     return router_metadata if isinstance(router_metadata, dict) else {}
+
+
+def _total_call_latency_seconds(calls: Any) -> tuple[float, bool]:
+    """Sum ``duration_ms`` across router calls, in seconds.
+
+    Fails closed (valid=False) when the calls list is missing/empty or any
+    entry lacks a finite non-negative ``duration_ms`` — mirroring the strict
+    total_cost semantics so a latency-shaped run never silently under-counts.
+    """
+    if not isinstance(calls, list) or not calls:
+        return 0.0, False
+    total_ms = 0.0
+    for call in calls:
+        if not isinstance(call, dict):
+            return 0.0, False
+        duration_ms, valid = _nonnegative_finite_float(call.get("duration_ms"))
+        if not valid:
+            return 0.0, False
+        total_ms += duration_ms
+    return total_ms / 1000.0, True
 
 
 def _nonnegative_finite_float(value: Any) -> tuple[float, bool]:
