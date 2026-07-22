@@ -1231,10 +1231,10 @@ _polar_load_export_from_zshrc() {
     local name="$1"
     local line value
     if [ -n "${!name:-}" ] || [ ! -f "$HOME/.zshrc" ]; then
-        return
+        return 0
     fi
     line="$(grep -E "^export ${name}=" "$HOME/.zshrc" 2>/dev/null | tail -n 1 || true)"
-    [ -n "$line" ] || return
+    [ -n "$line" ] || return 0
     value="${line#export ${name}=}"
     eval "export ${name}=${value}"
 }
