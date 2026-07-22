@@ -59,6 +59,8 @@ export MINI_SWE_AGENT_SPEC="mini-swe-agent==2.4.0"
 export POLR_TRAIN_VENV="${POLR_TRAIN_VENV:-${_CONTROLLER_V3_USER_ROOT}/projects/slime/.venv-cu13}"
 export SLIME_DIR="${SLIME_DIR:-${_CONTROLLER_V3_ROOT}/../slime}"
 export POLR_TRAIN_SQSH="${POLR_TRAIN_SQSH:-/lustre/fsw/portfolios/nvr/projects/nvr_lpr_llm/users/gheinrich/container-images/pytorch-25.10-py3.sqsh}"
+export MEGATRON_DIR="${MEGATRON_DIR:-${_CONTROLLER_V3_USER_ROOT}/scratch/Megatron-LM}"
+export SGLANG_DIR="${SGLANG_DIR:-${_CONTROLLER_V3_USER_ROOT}/scratch/sglang}"
 
 export TMAX_DATASET_DIR="${TMAX_DATASET_DIR:-${_CONTROLLER_V3_USER_ROOT}/data/training_data/tmax/tmax-15k}"
 export TMAX_OPEN_INSTRUCT_DIR="${TMAX_OPEN_INSTRUCT_DIR:-${_CONTROLLER_V3_USER_ROOT}/data/training_data/tmax/tmax-15k-open-instruct}"
