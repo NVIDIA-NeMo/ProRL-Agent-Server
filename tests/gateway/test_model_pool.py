@@ -545,6 +545,98 @@ async def test_pool_alias_uses_host_auth_and_is_not_persisted(
 
 
 @pytest.mark.asyncio
+async def test_pool_alias_forwards_native_responses_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    forwarded: list[dict] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/responses"
+        assert request.headers["authorization"] == "Bearer host-nvidia-secret"
+        body = json.loads(request.content)
+        forwarded.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "id": "response-id",
+                "object": "response",
+                "model": "openai/openai/gpt-5.6-luna",
+                "output": [],
+            },
+        )
+
+    pool_client = InferenceClient(
+        "https://nvidia.example/v1",
+        OpenAICompatibleEngine(),
+        default_headers={"Authorization": "Bearer host-nvidia-secret"},
+    )
+    pool_client._client = httpx.AsyncClient(
+        base_url="https://nvidia.example/v1",
+        transport=httpx.MockTransport(upstream),
+    )
+
+    class Storage:
+        def save_message(self, *args, **kwargs) -> None:
+            raise AssertionError("pool responses must not enter SessionStore")
+
+    registry = SessionRegistry()
+    registry.register(
+        "sandbox-session",
+        registered=True,
+        status=SessionStatus.RUNNING,
+    )
+    capability = registry.issue_capability(
+        "sandbox-session",
+        scope=MODEL_POOL_CAPABILITY_SCOPE,
+    )
+    state = SimpleNamespace(
+        inference=object(),
+        model_pool={
+            "pool/gpt-5.6-luna": server.ModelPoolRoute(
+                model="openai/openai/gpt-5.6-luna",
+                inference=pool_client,
+            )
+        },
+        storage=Storage(),
+        node=SimpleNamespace(model_served="local-router-policy"),
+        transform_manager=TransformManager(),
+        session_registry=registry,
+    )
+    monkeypatch.setattr(server, "get_state", lambda: state)
+
+    try:
+        response = await server.proxy_request(
+            _request(
+                "/v1/responses",
+                {
+                    "model": "pool/gpt-5.6-luna",
+                    "input": [{"role": "user", "content": "fix it"}],
+                    "tools": [{"type": "function", "name": "bash"}],
+                    "reasoning": {"effort": "max"},
+                    "max_output_tokens": 65536,
+                },
+                authorization=f"Bearer {capability}",
+            ),
+            "v1/responses",
+        )
+    finally:
+        await pool_client.close()
+
+    assert response.status_code == 200
+    assert orjson.loads(response.body)["model"] == "pool/gpt-5.6-luna"
+    assert forwarded == [
+        {
+            "model": "openai/openai/gpt-5.6-luna",
+            "input": [{"role": "user", "content": "fix it"}],
+            "tools": [{"type": "function", "name": "bash"}],
+            "reasoning": {"effort": "max"},
+            "max_output_tokens": 65536,
+            "stream": False,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_unknown_pool_alias_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     registry = SessionRegistry()
     registry.register(
