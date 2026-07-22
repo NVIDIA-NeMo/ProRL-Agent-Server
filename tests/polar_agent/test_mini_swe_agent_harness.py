@@ -230,6 +230,51 @@ def test_tmax_launch_contract_accepts_vanillux2() -> None:
     assert "config/vanillux2.yaml" in submit_script
 
 
+def _run_preflight_fragment(tmp_path: Path, *, probe_exit: int) -> "subprocess.CompletedProcess[str]":
+    import subprocess
+
+    runtime = tmp_path / "runtime"
+    (runtime / "bin").mkdir(parents=True)
+    (runtime / "venv" / "bin").mkdir(parents=True)
+    fake_agent = runtime / "bin" / "mini-swe-agent"
+    fake_agent.write_text("#!/usr/bin/env bash\necho AGENT-RAN\n")
+    fake_agent.chmod(0o755)
+    fake_python = runtime / "venv" / "bin" / "python"
+    fake_python.write_text(f"#!/usr/bin/env bash\nexit {probe_exit}\n")
+    fake_python.chmod(0o755)
+
+    harness = MiniSweAgentHarness(
+        AgentSpec(harness="mini_swe_agent", model_name="m", settings={})
+    )
+    command = harness.run_steps("do the task")[0].command
+    # Neutralize pieces that need the real session/gateway environment.
+    command = command.replace('export OPENAI_API_BASE="$OPENAI_BASE_URL" && ', "")
+    command = command.replace('export PATH="$HOME/.local/bin:$PATH" && ', "")
+    command = command.split("2>&1 | tee", 1)[0]
+    return subprocess.run(
+        ["bash", "-c", command],
+        env={"PATH": f"{runtime / 'bin'}:/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_mini_swe_task_protocol_preflight_blocks_stale_runtimes(tmp_path: Path) -> None:
+    # A runtime whose runner lacks _inject_task_from_env would run every
+    # session with an empty task (zero-trace training); the harness must
+    # refuse it loudly instead.
+    result = _run_preflight_fragment(tmp_path, probe_exit=64)
+    assert result.returncode == 64
+    assert "POLAR_MINI_SWE_TASK_B64 task protocol" in result.stderr
+    assert "AGENT-RAN" not in result.stdout
+
+
+def test_mini_swe_task_protocol_preflight_passes_current_runtimes(tmp_path: Path) -> None:
+    result = _run_preflight_fragment(tmp_path, probe_exit=0)
+    assert result.returncode == 0
+    assert "AGENT-RAN" in result.stdout
+
+
 def test_mini_swe_postprocess_aggregates_fixed_categories(tmp_path: Path) -> None:
     timing_path = tmp_path / "logs" / "agent" / "mini-swe-command-timing.jsonl"
     timing_path.parent.mkdir(parents=True)

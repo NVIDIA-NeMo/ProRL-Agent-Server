@@ -134,6 +134,19 @@ class MiniSweAgentHarness(BaseHarness):
                     'export PATH="$HOME/.local/bin:$PATH" && '
                     # LiteLLM reads OPENAI_API_BASE; the gateway only sets OPENAI_BASE_URL.
                     'export OPENAI_API_BASE="$OPENAI_BASE_URL" && '
+                    # Fail-closed protocol preflight: the task now travels in
+                    # POLAR_MINI_SWE_TASK_B64, and a runtime built before that
+                    # protocol silently runs every session with an EMPTY task
+                    # (observed as zero-trace training on cont300, 2026-07-20).
+                    # Refuse to start against such a runtime.
+                    '_mswea_root="$(cd "$(dirname "$(command -v mini-swe-agent)")/.." && pwd)" && '
+                    'if ! "${_mswea_root}/venv/bin/python" -c '
+                    "'import sys, polar_mini_swe_runner as r; "
+                    "sys.exit(0 if hasattr(r, \"_inject_task_from_env\") else 64)'; then "
+                    'echo "FATAL: mini-SWE runtime at ${_mswea_root} predates the '
+                    "POLAR_MINI_SWE_TASK_B64 task protocol; rebuild it with "
+                    'prepare_mini_swe_agent.sh (a stale runtime trains on empty tasks)" >&2; '
+                    "exit 64; fi && "
                     f"mini-swe-agent {flags_str} "
                     f"2>&1 | tee {RUNTIME_AGENT_LOG_DIR}/mini-swe-agent.txt"
                 ),
