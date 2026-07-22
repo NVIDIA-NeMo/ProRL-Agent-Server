@@ -1846,7 +1846,7 @@ PY
     # register with it and retain their node-local sandbox/UDS lifecycle.
     export SLIME_ROLLOUT_SERVICE_START_UNIX_NS="$(date +%s%N)"
     echo "=== Starting Polar rollout server (${POLAR_ROLLOUT_URL}) ==="
-    polar serve_rollout -c "${TOPOLOGY_PATH}" &
+    "${PYTHON_BIN}" -m polar.cli serve_rollout -c "${TOPOLOGY_PATH}" &
     POLAR_ROLLOUT_PID=$!
     PIDS+=("${POLAR_ROLLOUT_PID}")
     wait_http_ok "Polar rollout server" "${POLAR_ROLLOUT_LOCAL_URL}/health" 60
