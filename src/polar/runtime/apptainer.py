@@ -456,12 +456,6 @@ class ApptainerRuntime(BaseRuntime):
             self._broker_dir / self._protected_broker_socket_name
         )
         self._protected_broker_identity: tuple[int, int] | None = None
-        # Recovery is forbidden only after a protected SECRET has actually been
-        # delivered through this broker (exec_protected — the SPilot capability
-        # path). Startup pinning alone does not forbid it, so a persistent
-        # broker that only ran plain exec (direct training's default) stays
-        # recoverable across a supervisor restart, as it was pre-router.
-        self._protected_broker_secret_delivered = False
         self._known_runtime_sessions: set[int] = set()
         self._broker_log = self._broker_dir / _BROKER_LOG_NAME
         self._broker_interpreter_file = self._broker_dir / _BROKER_INTERPRETER_NAME
@@ -840,17 +834,14 @@ class ApptainerRuntime(BaseRuntime):
         restart budget; this host-side lock only coalesces concurrent waiters.
         """
 
-        if self._protected_broker_secret_delivered:
-            # A secret was delivered to this control plane; accepting a
+        if self._protected_broker_identity is not None:
+            # Once the secret-bearing control plane is pinned, accepting a
             # replacement same-UID process would make its identity ambiguous.
             # The session must be torn down instead of recovering or replaying.
             self._broker_recovery_failure_count += 1
             raise RuntimeError(
                 "protected Apptainer broker identity changed; recovery is forbidden"
             ) from error
-        # No secret delivered yet: the fresh broker child will be re-pinned by
-        # _wait_for_broker_ready's secure_pin, so drop the stale identity.
-        self._protected_broker_identity = None
 
         recovery_count_before = self._broker_recovery_count
         async with self._broker_recovery_lock:
@@ -1567,10 +1558,6 @@ class ApptainerRuntime(BaseRuntime):
             "file_digests": dict(protected_file_digests),
             "timeout_sec": timeout_sec,
         }
-        # From here on a replacement broker of the same UID could impersonate
-        # a control plane that has seen this secret, so recovery must fail
-        # closed for the rest of the session.
-        self._protected_broker_secret_delivered = True
         try:
             return await self._broker_exec_request(
                 request_id,

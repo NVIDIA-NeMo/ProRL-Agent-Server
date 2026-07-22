@@ -452,22 +452,17 @@ def test_direct_broker_preserves_background_processes_and_recovers_after_timeout
     asyncio.run(scenario())
 
 
-def test_secret_bearing_broker_is_hidden_from_pkill_and_rejects_recovery(
+def test_pinned_broker_identity_survives_python_pkill_and_rejects_recovery(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Once a protected secret is delivered, the broker is never replaced."""
+    """A pinned secret broker is hidden from pkill and never replaced."""
 
     runtime = _local_broker_runtime(monkeypatch, tmp_path)
 
     async def scenario() -> None:
         await runtime.start()
         try:
-            # Simulate that a protected capability was delivered through this
-            # broker (the SPilot exec_protected path); recovery must now fail
-            # closed even though the crash is otherwise survivable.
-            runtime._protected_broker_secret_delivered = True  # noqa: SLF001
-
             broker_pid_path = runtime._broker_dir / "broker.pid"  # noqa: SLF001
             original_pid = int(broker_pid_path.read_text())
             command_line, process_name = _process_identity(original_pid)
@@ -486,40 +481,6 @@ def test_secret_bearing_broker_is_hidden_from_pkill_and_rejects_recovery(
             assert summary["broker_recovery_count"] == 0
             assert summary["broker_recovery_failure_count"] == 1
             assert summary["broker_preflight_failure_count"] >= 1
-        finally:
-            await runtime.stop()
-
-    asyncio.run(scenario())
-
-
-def test_plain_exec_broker_recovers_after_kill(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """A broker that only ran plain exec (direct training) is recoverable."""
-
-    runtime = _local_broker_runtime(monkeypatch, tmp_path)
-
-    async def scenario() -> None:
-        await runtime.start()
-        try:
-            # No protected secret was ever delivered.
-            assert runtime._protected_broker_secret_delivered is False  # noqa: SLF001
-            original_pid = int(
-                (runtime._broker_dir / "broker.pid").read_text()  # noqa: SLF001
-            )
-
-            os.kill(original_pid, signal.SIGKILL)
-            recovered = await runtime.exec("echo recovered")
-            assert recovered.return_code == 0
-            assert recovered.stdout == "recovered\n"
-
-            summary = runtime.exec_timing_summary()
-            assert summary["broker_recovery_count"] >= 1
-            # The fresh broker child is re-pinned, not the killed identity.
-            assert int(
-                (runtime._broker_dir / "broker.pid").read_text()  # noqa: SLF001
-            ) != original_pid
         finally:
             await runtime.stop()
 
@@ -622,9 +583,6 @@ def test_command_that_kills_pinned_control_broker_fails_closed(
     async def scenario() -> None:
         await runtime.start()
         try:
-            # A secret-bearing control broker (SPilot capability delivered)
-            # must not be recovered if a task command kills it.
-            runtime._protected_broker_secret_delivered = True  # noqa: SLF001
             broker_pid = runtime._broker_dir / "broker.pid"  # noqa: SLF001
             with pytest.raises(RuntimeError, match="identity changed.*forbidden"):
                 await runtime.exec(
