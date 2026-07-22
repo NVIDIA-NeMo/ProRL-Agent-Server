@@ -61,6 +61,12 @@ export SLIME_DIR="${SLIME_DIR:-${_CONTROLLER_V3_ROOT}/../slime}"
 export POLR_TRAIN_SQSH="${POLR_TRAIN_SQSH:-/lustre/fsw/portfolios/nvr/projects/nvr_lpr_llm/users/gheinrich/container-images/pytorch-25.10-py3.sqsh}"
 export MEGATRON_DIR="${MEGATRON_DIR:-${_CONTROLLER_V3_USER_ROOT}/scratch/Megatron-LM}"
 export SGLANG_DIR="${SGLANG_DIR:-${_CONTROLLER_V3_USER_ROOT}/scratch/sglang}"
+_CONTROLLER_V3_PYTHON_LINK="$(readlink -- "${POLR_TRAIN_VENV}/bin/python")"
+_CONTROLLER_V3_PYTHON_TARGET_ROOT="$(dirname -- "$(dirname -- "${_CONTROLLER_V3_PYTHON_LINK}")")"
+_CONTROLLER_V3_PYTHON_SOURCE_ROOT="$(realpath -e -- "${_CONTROLLER_V3_PYTHON_TARGET_ROOT}")"
+export TRAIN_CONTAINER_MOUNTS="${TRAIN_CONTAINER_MOUNTS:-/lustre/fsw:/lustre/fsw,${_CONTROLLER_V3_PYTHON_SOURCE_ROOT}:${_CONTROLLER_V3_PYTHON_TARGET_ROOT}:ro}"
+unset _CONTROLLER_V3_PYTHON_LINK _CONTROLLER_V3_PYTHON_TARGET_ROOT
+unset _CONTROLLER_V3_PYTHON_SOURCE_ROOT
 
 export TMAX_DATASET_DIR="${TMAX_DATASET_DIR:-${_CONTROLLER_V3_USER_ROOT}/data/training_data/tmax/tmax-15k}"
 export TMAX_OPEN_INSTRUCT_DIR="${TMAX_OPEN_INSTRUCT_DIR:-${_CONTROLLER_V3_USER_ROOT}/data/training_data/tmax/tmax-15k-open-instruct}"
