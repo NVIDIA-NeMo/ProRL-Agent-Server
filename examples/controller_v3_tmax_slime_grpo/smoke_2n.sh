@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 export NUM_NODES=2
 export ACTOR_NUM_NODES=1
+export ACTOR_TENSOR_MODEL_PARALLEL_SIZE=8
 export PARTITION=interactive
 export WALL_TIME=04:00:00
 export TMAX_MIN_WALL_TIME=04:00:00
