@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 
-_SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "backfill_spilot_decomposed_metrics.py"
+_SCRIPT_PATH = Path(__file__).parents[2] / "scripts" / "backfill_spilot_decomposed_metrics.py"
 _SPEC = importlib.util.spec_from_file_location("backfill_spilot_decomposed_metrics", _SCRIPT_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 backfill = importlib.util.module_from_spec(_SPEC)

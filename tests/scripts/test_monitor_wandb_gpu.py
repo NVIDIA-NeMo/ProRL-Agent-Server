@@ -7,7 +7,7 @@ import threading
 import pytest
 
 
-_SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "monitor_wandb_gpu.py"
+_SCRIPT_PATH = Path(__file__).parents[2] / "scripts" / "monitor_wandb_gpu.py"
 _SPEC = importlib.util.spec_from_file_location("monitor_wandb_gpu", _SCRIPT_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 monitor_wandb_gpu = importlib.util.module_from_spec(_SPEC)
