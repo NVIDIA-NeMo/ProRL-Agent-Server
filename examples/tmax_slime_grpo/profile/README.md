@@ -58,11 +58,15 @@ available to the strict summary even with evaluation disabled. It rechecks the
 file before submitting every arm.
 
 All default arms use `POLAR_MIN_COMPLETE_ACCEPT_FRACTION=0.5`, grace 2, and a
-32,768-token dynamic trainer cap. Since a valid TMax trajectory can still be a
-complete 67,584-token pack, oversize individual samples are admitted alone;
-the lower cap limits aggregate microbatch pressure without truncating the task.
-The submission also carries the sanctioned four-hour idle-GPU reaper exemption.
-Do not use `watch_training.sh` for these runs.
+24,576-token dynamic trainer cap. Oversize trajectories are not admitted above
+that cap: the bridge preserves the complete prompt and keeps the longest exact
+causal response prefix that fits, including the aligned rollout log-probability
+prefix. This conservative Qwen3.5-9B cap is shared by all arms because a 32K
+singleton reached the H100 physical-memory ceiling during collocated backward.
+It makes the memory contract identical across topologies instead of
+letting one long sample consume an unbounded microbatch. The submission also
+carries the sanctioned four-hour idle-GPU reaper exemption. Do not use
+`watch_training.sh` for these runs.
 
 `collocate-32shared` is statically valid but has not yet been demonstrated for
 the 9B TMax workload. For a lower-risk first launch, submit it alone with
@@ -106,20 +110,36 @@ report. Both default to `ACCOUNT`, then `SBATCH_ACCOUNT`, then `nvr_lpr_llm`.
 For example, prefix either command with `MONITOR_ACCOUNT=my_account` or
 `REPORT_ACCOUNT=my_account`.
 
-Schedule the self-contained HTML report after the last TMax arm with:
+After all eight allocations are terminal, capture Slurm allocation evidence
+for both manifests:
 
 ```bash
-POLAR_DATA_ROOT=/abs/data \
-bash examples/tmax_slime_grpo/profile/submit_report.sh \
-  129 /abs/spilot/manifest.tsv /abs/tmax/manifest.tsv /abs/report
+python examples/tmax_slime_grpo/profile/capture_slurm_terminal_evidence.py \
+  --manifest /abs/spilot/manifest.tsv \
+  --manifest /abs/tmax/manifest.tsv \
+  --output /abs/report/slurm-accounting-capture.json
+```
+
+Then build the strict bundle directly (no scheduler dependency is required):
+
+```bash
+python examples/tmax_slime_grpo/profile/run_profile_report.py \
+  --data-root /abs/data \
+  --log-root /abs/data/logs/slurm \
+  --spilot-manifest /abs/spilot/manifest.tsv \
+  --tmax-manifest /abs/tmax/manifest.tsv \
+  --slurm-terminal-evidence /abs/report/slurm-accounting-capture.json \
+  --output-dir /abs/report \
+  --expected-steps 3 --warmup-steps 1 --log-timezone UTC
 ```
 
 The report bundle contains HTML and Markdown reports, the strict analysis
 JSON, both suite summaries, and arm/GPU-role audit CSVs. An arm is ranked only
-when the Ray job succeeded, all expected train and rollout step records are
-present, strict trainable-session provenance exists, and the model/checkpoint/
-data/batch/code fingerprint is consistent within its suite. SPilot Router and
-TMax remain separate workload blocks; their raw rates are never pooled.
+when both Ray and Slurm report successful terminal states, all expected train
+and rollout step records are present, strict trainable-session provenance
+exists, and the model/checkpoint/data/batch/code fingerprint is consistent
+within its suite. SPilot Router and TMax remain separate workload blocks; their
+raw rates are never pooled.
 
 `REPORT_COMPLETE` is written only when each manifest contains exactly the
 four comparison arms (SPilot async depth 3, TMax async depth 4, plus each
@@ -133,4 +153,5 @@ With three optimizer steps, only two intervals remain after warmup. Treat the
 result as a directional systems recommendation, not a statistically
 significant training-quality result. Rank both steady steps/hour and accepted
 sessions per allocated GPU-hour; never call the 40-GPU arm optimal from raw
-wall throughput alone.
+wall throughput alone. For a final decision, collect at least six post-warmup
+optimizer steps in each of at least two independent repeats.

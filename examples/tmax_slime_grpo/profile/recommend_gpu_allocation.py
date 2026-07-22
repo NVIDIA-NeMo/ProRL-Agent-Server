@@ -32,6 +32,10 @@ COMPARABILITY_FIELDS = (
     "harness",
     "rollout_batch_size",
     "samples_per_prompt",
+    "context_parallel_size",
+    "max_tokens_per_gpu",
+    "allow_single_sample_over_token_cap",
+    "optimizer_cpu_offload",
     "min_complete_accept_fraction",
     "early_stop_grace_sessions",
 )
@@ -42,6 +46,10 @@ CROSS_SUITE_INVARIANTS = (
     "global_batch_size",
     "rollout_batch_size",
     "samples_per_prompt",
+    "context_parallel_size",
+    "max_tokens_per_gpu",
+    "allow_single_sample_over_token_cap",
+    "optimizer_cpu_offload",
     "min_complete_accept_fraction",
     "early_stop_grace_sessions",
 )
@@ -154,7 +162,12 @@ def _validate_comparability(
         else:
             normalized[key] = revision.lower()
 
-    for key in ("rollout_batch_size", "samples_per_prompt"):
+    for key in (
+        "rollout_batch_size",
+        "samples_per_prompt",
+        "context_parallel_size",
+        "max_tokens_per_gpu",
+    ):
         value = _integer(raw.get(key))
         if value is None or value <= 0:
             reasons.append(f"comparability.{key} is not a positive integer")
@@ -162,6 +175,18 @@ def _validate_comparability(
             normalized[key] = value
             config_value = _integer(config.get(key))
             if config_value != value:
+                reasons.append(f"config.{key} does not match comparability.{key}")
+
+    for key in (
+        "allow_single_sample_over_token_cap",
+        "optimizer_cpu_offload",
+    ):
+        value = raw.get(key)
+        if not isinstance(value, bool):
+            reasons.append(f"comparability.{key} is not a boolean")
+        else:
+            normalized[key] = value
+            if config.get(key) != value:
                 reasons.append(f"config.{key} does not match comparability.{key}")
 
     early_stop_grace = _integer(raw.get("early_stop_grace_sessions"))

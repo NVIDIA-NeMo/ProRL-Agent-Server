@@ -51,13 +51,28 @@ def test_tmax_profile_is_checkpoint_free_and_isolated() -> None:
     assert "TMAX_AGENT_HARNESS=mini_swe_agent" in launcher
     assert "TMAX_EVAL_ENABLED=0" in launcher
     assert 'run_id="tmax-prof-${canonical_arm}-r${repeat}-${PROFILE_ID}"' in launcher
-    assert 'PROFILE_AFTER_JOB_ID' in launcher
+    assert "PROFILE_AFTER_JOB_ID" in launcher
+    assert 'PROFILE_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP:-0' in launcher
+
+
+def test_tmax_profile_enforces_the_safe_per_sample_token_cap() -> None:
+    launcher = (PROFILE / "submit_profile.sh").read_text()
+    polar_config = (ROOT / "examples" / "tmax_slime_grpo" / "polar_config.yaml").read_text()
+
+    assert 'PROFILE_MAX_TOKENS_PER_GPU="${PROFILE_MAX_TOKENS_PER_GPU:-24576}"' in launcher
+    assert 'TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP="${PROFILE_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP}"' in launcher
+    assert (
+        "polar_allow_single_sample_over_token_cap: ${TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP}"
+    ) in polar_config
 
 
 def test_profile_monitor_is_a_serial_cpu_relay() -> None:
     launcher = (PROFILE / "submit_monitor.sh").read_text()
     assert "MONITOR_PARTITION:-cpu_short" in launcher
-    assert 'MONITOR_ACCOUNT="${MONITOR_ACCOUNT:-${ACCOUNT:-${SBATCH_ACCOUNT:-nvr_lpr_llm}}}"' in launcher
+    assert (
+        'MONITOR_ACCOUNT="${MONITOR_ACCOUNT:-${ACCOUNT:-${SBATCH_ACCOUNT:-nvr_lpr_llm}}}"'
+        in launcher
+    )
     assert '--account="${MONITOR_ACCOUNT}"' in launcher
     assert 'dependency_args=(--dependency="afterany:${previous_job_id}")' in launcher
     assert "monitor_profile.py" in launcher
@@ -68,7 +83,10 @@ def test_profile_monitor_is_a_serial_cpu_relay() -> None:
 
 def test_profile_report_is_chained_after_all_gpu_arms() -> None:
     launcher = (PROFILE / "submit_report.sh").read_text()
-    assert 'REPORT_ACCOUNT="${REPORT_ACCOUNT:-${ACCOUNT:-${SBATCH_ACCOUNT:-nvr_lpr_llm}}}"' in launcher
+    assert (
+        'REPORT_ACCOUNT="${REPORT_ACCOUNT:-${ACCOUNT:-${SBATCH_ACCOUNT:-nvr_lpr_llm}}}"'
+        in launcher
+    )
     assert '--account="${REPORT_ACCOUNT}"' in launcher
     assert '--dependency="afterany:${after_job_id}"' in launcher
     assert "run_profile_report.py" in launcher
@@ -178,16 +196,10 @@ def test_tmax_profile_replaces_stale_model_and_data_environment(tmp_path: Path) 
 
     assert result.returncode == 0, result.stderr
     submitted = dict(
-        line.split("=", 1)
-        for line in captured_env.read_text().splitlines()
-        if "=" in line
+        line.split("=", 1) for line in captured_env.read_text().splitlines() if "=" in line
     )
-    assert submitted["HF_CHECKPOINT"] == str(
-        data_root / "checkpoints" / "Qwen3.5-9B"
-    )
-    assert submitted["REF_LOAD"] == str(
-        data_root / "checkpoints" / "Qwen3.5-9B_torch_dist"
-    )
+    assert submitted["HF_CHECKPOINT"] == str(data_root / "checkpoints" / "Qwen3.5-9B")
+    assert submitted["REF_LOAD"] == str(data_root / "checkpoints" / "Qwen3.5-9B_torch_dist")
     assert submitted["TORCH_DIST_DIR"] == submitted["REF_LOAD"]
     assert submitted["MODEL_ARGS_FILE"] == str(
         ROOT / "examples" / "tmax_slime_grpo" / "model_args.sh"

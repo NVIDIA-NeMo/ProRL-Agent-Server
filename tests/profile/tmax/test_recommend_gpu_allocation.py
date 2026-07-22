@@ -7,7 +7,7 @@ import sys
 import pytest
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "examples" / "tmax_slime_grpo" / "profile"))
 import recommend_gpu_allocation as recommendation  # noqa: E402
 
 
@@ -28,6 +28,10 @@ def _comparability(
         "harness": harness,
         "rollout_batch_size": 8,
         "samples_per_prompt": 32,
+        "context_parallel_size": 1,
+        "max_tokens_per_gpu": 32768,
+        "allow_single_sample_over_token_cap": False,
+        "optimizer_cpu_offload": False,
         "min_complete_accept_fraction": 1.0,
         "early_stop_grace_sessions": 64,
     }
@@ -87,6 +91,12 @@ def _job(
             "global_batch_size": contract["global_batch_size"],
             "rollout_batch_size": contract["rollout_batch_size"],
             "samples_per_prompt": contract["samples_per_prompt"],
+            "context_parallel_size": contract["context_parallel_size"],
+            "max_tokens_per_gpu": contract["max_tokens_per_gpu"],
+            "allow_single_sample_over_token_cap": contract[
+                "allow_single_sample_over_token_cap"
+            ],
+            "optimizer_cpu_offload": contract["optimizer_cpu_offload"],
             "min_complete_accept_fraction": contract[
                 "min_complete_accept_fraction"
             ],
@@ -216,6 +226,42 @@ def test_terminal_success_and_comparability_fingerprint_are_required(
     assert "comparability fingerprint does not match its fields" in rows[1][
         "exclusion_reasons"
     ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("context_parallel_size", 2),
+        ("max_tokens_per_gpu", 67584),
+        ("allow_single_sample_over_token_cap", True),
+        ("optimizer_cpu_offload", True),
+    ],
+)
+def test_memory_contract_mismatch_blocks_suite_ranking(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    baseline = _job("baseline", 16, 16, 32, 10.0)
+    changed_contract = _comparability()
+    changed_contract[field] = value
+    changed_contract["fingerprint"] = recommendation.comparability_fingerprint(
+        changed_contract
+    )
+    changed = _job(
+        "changed",
+        8,
+        24,
+        32,
+        11.0,
+        comparability=changed_contract,
+    )
+
+    analysis = recommendation.build_analysis(
+        [("suite", _summary(tmp_path, field, [baseline, changed]))],
+        expected_steps=6,
+        warmup_steps=1,
+    )
+
+    assert analysis["suites"][0]["status"] == "inconclusive"
 
 
 def test_suite_fingerprint_mismatch_blocks_ranking(tmp_path: Path) -> None:

@@ -40,7 +40,8 @@ Useful environment overrides:
   PROFILE_TORCH_DIST_DIR=/abs/ckpt
   PROFILE_MODEL_ARGS_FILE=/abs/model_args.sh
   PROFILE_AGENT_MODEL_NAME=Qwen/Qwen3.5-9B
-  PROFILE_MAX_TOKENS_PER_GPU=32768
+  PROFILE_MAX_TOKENS_PER_GPU=24576
+  PROFILE_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP=0
   PROFILE_MIN_COMPLETE_ACCEPT_FRACTION=0.5
   PROFILE_EARLY_STOP_GRACE_SESSIONS=2
   PROFILE_PARTITION=backfill,batch
@@ -139,7 +140,8 @@ PROFILE_ID="${PROFILE_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 PROFILE_PARTITION="${PROFILE_PARTITION:-backfill,batch}"
 PROFILE_WALL_TIME="${PROFILE_WALL_TIME:-04:00:00}"
 PROFILE_DEPENDENCY_KIND="${PROFILE_DEPENDENCY_KIND:-afterany}"
-PROFILE_MAX_TOKENS_PER_GPU="${PROFILE_MAX_TOKENS_PER_GPU:-32768}"
+PROFILE_MAX_TOKENS_PER_GPU="${PROFILE_MAX_TOKENS_PER_GPU:-24576}"
+PROFILE_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP="${PROFILE_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP:-0}"
 PROFILE_MIN_COMPLETE_ACCEPT_FRACTION="${PROFILE_MIN_COMPLETE_ACCEPT_FRACTION:-0.5}"
 PROFILE_EARLY_STOP_GRACE_SESSIONS="${PROFILE_EARLY_STOP_GRACE_SESSIONS:-2}"
 # The only reaper reason currently sanctioned for these profiling/debug jobs.
@@ -167,6 +169,10 @@ for value_name in PROFILE_STEPS PROFILE_REPEATS; do
 done
 if ! [[ "${PROFILE_MAX_TOKENS_PER_GPU}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: PROFILE_MAX_TOKENS_PER_GPU must be a positive integer" >&2
+    exit 1
+fi
+if ! [[ "${PROFILE_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP}" =~ ^[01]$ ]]; then
+    echo "ERROR: PROFILE_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP must be 0 or 1" >&2
     exit 1
 fi
 if ! [[ "${PROFILE_MIN_COMPLETE_ACCEPT_FRACTION}" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]; then
@@ -288,7 +294,8 @@ if [ "${ACTION}" = submit ]; then
             printf 'export TMAX_TRAIN_DATA=%q\n' "${PROFILE_TRAIN_DATA}"
             printf 'export TMAX_TRAIN_DATA_SHA256=%q\n' "${PROFILE_TRAIN_DATA_SHA256}"
             printf 'export MAX_TOKENS_PER_GPU=%q\n' "${PROFILE_MAX_TOKENS_PER_GPU}"
-            printf 'export TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP=1\n'
+            printf 'export TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP=%q\n' \
+                "${PROFILE_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP}"
             printf 'export POLAR_MIN_COMPLETE_ACCEPT_FRACTION=%q\n' \
                 "${PROFILE_MIN_COMPLETE_ACCEPT_FRACTION}"
             printf 'export POLAR_EARLY_STOP_GRACE_SESSIONS=%q\n' \
@@ -384,12 +391,10 @@ for repeat in $(seq 1 "${PROFILE_REPEATS}"); do
             export ACTOR_NUM_GPUS_PER_NODE="${ACTOR_GPUS_PER_NODE}"
             export ACTOR_TENSOR_MODEL_PARALLEL_SIZE="${TP}"
             export CONTEXT_PARALLEL_SIZE=1
-            # 32K bounds aggregate dynamic microbatches. A valid TMax episode
-            # may still contain a complete 67,584-token pack, so such a sample
-            # must be admitted alone rather than rejected by the topology
-            # preflight. This contract is identical for every arm.
+            # Apply the same causal-prefix trajectory cap to every topology;
+            # retained prompt/response tokens keep exact rollout log-probs.
             export MAX_TOKENS_PER_GPU="${PROFILE_MAX_TOKENS_PER_GPU}"
-            export TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP=1
+            export TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP="${PROFILE_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP}"
             export ROLLOUT_NUM_GPUS="${ROLLOUT_GPUS}"
             export ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_TP}"
             export TMAX_REQUIRE_FULL_GPU_ALLOCATION=1
