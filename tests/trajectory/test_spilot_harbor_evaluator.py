@@ -478,3 +478,66 @@ def test_cost_penalty_mode_is_validated(tmp_path) -> None:
         SpilotHarborEvaluator(
             tests_dir=str(tmp_path), difficulty_easy_multiplier=-1.0
         )
+
+
+@pytest.mark.asyncio
+async def test_difficulty_ledger_tolerates_non_dict_json(
+    tmp_path, monkeypatch
+) -> None:
+    """Valid JSON that is not an object (or has non-dict tasks) must fail
+    open to 'unknown', never raise into the reward path."""
+    for content in ('[1, 2, 3]', '"just a string"', '42', '{"tasks": [1, 2]}',
+                    '{"tasks": {"566": "easy"}}'):
+        ledger = tmp_path / "weird.json"
+        ledger.write_text(content)
+        evaluator = _evaluator(
+            tmp_path,
+            monkeypatch,
+            cost_penalty_lambda=0.2,
+            cost_normalizer=176.0,
+            cost_penalty_mode="additive",
+            difficulty_ledger_path=str(ledger),
+            difficulty_easy_multiplier=2.0,
+        )
+        result = await evaluator.evaluate(
+            Trajectory(
+                status="COMPLETED",
+                metadata={"task_id": "polar-spilot-router-1-566"},
+            ),
+            agent_result=_agent_result(_costed_router_metadata(60.0)),
+        )
+        assert result.metadata["difficulty_class"] == "unknown", content
+        assert result.outcome_reward == pytest.approx(1.0 - 0.2 * 60.0 / 176.0)
+
+
+@pytest.mark.asyncio
+async def test_difficulty_ledger_recovers_after_repair(tmp_path, monkeypatch) -> None:
+    import os as _os
+
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text("{broken")
+    evaluator = _evaluator(
+        tmp_path,
+        monkeypatch,
+        cost_penalty_lambda=0.2,
+        cost_normalizer=176.0,
+        cost_penalty_mode="additive",
+        difficulty_ledger_path=str(ledger),
+        difficulty_easy_multiplier=2.0,
+    )
+    trajectory = Trajectory(
+        status="COMPLETED", metadata={"task_id": "polar-spilot-router-1-566"}
+    )
+    broken = await evaluator.evaluate(
+        trajectory, agent_result=_agent_result(_costed_router_metadata(60.0))
+    )
+    assert broken.metadata["difficulty_class"] == "unknown"
+
+    ledger.write_text('{"tasks": {"566": {"class": "easy"}}}')
+    stat = _os.stat(ledger)
+    _os.utime(ledger, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+    repaired = await evaluator.evaluate(
+        trajectory, agent_result=_agent_result(_costed_router_metadata(60.0))
+    )
+    assert repaired.metadata["difficulty_class"] == "easy"
+    assert repaired.outcome_reward == pytest.approx(1.0 - 0.4 * 60.0 / 176.0)

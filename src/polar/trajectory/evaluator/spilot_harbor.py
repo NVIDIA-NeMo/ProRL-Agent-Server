@@ -13,6 +13,7 @@ from polar.trajectory.models import EvalResult, Trajectory
 _COST_PENALTY_MODES = ("multiplicative", "additive")
 _DIFFICULTY_CLASSES = ("easy", "hard", "unknown")
 _ADDITIVE_REWARD_FLOOR = -1.0
+_LEDGER_MAX_BYTES = 256 * 1024 * 1024
 
 
 class SpilotHarborEvaluator(HarborEvaluator):
@@ -142,25 +143,40 @@ class SpilotHarborEvaluator(HarborEvaluator):
         if key is None:
             return "unknown"
         try:
-            mtime_ns = os.stat(self.difficulty_ledger_path).st_mtime_ns
-            if mtime_ns != self._ledger_mtime_ns:
+            stat = os.stat(self.difficulty_ledger_path)
+        except OSError:
+            # File absent/unreadable right now: fail open without caching so
+            # a ledger that appears later is picked up immediately.
+            return "unknown"
+        if stat.st_mtime_ns != self._ledger_mtime_ns:
+            cache: dict[str, str] = {}
+            try:
+                if stat.st_size > _LEDGER_MAX_BYTES:
+                    raise ValueError("ledger file implausibly large")
                 with open(self.difficulty_ledger_path, encoding="utf-8") as fh:
                     payload = json.load(fh)
-                tasks = payload.get("tasks")
-                cache: dict[str, str] = {}
-                if isinstance(tasks, dict):
-                    for raw_key, entry in tasks.items():
-                        cls = (
-                            entry.get("class") if isinstance(entry, dict) else None
-                        )
-                        if cls in _DIFFICULTY_CLASSES:
-                            cache[str(raw_key)] = str(cls)
-                self._ledger_cache = cache
-                self._ledger_mtime_ns = mtime_ns
-        except (OSError, ValueError, TypeError):
-            # Fail open to "unknown": a missing/corrupt ledger must never
-            # change reward validity, only disable the conditioning.
-            return "unknown"
+                if isinstance(payload, dict):
+                    tasks = payload.get("tasks")
+                    if isinstance(tasks, dict):
+                        for raw_key, entry in tasks.items():
+                            cls = (
+                                entry.get("class")
+                                if isinstance(entry, dict)
+                                else None
+                            )
+                            if cls in _DIFFICULTY_CLASSES:
+                                cache[str(raw_key)] = str(cls)
+            except Exception:  # noqa: BLE001
+                # ANY malformed content (non-dict JSON, wrong nesting, binary
+                # garbage, decode/recursion errors, ...) must fail open to
+                # "unknown" — the ledger conditions shaping, it must never
+                # break evaluation itself.
+                cache = {}
+            # Cache the (possibly empty) result AT this mtime so a broken
+            # file is not re-parsed for every session; the next rebuild
+            # changes the mtime and is re-read.
+            self._ledger_cache = cache
+            self._ledger_mtime_ns = stat.st_mtime_ns
         return self._ledger_cache.get(key, "unknown")
 
     def _difficulty_multiplier(self, difficulty: str) -> float:
