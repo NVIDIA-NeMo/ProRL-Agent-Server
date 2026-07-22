@@ -234,15 +234,19 @@ def _run_preflight(
     tmp_path: Path,
     *,
     layout: str,
-    injects_task: bool,
+    routes_through_runner: bool = True,
+    injects_task: bool = True,
 ) -> "subprocess.CompletedProcess[str]":
     """Drive the harness command's task-protocol preflight against a fake install.
 
-    layout="portable": bundled ``<root>/bin/mini-swe-agent`` wrapper beside
+    layout="portable": bundled ``<root>/bin/mini-swe-agent`` bash wrapper beside
     ``<root>/venv/bin/python`` (production). layout="uv_tool": a console-script
-    entry point whose python shebang points at a standalone interpreter with
-    no venv sibling. ``injects_task`` controls whether that interpreter's
-    ``polar_mini_swe_runner`` exposes ``_inject_task_from_env``.
+    entry point whose python shebang points at a standalone interpreter with no
+    venv sibling. ``routes_through_runner`` controls whether the ENTRY POINT
+    dispatches through polar_mini_swe_runner (upstream mini-swe-agent does not,
+    even if the module is importable). ``injects_task`` controls whether the
+    resolved interpreter's ``polar_mini_swe_runner`` exposes
+    ``_inject_task_from_env``.
     """
 
     import subprocess
@@ -251,8 +255,8 @@ def _run_preflight(
     bindir = root / "bin"
     bindir.mkdir(parents=True)
 
-    # A fake python that answers the runner-import probe, then behaves as the
-    # agent (prints AGENT-RAN) for any other argv.
+    # The module is ALWAYS importable (proving availability is not enough);
+    # injection depends on routing + version.
     modroot = root / "pylib"
     modroot.mkdir()
     (modroot / "polar_mini_swe_runner.py").write_text(
@@ -261,7 +265,7 @@ def _run_preflight(
     interpreter = root / "python"
     interpreter.write_text(
         "#!/usr/bin/env python3\n"
-        "import os, sys\n"
+        "import sys\n"
         f"sys.path.insert(0, {str(modroot)!r})\n"
         "if len(sys.argv) >= 3 and sys.argv[1] == '-c':\n"
         "    exec(compile(sys.argv[2], '<probe>', 'exec'))\n"
@@ -273,11 +277,21 @@ def _run_preflight(
     agent = bindir / "mini-swe-agent"
     if layout == "portable":
         (root / "venv" / "bin").mkdir(parents=True)
+        (root / "venv" / "bin" / "python").symlink_to(interpreter)
         venv_python = root / "venv" / "bin" / "python"
-        venv_python.symlink_to(interpreter)
-        agent.write_text(f'#!/usr/bin/env bash\nexec {venv_python} "$@"\n')
-    else:  # uv_tool: console script with a direct python-path shebang, no venv sibling
-        agent.write_text(f"#!{interpreter}\nprint('AGENT-RAN')\n")
+        dispatch = (
+            f'exec "{venv_python}" -m polar_mini_swe_runner "$@"'
+            if routes_through_runner
+            else f'exec "{venv_python}" -m minisweagent.run.mini "$@"'
+        )
+        agent.write_text(f"#!/usr/bin/env bash\n{dispatch}\n")
+    else:  # uv_tool console script, no venv sibling; python-path shebang
+        entry = (
+            "from polar_mini_swe_runner import main"
+            if routes_through_runner
+            else "from minisweagent.run.mini import app"
+        )
+        agent.write_text(f"#!{interpreter}\n{entry}\nprint('AGENT-RAN')\n")
     agent.chmod(0o755)
 
     harness = MiniSweAgentHarness(
@@ -298,30 +312,37 @@ def _run_preflight(
 def test_preflight_blocks_stale_portable_runtime(tmp_path: Path) -> None:
     result = _run_preflight(tmp_path, layout="portable", injects_task=False)
     assert result.returncode == 64
-    assert "POLAR_MINI_SWE_TASK_B64" in result.stderr
+    assert "predates" in result.stderr
     assert "AGENT-RAN" not in result.stdout
 
 
 def test_preflight_passes_current_portable_runtime(tmp_path: Path) -> None:
-    result = _run_preflight(tmp_path, layout="portable", injects_task=True)
+    result = _run_preflight(tmp_path, layout="portable")
     assert result.returncode == 0
     assert "AGENT-RAN" in result.stdout
 
 
-def test_preflight_passes_uv_tool_install_with_polar_runner(tmp_path: Path) -> None:
-    # A uv-tool install (no venv sibling) whose shebang python carries the
-    # polar runner with task injection is supported and must run.
-    result = _run_preflight(tmp_path, layout="uv_tool", injects_task=True)
+def test_preflight_passes_uv_tool_install_that_routes_through_runner(tmp_path: Path) -> None:
+    # A uv-tool install (no venv sibling) whose entry point dispatches through
+    # the polar runner is supported and must run.
+    result = _run_preflight(tmp_path, layout="uv_tool")
     assert result.returncode == 0
     assert "AGENT-RAN" in result.stdout
 
 
-def test_preflight_blocks_uv_tool_install_without_task_injection(tmp_path: Path) -> None:
-    # A uv-tool/upstream install that cannot inject POLAR_MINI_SWE_TASK_B64
-    # would launch a TASKLESS rollout; the guard must fail closed, not skip.
-    result = _run_preflight(tmp_path, layout="uv_tool", injects_task=False)
-    assert result.returncode == 64
-    assert "AGENT-RAN" not in result.stdout
+def test_preflight_blocks_entry_point_that_does_not_route_through_runner(
+    tmp_path: Path,
+) -> None:
+    # The runner module is importable, but the entry point dispatches through
+    # upstream mini-swe-agent and never injects the task — a TASKLESS rollout.
+    # Availability of the module must NOT be mistaken for injection.
+    for layout in ("portable", "uv_tool"):
+        result = _run_preflight(
+            tmp_path / layout, layout=layout, routes_through_runner=False
+        )
+        assert result.returncode == 64, layout
+        assert "does not dispatch through" in result.stderr
+        assert "AGENT-RAN" not in result.stdout
 
 
 def test_mini_swe_postprocess_aggregates_fixed_categories(tmp_path: Path) -> None:
