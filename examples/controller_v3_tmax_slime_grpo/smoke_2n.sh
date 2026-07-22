@@ -31,6 +31,7 @@ export TMAX_EVAL_ENABLED=0
 export TMAX_REQUIRE_WANDB=1
 export WANDB_MODE=online
 export SAVE_INTERVAL=9999
+export TMAX_PERSIST_RUN_STATE=0
 export EXPERIMENT_NAME=controller-v3-smoke-2n
 export WANDB_GROUP=controller-v3-smoke-2n
 
