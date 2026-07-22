@@ -18,6 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--tasks-dir", required=True)
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument("--max-rows", type=int, default=0)
     return parser.parse_args()
 
 
@@ -144,6 +145,11 @@ def main() -> None:
     if not archive.is_file():
         raise SystemExit(f"TMax task archive is missing: {archive}")
     rows, image_names = ready_rows(root)
+    if args.max_rows < 0:
+        raise SystemExit("--max-rows must be non-negative")
+    if args.max_rows:
+        rows = rows[: args.max_rows]
+        image_names = {Path(str(row["sif_path"])).name for row in rows}
     selected = {str(row["task_name"]) for row in rows}
     missing_tasks = sorted(selected - archive_task_names(archive))
     if missing_tasks:

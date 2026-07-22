@@ -54,10 +54,29 @@ def test_slurm_dry_run_is_side_effect_free_and_reports_full_topology() -> None:
     assert "no command executed" in output
     assert "nodes=3 gpus_per_node=8 total_gpus=24" in output
     assert "actor=2x8 controller_rollout=1x2 frozen_qwen=3x2" in output
-    assert "ray_gpu_capacity_by_rank=8,8,2 gateways=3" in output
+    assert "gateways=3" in output
     assert "api=responses reasoning=max" in output
     assert "request_caps_per_gateway=qwen:1,gpt:4" in output
     assert "TMax ready rows=1007 images=1000" in output
     assert "/data/training_data/tmax/tmax-15k" in output
     assert "/tmax-15k-open-instruct/enroot-images" in output
     assert "sbatch --nodes=3" in output
+
+
+def test_two_node_smoke_dry_run_uses_one_prompt_and_two_trajectories() -> None:
+    result = subprocess.run(
+        ["bash", str(EXAMPLE / "smoke_2n.sh"), "--dry-run"],
+        cwd=ROOT,
+        env={**os.environ, "DRY_RUN": "1"},
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    output = result.stdout
+    assert "no command executed" in output
+    assert "TMax ready rows=1 images=1" in output
+    assert "nodes=2 gpus_per_node=8 total_gpus=16 partition=interactive" in output
+    assert "actor=1x8 controller_rollout=1x2 frozen_qwen=3x2" in output
+    assert "gateways=2" in output
+    assert "request_caps_per_gateway=qwen:1,gpt:4" in output
+    assert "sbatch --nodes=2" in output

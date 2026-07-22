@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reserve GPUs 2-7 on rank 2 for frozen Qwen workers, then enter shared TMax.
+# Reserve GPUs 2-7 on the final rank for frozen Qwen workers.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -12,12 +12,13 @@ SHARED_RUN="${SCRIPT_DIR}/../tmax_slime_grpo/run.sh"
 : "${SGLANG_DIR:?}"
 
 mapfile -t CONTROLLER_V3_NODES < <(scontrol show hostnames "${SLURM_NODELIST}")
-if [ "${#CONTROLLER_V3_NODES[@]}" -ne 3 ]; then
-    echo "ERROR: Controller V3 requires exactly three nodes" >&2
+if [ "${#CONTROLLER_V3_NODES[@]}" -ne "${NUM_NODES}" ]; then
+    echo "ERROR: expected ${NUM_NODES} Controller V3 nodes" >&2
     exit 1
 fi
 
-SMALL_NODE="${CONTROLLER_V3_NODES[2]}"
+SMALL_NODE_RANK="$((NUM_NODES - 1))"
+SMALL_NODE="${CONTROLLER_V3_NODES[${SMALL_NODE_RANK}]}"
 SMALL_ROUTER_PORT="${CONTROLLER_V3_SMALL_ROUTER_PORT:-19090}"
 export CONTROLLER_V3_SMALL_ROUTER_BASE_URL="http://${SMALL_NODE}:${SMALL_ROUTER_PORT}/v1"
 READY_FILE="${RUN_DIR}/startup/controller-v3-small-ready"
@@ -57,7 +58,7 @@ start_group() {
     PIDS+=("${LAST_PID}")
 }
 
-if [ "${SLURM_NODEID}" = "2" ]; then
+if [ "${SLURM_NODEID}" = "${SMALL_NODE_RANK}" ]; then
     export RAY_NUM_GPUS_PER_NODE=2
     mkdir -p "${RUN_DIR}/startup" "${RUN_DIR}/controller-v3-small"
     rm -f "${READY_FILE}"

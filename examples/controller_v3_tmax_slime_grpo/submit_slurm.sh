@@ -47,6 +47,9 @@ PREPARE_ARGS=(
     --output "${TMAX_TRAIN_DATA}"
     --tasks-dir "${TMAX_OPEN_INSTRUCT_TASKS_DIR}"
 )
+if [ -n "${TMAX_OPEN_INSTRUCT_MAX_ROWS:-}" ]; then
+    PREPARE_ARGS+=(--max-rows "${TMAX_OPEN_INSTRUCT_MAX_ROWS}")
+fi
 if [ "${dry_run}" = "1" ]; then
     PREPARE_ARGS+=(--check-only)
 fi
@@ -54,9 +57,9 @@ fi
 
 if [ "${dry_run}" = "1" ]; then
     printf '%s\n' "Controller V3 Slurm dry-run (no command executed)"
-    printf '%s\n' "  nodes=3 gpus_per_node=8 total_gpus=24 partition=${PARTITION}"
-    printf '%s\n' "  actor=2x8 controller_rollout=1x2 frozen_qwen=3x2"
-    printf '%s\n' "  ray_gpu_capacity_by_rank=8,8,2 gateways=3"
+    printf '%s\n' "  nodes=${NUM_NODES} gpus_per_node=8 total_gpus=$((NUM_NODES * 8)) partition=${PARTITION}"
+    printf '%s\n' "  actor=${ACTOR_NUM_NODES}x8 controller_rollout=1x2 frozen_qwen=3x2"
+    printf '%s\n' "  gateways=${POLAR_GATEWAY_COUNT_OVERRIDE}"
     printf '%s\n' "  controller=Qwen3.6-35B-A3B"
     printf '%s\n' "  small=pool/qwen3.6-35b-a3b local_replicas=3 tp=2"
     printf '%s\n' "  large=pool/gpt-5.6-luna upstream=openai/openai/gpt-5.6-luna api=responses reasoning=max"
@@ -69,16 +72,26 @@ if [ "${dry_run}" = "1" ]; then
     printf '%s\n' "  tmax_open_instruct=${TMAX_OPEN_INSTRUCT_DIR}"
     printf '%s\n' "  tmax_train_data=${TMAX_TRAIN_DATA}"
     printf '  command='
-    printf '%q ' sbatch         --nodes=3         --ntasks=3         --ntasks-per-node=1         --gres=gpu:8         --partition="${PARTITION}"         --time="${WALL_TIME}"         --wrap="srun --nodes=3 --ntasks=3 bash ${SCRIPT_DIR}/run.sh"
+    printf '%q ' sbatch         --nodes="${NUM_NODES}"         --ntasks="${NUM_NODES}"         --ntasks-per-node=1         --gres=gpu:8         --partition="${PARTITION}"         --time="${WALL_TIME}"         --wrap="srun --nodes=${NUM_NODES} --ntasks=${NUM_NODES} bash ${SCRIPT_DIR}/run.sh"
     printf '\n'
     exit 0
 fi
 
-if [ -z "${POLAR_NVIDIA_API_KEY:-${NVIDIA_API_KEY:-}}" ]; then
-    echo "ERROR: NVIDIA_API_KEY is required for GPT-5.6 Luna" >&2
+if [ -z "${POLAR_NVIDIA_API_KEY:-${NVIDIA_API_KEY:-${NVIDIA_INFERENCE_API_KEY:-}}}" ] && [ -f "${CONTROLLER_V3_NVIDIA_CREDENTIALS_FILE}" ]; then
+    if [ "$(stat -c '%U:%a' "${CONTROLLER_V3_NVIDIA_CREDENTIALS_FILE}")" != "$(id -un):600" ]; then
+        echo "ERROR: NVIDIA credentials must be owned by the submitter with mode 600" >&2
+        exit 1
+    fi
+    set -a
+    # shellcheck disable=SC1090
+    source "${CONTROLLER_V3_NVIDIA_CREDENTIALS_FILE}"
+    set +a
+fi
+export POLAR_NVIDIA_API_KEY="${POLAR_NVIDIA_API_KEY:-${NVIDIA_API_KEY:-${NVIDIA_INFERENCE_API_KEY:-}}}"
+if [ -z "${POLAR_NVIDIA_API_KEY}" ]; then
+    echo "ERROR: NVIDIA credential is required for GPT-5.6 Luna" >&2
     exit 1
 fi
-export POLAR_NVIDIA_API_KEY="${POLAR_NVIDIA_API_KEY:-${NVIDIA_API_KEY}}"
 if [ -z "${POLAR_CONTROL_PLANE_TOKEN:-}" ]; then
     POLAR_CONTROL_PLANE_TOKEN="$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')"
     export POLAR_CONTROL_PLANE_TOKEN

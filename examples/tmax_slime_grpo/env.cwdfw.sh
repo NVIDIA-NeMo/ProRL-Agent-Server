@@ -427,7 +427,7 @@ _tmax_validate_resource_topology() {
 
     local actor_gpus actor_parallel_size capacity allocated_gpus rollout_product expected_global_batch
     local required_gpus
-    local global_batch actor_dp train_rollouts_per_dp
+    local global_batch actor_dp train_rollouts_per_dp min_train_rollouts_per_dp
     actor_gpus="$((ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE))"
     capacity="$((NUM_NODES * RAY_NUM_GPUS_PER_NODE))"
     allocated_gpus="$((NUM_NODES * SLURM_GPUS))"
@@ -518,8 +518,9 @@ _tmax_validate_resource_topology() {
         return 1
     fi
     train_rollouts_per_dp="$((global_batch / actor_dp))"
-    if [ "$train_rollouts_per_dp" -lt 8 ]; then
-        echo "ERROR: global batch gives only ${train_rollouts_per_dp} trajectories per actor DP rank; require at least 8 to avoid underfilled trainer GPUs" >&2
+    min_train_rollouts_per_dp="${TMAX_MIN_TRAIN_ROLLOUTS_PER_DP:-8}"
+    if [ "$train_rollouts_per_dp" -lt "$min_train_rollouts_per_dp" ]; then
+        echo "ERROR: global batch gives only ${train_rollouts_per_dp} trajectories per actor DP rank; require at least ${min_train_rollouts_per_dp}" >&2
         return 1
     fi
 }
