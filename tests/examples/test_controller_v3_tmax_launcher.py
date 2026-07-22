@@ -46,6 +46,16 @@ def test_slurm_submit_preserves_last_node_ray_gpu_limit() -> None:
     assert "RAY_NUM_*|RAY_LAST_NODE_NUM_GPUS|" in text
 
 
+def test_actor_expert_parallelism_reaches_megatron() -> None:
+    profile = (EXAMPLE / "profile.sh").read_text()
+    shared_run = (ROOT / "examples/swegym_slime_grpo/run.sh").read_text()
+    submit = (ROOT / "examples/swegym_slime_grpo/submit_slurm.sh").read_text()
+    assert 'ACTOR_TENSOR_MODEL_PARALLEL_SIZE:-2' in profile
+    assert 'export EXPERT_MODEL_PARALLEL_SIZE=8' in profile
+    assert '--expert-model-parallel-size "${EXPERT_MODEL_PARALLEL_SIZE:-1}"' in shared_run
+    assert "ACTOR_*|EXPERT_*|ROLLOUT_*" in submit
+
+
 def test_slurm_dry_run_is_side_effect_free_and_reports_full_topology() -> None:
     result = subprocess.run(
         ["bash", str(EXAMPLE / "submit_slurm.sh"), "--dry-run"],

@@ -2123,7 +2123,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     "${SEQUENCE_PARALLEL_ARGS[@]}" \
     --pipeline-model-parallel-size 1 \
     --context-parallel-size "$CONTEXT_PARALLEL_SIZE" \
-    --expert-model-parallel-size 1 \
+    --expert-model-parallel-size "${EXPERT_MODEL_PARALLEL_SIZE:-1}" \
     --expert-tensor-parallel-size 1 \
     --recompute-granularity full \
     --recompute-method uniform \
