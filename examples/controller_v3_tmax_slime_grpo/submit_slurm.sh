@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Submit Controller V3 through Jiarui's TMax launcher; --dry-run is side-effect free.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
+# shellcheck source=./profile.sh
+source "${SCRIPT_DIR}/profile.sh"
+
+dry_run="${DRY_RUN:-0}"
+if [ "${1:-}" = "--dry-run" ]; then
+    dry_run=1
+    shift
+fi
+SPILOT_ROOT="$(cd -- "${PROJECT_ROOT}/../.." && pwd -P)"
+POLAR_DATA_ROOT="${POLAR_DATA_ROOT:-${SPILOT_ROOT}/data}"
+if [ "$#" -ne 0 ]; then
+    echo "usage: $0 [--dry-run]" >&2
+    exit 2
+fi
+
+for path in     "${HF_CHECKPOINT}"     "${REF_LOAD}"     "${MINI_SWE_AGENT_RUNTIME_DIR}"     "${MODEL_ARGS_FILE}"     "${POLAR_CONFIG_TEMPLATE}"     "${TOPOLOGY_TEMPLATE}"; do
+    if [ ! -e "${path}" ]; then
+        echo "ERROR: required Controller V3 path is missing: ${path}" >&2
+        exit 1
+    fi
+done
+
+for path in "${TMAX_DATASET_DIR}" "${TMAX_OPEN_INSTRUCT_DIR}" "${APPTAINER_IMAGE_DIR}"; do
+    if [ ! -e "${path}" ]; then
+        echo "ERROR: required TMax path is missing: ${path}" >&2
+        exit 1
+    fi
+done
+
+"${TMAX_SIF_PYTHON_BIN:-python3}" - "${MINI_SWE_AGENT_RUNTIME_DIR}/.polar-mini-runtime-manifest.json" <<'PY'
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+assert manifest["python_version"] == "3.10.20", manifest["python_version"]
+assert manifest["mini_swe_agent_version"] == "2.4.0", manifest["mini_swe_agent_version"]
+PY
+
+PREPARE_ARGS=(
+    --open-instruct-dir "${TMAX_OPEN_INSTRUCT_DIR}"
+    --output "${TMAX_TRAIN_DATA}"
+    --tasks-dir "${TMAX_OPEN_INSTRUCT_TASKS_DIR}"
+)
+if [ "${dry_run}" = "1" ]; then
+    PREPARE_ARGS+=(--check-only)
+fi
+"${TMAX_SIF_PYTHON_BIN}" "${SCRIPT_DIR}/prepare_open_instruct_data.py" "${PREPARE_ARGS[@]}"
+
+if [ "${dry_run}" = "1" ]; then
+    printf '%s\n' "Controller V3 Slurm dry-run (no command executed)"
+    printf '%s\n' "  nodes=3 gpus_per_node=8 total_gpus=24 partition=${PARTITION}"
+    printf '%s\n' "  actor=2x8 controller_rollout=1x2 frozen_qwen=3x2"
+    printf '%s\n' "  ray_gpu_capacity_by_rank=8,8,2 gateways=3"
+    printf '%s\n' "  controller=Qwen3.6-35B-A3B"
+    printf '%s\n' "  small=pool/qwen3.6-35b-a3b local_replicas=3 tp=2"
+    printf '%s\n' "  large=pool/gpt-5.6-luna upstream=openai/openai/gpt-5.6-luna api=responses reasoning=max"
+    printf '%s\n' "  request_caps_per_gateway=qwen:1,gpt:4 episode_admission=false"
+    printf '%s\n' "  hf_checkpoint=${HF_CHECKPOINT}"
+    printf '%s\n' "  ref_checkpoint=${REF_LOAD}"
+    printf '%s\n' "  runtime=${MINI_SWE_AGENT_RUNTIME_DIR} (Python 3.10.20, Mini-SWE-Agent 2.4.0)"
+    printf '%s\n' "  tmax_dataset=${TMAX_DATASET_DIR:-${POLAR_DATA_ROOT}/tmax-15k}"
+    printf '%s\n' "  tmax_sif_dir=${APPTAINER_IMAGE_DIR:-${POLAR_DATA_ROOT}/tmax-15k-sif}"
+    printf '%s\n' "  tmax_open_instruct=${TMAX_OPEN_INSTRUCT_DIR}"
+    printf '%s\n' "  tmax_train_data=${TMAX_TRAIN_DATA}"
+    printf '  command='
+    printf '%q ' sbatch         --nodes=3         --ntasks=3         --ntasks-per-node=1         --gres=gpu:8         --partition="${PARTITION}"         --time="${WALL_TIME}"         --wrap="srun --nodes=3 --ntasks=3 bash ${SCRIPT_DIR}/run.sh"
+    printf '\n'
+    exit 0
+fi
+
+if [ -z "${POLAR_NVIDIA_API_KEY:-${NVIDIA_API_KEY:-}}" ]; then
+    echo "ERROR: NVIDIA_API_KEY is required for GPT-5.6 Luna" >&2
+    exit 1
+fi
+export POLAR_NVIDIA_API_KEY="${POLAR_NVIDIA_API_KEY:-${NVIDIA_API_KEY}}"
+if [ -z "${POLAR_CONTROL_PLANE_TOKEN:-}" ]; then
+    POLAR_CONTROL_PLANE_TOKEN="$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')"
+    export POLAR_CONTROL_PLANE_TOKEN
+fi
+
+export TMAX_SUBMIT_SCRIPT="${SCRIPT_DIR}/submit_slurm.sh"
+export POLAR_TRAIN_RUN_SCRIPT="${SCRIPT_DIR}/run.sh"
+export POLAR_CONFIG_TEMPLATE="${SCRIPT_DIR}/polar_config.yaml"
+export TOPOLOGY_TEMPLATE="${SCRIPT_DIR}/topology.yaml"
+exec bash "${SCRIPT_DIR}/../tmax_slime_grpo/submit_slurm.sh"

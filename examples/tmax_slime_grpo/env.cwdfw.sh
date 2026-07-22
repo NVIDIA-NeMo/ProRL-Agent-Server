@@ -705,7 +705,8 @@ unset -f _tmax_validate_async_capacity
 
 export TMAX_AGENT_HARNESS="${TMAX_AGENT_HARNESS:-${POLAR_AGENT_HARNESS:-mini_swe_agent}}"
 export POLAR_AGENT_HARNESS="${TMAX_AGENT_HARNESS}"
-if [ "${TMAX_AGENT_HARNESS}" = "spilot_router" ]; then
+if [ "${TMAX_AGENT_HARNESS}" = "spilot_router" ] || \
+   [ "${TMAX_AGENT_HARNESS}" = "controller_v3" ]; then
     for _tmax_spilot_isolation_name in \
         POLAR_APPTAINER_NO_MOUNT_HOSTFS \
         POLAR_APPTAINER_NO_MOUNT_TMP \
@@ -743,7 +744,7 @@ if ! [[ "${POLAR_AGENT_MAX_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
     return 1 2>/dev/null || exit 1
 fi
 case "${TMAX_AGENT_HARNESS}" in
-    mini_swe_agent|spilot_router|vanillux2)
+    controller_v3|mini_swe_agent|spilot_router|vanillux2)
         export POLAR_AGENT_PATH="${MINI_SWE_AGENT_CONTAINER_DIR}/bin:/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         printf -v POLAR_AGENT_RUNTIME_VOLUME '        - %s:%s:ro' \
             "${MINI_SWE_AGENT_RUNTIME_DIR}" "${MINI_SWE_AGENT_CONTAINER_DIR}"

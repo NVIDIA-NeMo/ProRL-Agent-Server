@@ -1,0 +1,39 @@
+rollout:
+  host: "${POLAR_ROLLOUT_HOST}"
+  port: ${POLAR_ROLLOUT_PORT}
+  public_url: "${POLAR_ROLLOUT_URL}"
+  save_dir: "${POLAR_ROLLOUT_SAVE_DIR}"
+
+gateway:
+  heartbeat_interval_seconds: 30
+  completion_persistence:
+    enabled: true
+    max_field_bytes: 1048576
+    queue_size: ${POLAR_GATEWAY_COMPLETION_QUEUE_SIZE}
+    write_workers: ${POLAR_GATEWAY_COMPLETION_WRITE_WORKERS}
+    batch_size: ${POLAR_COMPLETION_BATCH_SIZE}
+    write_max_attempts: ${POLAR_COMPLETION_WRITE_MAX_ATTEMPTS}
+    retry_backoff_seconds: ${POLAR_COMPLETION_RETRY_BACKOFF_SECONDS}
+  nodes:
+    - id: localhost-node-01
+      host: "${POLAR_GATEWAY_HOST}"
+      port: ${POLAR_GATEWAY_PORT}
+      public_url: "${POLAR_GATEWAY_URL}"
+      max_init_workers: ${POLAR_GATEWAY_MAX_INIT_WORKERS}
+      max_run_workers: ${POLAR_GATEWAY_MAX_RUN_WORKERS}
+      max_postrun_workers: ${POLAR_GATEWAY_MAX_POSTRUN_WORKERS}
+      model_served: ${POLAR_AGENT_MODEL_NAME}
+      inference:
+        engine: sglang
+        base_url: ${SGLANG_ROUTER_BASE_URL}
+      model_pool:
+        - alias: pool/qwen3.6-35b-a3b
+          model: nvidia/qwen/qwen3.6-35b-a3b
+          base_url: "${CONTROLLER_V3_SMALL_ROUTER_BASE_URL}"
+          api_key_env: POLAR_LOCAL_MODEL_API_KEY
+          max_concurrency: ${CONTROLLER_V3_QWEN_GATEWAY_MAX_CONCURRENCY}
+        - alias: pool/gpt-5.6-luna
+          model: openai/openai/gpt-5.6-luna
+          base_url: "${POLAR_MODEL_POOL_BASE_URL}"
+          api_key_env: POLAR_NVIDIA_API_KEY
+          max_concurrency: ${CONTROLLER_V3_GPT_GATEWAY_MAX_CONCURRENCY}
