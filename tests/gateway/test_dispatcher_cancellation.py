@@ -66,6 +66,32 @@ class _BlockingTeardownRuntime(_FailingTeardownRuntime):
         await asyncio.Event().wait()
 
 
+def test_dispatcher_shutdown_timeout_is_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS", "300")
+    dispatcher = SessionDispatcher(
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+    )
+    assert dispatcher._shutdown_runtime_timeout_seconds == 300.0
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "invalid"])
+def test_dispatcher_shutdown_timeout_rejects_unsafe_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS", value)
+    with pytest.raises(ValueError, match="positive finite number"):
+        SessionDispatcher(
+            max_init_workers=1,
+            max_run_workers=1,
+            max_postrun_workers=1,
+        )
+
+
 def _managed(index: int, runtime, tmp_path: Path) -> ManagedSession:
     session_id = f"session-{index}"
     request = SessionDispatchRequest(

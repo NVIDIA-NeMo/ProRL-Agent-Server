@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import math
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -27,7 +29,29 @@ logger = logging.getLogger(__name__)
 StageCallback = Callable[["ManagedSession"], Awaitable[None]]
 StageTransitionCallback = Callable[["ManagedSession"], None]
 _STOP = object()
-_SHUTDOWN_RUNTIME_TIMEOUT_SECONDS = 60.0
+# Stage callbacks can still be proving Apptainer process containment after
+# cancellation.  Keep one shared bound, but leave enough time for a callback
+# that needs roughly a minute to finish and for the final runtime sweep that
+# follows it.  Teardown remains fail-closed when this deadline is exceeded.
+_SHUTDOWN_RUNTIME_TIMEOUT_SECONDS = 120.0
+_SHUTDOWN_RUNTIME_TIMEOUT_ENV = "POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS"
+
+
+def _shutdown_runtime_timeout_seconds() -> float:
+    raw = os.environ.get(_SHUTDOWN_RUNTIME_TIMEOUT_ENV)
+    if raw is None:
+        return _SHUTDOWN_RUNTIME_TIMEOUT_SECONDS
+    try:
+        timeout = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_SHUTDOWN_RUNTIME_TIMEOUT_ENV} must be a positive finite number"
+        ) from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(
+            f"{_SHUTDOWN_RUNTIME_TIMEOUT_ENV} must be a positive finite number"
+        )
+    return timeout
 
 
 class SessionStage(str, Enum):
@@ -107,6 +131,9 @@ class SessionDispatcher:
         self.max_init_workers = max_init_workers
         self.max_run_workers = max_run_workers
         self.max_postrun_workers = max_postrun_workers
+        # Resolve once at construction so an invalid safety bound fails during
+        # gateway startup, not after training when teardown begins.
+        self._shutdown_runtime_timeout_seconds = _shutdown_runtime_timeout_seconds()
         self.on_init: StageCallback | None = None
         self.on_run: StageCallback | None = None
         self.on_postrun: StageCallback | None = None
@@ -146,7 +173,7 @@ class SessionDispatcher:
         if not self._started:
             return
         loop = asyncio.get_running_loop()
-        shutdown_deadline = loop.time() + _SHUTDOWN_RUNTIME_TIMEOUT_SECONDS
+        shutdown_deadline = loop.time() + self._shutdown_runtime_timeout_seconds
         async with self._lock:
             self._stopping = True
             self._started = False
