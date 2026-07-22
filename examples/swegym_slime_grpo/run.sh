@@ -1739,6 +1739,19 @@ if [ -z "$RAY_NUM_GPUS_PER_NODE" ]; then
         RAY_NUM_GPUS_PER_NODE=$((ACTOR_NUM_GPUS_PER_NODE + ROLLOUT_NUM_GPUS))
     fi
 fi
+RAY_TOTAL_GPUS="$((RAY_NUM_NODES * RAY_NUM_GPUS_PER_NODE))"
+if [ -n "${RAY_LAST_NODE_NUM_GPUS:-}" ]; then
+    if ! [[ "${RAY_LAST_NODE_NUM_GPUS}" =~ ^[1-9][0-9]*$ ]] || \
+       [ "${RAY_LAST_NODE_NUM_GPUS}" -gt "${RAY_NUM_GPUS_PER_NODE}" ] || \
+       [ "${RAY_NUM_NODES}" -lt 2 ]; then
+        echo "ERROR: RAY_LAST_NODE_NUM_GPUS must be positive, no larger than RAY_NUM_GPUS_PER_NODE, and used with at least two nodes" >&2
+        exit 1
+    fi
+    RAY_TOTAL_GPUS="$(((RAY_NUM_NODES - 1) * RAY_NUM_GPUS_PER_NODE + RAY_LAST_NODE_NUM_GPUS))"
+    if [ "${RAY_NODE_RANK}" = "$((RAY_NUM_NODES - 1))" ]; then
+        RAY_NUM_GPUS_PER_NODE="${RAY_LAST_NODE_NUM_GPUS}"
+    fi
+fi
 
 echo "=== Ray node rank ${RAY_NODE_RANK}/${RAY_NUM_NODES} head=${RAY_HEAD_IP} local=${RAY_NODE_IP} gpus/node=${RAY_NUM_GPUS_PER_NODE} ==="
 RAY_READY_DIR="${RUN_DIR}/startup/ray-${SLURM_JOB_ID:-manual}"
@@ -1816,7 +1829,7 @@ if [ "${RAY_NODE_RANK}" = "0" ]; then
     fi
     ray status || true
     wait_ray_dashboard
-    "${PYTHON_BIN}" - "${RAY_NUM_NODES}" "$((RAY_NUM_NODES * RAY_NUM_GPUS_PER_NODE))" <<'PY'
+    "${PYTHON_BIN}" - "${RAY_NUM_NODES}" "${RAY_TOTAL_GPUS}" <<'PY'
 import sys
 import time
 
