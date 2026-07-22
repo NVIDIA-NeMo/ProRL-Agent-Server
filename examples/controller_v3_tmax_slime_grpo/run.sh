@@ -9,6 +9,7 @@ SHARED_RUN="${SCRIPT_DIR}/../tmax_slime_grpo/run.sh"
 : "${HF_CHECKPOINT:?}"
 : "${POLR_TRAIN_VENV:?}"
 : "${SGLANG_DIR:?}"
+export RAY_LAST_NODE_NUM_GPUS="${RAY_LAST_NODE_NUM_GPUS:-2}"
 
 SMALL_NODE_RANK="$((NUM_NODES - 1))"
 SMALL_NODE_FILE="${RUN_DIR}/startup/controller-v3-small-node"
