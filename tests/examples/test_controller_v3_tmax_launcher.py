@@ -95,3 +95,21 @@ def test_two_node_smoke_dry_run_uses_one_prompt_and_two_trajectories() -> None:
     assert "gateways=2" in output
     assert "request_caps_per_gateway=qwen:1,gpt:4" in output
     assert "sbatch --nodes=2" in output
+
+
+def test_three_node_smoke_dry_run_uses_split_actor_topology() -> None:
+    result = subprocess.run(
+        ["bash", str(EXAMPLE / "smoke_3n.sh"), "--dry-run"],
+        cwd=ROOT,
+        env={**os.environ, "DRY_RUN": "1"},
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    output = result.stdout
+    assert "no command executed" in output
+    assert "TMax ready rows=1 images=1" in output
+    assert "nodes=3 gpus_per_node=8 total_gpus=24 partition=batch" in output
+    assert "actor=2x8 controller_rollout=1x2 frozen_qwen=3x2" in output
+    assert "gateways=3" in output
+    assert "sbatch --nodes=3" in output
