@@ -73,7 +73,6 @@ start_group() {
 }
 
 if [ "${SLURM_NODEID}" = "${SMALL_NODE_RANK}" ]; then
-    export RAY_NUM_GPUS_PER_NODE=2
     mkdir -p "${RUN_DIR}/startup" "${RUN_DIR}/controller-v3-small"
     rm -f "${READY_FILE}"
 
