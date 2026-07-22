@@ -230,79 +230,98 @@ def test_tmax_launch_contract_accepts_vanillux2() -> None:
     assert "config/vanillux2.yaml" in submit_script
 
 
-def _run_preflight_fragment(tmp_path: Path, *, probe_exit: int) -> "subprocess.CompletedProcess[str]":
+def _run_preflight(
+    tmp_path: Path,
+    *,
+    layout: str,
+    injects_task: bool,
+) -> "subprocess.CompletedProcess[str]":
+    """Drive the harness command's task-protocol preflight against a fake install.
+
+    layout="portable": bundled ``<root>/bin/mini-swe-agent`` wrapper beside
+    ``<root>/venv/bin/python`` (production). layout="uv_tool": a console-script
+    entry point whose python shebang points at a standalone interpreter with
+    no venv sibling. ``injects_task`` controls whether that interpreter's
+    ``polar_mini_swe_runner`` exposes ``_inject_task_from_env``.
+    """
+
     import subprocess
 
-    runtime = tmp_path / "runtime"
-    (runtime / "bin").mkdir(parents=True)
-    (runtime / "venv" / "bin").mkdir(parents=True)
-    fake_agent = runtime / "bin" / "mini-swe-agent"
-    fake_agent.write_text("#!/usr/bin/env bash\necho AGENT-RAN\n")
-    fake_agent.chmod(0o755)
-    fake_python = runtime / "venv" / "bin" / "python"
-    fake_python.write_text(f"#!/usr/bin/env bash\nexit {probe_exit}\n")
-    fake_python.chmod(0o755)
+    root = tmp_path / layout
+    bindir = root / "bin"
+    bindir.mkdir(parents=True)
+
+    # A fake python that answers the runner-import probe, then behaves as the
+    # agent (prints AGENT-RAN) for any other argv.
+    modroot = root / "pylib"
+    modroot.mkdir()
+    (modroot / "polar_mini_swe_runner.py").write_text(
+        "def _inject_task_from_env():\n    pass\n" if injects_task else "pass\n"
+    )
+    interpreter = root / "python"
+    interpreter.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        f"sys.path.insert(0, {str(modroot)!r})\n"
+        "if len(sys.argv) >= 3 and sys.argv[1] == '-c':\n"
+        "    exec(compile(sys.argv[2], '<probe>', 'exec'))\n"
+        "    sys.exit(0)\n"
+        "print('AGENT-RAN')\n"
+    )
+    interpreter.chmod(0o755)
+
+    agent = bindir / "mini-swe-agent"
+    if layout == "portable":
+        (root / "venv" / "bin").mkdir(parents=True)
+        venv_python = root / "venv" / "bin" / "python"
+        venv_python.symlink_to(interpreter)
+        agent.write_text(f'#!/usr/bin/env bash\nexec {venv_python} "$@"\n')
+    else:  # uv_tool: console script with a direct python-path shebang, no venv sibling
+        agent.write_text(f"#!{interpreter}\nprint('AGENT-RAN')\n")
+    agent.chmod(0o755)
 
     harness = MiniSweAgentHarness(
         AgentSpec(harness="mini_swe_agent", model_name="m", settings={})
     )
     command = harness.run_steps("do the task")[0].command
-    # Neutralize pieces that need the real session/gateway environment.
     command = command.replace('export OPENAI_API_BASE="$OPENAI_BASE_URL" && ', "")
     command = command.replace('export PATH="$HOME/.local/bin:$PATH" && ', "")
     command = command.split("2>&1 | tee", 1)[0]
     return subprocess.run(
         ["bash", "-c", command],
-        env={"PATH": f"{runtime / 'bin'}:/usr/bin:/bin"},
-        capture_output=True,
-        text=True,
-    )
-
-
-def test_mini_swe_task_protocol_preflight_blocks_stale_runtimes(tmp_path: Path) -> None:
-    # A runtime whose runner lacks _inject_task_from_env would run every
-    # session with an empty task (zero-trace training); the harness must
-    # refuse it loudly instead.
-    result = _run_preflight_fragment(tmp_path, probe_exit=64)
-    assert result.returncode == 64
-    assert "POLAR_MINI_SWE_TASK_B64 task protocol" in result.stderr
-    assert "AGENT-RAN" not in result.stdout
-
-
-def test_mini_swe_task_protocol_preflight_passes_current_runtimes(tmp_path: Path) -> None:
-    result = _run_preflight_fragment(tmp_path, probe_exit=0)
-    assert result.returncode == 0
-    assert "AGENT-RAN" in result.stdout
-
-
-def test_mini_swe_preflight_is_a_noop_for_uv_tool_installs(tmp_path: Path) -> None:
-    # A plain `uv tool` install puts the entry point in a bin dir with no
-    # sibling venv/bin/python. The portable-runtime guard must not fire and
-    # break that supported layout.
-    bindir = tmp_path / "uvtool" / "bin"
-    bindir.mkdir(parents=True)
-    fake_agent = bindir / "mini-swe-agent"
-    fake_agent.write_text("#!/usr/bin/env bash\necho AGENT-RAN\n")
-    fake_agent.chmod(0o755)
-
-    harness = MiniSweAgentHarness(
-        AgentSpec(harness="mini_swe_agent", model_name="m", settings={})
-    )
-    command = harness.run_steps("do the task")[0].command
-    command = command.replace('export OPENAI_API_BASE="$OPENAI_BASE_URL" && ', "")
-    command = command.replace('export PATH="$HOME/.local/bin:$PATH" && ', "")
-    command = command.split("2>&1 | tee", 1)[0]
-
-    import subprocess
-
-    result = subprocess.run(
-        ["bash", "-c", command],
         env={"PATH": f"{bindir}:/usr/bin:/bin"},
         capture_output=True,
         text=True,
     )
+
+
+def test_preflight_blocks_stale_portable_runtime(tmp_path: Path) -> None:
+    result = _run_preflight(tmp_path, layout="portable", injects_task=False)
+    assert result.returncode == 64
+    assert "POLAR_MINI_SWE_TASK_B64" in result.stderr
+    assert "AGENT-RAN" not in result.stdout
+
+
+def test_preflight_passes_current_portable_runtime(tmp_path: Path) -> None:
+    result = _run_preflight(tmp_path, layout="portable", injects_task=True)
     assert result.returncode == 0
     assert "AGENT-RAN" in result.stdout
+
+
+def test_preflight_passes_uv_tool_install_with_polar_runner(tmp_path: Path) -> None:
+    # A uv-tool install (no venv sibling) whose shebang python carries the
+    # polar runner with task injection is supported and must run.
+    result = _run_preflight(tmp_path, layout="uv_tool", injects_task=True)
+    assert result.returncode == 0
+    assert "AGENT-RAN" in result.stdout
+
+
+def test_preflight_blocks_uv_tool_install_without_task_injection(tmp_path: Path) -> None:
+    # A uv-tool/upstream install that cannot inject POLAR_MINI_SWE_TASK_B64
+    # would launch a TASKLESS rollout; the guard must fail closed, not skip.
+    result = _run_preflight(tmp_path, layout="uv_tool", injects_task=False)
+    assert result.returncode == 64
+    assert "AGENT-RAN" not in result.stdout
 
 
 def test_mini_swe_postprocess_aggregates_fixed_categories(tmp_path: Path) -> None:
