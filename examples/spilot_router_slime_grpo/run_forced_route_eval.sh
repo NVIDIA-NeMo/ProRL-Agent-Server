@@ -47,24 +47,31 @@ run_child() {
 trap cleanup EXIT
 trap on_signal INT TERM
 
-REQUIRED_ISOLATION_VARIABLES=(
+# The forced runner is dispatched through ``exec_protected`` so the short-lived
+# model-pool capability never enters the ordinary task environment.  Protected
+# execution exists only on the persistent direct-exec broker backend.  Validate
+# this complete contract before reading credentials or starting any service;
+# an inherited opt-out must fail closed rather than be silently repaired.
+REQUIRED_PROTECTED_RUNTIME_VARIABLES=(
     POLAR_APPTAINER_NO_INSTANCE
+    POLAR_APPTAINER_PERSISTENT_BROKER
     POLAR_APPTAINER_NO_MOUNT_HOSTFS
     POLAR_APPTAINER_NO_MOUNT_TMP
     POLAR_APPTAINER_ISOLATE_PID
     POLAR_APPTAINER_ISOLATE_IPC
+    POLAR_APPTAINER_CLEANENV
 )
-for isolation_name in "${REQUIRED_ISOLATION_VARIABLES[@]}"; do
-    if [[ -v "${isolation_name}" ]]; then
-        isolation_value="${!isolation_name}"
+for runtime_name in "${REQUIRED_PROTECTED_RUNTIME_VARIABLES[@]}"; do
+    if [[ -v "${runtime_name}" ]]; then
+        runtime_value="${!runtime_name}"
     else
-        isolation_value=1
+        runtime_value=1
     fi
-    if [ "${isolation_value}" != "1" ]; then
-        echo "ERROR: ${isolation_name} must be exactly 1 for forced evaluation" >&2
+    if [ "${runtime_value}" != "1" ]; then
+        echo "ERROR: ${runtime_name} must be exactly 1 for protected forced evaluation" >&2
         exit 2
     fi
-    export "${isolation_name}=1"
+    export "${runtime_name}=1"
 done
 
 if [ -z "${SLURM_JOB_ID:-}" ]; then
@@ -188,7 +195,7 @@ export XDG_CONFIG_HOME="${POLAR_JOB_CACHE_ROOT}/xdg-config"
 export XDG_RUNTIME_DIR="${POLAR_JOB_CACHE_ROOT}/xdg-runtime"
 export POLAR_APPTAINER_BIN="${POLAR_APPTAINER_BIN:-/usr/bin/apptainer}"
 export POLAR_APPTAINER_NO_INSTANCE="${POLAR_APPTAINER_NO_INSTANCE:-1}"
-export POLAR_APPTAINER_PERSISTENT_BROKER="${POLAR_APPTAINER_PERSISTENT_BROKER:-0}"
+export POLAR_APPTAINER_PERSISTENT_BROKER="${POLAR_APPTAINER_PERSISTENT_BROKER:-1}"
 export POLAR_APPTAINER_NO_MOUNT_HOSTFS="${POLAR_APPTAINER_NO_MOUNT_HOSTFS:-1}"
 export POLAR_APPTAINER_NO_MOUNT_TMP="${POLAR_APPTAINER_NO_MOUNT_TMP:-1}"
 export POLAR_APPTAINER_ISOLATE_PID="${POLAR_APPTAINER_ISOLATE_PID:-1}"

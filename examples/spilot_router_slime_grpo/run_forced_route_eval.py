@@ -56,12 +56,19 @@ DEFAULT_RUNNER_TOTAL_TIMEOUT_SECONDS = 3000
 DEFAULT_FORCED_EVAL_CANDIDATE_COUNT = 2
 DEFAULT_SLURM_MARGIN_SECONDS = 1800
 OWNER_FD_ENV = "SPILOT_FORCED_EVAL_OWNER_FD"
-REQUIRED_ISOLATION_VARIABLES = (
+# The forced runner uses ``Runtime.exec_protected`` to receive its short-lived
+# model-pool capability.  That operation is available only on the persistent
+# direct-exec broker.  Keep the backend requirement in the same exact-value
+# contract as the namespace/mount controls so direct Python invocations and
+# resumed allocations cannot bypass the shell entrypoint's fail-closed check.
+REQUIRED_PROTECTED_RUNTIME_VARIABLES = (
     "POLAR_APPTAINER_NO_INSTANCE",
+    "POLAR_APPTAINER_PERSISTENT_BROKER",
     "POLAR_APPTAINER_NO_MOUNT_HOSTFS",
     "POLAR_APPTAINER_NO_MOUNT_TMP",
     "POLAR_APPTAINER_ISOLATE_PID",
     "POLAR_APPTAINER_ISOLATE_IPC",
+    "POLAR_APPTAINER_CLEANENV",
 )
 SNAPSHOT_TREES = ("src", "examples/spilot_router_slime_grpo")
 TOKENIZER_ASSETS = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja")
@@ -84,11 +91,17 @@ class GatewayAdmissionFatalError(LauncherError):
 
 
 def required_isolation_environment() -> dict[str, str]:
-    values = {name: os.environ.get(name, "1") for name in REQUIRED_ISOLATION_VARIABLES}
+    values = {
+        name: os.environ.get(name, "1")
+        for name in REQUIRED_PROTECTED_RUNTIME_VARIABLES
+    }
     invalid = {name: value for name, value in values.items() if value != "1"}
     if invalid:
         rendered = ", ".join(f"{name}={value!r}" for name, value in sorted(invalid.items()))
-        raise LauncherError(f"forced evaluation requires isolation variables exact=1: {rendered}")
+        raise LauncherError(
+            "protected forced evaluation requires runtime variables exact=1: "
+            f"{rendered}"
+        )
     return values
 
 
@@ -1107,6 +1120,17 @@ def render_polar_config(
         "SPILOT_GPT_COST_WEIGHT": "1.0",
         "SPILOT_COST_PENALTY_LAMBDA": "0.0",
         "SPILOT_COST_NORMALIZER": "1.0",
+        # Reward shaping is disabled in forced evaluation; latency shaping too.
+        "SPILOT_LATENCY_PENALTY_LAMBDA": "0.0",
+        "SPILOT_LATENCY_NORMALIZER": "1800",
+        # Forced-route evaluation targets checkpoints trained on the historical
+        # M0/M1 protocol; keep the byte-exact anonymous labels here.
+        "SPILOT_SLOT_LABEL_MODE": "anonymous",
+        "SPILOT_ROUTING_MODE": "task_level",
+        "SPILOT_MAX_POOL_CALLS": "2",
+        # Unused under task_level; rendered because the shared template
+        # declares it for turn_level lanes.
+        "SPILOT_ROUTER_OBS_MAX_CHARS": "1500",
     }
     template = (template_path or EXAMPLE_DIR / "polar_config.yaml").read_text(encoding="utf-8")
     missing = sorted(set(TEMPLATE_VARIABLE_RE.findall(template)) - values.keys())

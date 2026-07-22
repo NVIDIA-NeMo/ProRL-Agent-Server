@@ -138,6 +138,28 @@ def test_services_only_topology_is_loopback_zero_actor_and_exact_pool(tmp_path: 
     assert "pool/qwen3.5-9b-baseline" not in json.dumps(training_topology)
 
 
+def test_protected_runtime_contract_requires_persistent_broker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in module.REQUIRED_PROTECTED_RUNTIME_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+
+    contract = module.required_isolation_environment()
+
+    assert contract == {
+        name: "1" for name in module.REQUIRED_PROTECTED_RUNTIME_VARIABLES
+    }
+    assert contract["POLAR_APPTAINER_PERSISTENT_BROKER"] == "1"
+    assert contract["POLAR_APPTAINER_CLEANENV"] == "1"
+
+    monkeypatch.setenv("POLAR_APPTAINER_PERSISTENT_BROKER", "0")
+    with pytest.raises(
+        module.LauncherError,
+        match=r"POLAR_APPTAINER_PERSISTENT_BROKER='0'",
+    ):
+        module.required_isolation_environment()
+
+
 def test_rendered_config_reuses_current_pool_parity_and_job_local_uds(tmp_path: Path) -> None:
     data_root, dataset = _assets(tmp_path)
     uds_root = Path("/tmp/polar-forced-test")
@@ -256,6 +278,8 @@ def test_dry_run_writes_auditable_secret_free_plan(tmp_path: Path, monkeypatch) 
     assert manifest["tokenizer_url"] == "http://127.0.0.1:18200"
     assert manifest["source_snapshot_sha256"]
     assert manifest["semantic_identity_sha256"]
+    assert manifest["runtime_isolation"]["POLAR_APPTAINER_PERSISTENT_BROKER"] == "1"
+    assert manifest["runtime_isolation"]["POLAR_APPTAINER_CLEANENV"] == "1"
     assert manifest["pool_timeout_seconds"] == 1200
     assert manifest["runner_total_timeout_seconds"] == 3000
     assert manifest["outer_agent_timeout_seconds"] == 3300
@@ -274,6 +298,7 @@ def test_dry_run_writes_auditable_secret_free_plan(tmp_path: Path, monkeypatch) 
     assert "--semantic-identity" in manifest["evaluator_command"]
     assert str(service_dir / "source_snapshot") in manifest["evaluator_command"][1]
     identity = json.loads((service_dir / "semantic_identity.json").read_text())
+    assert identity["semantic"]["runtime_isolation"] == manifest["runtime_isolation"]
     assert identity["semantic"]["topology"]["gateway"]["nodes"][0]["model_pool"][0][
         "max_active_episodes"
     ] == 4
@@ -837,6 +862,11 @@ def test_slurm_entrypoint_is_one_node_and_has_no_training_stack() -> None:
     assert "printf 'export SRUN_BIN=%q" in submit_text
     assert 'FORCED_EVAL_GPUS="${FORCED_EVAL_GPUS:-0}"' in submit_text
     assert 'SBATCH_ARGS+=(--gres="gpu:${FORCED_EVAL_GPUS}")' in submit_text
+    assert (
+        'POLAR_APPTAINER_PERSISTENT_BROKER="${POLAR_APPTAINER_PERSISTENT_BROKER:-1}"'
+        in run_text
+    )
+    assert "POLAR_APPTAINER_PERSISTENT_BROKER:-0" not in run_text
     assert "--gpus" not in run_text
     assert "--gres" not in run_text
     combined = run_text.lower() + submit_text.lower()
@@ -1228,6 +1258,69 @@ def test_inner_pyxis_entrypoint_does_not_require_host_srun_path(tmp_path: Path) 
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_inner_entrypoint_enables_persistent_broker_and_rejects_opt_out(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "protected-runtime.env"
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "printf '%s|%s|%s\\n' "
+        '"${POLAR_APPTAINER_PERSISTENT_BROKER:-}" '
+        '"${POLAR_APPTAINER_NO_INSTANCE:-}" '
+        '"${POLAR_APPTAINER_CLEANENV:-}" >"${FAKE_PYTHON_ENV}"\n'
+    )
+    fake_python.chmod(0o700)
+    train_image = tmp_path / "train.sqsh"
+    train_image.write_bytes(b"test")
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    environment = dict(os.environ)
+    environment.pop("POLAR_CONTROL_PLANE_TOKEN", None)
+    for name in module.REQUIRED_PROTECTED_RUNTIME_VARIABLES:
+        environment.pop(name, None)
+    environment.update(
+        {
+            "SLURM_JOB_ID": "5432101",
+            "SLURM_JOB_NUM_NODES": "1",
+            "SPILOT_FORCED_EVAL_IN_CONTAINER": "1",
+            "POLAR_NVIDIA_API_KEY": "nvapi-protected-runtime-sentinel",
+            "POLAR_DATA_ROOT": str(data_root),
+            "POLR_TRAIN_SQSH": str(train_image),
+            "TMAX_SIF_PYTHON_BIN": str(fake_python),
+            "FAKE_PYTHON_ENV": str(capture),
+        }
+    )
+
+    completed = subprocess.run(
+        ["bash", str(RUN_SCRIPT), "--i-understand-eval-only"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert capture.read_text().strip() == "1|1|1"
+
+    capture.unlink()
+    environment["SLURM_JOB_ID"] = "5432102"
+    environment["POLAR_APPTAINER_PERSISTENT_BROKER"] = "0"
+    rejected = subprocess.run(
+        ["bash", str(RUN_SCRIPT), "--i-understand-eval-only"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert rejected.returncode == 2
+    assert (
+        "POLAR_APPTAINER_PERSISTENT_BROKER must be exactly 1 for protected forced evaluation"
+    ) in rejected.stderr
+    assert not capture.exists()
 
 
 def test_child_environments_scope_each_credential(monkeypatch) -> None:
