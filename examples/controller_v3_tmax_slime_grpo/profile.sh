@@ -37,6 +37,10 @@ export SGLANG_EP_SIZE=2
 export SGLANG_DP_SIZE=1
 export SGLANG_MEM_FRACTION_STATIC=0.70
 export SGLANG_DISABLE_CUSTOM_ALL_REDUCE=1
+# Keep projection weights in model precision; Slime casts bounded response
+# logits to FP32 for log-prob and entropy calculations.
+export TMAX_ENABLE_FP32_LM_HEAD=0
+export SGLANG_ENABLE_FP32_LM_HEAD=0
 
 export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
 export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
