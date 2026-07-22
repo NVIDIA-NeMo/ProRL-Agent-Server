@@ -249,7 +249,11 @@ for _tmax_token_budget_name in ROLLOUT_MAX_PROMPT_LEN ROLLOUT_MAX_RESPONSE_LEN T
     fi
 done
 unset _tmax_token_budget_name _tmax_token_budget_value
-export TMAX_TRAIN_PACK_LENGTH="$((ROLLOUT_MAX_PROMPT_LEN + TMAX_MAX_TOTAL_RESPONSE_LEN))"
+if [ "${TMAX_AGENT_HARNESS:-}" = "controller_v3" ]; then
+    export TMAX_TRAIN_PACK_LENGTH="$((ROLLOUT_MAX_PROMPT_LEN + ROLLOUT_MAX_RESPONSE_LEN))"
+else
+    export TMAX_TRAIN_PACK_LENGTH="$((ROLLOUT_MAX_PROMPT_LEN + TMAX_MAX_TOTAL_RESPONSE_LEN))"
+fi
 export SEQ_LENGTH="${SEQ_LENGTH:-${TMAX_TRAIN_PACK_LENGTH}}"
 # Slime's dynamic scheduler multiplies this cap by CP, not TP. With CP=1 it
 # must therefore admit one complete 67,584-token pack. TP4 sequence
@@ -425,7 +429,7 @@ _tmax_validate_resource_topology() {
         return 1
     fi
 
-    local actor_gpus actor_parallel_size capacity allocated_gpus rollout_product expected_global_batch
+    local actor_gpus actor_parallel_size capacity allocated_gpus rollout_product expected_global_batch expected_train_pack_length
     local required_gpus
     local global_batch actor_dp train_rollouts_per_dp min_train_rollouts_per_dp
     actor_gpus="$((ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE))"
@@ -487,9 +491,14 @@ _tmax_validate_resource_topology() {
         echo "ERROR: per-turn ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN} exceeds cumulative TMAX_MAX_TOTAL_RESPONSE_LEN=${TMAX_MAX_TOTAL_RESPONSE_LEN}" >&2
         return 1
     fi
-    if [ "${TMAX_TRAIN_PACK_LENGTH}" -ne "$((ROLLOUT_MAX_PROMPT_LEN + TMAX_MAX_TOTAL_RESPONSE_LEN))" ] || \
+    if [ "${TMAX_AGENT_HARNESS:-}" = "controller_v3" ]; then
+        expected_train_pack_length="$((ROLLOUT_MAX_PROMPT_LEN + ROLLOUT_MAX_RESPONSE_LEN))"
+    else
+        expected_train_pack_length="$((ROLLOUT_MAX_PROMPT_LEN + TMAX_MAX_TOTAL_RESPONSE_LEN))"
+    fi
+    if [ "${TMAX_TRAIN_PACK_LENGTH}" -ne "${expected_train_pack_length}" ] || \
        [ "${SEQ_LENGTH}" -ne "${TMAX_TRAIN_PACK_LENGTH}" ]; then
-        echo "ERROR: TMax requires SEQ_LENGTH=prompt+total_response=${TMAX_TRAIN_PACK_LENGTH}, got SEQ_LENGTH=${SEQ_LENGTH}" >&2
+        echo "ERROR: TMax requires SEQ_LENGTH=${expected_train_pack_length} for harness ${TMAX_AGENT_HARNESS:-default}, got SEQ_LENGTH=${SEQ_LENGTH}" >&2
         return 1
     fi
     if [ "$((MAX_TOKENS_PER_GPU * CONTEXT_PARALLEL_SIZE))" -lt "${TMAX_TRAIN_PACK_LENGTH}" ] && \
