@@ -1510,9 +1510,31 @@ POLAR_BACKGROUND_KILL_GRACE_SECONDS=1 \
 def test_spilot_gateway_shutdown_budget_covers_http_and_runtime_teardown() -> None:
     launcher = (SHARED / "run.sh").read_text()
 
-    assert 'POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS:-150' in launcher
-    assert 'POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS}" -lt 150' in launcher
-    assert "60s HTTP drain + 60s runtime proof + 30s margin" in launcher
+    assert 'POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS:-120' in launcher
+    assert "60 + POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS + 30" in launcher
+    assert "_POLAR_GATEWAY_MIN_SHUTDOWN_GRACE_SECONDS" in launcher
+    assert "60s HTTP drain" in launcher
+    assert 'PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"' in launcher
+    assert '"${PYTHON_BIN}" -m polar.cli serve_gateway' in launcher
+
+
+def test_spilot_300_second_runtime_proof_gets_390_second_outer_grace() -> None:
+    launcher = (SHARED / "run.sh").read_text()
+    start = launcher.index('POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS="')
+    end = launcher.index("\n\npolar_pid_is_active()", start)
+    budget_setup = launcher[start:end]
+    result = run_bash(
+        f"""
+set -euo pipefail
+TMAX_AGENT_HARNESS=spilot_router
+POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS=300
+{budget_setup}
+printf '%s\\n' "${{POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS}}"
+"""
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "390"
 
 
 def test_shared_launcher_bounded_cleanup_kills_stuck_process_group() -> None:

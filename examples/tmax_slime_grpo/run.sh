@@ -12,6 +12,20 @@ source "${SCRIPT_DIR}/lifecycle.sh"
 # shellcheck source=./run_state.sh
 source "${SCRIPT_DIR}/run_state.sh"
 
+# The long-lived Polar services must import from this allocation's PROJECT_ROOT.
+# The shared training environment is commonly an editable install whose .pth
+# points at the mutable developer checkout; without this precedence a frozen
+# profiling worktree can silently mix code from that checkout across nodes.
+PYTHON_BIN="${PYTHON_BIN:-${PROJECT_ROOT}/.venv/bin/python3}"
+if [ ! -x "${PYTHON_BIN}" ]; then
+    PYTHON_BIN="$(command -v python3 || command -v python)"
+fi
+export PYTHON_BIN
+export PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+"${PYTHON_BIN}" "${SCRIPT_DIR}/verify_python_provenance.py" \
+    --project-root "${PROJECT_ROOT}" \
+    --harness "${TMAX_AGENT_HARNESS:-}"
+
 # Repeat the submit-side guard inside the allocation.  This protects direct or
 # stale environment-file launches that bypassed the current submitter.
 tmax_require_spilot_entrypoints "allocation startup"

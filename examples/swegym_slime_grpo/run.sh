@@ -819,16 +819,30 @@ PROCESS_GROUPS=()
 POLAR_ROLLOUT_PID=""
 POLAR_GATEWAY_PID=""
 POLAR_UDS_TUNNEL_PID=""
-POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS="${POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS:-150}"
+POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS="${POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS:-120}"
+if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ] && \
+   ! [[ "${POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: formal SPilot requires POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS to be a positive integer" >&2
+    exit 1
+fi
+export POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS
+_POLAR_GATEWAY_MIN_SHUTDOWN_GRACE_SECONDS=210
+if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ]; then
+    # The outer process bound must not kill the gateway while its fail-closed
+    # runtime-containment proof is still within budget.
+    _POLAR_GATEWAY_MIN_SHUTDOWN_GRACE_SECONDS=$((60 + POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS + 30))
+fi
+POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS="${POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS:-${_POLAR_GATEWAY_MIN_SHUTDOWN_GRACE_SECONDS}}"
 if ! [[ "${POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS}" =~ ^[0-9]+$ ]]; then
     echo "ERROR: POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS must be a non-negative integer" >&2
     exit 1
 fi
 if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ] && \
-   [ "${POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS}" -lt 150 ]; then
-    echo "ERROR: formal SPilot requires POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS>=150 (60s HTTP drain + 60s runtime proof + 30s margin)" >&2
+   [ "${POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS}" -lt "${_POLAR_GATEWAY_MIN_SHUTDOWN_GRACE_SECONDS}" ]; then
+    echo "ERROR: formal SPilot requires POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS>=${_POLAR_GATEWAY_MIN_SHUTDOWN_GRACE_SECONDS} (60s HTTP drain + ${POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS}s runtime proof + 30s margin)" >&2
     exit 1
 fi
+unset _POLAR_GATEWAY_MIN_SHUTDOWN_GRACE_SECONDS
 
 polar_pid_is_active() {
     local pid="$1" proc_stat remainder state
@@ -981,7 +995,7 @@ polar_shutdown_gateway_bounded() {
     local pid="$1" grace_seconds="$2" term_already_sent="${3:-0}"
     local kill_grace_seconds rc timed_out=0
     [ -n "${pid}" ] || return 0
-    [[ "${grace_seconds}" =~ ^[0-9]+$ ]] || grace_seconds=150
+    [[ "${grace_seconds}" =~ ^[0-9]+$ ]] || grace_seconds=210
     kill_grace_seconds="${POLAR_BACKGROUND_KILL_GRACE_SECONDS:-2}"
     [[ "${kill_grace_seconds}" =~ ^[0-9]+$ ]] || kill_grace_seconds=2
 
@@ -1264,7 +1278,9 @@ start_polar_gateway() {
         node_id="localhost-node-01"
     fi
     echo "=== Starting Polar gateway node_id=${node_id} host=$(hostname) ip=${RAY_NODE_IP} local=${POLAR_GATEWAY_LOCAL_URL} quotas=${POLAR_GATEWAY_MAX_INIT_WORKERS}/${POLAR_GATEWAY_MAX_RUN_WORKERS}/${POLAR_GATEWAY_MAX_POSTRUN_WORKERS} ==="
-    polar serve_gateway -c "${TOPOLOGY_PATH}" --node-id "${node_id}" &
+    PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+        "${PYTHON_BIN}" -m polar.cli serve_gateway \
+        -c "${TOPOLOGY_PATH}" --node-id "${node_id}" &
     POLAR_GATEWAY_PID=$!
     PIDS+=("${POLAR_GATEWAY_PID}")
     wait_http_ok "Polar gateway ${node_id}" "${POLAR_GATEWAY_LOCAL_URL}/health" 60

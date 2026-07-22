@@ -207,6 +207,12 @@ fi
 # ride on the job comment. Rollout phases of pool-routed RL runs hold GPUs
 # at low utilization while remote model calls execute, so those runs must
 # declare an exemption window instead of being reaped mid-rollout.
+# Default to the idle-GPU-reaper exemption when the caller did not set
+# TMAX_SBATCH_COMMENT at all; an explicitly EMPTY value opts out (no comment).
+# ${VAR-default} (no colon) keeps the set-but-empty case distinct from unset.
+_TMAX_DEFAULT_REAPER_COMMENT='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"240","reason":"interactive","description":"Interactive and debugging sessions"}}'
+TMAX_SBATCH_COMMENT="${TMAX_SBATCH_COMMENT-${_TMAX_DEFAULT_REAPER_COMMENT}}"
+unset _TMAX_DEFAULT_REAPER_COMMENT
 SBATCH_COMMENT_ARG=()
 if [ -n "${TMAX_SBATCH_COMMENT:-}" ]; then
     SBATCH_COMMENT_ARG=(--comment="${TMAX_SBATCH_COMMENT}")
@@ -237,6 +243,7 @@ if [ "${SUBMIT_BACKEND}" = "srun" ]; then
     SRUN_ERR="${SRUN_ERR:-${LOG_DIR}/${JOB_NAME}-srun-${SRUN_LOG_STAMP}.err}"
     SRUN_CMD=(
         "${SRUN_BIN}"
+        "${SBATCH_COMMENT_ARG[@]}"
         --account="${ACCOUNT}"
         --job-name="${JOB_NAME}"
         --partition="${PARTITION}"
