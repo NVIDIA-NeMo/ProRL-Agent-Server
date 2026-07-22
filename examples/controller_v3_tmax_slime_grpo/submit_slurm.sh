@@ -77,6 +77,24 @@ if [ "${dry_run}" = "1" ]; then
     exit 0
 fi
 
+if [ "${WANDB_MODE:-offline}" = "online" ] && [ -z "${WANDB_API_KEY:-}" ]; then
+    if [ "$(stat -c '%U:%a' "${CONTROLLER_V3_WANDB_NETRC}")" != "$(id -un):600" ]; then
+        echo "ERROR: W&B netrc must be owned by the submitter with mode 600" >&2
+        exit 1
+    fi
+    WANDB_API_KEY="$("${TMAX_SIF_PYTHON_BIN}" - "${CONTROLLER_V3_WANDB_NETRC}" <<'PY'
+import netrc
+import sys
+
+credentials = netrc.netrc(sys.argv[1]).authenticators("api.wandb.ai")
+if credentials is None:
+    raise SystemExit("W&B credential for api.wandb.ai is missing")
+print(credentials[2])
+PY
+)"
+    export WANDB_API_KEY
+fi
+
 if [ -z "${POLAR_NVIDIA_API_KEY:-${NVIDIA_API_KEY:-${NVIDIA_INFERENCE_API_KEY:-}}}" ] && [ -f "${CONTROLLER_V3_NVIDIA_CREDENTIALS_FILE}" ]; then
     if [ "$(stat -c '%U:%a' "${CONTROLLER_V3_NVIDIA_CREDENTIALS_FILE}")" != "$(id -un):600" ]; then
         echo "ERROR: NVIDIA credentials must be owned by the submitter with mode 600" >&2
