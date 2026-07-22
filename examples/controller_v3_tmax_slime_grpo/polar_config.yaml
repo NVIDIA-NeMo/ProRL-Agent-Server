@@ -4,6 +4,7 @@ polar_gateway_url: "${POLAR_GATEWAY_URL}"
 polar_reward_key: "score"
 polar_max_async_level: ${POLAR_MAX_ASYNC_LEVEL}
 polar_fully_async: ${POLAR_FULLY_ASYNC}
+polar_max_consecutive_infrastructure_failures: ${POLAR_MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES}
 polar_request_timeout: ${POLAR_REQUEST_TIMEOUT}
 polar_task_timeout_floor: ${POLAR_TASK_TIMEOUT_FLOOR_SECONDS}
 polar_train_agent_timeout: ${TMAX_TRAIN_AGENT_TIMEOUT_SECONDS}

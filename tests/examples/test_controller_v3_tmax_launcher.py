@@ -14,6 +14,7 @@ def test_controller_v3_polar_contract() -> None:
     assert 'harness: "controller_v3"' in text
     assert 'strategy: "router_policy"' in text
     assert 'strategy: "harbor"' in text
+    assert "polar_max_consecutive_infrastructure_failures:" in text
     assert "cost_penalty" not in text
     assert "latency_penalty" not in text
 
@@ -78,7 +79,12 @@ def test_slurm_dry_run_is_side_effect_free_and_reports_full_topology() -> None:
     assert "sbatch --nodes=3" in output
 
 
-def test_two_node_smoke_dry_run_uses_one_prompt_and_two_trajectories() -> None:
+def test_two_node_smoke_dry_run_uses_one_prompt_and_eight_trajectories() -> None:
+    script = (EXAMPLE / "smoke_2n.sh").read_text()
+    assert "export ACTOR_TENSOR_MODEL_PARALLEL_SIZE=4" in script
+    assert "export EXPERT_MODEL_PARALLEL_SIZE=8" in script
+    assert "export N_SAMPLES_PER_PROMPT=8" in script
+    assert "export GLOBAL_BATCH_SIZE=8" in script
     result = subprocess.run(
         ["bash", str(EXAMPLE / "smoke_2n.sh"), "--dry-run"],
         cwd=ROOT,

@@ -310,6 +310,14 @@ class PolarRolloutSchedulerError(RuntimeError):
     """Raised when the async Polar scheduler cannot safely make progress."""
 
 
+class PolarUntrainableGroupError(PolarRolloutSchedulerError):
+    """Raised when a completed group contains no loss-bearing tokens."""
+
+    def __init__(self, message: str, *, infrastructure_only: bool) -> None:
+        super().__init__(message)
+        self.infrastructure_only = infrastructure_only
+
+
 class PolarLowCompleteAcceptFractionError(PolarRolloutSchedulerError):
     """Raised when a completed task has too few trainable completed sessions."""
 
@@ -943,6 +951,18 @@ def _is_zero_trainable_error(exc: BaseException) -> bool:
     return "zero trainable tokens" in str(exc)
 
 
+def _task_result_is_infrastructure_only(task_result: TaskResult) -> bool:
+    if not task_result.results:
+        return False
+    for result in task_result.results:
+        if _status_value(result.status).upper() != "ERROR":
+            return False
+        trajectory = getattr(result, "trajectory", None)
+        if getattr(trajectory, "traces", None):
+            return False
+    return True
+
+
 def _annotate_accepted_samples(
     samples: list[Any],
     *,
@@ -1030,6 +1050,7 @@ class AsyncPolarRolloutWorker:
         self._fully_async_request_count = 0
         self._fully_async_admission_credit = 0
         self._fatal_error: BaseException | None = None
+        self._consecutive_infrastructure_failures = 0
         self._state_lock = threading.RLock()
         self._metrics: dict[str, float] = {}
         self._last_reported_counters: dict[str, float] = {}
@@ -1461,19 +1482,30 @@ class AsyncPolarRolloutWorker:
         if not self._running:
             return
 
+        fuse_error: PolarRolloutSchedulerError | None = None
         if _is_zero_trainable_error(last_error):
             category_metric = "polar/dropped_zero_trainable_groups"
             reason = "zero trainable tokens"
             permanently_consumed = True
+            if (
+                isinstance(last_error, PolarUntrainableGroupError)
+                and last_error.infrastructure_only
+            ):
+                fuse_error = self._note_infrastructure_failure()
+            else:
+                self._reset_infrastructure_failures()
         elif isinstance(last_error, PolarLowCompleteAcceptFractionError):
+            self._reset_infrastructure_failures()
             category_metric = "polar/dropped_low_complete_fraction_groups"
             reason = "low complete accept fraction"
             permanently_consumed = True
         elif isinstance(last_error, RolloutLogprobError):
+            self._reset_infrastructure_failures()
             category_metric = "polar/dropped_logprob_error_groups"
             reason = "rollout logprob error"
             permanently_consumed = True
         else:
+            self._reset_infrastructure_failures()
             category_metric = "polar/dropped_failed_groups"
             reason = "task failure"
             permanently_consumed = False
@@ -1496,6 +1528,9 @@ class AsyncPolarRolloutWorker:
                 )
             self._consume_reservation(pending.reservation_id, outcome="permanent_drop")
             self._restore_fully_async_admission_credit(1)
+            if fuse_error is not None:
+                self._set_fatal(fuse_error)
+                self._running = False
         else:
             if pending.reservation_id is not None:
                 self._inc_metric("polar/replay_on_resume_groups")
@@ -1574,8 +1609,9 @@ class AsyncPolarRolloutWorker:
         if not _has_trainable_tokens(group_samples):
             self._emit_health_observation(completed)
             self._record_wasted_samples(group_samples)
-            raise PolarRolloutSchedulerError(
-                f"Task {task_result.task_id} produced zero trainable tokens"
+            raise PolarUntrainableGroupError(
+                f"Task {task_result.task_id} produced zero trainable tokens",
+                infrastructure_only=_task_result_is_infrastructure_only(task_result),
             )
         rejection_reason = _low_complete_accept_fraction_rejection_reason(
             self.config, task_result, group_samples
@@ -1596,6 +1632,7 @@ class AsyncPolarRolloutWorker:
             try:
                 completed.output_queue_wait_seconds = time.perf_counter() - wait_started
                 self.output_queue.put_nowait(completed)
+                self._reset_infrastructure_failures()
                 self._inc_metric("polar/completed_groups")
                 return
             except queue.Full:
@@ -1890,6 +1927,27 @@ class AsyncPolarRolloutWorker:
         with self._state_lock:
             if self._fatal_error is None:
                 self._fatal_error = exc
+
+    def _note_infrastructure_failure(self) -> PolarRolloutSchedulerError | None:
+        with self._state_lock:
+            self._consecutive_infrastructure_failures += 1
+            count = self._consecutive_infrastructure_failures
+            self._metrics["polar/consecutive_infrastructure_failures"] = float(count)
+            limit = self.config.max_consecutive_infrastructure_failures
+        if limit > 0 and count >= limit:
+            return PolarRolloutSchedulerError(
+                "Polar rollout stopped after "
+                f"{count} consecutive infrastructure-only untrainable groups "
+                f"(limit={limit})"
+            )
+        return None
+
+    def _reset_infrastructure_failures(self) -> None:
+        with self._state_lock:
+            if self._consecutive_infrastructure_failures == 0:
+                return
+            self._consecutive_infrastructure_failures = 0
+            self._metrics["polar/consecutive_infrastructure_failures"] = 0.0
 
     async def _submit_with_callback(
         self, client: httpx.AsyncClient, payload: dict[str, Any]
