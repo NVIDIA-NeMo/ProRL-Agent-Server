@@ -138,6 +138,7 @@ umask 077
     while IFS= read -r name; do
         case "$name" in
             POLAR_*|POLR_*|TMAX_*|MINI_SWE_*|WANDB_*|HF_*|HUGGINGFACE_*|\
+            APPTAINER_ENV|\
             SPILOT_EPISODE_ADMISSION_ENABLED|SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS|\
             SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT|\
             SPILOT_QWEN_COST_WEIGHT|SPILOT_GPT_COST_WEIGHT|\
@@ -183,13 +184,22 @@ printf -v ENTRY_Q '%q' "$CONTAINER_ENTRYPOINT"
 printf -v LOG_Q   '%q' "$LOG_DIR"
 SRUN_BIN="$(command -v srun)"
 printf -v SRUN_Q '%q' "$SRUN_BIN"
+if [ "${POLAR_APPTAINER_JOB_SESSION_MOUNT:-0}" = "1" ]; then
+    APPTAINER_SESSIONDIR="${POLAR_APPTAINER_SESSIONDIR:?set POLAR_APPTAINER_SESSIONDIR}"
+    printf -v APPTAINER_SESSIONDIR_Q '%q' "${APPTAINER_SESSIONDIR}"
+    APPTAINER_SESSION_SETUP="APPTAINER_SESSION_HOST=/tmp/polar-apptainer-session-\${SLURM_JOB_ID}-\${UID}; ${SRUN_Q} --overlap --nodes=${NUM_NODES} --ntasks=${NUM_NODES} --ntasks-per-node=1 --cpus-per-task=1 --cpu-bind=none bash -c 'set -euo pipefail; root=\"\$1\"; if [ -e \"\${root}\" ] || [ -L \"\${root}\" ]; then echo \"ERROR: refusing existing Apptainer session root: \${root}\" >&2; exit 1; fi; install -d -m 700 -- \"\${root}\"' bash \"\${APPTAINER_SESSION_HOST}\"; MNT_Q_WITH_SESSION=${MNT_Q},\${APPTAINER_SESSION_HOST}:${APPTAINER_SESSIONDIR_Q}:rw"
+    MNT_ARG='${MNT_Q_WITH_SESSION}'
+else
+    APPTAINER_SESSION_SETUP=:
+    MNT_ARG="${MNT_Q}"
+fi
 CPUS_PER_TASK="${CPUS_PER_TASK:-128}"
 SLURM_STEP_CPUS_PER_TASK="${SLURM_STEP_CPUS_PER_TASK:-96}"
 # The job allocation already owns all requested CPU/GPU/memory TRES. Repeating
 # the entire 128-CPU allocation on an overlapping step makes the NVIDIA select
 # plugin reject step creation. Leave CPU headroom for the batch shell and let
 # the step inherit job-level GPU and memory TRES.
-WRAP_CMD="umask 077; chmod 600 ${LOG_Q}/\"\${SLURM_JOB_NAME}-\${SLURM_JOB_ID}.out\" ${LOG_Q}/\"\${SLURM_JOB_NAME}-\${SLURM_JOB_ID}.err\" 2>/dev/null || true; export SLIME_SLURM_BATCH_START_UNIX_NS=\$(date +%s%N); ${SRUN_Q} --overlap --nodes=${NUM_NODES} --ntasks=${NUM_NODES} --ntasks-per-node=1 --cpus-per-task=${SLURM_STEP_CPUS_PER_TASK} --cpu-bind=none --kill-on-bad-exit=1 --container-image=${SQSH_Q} --container-mounts=${MNT_Q} --container-workdir=${PR_Q} --container-writable --no-container-mount-home bash ${ENTRY_Q}"
+WRAP_CMD="umask 077; chmod 600 ${LOG_Q}/\"\${SLURM_JOB_NAME}-\${SLURM_JOB_ID}.out\" ${LOG_Q}/\"\${SLURM_JOB_NAME}-\${SLURM_JOB_ID}.err\" 2>/dev/null || true; export SLIME_SLURM_BATCH_START_UNIX_NS=\$(date +%s%N); ${APPTAINER_SESSION_SETUP}; ${SRUN_Q} --overlap --nodes=${NUM_NODES} --ntasks=${NUM_NODES} --ntasks-per-node=1 --cpus-per-task=${SLURM_STEP_CPUS_PER_TASK} --cpu-bind=none --kill-on-bad-exit=1 --container-image=${SQSH_Q} --container-mounts=${MNT_ARG} --container-workdir=${PR_Q} --container-writable --no-container-mount-home bash ${ENTRY_Q}"
 
 SBATCH_CONSTRAINT_ARG=()
 if [ -n "${SLURM_CONSTRAINT}" ]; then

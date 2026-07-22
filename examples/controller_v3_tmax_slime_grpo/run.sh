@@ -9,6 +9,18 @@ SHARED_RUN="${SCRIPT_DIR}/../tmax_slime_grpo/run.sh"
 : "${HF_CHECKPOINT:?}"
 : "${POLR_TRAIN_VENV:?}"
 : "${SGLANG_DIR:?}"
+: "${POLAR_APPTAINER_BIN:?}"
+: "${POLAR_APPTAINER_SESSIONDIR:?}"
+export PATH="$(dirname -- "${POLAR_APPTAINER_BIN}"):${PATH}"
+export POLAR_APPTAINER_DIRECT_EXEC=1
+export POLAR_APPTAINER_NO_INSTANCE=1
+actual_session_dir="$("${POLAR_APPTAINER_BIN}" buildcfg | sed -n 's/^SESSIONDIR=//p')"
+if [[ "${actual_session_dir}" != /* ]] || \
+   [ ! "${actual_session_dir}" -ef "${POLAR_APPTAINER_SESSIONDIR}" ]; then
+    echo "ERROR: Controller V3 Apptainer session bind does not match buildcfg" >&2
+    exit 1
+fi
+unset actual_session_dir
 export RAY_LAST_NODE_NUM_GPUS="${RAY_LAST_NODE_NUM_GPUS:-2}"
 
 SMALL_NODE_RANK="$((NUM_NODES - 1))"

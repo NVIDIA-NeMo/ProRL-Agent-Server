@@ -26,6 +26,17 @@ for path in     "${HF_CHECKPOINT}"     "${REF_LOAD}"     "${MINI_SWE_AGENT_RUNTI
     fi
 done
 
+if [ ! -x "${POLAR_APPTAINER_BIN}" ]; then
+    echo "ERROR: project-local Apptainer is not executable: ${POLAR_APPTAINER_BIN}" >&2
+    exit 1
+fi
+actual_session_dir="$("${POLAR_APPTAINER_BIN}" buildcfg | sed -n 's/^SESSIONDIR=//p')"
+if [ "${actual_session_dir}" != "${POLAR_APPTAINER_SESSIONDIR}" ]; then
+    echo "ERROR: Apptainer SESSIONDIR mismatch: ${actual_session_dir}" >&2
+    exit 1
+fi
+unset actual_session_dir
+
 for path in "${TMAX_DATASET_DIR}" "${TMAX_OPEN_INSTRUCT_DIR}" "${APPTAINER_IMAGE_DIR}"; do
     if [ ! -e "${path}" ]; then
         echo "ERROR: required TMax path is missing: ${path}" >&2
