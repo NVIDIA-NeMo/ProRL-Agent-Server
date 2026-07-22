@@ -275,6 +275,36 @@ def test_mini_swe_task_protocol_preflight_passes_current_runtimes(tmp_path: Path
     assert "AGENT-RAN" in result.stdout
 
 
+def test_mini_swe_preflight_is_a_noop_for_uv_tool_installs(tmp_path: Path) -> None:
+    # A plain `uv tool` install puts the entry point in a bin dir with no
+    # sibling venv/bin/python. The portable-runtime guard must not fire and
+    # break that supported layout.
+    bindir = tmp_path / "uvtool" / "bin"
+    bindir.mkdir(parents=True)
+    fake_agent = bindir / "mini-swe-agent"
+    fake_agent.write_text("#!/usr/bin/env bash\necho AGENT-RAN\n")
+    fake_agent.chmod(0o755)
+
+    harness = MiniSweAgentHarness(
+        AgentSpec(harness="mini_swe_agent", model_name="m", settings={})
+    )
+    command = harness.run_steps("do the task")[0].command
+    command = command.replace('export OPENAI_API_BASE="$OPENAI_BASE_URL" && ', "")
+    command = command.replace('export PATH="$HOME/.local/bin:$PATH" && ', "")
+    command = command.split("2>&1 | tee", 1)[0]
+
+    import subprocess
+
+    result = subprocess.run(
+        ["bash", "-c", command],
+        env={"PATH": f"{bindir}:/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "AGENT-RAN" in result.stdout
+
+
 def test_mini_swe_postprocess_aggregates_fixed_categories(tmp_path: Path) -> None:
     timing_path = tmp_path / "logs" / "agent" / "mini-swe-command-timing.jsonl"
     timing_path.parent.mkdir(parents=True)
