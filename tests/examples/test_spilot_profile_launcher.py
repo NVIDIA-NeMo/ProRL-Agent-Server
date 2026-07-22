@@ -65,11 +65,18 @@ def test_profile_plan_exposes_requested_8_32_and_equal_budget_collocate(
     assert result.returncode == 0, result.stderr
     assert "steps=3 num_rollout=3" in result.stdout
     assert "seed=release model=Qwen/Qwen3.5-9B" in result.stdout
-    assert "max_tokens_per_gpu=32768 early_stop=0.5+2" in result.stdout
+    assert "max_tokens_per_gpu=24576 early_stop=0.5+2" in result.stdout
     assert "async-8t32r-l3" in result.stdout
     assert "collocate-32shared" in result.stdout
     assert "5x8" in result.stdout
     assert "4x8" in result.stdout
+
+
+def test_profile_uses_extended_fail_closed_runtime_teardown_budget() -> None:
+    launcher = (PROFILE / "submit_profile.sh").read_text()
+
+    assert "PROFILE_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS=300" in launcher
+    assert 'POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS="${PROFILE_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS:-300}"' in launcher
 
 
 def test_profile_numbered_seed_uses_exclusive_rollout_boundary(tmp_path: Path) -> None:
@@ -389,8 +396,8 @@ def test_profile_submit_pins_release_model_memory_and_completion_contract(
     assert submitted["POLAR_AGENT_MODEL_NAME"] == "Qwen/Qwen3.5-9B"
     assert submitted["LOAD_DIR"] == str(ref_load)
     assert submitted["TMAX_NUM_ROLLOUT"] == "3"
-    assert submitted["MAX_TOKENS_PER_GPU"] == "32768"
-    assert submitted["TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP"] == "1"
+    assert submitted["MAX_TOKENS_PER_GPU"] == "24576"
+    assert submitted["TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP"] == "0"
     assert submitted["POLAR_MIN_COMPLETE_ACCEPT_FRACTION"] == "0.5"
     assert submitted["POLAR_EARLY_STOP_GRACE_SESSIONS"] == "2"
     assert submitted["TMAX_PYTORCH_ALLOC_CONF"] == "max_split_size_mb:2048"

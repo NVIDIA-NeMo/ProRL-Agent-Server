@@ -10,20 +10,21 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 POLAR_DATA_ROOT="${POLAR_DATA_ROOT:-${WORKSPACE_ROOT}/data}"
 REPORT_ACCOUNT="${REPORT_ACCOUNT:-${ACCOUNT:-${SBATCH_ACCOUNT:-nvr_lpr_llm}}}"
 
-if [ "$#" -ne 4 ]; then
-    echo "Usage: submit_report.sh AFTER_JOB_ID SPILOT_MANIFEST TMAX_MANIFEST OUTPUT_DIR" >&2
+if [ "$#" -ne 5 ]; then
+    echo "Usage: submit_report.sh AFTER_JOB_ID SPILOT_MANIFEST TMAX_MANIFEST SLURM_TERMINAL_EVIDENCE OUTPUT_DIR" >&2
     exit 2
 fi
 
 after_job_id="$1"
 spilot_manifest="$2"
 tmax_manifest="$3"
-output_dir="$4"
+slurm_terminal_evidence="$4"
+output_dir="$5"
 if ! [[ "${after_job_id}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: AFTER_JOB_ID must be numeric" >&2
     exit 2
 fi
-for path in "${spilot_manifest}" "${tmax_manifest}"; do
+for path in "${spilot_manifest}" "${tmax_manifest}" "${slurm_terminal_evidence}"; do
     if [[ "${path}" != /* ]] || [ ! -s "${path}" ]; then
         echo "ERROR: manifest must be an existing non-empty absolute file: ${path}" >&2
         exit 2
@@ -41,6 +42,7 @@ command=(
     --log-root "${POLAR_DATA_ROOT}/logs/slurm"
     --spilot-manifest "${spilot_manifest}"
     --tmax-manifest "${tmax_manifest}"
+    --slurm-terminal-evidence "${slurm_terminal_evidence}"
     --output-dir "${output_dir}"
     --expected-steps "${PROFILE_EXPECTED_STEPS:-3}"
     --warmup-steps "${PROFILE_WARMUP_STEPS:-1}"

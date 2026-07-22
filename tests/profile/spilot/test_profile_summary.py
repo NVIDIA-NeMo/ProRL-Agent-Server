@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "examples" / "spilot_router_slime_grpo" / "profile"))
 
 import profile_summary as ps  # noqa: E402
 
@@ -56,6 +56,10 @@ class ProfileSummaryTest(unittest.TestCase):
                     "export GLOBAL_BATCH_SIZE=256",
                     "export ROLLOUT_BATCH_SIZE=8",
                     "export N_SAMPLES_PER_PROMPT=32",
+                    "export CONTEXT_PARALLEL_SIZE=1",
+                    "export MAX_TOKENS_PER_GPU=32768",
+                    "export TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP=0",
+                    "export TMAX_OPTIMIZER_CPU_OFFLOAD=0",
                     "export POLAR_MIN_COMPLETE_ACCEPT_FRACTION=0.5",
                     "export POLAR_EARLY_STOP_GRACE_SESSIONS=2",
                     # This must never be retained in the report.
@@ -139,6 +143,13 @@ class ProfileSummaryTest(unittest.TestCase):
             self.assertEqual(job["job_status"], "SUCCEEDED")
             self.assertEqual(job["comparability"]["model"], "Qwen/Qwen3.5-9B")
             self.assertEqual(job["comparability"]["data_sha256"], "abc123")
+            self.assertEqual(job["comparability"]["context_parallel_size"], 1)
+            self.assertEqual(job["comparability"]["max_tokens_per_gpu"], 32768)
+            self.assertIs(
+                job["comparability"]["allow_single_sample_over_token_cap"],
+                False,
+            )
+            self.assertIs(job["comparability"]["optimizer_cpu_offload"], False)
             self.assertEqual(len(job["comparability"]["fingerprint"]), 64)
             self.assertNotIn("secret-value", json.dumps(job))
 

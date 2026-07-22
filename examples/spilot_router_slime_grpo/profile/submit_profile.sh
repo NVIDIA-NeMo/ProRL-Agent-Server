@@ -45,9 +45,11 @@ Useful environment overrides:
   PROFILE_HF_CHECKPOINT=/abs/hf   Qwen3.5-9B HF assets
   PROFILE_REF_LOAD=/abs/ckpt      Qwen3.5-9B reference release
   PROFILE_AGENT_MODEL_NAME=Qwen/Qwen3.5-9B
-  PROFILE_MAX_TOKENS_PER_GPU=32768
+  PROFILE_MAX_TOKENS_PER_GPU=24576
+  PROFILE_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP=0
   PROFILE_MIN_COMPLETE_ACCEPT_FRACTION=0.5
   PROFILE_EARLY_STOP_GRACE_SESSIONS=2
+  PROFILE_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS=300
   PROFILE_PARTITION=batch         Slurm partition
   PROFILE_WALL_TIME=04:00:00      wall time for each arm
   PROFILE_AFTER_JOB_ID=12345      chain the first arm after this job
@@ -171,7 +173,8 @@ PROFILE_ID="${PROFILE_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 PROFILE_PARTITION="${PROFILE_PARTITION:-batch}"
 PROFILE_WALL_TIME="${PROFILE_WALL_TIME:-04:00:00}"
 PROFILE_DEPENDENCY_KIND="${PROFILE_DEPENDENCY_KIND:-afterok}"
-PROFILE_MAX_TOKENS_PER_GPU="${PROFILE_MAX_TOKENS_PER_GPU:-32768}"
+PROFILE_MAX_TOKENS_PER_GPU="${PROFILE_MAX_TOKENS_PER_GPU:-24576}"
+PROFILE_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP="${PROFILE_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP:-0}"
 PROFILE_MIN_COMPLETE_ACCEPT_FRACTION="${PROFILE_MIN_COMPLETE_ACCEPT_FRACTION:-0.5}"
 PROFILE_EARLY_STOP_GRACE_SESSIONS="${PROFILE_EARLY_STOP_GRACE_SESSIONS:-2}"
 POLAR_DATA_ROOT="${POLAR_DATA_ROOT:-${WORKSPACE_ROOT}/data}"
@@ -195,6 +198,10 @@ for value_name in PROFILE_STEPS PROFILE_REPEATS; do
 done
 if ! [[ "${PROFILE_MAX_TOKENS_PER_GPU}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: PROFILE_MAX_TOKENS_PER_GPU must be a positive integer" >&2
+    exit 1
+fi
+if ! [[ "${PROFILE_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP}" =~ ^[01]$ ]]; then
+    echo "ERROR: PROFILE_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP must be 0 or 1" >&2
     exit 1
 fi
 if ! [[ "${PROFILE_MIN_COMPLETE_ACCEPT_FRACTION}" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]; then
@@ -423,12 +430,12 @@ for repeat in $(seq 1 "${PROFILE_REPEATS}"); do
             export ACTOR_NUM_GPUS_PER_NODE="${ACTOR_GPUS_PER_NODE}"
             export ACTOR_TENSOR_MODEL_PARALLEL_SIZE="${TP}"
             export CONTEXT_PARALLEL_SIZE=1
-            # Bound a dynamic microbatch to 32K tokens per GPU for both 8-GPU
-            # and 16-GPU learners.  Preserve the released sequence/pack shape:
-            # an individually oversize trajectory is admitted alone rather
-            # than rejected by the topology preflight.
+            # Bound both packed microbatches and individual trajectories. The
+            # adapter clips an oversize response to an exact causal prefix,
+            # avoiding topology-dependent OOMs while preserving prompt and
+            # retained-token rollout log-prob alignment.
             export MAX_TOKENS_PER_GPU="${PROFILE_MAX_TOKENS_PER_GPU}"
-            export TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP=1
+            export TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP="${PROFILE_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP}"
             export ROLLOUT_NUM_GPUS="${ROLLOUT_GPUS}"
             export ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_TP}"
             export TMAX_REQUIRE_FULL_GPU_ALLOCATION=1
@@ -459,6 +466,10 @@ for repeat in $(seq 1 "${PROFILE_REPEATS}"); do
             # instead of the previous accidental 32/32 long-tail barrier.
             export POLAR_MIN_COMPLETE_ACCEPT_FRACTION="${PROFILE_MIN_COMPLETE_ACCEPT_FRACTION}"
             export POLAR_EARLY_STOP_GRACE_SESSIONS="${PROFILE_EARLY_STOP_GRACE_SESSIONS}"
+            # High-concurrency SPilot arms can own hundreds of Apptainer
+            # runtimes at early-stop. Keep destruction proof fail-closed while
+            # allowing enough time to cancel, reap, and verify every runtime.
+            export POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS="${PROFILE_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS:-300}"
             export POLAR_CANDIDATE_POOL_HEALTH_GATE_ENABLED=true
             export POLAR_CANDIDATE_POOL_HEALTH_MIN_OBSERVED_SESSIONS=16
             export POLAR_CANDIDATE_POOL_HEALTH_MIN_COMPLETION_FRACTION=0.1

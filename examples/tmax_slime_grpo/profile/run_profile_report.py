@@ -7,6 +7,7 @@ import argparse
 from collections import Counter
 import csv
 import datetime as dt
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -50,6 +51,7 @@ REQUIRED_REPORT_ARTIFACTS = (
     "gpu-allocation-analysis.json",
     "gpu-allocation-arms.csv",
     "gpu-role-utilization.csv",
+    "slurm-terminal-evidence.json",
     "report-inputs.json",
 )
 COMPLETE_MARKER = "REPORT_COMPLETE"
@@ -192,6 +194,111 @@ def read_manifest(path: Path, data_root: Path) -> tuple[list[dict[str, str]], li
     return rows, job_dirs
 
 
+def validate_slurm_terminal_evidence(
+    path: Path,
+    suite_rows: dict[str, Sequence[dict[str, str]]],
+) -> dict[str, Any]:
+    """Validate exact Slurm allocation terminal state for every manifest job."""
+
+    raw_bytes = path.read_bytes()
+    payload = json.loads(raw_bytes.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Slurm terminal evidence is not a JSON object: {path}")
+    raw_jobs = payload.get("jobs")
+    if not isinstance(raw_jobs, dict):
+        raise ValueError("Slurm terminal evidence has no jobs object")
+
+    expected: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for suite, rows in suite_rows.items():
+        for row in rows:
+            job_id = str(row.get("job_id") or "").strip()
+            arm = str(row.get("arm") or "").strip()
+            try:
+                allocated_gpus = _integer_field(row, "allocated_gpus")
+            except ValueError as exc:
+                errors.append(f"{suite}/{arm or '<missing>'}: {exc}")
+                continue
+            if allocated_gpus % 8 != 0:
+                errors.append(
+                    f"{suite}/{arm or '<missing>'}: allocated_gpus={allocated_gpus} "
+                    "is not divisible by the fixed 8 GPUs/node contract"
+                )
+                continue
+            expected[job_id] = {
+                "suite": suite,
+                "arm": arm,
+                "allocated_gpus": allocated_gpus,
+                "allocated_nodes": allocated_gpus // 8,
+            }
+
+    observed_ids = {str(job_id) for job_id in raw_jobs}
+    expected_ids = set(expected)
+    missing = sorted(expected_ids - observed_ids)
+    unexpected = sorted(observed_ids - expected_ids)
+    if missing:
+        errors.append(f"Slurm evidence is missing jobs: {', '.join(missing)}")
+    if unexpected:
+        errors.append(f"Slurm evidence contains unexpected jobs: {', '.join(unexpected)}")
+
+    normalized_jobs: dict[str, dict[str, Any]] = {}
+    for job_id in sorted(expected_ids & observed_ids, key=int):
+        record = raw_jobs.get(job_id)
+        if not isinstance(record, dict):
+            errors.append(f"Slurm evidence job {job_id} is not an object")
+            continue
+        state = str(record.get("state") or "").strip().upper()
+        exit_code = str(record.get("exit_code") or "").strip()
+        try:
+            alloc_gpus = int(record.get("allocated_gpus"))
+            alloc_nodes = int(record.get("allocated_nodes"))
+        except (TypeError, ValueError):
+            errors.append(f"Slurm evidence job {job_id} has invalid allocation counts")
+            continue
+        expected_record = expected[job_id]
+        if state != "COMPLETED":
+            errors.append(f"Slurm job {job_id} state is {state or 'missing'}, not COMPLETED")
+        if exit_code != "0:0":
+            errors.append(f"Slurm job {job_id} exit code is {exit_code or 'missing'}, not 0:0")
+        if alloc_gpus != expected_record["allocated_gpus"]:
+            errors.append(
+                f"Slurm job {job_id} allocated {alloc_gpus} GPUs; expected "
+                f"{expected_record['allocated_gpus']}"
+            )
+        if alloc_nodes != expected_record["allocated_nodes"]:
+            errors.append(
+                f"Slurm job {job_id} allocated {alloc_nodes} nodes; expected "
+                f"{expected_record['allocated_nodes']}"
+            )
+        start = str(record.get("start") or "").strip()
+        end = str(record.get("end") or "").strip()
+        elapsed = str(record.get("elapsed") or "").strip()
+        if not start or not end or not elapsed:
+            errors.append(f"Slurm job {job_id} is missing start/end/elapsed accounting")
+        normalized_jobs[job_id] = {
+            **expected_record,
+            "state": state,
+            "exit_code": exit_code,
+            "allocated_gpus": alloc_gpus,
+            "allocated_nodes": alloc_nodes,
+            "start": start,
+            "end": end,
+            "elapsed": elapsed,
+        }
+
+    return {
+        "schema_version": 1,
+        "valid": not errors,
+        "captured_at_utc": payload.get("captured_at_utc"),
+        "source": str(path),
+        "source_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        "expected_job_count": len(expected_ids),
+        "observed_job_count": len(observed_ids),
+        "jobs": normalized_jobs,
+        "errors": errors,
+    }
+
+
 def run_checked(command: Sequence[str]) -> str:
     result = subprocess.run(command, check=False, text=True, capture_output=True)
     if result.returncode != 0:
@@ -250,6 +357,7 @@ def evaluate_completion_gate(
     *,
     analysis: dict[str, Any],
     manifest_validation: dict[str, dict[str, Any]],
+    slurm_terminal_validation: dict[str, Any],
     output_dir: Path,
 ) -> dict[str, Any]:
     """Return auditable evidence for whether the final report is complete."""
@@ -258,6 +366,8 @@ def evaluate_completion_gate(
     for suite, validation in manifest_validation.items():
         for error in validation["errors"]:
             reasons.append(f"{suite} manifest: {error}")
+    for error in slurm_terminal_validation.get("errors", []):
+        reasons.append(f"Slurm terminal evidence: {error}")
 
     raw_suites = analysis.get("suites")
     suites = raw_suites if isinstance(raw_suites, list) else []
@@ -376,6 +486,7 @@ def evaluate_completion_gate(
         "valid_arm_count": total_valid_arms,
         "required_valid_arm_count": 8,
         "suites": suite_evidence,
+        "slurm_terminal_valid": slurm_terminal_validation.get("valid") is True,
         "artifacts": artifact_status,
         "reasons": list(dict.fromkeys(reasons)),
     }
@@ -413,6 +524,17 @@ def build_bundle(args: argparse.Namespace) -> dict[str, Any]:
         "spilot_router": validate_manifest_contract("spilot_router", spilot_rows),
         "tmax": validate_manifest_contract("tmax", tmax_rows),
     }
+    slurm_terminal_validation = validate_slurm_terminal_evidence(
+        args.slurm_terminal_evidence,
+        {
+            "spilot_router": spilot_rows,
+            "tmax": tmax_rows,
+        },
+    )
+    _write_json(
+        args.output_dir / "slurm-terminal-evidence.json",
+        slurm_terminal_validation,
+    )
 
     spilot_summary = args.output_dir / "spilot-summary.json"
     tmax_summary = args.output_dir / "tmax-summary.json"
@@ -468,6 +590,7 @@ def build_bundle(args: argparse.Namespace) -> dict[str, Any]:
         "spilot_rows": spilot_rows,
         "tmax_rows": tmax_rows,
         "manifest_validation": manifest_validation,
+        "slurm_terminal_validation": slurm_terminal_validation,
     }
     _write_json(args.output_dir / "report-inputs.json", inputs)
     analysis_path = args.output_dir / "gpu-allocation-analysis.json"
@@ -477,6 +600,7 @@ def build_bundle(args: argparse.Namespace) -> dict[str, Any]:
     completion_gate = evaluate_completion_gate(
         analysis=analysis,
         manifest_validation=manifest_validation,
+        slurm_terminal_validation=slurm_terminal_validation,
         output_dir=args.output_dir,
     )
     inputs["completion_gate"] = completion_gate
@@ -504,6 +628,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--log-root", required=True, type=Path)
     result.add_argument("--spilot-manifest", required=True, type=Path)
     result.add_argument("--tmax-manifest", required=True, type=Path)
+    result.add_argument("--slurm-terminal-evidence", required=True, type=Path)
     result.add_argument("--output-dir", required=True, type=Path)
     result.add_argument("--expected-steps", type=int, default=3)
     result.add_argument("--warmup-steps", type=int, default=1)
@@ -522,6 +647,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         (args.log_root, "log root"),
         (args.spilot_manifest, "SPilot manifest"),
         (args.tmax_manifest, "TMax manifest"),
+        (args.slurm_terminal_evidence, "Slurm terminal evidence"),
     ):
         if not path.exists():
             parser().error(f"{label} does not exist: {path}")

@@ -114,17 +114,21 @@ If the checkpoint tracker is `N`, the script sets Slime's exclusive
 `TMAX_NUM_ROLLOUT` boundary to `N + 1 + PROFILE_STEPS`.  It refuses a numbered
 seed without `PROFILE_TRAIN_DATA`.
 
-For a final decision rather than a directional probe, use at least six steps
-and two repetitions (`PROFILE_STEPS=6 PROFILE_REPEATS=2`).  Repetitions are
-also serialized.
+For a final decision rather than a directional probe, collect at least six
+post-warmup optimizer steps and two repetitions (for one warmup step, use at
+least `PROFILE_STEPS=7 PROFILE_REPEATS=2`). Repetitions are serialized by the
+standard launcher.
 
 The fast profile defaults to `PROFILE_STEPS=3`: one warmup plus two steady
 steps, matching the strict cross-suite report contract. It also uses the same
 memory and completion policy in every arm:
 
-- `PROFILE_MAX_TOKENS_PER_GPU=32768` bounds each dynamic microbatch while
-  preserving the released sequence length and allowing one individually long
-  trajectory to occupy a batch alone;
+- `PROFILE_MAX_TOKENS_PER_GPU=24576` bounds each dynamic microbatch and every
+  individual trajectory. The bridge preserves the complete prompt and clips
+  only the response to the longest exact causal prefix that fits, retaining
+  aligned rollout log probabilities for every kept response token. The 24K
+  default is shared with direct TMax so the 9B collocate arm remains within
+  physical H100 memory and the cross-suite report uses one token contract;
 - `PROFILE_MIN_COMPLETE_ACCEPT_FRACTION=0.5` and
   `PROFILE_EARLY_STOP_GRACE_SESSIONS=2` make a 32-session prompt group return
   after 18 usable sessions. The old grace of 16 accidentally restored a

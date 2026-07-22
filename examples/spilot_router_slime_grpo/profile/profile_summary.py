@@ -76,6 +76,10 @@ SAFE_ENV_KEYS = {
     "ACTOR_NUM_GPUS_PER_NODE",
     "ROLLOUT_NUM_GPUS",
     "ROLLOUT_NUM_GPUS_PER_ENGINE",
+    "CONTEXT_PARALLEL_SIZE",
+    "MAX_TOKENS_PER_GPU",
+    "TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP",
+    "TMAX_OPTIMIZER_CPU_OFFLOAD",
     "RAY_NUM_NODES",
     "NUM_NODES",
     "RAY_NUM_GPUS_PER_NODE",
@@ -414,6 +418,12 @@ def _load_config(
         "global_batch_size": _int(env.get("GLOBAL_BATCH_SIZE")),
         "rollout_batch_size": _int(env.get("ROLLOUT_BATCH_SIZE")),
         "samples_per_prompt": _int(env.get("N_SAMPLES_PER_PROMPT")),
+        "context_parallel_size": _int(env.get("CONTEXT_PARALLEL_SIZE")),
+        "max_tokens_per_gpu": _int(env.get("MAX_TOKENS_PER_GPU")),
+        "allow_single_sample_over_token_cap": _truthy(
+            env.get("TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP")
+        ),
+        "optimizer_cpu_offload": _truthy(env.get("TMAX_OPTIMIZER_CPU_OFFLOAD")),
         "min_complete_accept_fraction": _float(
             env.get("POLAR_MIN_COMPLETE_ACCEPT_FRACTION")
         ),
@@ -433,6 +443,12 @@ def _load_config(
         "harness": env.get("TMAX_AGENT_HARNESS") or env.get("POLAR_AGENT_HARNESS"),
         "rollout_batch_size": config["rollout_batch_size"],
         "samples_per_prompt": config["samples_per_prompt"],
+        "context_parallel_size": config["context_parallel_size"],
+        "max_tokens_per_gpu": config["max_tokens_per_gpu"],
+        "allow_single_sample_over_token_cap": config[
+            "allow_single_sample_over_token_cap"
+        ],
+        "optimizer_cpu_offload": config["optimizer_cpu_offload"],
         "min_complete_accept_fraction": _float(
             env.get("POLAR_MIN_COMPLETE_ACCEPT_FRACTION")
         ),

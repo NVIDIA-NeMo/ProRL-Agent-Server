@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "examples" / "tmax_slime_grpo" / "profile"))
 import run_profile_report as report_runner  # noqa: E402
 
 
@@ -54,6 +54,10 @@ def _write_run(
                 "export GLOBAL_BATCH_SIZE=256",
                 "export ROLLOUT_BATCH_SIZE=8",
                 "export N_SAMPLES_PER_PROMPT=32",
+                "export CONTEXT_PARALLEL_SIZE=1",
+                "export MAX_TOKENS_PER_GPU=32768",
+                "export TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP=0",
+                "export TMAX_OPTIMIZER_CPU_OFFLOAD=0",
                 "export POLAR_MIN_COMPLETE_ACCEPT_FRACTION=0.5",
                 "export POLAR_EARLY_STOP_GRACE_SESSIONS=2",
                 "export POLAR_AGENT_MODEL_NAME=Qwen/Qwen3.5-9B",
@@ -181,6 +185,34 @@ def _run_args(
     *,
     expected_steps: int = 3,
 ) -> list[str]:
+    terminal_evidence = output.parent / f"{output.name}-slurm-accounting.json"
+    jobs: dict[str, dict[str, str | int]] = {}
+    for manifest in (spilot_manifest, tmax_manifest):
+        with manifest.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle, delimiter="\t"))
+        for row in rows:
+            job_id = row["job_id"]
+            allocated_gpus = int(row["allocated_gpus"])
+            jobs[job_id] = {
+                "state": "COMPLETED",
+                "exit_code": "0:0",
+                "start": "2026-07-15T01:00:00",
+                "end": "2026-07-15T02:00:00",
+                "elapsed": "01:00:00",
+                "allocated_nodes": allocated_gpus // 8,
+                "allocated_gpus": allocated_gpus,
+            }
+    terminal_evidence.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "captured_at_utc": "2026-07-15T02:00:01+00:00",
+                "complete": True,
+                "jobs": jobs,
+            }
+        )
+        + "\n"
+    )
     return [
         "--data-root",
         str(data_root),
@@ -190,6 +222,8 @@ def _run_args(
         str(spilot_manifest),
         "--tmax-manifest",
         str(tmax_manifest),
+        "--slurm-terminal-evidence",
+        str(terminal_evidence),
         "--output-dir",
         str(output),
         "--expected-steps",
@@ -210,6 +244,8 @@ def test_report_defaults_to_compute_node_utc() -> None:
             "/spilot.tsv",
             "--tmax-manifest",
             "/tmax.tsv",
+            "--slurm-terminal-evidence",
+            "/terminal.json",
             "--output-dir",
             "/report",
         ]
@@ -244,9 +280,30 @@ def test_complete_gate_accepts_eight_valid_directional_arms(tmp_path: Path) -> N
     inputs = json.loads((output / "report-inputs.json").read_text())
     assert inputs["completion_gate"]["complete"] is True
     assert inputs["completion_gate"]["valid_arm_count"] == 8
+    assert inputs["completion_gate"]["slurm_terminal_valid"] is True
+    assert inputs["slurm_terminal_validation"]["valid"] is True
     assert all(item["valid"] for item in inputs["manifest_validation"].values())
     assert (output / "gpu-allocation-arms.csv").is_file()
     assert (output / "gpu-role-utilization.csv").is_file()
+    assert (output / "slurm-terminal-evidence.json").is_file()
+
+
+def test_slurm_failure_blocks_completion_even_when_ray_succeeds(tmp_path: Path) -> None:
+    data_root, log_root, spilot_manifest, tmax_manifest = _prepare_inputs(tmp_path)
+    output = tmp_path / "report"
+    args = _run_args(data_root, log_root, spilot_manifest, tmax_manifest, output)
+    evidence_path = Path(args[args.index("--slurm-terminal-evidence") + 1])
+    evidence = json.loads(evidence_path.read_text())
+    evidence["jobs"]["201"]["state"] = "FAILED"
+    evidence["jobs"]["201"]["exit_code"] = "70:0"
+    evidence_path.write_text(json.dumps(evidence) + "\n")
+
+    result = report_runner.main(args)
+
+    assert result == 1
+    incomplete = json.loads((output / "REPORT_INCOMPLETE.json").read_text())
+    assert any("Slurm job 201 state is FAILED" in reason for reason in incomplete["reasons"])
+    assert any("Slurm job 201 exit code is 70:0" in reason for reason in incomplete["reasons"])
 
 
 def test_manifest_must_contain_exactly_the_expected_four_arms(tmp_path: Path) -> None:
