@@ -1086,7 +1086,16 @@ cleanup() {
     PROCESS_GROUPS=()
     final_status="${status}"
     if [ "${gateway_shutdown_failed}" -ne 0 ] && [ "${final_status}" -eq 0 ]; then
-        final_status=70
+        # Only SPilot escalates an unprovable gateway teardown to a failed
+        # allocation: router runs must not risk unaccounted provider spend
+        # from leaked pool runtimes. Direct training keeps its outcome — a
+        # completed run is not retroactively failed by teardown noise; the
+        # ERROR lines above remain for operators.
+        if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ]; then
+            final_status=70
+        else
+            echo "WARNING: gateway teardown was unprovable; keeping allocation exit status ${final_status} (non-SPilot harness)" >&2
+        fi
     fi
     exit "${final_status}"
 }

@@ -1399,6 +1399,12 @@ def test_shared_launcher_cleanup_never_waits_unbounded() -> None:
     assert "POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS" in shared_run
     assert "polar_shutdown_gateway_bounded" in cleanup
     assert 'exit "${final_status}"' in cleanup
+    # Unprovable gateway teardown fails the allocation ONLY for SPilot
+    # (provider-spend safety); direct training keeps its own outcome.
+    escalation = cleanup.index("final_status=70")
+    guard = cleanup.rindex('[ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ]', 0, escalation)
+    assert guard < escalation
+    assert "keeping allocation exit status" in cleanup
 
 
 def test_shared_launcher_bounded_cleanup_kills_stuck_child() -> None:
