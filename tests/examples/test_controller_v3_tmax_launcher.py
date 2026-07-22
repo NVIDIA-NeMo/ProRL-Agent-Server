@@ -32,13 +32,18 @@ def test_controller_v3_topology_routes_local_qwen_and_nvidia_luna() -> None:
 
 def test_split_wrapper_reserves_exact_gpu_layout() -> None:
     text = (EXAMPLE / "run.sh").read_text()
-    assert 'export RAY_NUM_GPUS_PER_NODE=2' in text
+    assert 'export RAY_LAST_NODE_NUM_GPUS="${RAY_LAST_NODE_NUM_GPUS:-2}"' in text
     assert 'export RAY_NUM_GPUS_PER_NODE=8' in text
     assert 'CUDA_VISIBLE_DEVICES="${first_gpu},${second_gpu}"' in text
     assert "for replica in 0 1 2" in text
     assert "--tp-size 2" in text
     assert "--ep-size 2" in text
     assert "sglang_router.launch_router" in text
+
+
+def test_slurm_submit_preserves_last_node_ray_gpu_limit() -> None:
+    text = (ROOT / "examples/swegym_slime_grpo/submit_slurm.sh").read_text()
+    assert "RAY_NUM_*|RAY_LAST_NODE_NUM_GPUS|" in text
 
 
 def test_slurm_dry_run_is_side_effect_free_and_reports_full_topology() -> None:
