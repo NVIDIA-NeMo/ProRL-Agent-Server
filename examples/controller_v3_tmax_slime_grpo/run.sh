@@ -4,21 +4,34 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 SHARED_RUN="${SCRIPT_DIR}/../tmax_slime_grpo/run.sh"
-: "${SLURM_NODELIST:?controller_v3 run requires a Slurm allocation}"
 : "${SLURM_NODEID:?}"
 : "${RUN_DIR:?}"
 : "${HF_CHECKPOINT:?}"
 : "${POLR_TRAIN_VENV:?}"
 : "${SGLANG_DIR:?}"
 
-mapfile -t CONTROLLER_V3_NODES < <(scontrol show hostnames "${SLURM_NODELIST}")
-if [ "${#CONTROLLER_V3_NODES[@]}" -ne "${NUM_NODES}" ]; then
-    echo "ERROR: expected ${NUM_NODES} Controller V3 nodes" >&2
+SMALL_NODE_RANK="$((NUM_NODES - 1))"
+SMALL_NODE_FILE="${RUN_DIR}/startup/controller-v3-small-node"
+mkdir -p "${RUN_DIR}/startup"
+if [ "${SLURM_NODEID}" = "${SMALL_NODE_RANK}" ]; then
+    SMALL_NODE="$(hostname -s)"
+    printf '%s\n' "${SMALL_NODE}" >"${SMALL_NODE_FILE}.tmp"
+    mv -f "${SMALL_NODE_FILE}.tmp" "${SMALL_NODE_FILE}"
+else
+    for _ in $(seq 1 600); do
+        [ -s "${SMALL_NODE_FILE}" ] && break
+        sleep 1
+    done
+    if [ ! -s "${SMALL_NODE_FILE}" ]; then
+        echo "ERROR: timed out waiting for frozen-worker hostname" >&2
+        exit 1
+    fi
+    read -r SMALL_NODE <"${SMALL_NODE_FILE}"
+fi
+if ! [[ "${SMALL_NODE}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "ERROR: invalid frozen-worker hostname: ${SMALL_NODE}" >&2
     exit 1
 fi
-
-SMALL_NODE_RANK="$((NUM_NODES - 1))"
-SMALL_NODE="${CONTROLLER_V3_NODES[${SMALL_NODE_RANK}]}"
 SMALL_ROUTER_PORT="${CONTROLLER_V3_SMALL_ROUTER_PORT:-19090}"
 export CONTROLLER_V3_SMALL_ROUTER_BASE_URL="http://${SMALL_NODE}:${SMALL_ROUTER_PORT}/v1"
 READY_FILE="${RUN_DIR}/startup/controller-v3-small-ready"
