@@ -3071,21 +3071,12 @@ def test_shared_launcher_renders_and_validates_early_stop_grace():
     assert template_names <= rendered_names
     assert "unresolved template variable(s)" in launcher
     submitter = (SHARED / "submit_slurm.sh").read_text()
-    for name in (
-        "SPILOT_EPISODE_ADMISSION_ENABLED",
-        "SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS",
-        "SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT",
-        "SPILOT_QWEN_MAX_ACTIVE_EPISODES",
-        "SPILOT_GPT_MAX_ACTIVE_EPISODES",
-        "SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES",
-        "SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES",
-        "SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY",
-        "SPILOT_GPT_GATEWAY_MAX_CONCURRENCY",
-        "SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES",
-        "SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES",
-    ):
-        assert name in submitter
-    assert "SPILOT_*" not in submitter
+    # Since 98cb802d the private job-env snapshot serializes the WHOLE
+    # SPILOT_* namespace: the previous enumerated allowlist silently dropped
+    # newer knobs (SPILOT_ROUTING_MODE and friends), which rendered as YAML
+    # nulls in-container and failed every turn_level session fail-closed.
+    # The namespace carries configuration only, never credentials.
+    assert "SPILOT_*|" in submitter
 
 
 def test_graceful_deadline_prefers_slurm_end_time():

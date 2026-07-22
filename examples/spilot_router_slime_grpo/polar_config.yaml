@@ -134,8 +134,12 @@ ${POLAR_INTERNET_RUNTIME_VOLUME}
       verifier_timeout: "{sample.metadata.verifier_timeout}"
       require_valid_action: true
       cost_penalty_lambda: ${SPILOT_COST_PENALTY_LAMBDA}
+      cost_penalty_mode: ${SPILOT_COST_PENALTY_MODE}
       cost_normalizer: ${SPILOT_COST_NORMALIZER}
       latency_penalty_lambda: ${SPILOT_LATENCY_PENALTY_LAMBDA}
       latency_normalizer: ${SPILOT_LATENCY_NORMALIZER}
+      difficulty_ledger_path: ${SPILOT_DIFFICULTY_LEDGER_PATH}
+      difficulty_easy_multiplier: ${SPILOT_DIFFICULTY_EASY_MULT}
+      difficulty_hard_multiplier: ${SPILOT_DIFFICULTY_HARD_MULT}
 
 polar_task_id_template: "polar-spilot-router-{rollout_id}-{sample.group_index}"

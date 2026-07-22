@@ -281,6 +281,19 @@ export SPILOT_COST_NORMALIZER="${SPILOT_COST_NORMALIZER:-1.0}"
 # seconds (1800 s = a 30-minute session takes the full unit penalty at lambda=1).
 export SPILOT_LATENCY_PENALTY_LAMBDA="${SPILOT_LATENCY_PENALTY_LAMBDA:-0.0}"
 export SPILOT_LATENCY_NORMALIZER="${SPILOT_LATENCY_NORMALIZER:-1800}"
+# Cost-penalty application: "multiplicative" (historical default; penalty
+# gates successes only) or "additive" (penalty subtracts from the outcome,
+# floored at -1, so an expensive failure ranks below a cheap one; invalid
+# router actions stay at exactly 0).
+export SPILOT_COST_PENALTY_MODE="${SPILOT_COST_PENALTY_MODE:-multiplicative}"
+# Optional per-task difficulty conditioning of the cost lambda, from a ledger
+# JSON built offline by scripts/build_spilot_difficulty_ledger.py (within-group
+# counterfactuals; keyed by the dataset row index at the tail of the harness
+# task id). Empty path disables; missing/corrupt ledgers fall back to
+# multiplier 1.0 without affecting reward validity.
+export SPILOT_DIFFICULTY_LEDGER_PATH="${SPILOT_DIFFICULTY_LEDGER_PATH:-}"
+export SPILOT_DIFFICULTY_EASY_MULT="${SPILOT_DIFFICULTY_EASY_MULT:-1.0}"
+export SPILOT_DIFFICULTY_HARD_MULT="${SPILOT_DIFFICULTY_HARD_MULT:-1.0}"
 
 # Candidate labelling: "real_names" (default since 2026-07-21) presents
 # candidates under their actual pool model names; "anonymous" is the
