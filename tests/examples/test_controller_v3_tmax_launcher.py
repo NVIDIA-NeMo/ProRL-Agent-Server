@@ -98,6 +98,9 @@ def test_two_node_smoke_dry_run_uses_one_prompt_and_two_trajectories() -> None:
 
 
 def test_three_node_smoke_dry_run_uses_split_actor_topology() -> None:
+    script = (EXAMPLE / "smoke_3n.sh").read_text()
+    assert "export N_SAMPLES_PER_PROMPT=8" in script
+    assert "export GLOBAL_BATCH_SIZE=8" in script
     result = subprocess.run(
         ["bash", str(EXAMPLE / "smoke_3n.sh"), "--dry-run"],
         cwd=ROOT,
