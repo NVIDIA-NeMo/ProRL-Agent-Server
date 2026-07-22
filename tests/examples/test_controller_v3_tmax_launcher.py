@@ -47,6 +47,30 @@ def test_slurm_submit_preserves_last_node_ray_gpu_limit() -> None:
     assert "RAY_NUM_*|RAY_LAST_NODE_NUM_GPUS|" in text
 
 
+def test_controller_v3_requires_persistent_apptainer_broker() -> None:
+    profile = (EXAMPLE / "profile.sh").read_text()
+    submit = (EXAMPLE / "submit_slurm.sh").read_text()
+    assert 'POLAR_APPTAINER_PERSISTENT_BROKER:-1' in profile
+    assert (
+        'if [ "${POLAR_APPTAINER_PERSISTENT_BROKER:-}" != "1" ]; then'
+        in submit
+    )
+    result = subprocess.run(
+        ["bash", str(EXAMPLE / "submit_slurm.sh"), "--dry-run"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "DRY_RUN": "1",
+            "POLAR_APPTAINER_PERSISTENT_BROKER": "0",
+        },
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "protected execution requires" in result.stderr
+
+
 def test_actor_expert_parallelism_reaches_megatron() -> None:
     profile = (EXAMPLE / "profile.sh").read_text()
     shared_run = (ROOT / "examples/swegym_slime_grpo/run.sh").read_text()
@@ -73,6 +97,7 @@ def test_slurm_dry_run_is_side_effect_free_and_reports_full_topology() -> None:
     assert "gateways=3" in output
     assert "api=responses reasoning=max" in output
     assert "request_caps_per_gateway=qwen:1,gpt:4" in output
+    assert "apptainer_persistent_broker=1" in output
     assert "TMax ready rows=1007 images=1000" in output
     assert "/data/training_data/tmax/tmax-15k" in output
     assert "/tmax-15k-open-instruct/enroot-images" in output
@@ -100,6 +125,7 @@ def test_two_node_smoke_dry_run_uses_one_prompt_and_eight_trajectories() -> None
     assert "actor=1x8 controller_rollout=1x2 frozen_qwen=3x2" in output
     assert "gateways=2" in output
     assert "request_caps_per_gateway=qwen:1,gpt:4" in output
+    assert "apptainer_persistent_broker=1" in output
     assert "sbatch --nodes=2" in output
 
 

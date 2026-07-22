@@ -7,6 +7,11 @@ PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 # shellcheck source=./profile.sh
 source "${SCRIPT_DIR}/profile.sh"
 
+if [ "${POLAR_APPTAINER_PERSISTENT_BROKER:-}" != "1" ]; then
+    echo "ERROR: Controller V3 protected execution requires POLAR_APPTAINER_PERSISTENT_BROKER=1" >&2
+    exit 1
+fi
+
 dry_run="${DRY_RUN:-0}"
 if [ "${1:-}" = "--dry-run" ]; then
     dry_run=1
@@ -75,6 +80,7 @@ if [ "${dry_run}" = "1" ]; then
     printf '%s\n' "  small=pool/qwen3.6-35b-a3b local_replicas=3 tp=2"
     printf '%s\n' "  large=pool/gpt-5.6-luna upstream=openai/openai/gpt-5.6-luna api=responses reasoning=max"
     printf '%s\n' "  request_caps_per_gateway=qwen:1,gpt:4 episode_admission=false"
+    printf '%s\n' "  apptainer_persistent_broker=${POLAR_APPTAINER_PERSISTENT_BROKER}"
     printf '%s\n' "  hf_checkpoint=${HF_CHECKPOINT}"
     printf '%s\n' "  ref_checkpoint=${REF_LOAD}"
     printf '%s\n' "  runtime=${MINI_SWE_AGENT_RUNTIME_DIR} (Python 3.10.20, Mini-SWE-Agent 2.4.0)"
