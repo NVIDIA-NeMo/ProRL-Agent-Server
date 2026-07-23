@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import shutil
 from contextlib import suppress
 from pathlib import Path
@@ -427,12 +428,21 @@ class GatewayNodeManager:
 
             # Postprocess always runs so harnesses can collect artifacts from
             # failed or timed-out agent runs before post-run evaluation.
-            timeout_stage = "postprocess"
             managed.timer.mark("agent_postprocess", "started")
+
+            def start_postprocess():
+                # `_await_with_agent_budget` validates the remaining budget
+                # before it invokes this factory. Keep the stage as `exec`
+                # when the agent consumed its budget before postprocess could
+                # start; that is an aligned policy timeout, not a postprocess
+                # failure. Once invoked, a later timeout is a genuine
+                # postprocess timeout and remains fail-closed.
+                nonlocal timeout_stage
+                timeout_stage = "postprocess"
+                return harness.postprocess(runtime, agent_result)
+
             try:
-                await self._await_with_agent_budget(
-                    lambda: harness.postprocess(runtime, agent_result), managed
-                )
+                await self._await_with_agent_budget(start_postprocess, managed)
             finally:
                 managed.timer.mark("agent_postprocess", "finished")
         except GatewayExecutionTimeout as exc:
@@ -1049,6 +1059,7 @@ class GatewayNodeManager:
             and any(trace.loss_mask)
             and trace.response_logprobs is not None
             and len(trace.response_logprobs) == len(trace.response_ids)
+            and all(math.isfinite(value) for value in trace.response_logprobs)
         )
 
     @staticmethod

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 HUB_DATASET = "tmax/TMax-15K-Harbor@latest"
+HUB_EXPORT_DIRNAME = "TMax-15K-Harbor"
 IMAGE_PREFIX = "polar-tmax15k"
 
 # Coding-agent harnesses install at task time via the INIT prepare step (the
@@ -137,7 +138,21 @@ def load_tasks(
 ) -> list[TmaxTask]:
     """Enumerate tasks under *dataset_dir* (any depth — robust to export nesting)."""
     root = find_dataset_dir(dataset_dir)
-    task_dirs = sorted({p.parent for p in root.rglob("task.toml")})
+    # Harbor's canonical export has one known wrapper directory with every task
+    # directly beneath it. Prefer that bounded scan: a recursive walk also
+    # descends into all 15K environment/test trees and can generate gigabytes of
+    # unnecessary Lustre metadata traffic. Keep rglob as the compatibility
+    # fallback for non-standard exports and test fixtures.
+    canonical_root = (
+        root if root.name == HUB_EXPORT_DIRNAME else root / HUB_EXPORT_DIRNAME
+    )
+    canonical_paths = (
+        list(canonical_root.glob("*/task.toml"))
+        if canonical_root.is_dir()
+        else []
+    )
+    task_paths = canonical_paths or list(root.rglob("task.toml"))
+    task_dirs = sorted({path.parent for path in task_paths})
     tasks: list[TmaxTask] = []
     # Keep selection deterministic while avoiding a full metadata/content read
     # when callers request only a prefix. SIF array workers used to parse all

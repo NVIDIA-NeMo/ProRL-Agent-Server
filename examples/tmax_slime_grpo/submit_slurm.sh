@@ -38,6 +38,15 @@ if [ ! -x "${TMAX_SIF_PYTHON_BIN}" ]; then
     exit 1
 fi
 
+export TMAX_VALIDATE_EXISTING_ASSETS="${TMAX_VALIDATE_EXISTING_ASSETS:-1}"
+case "${TMAX_VALIDATE_EXISTING_ASSETS}" in
+    0|1) ;;
+    *)
+        echo "ERROR: TMAX_VALIDATE_EXISTING_ASSETS must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
+
 # Fail before requesting GPUs when the shared training venv no longer matches
 # its CUDA/Transformer-Engine ABI.  This caught a real failure where a package
 # operation replaced cuBLAS 13.3 with 13.1: importing torch alone still worked,
@@ -147,31 +156,24 @@ case "${TMAX_AGENT_HARNESS}" in
         _mini_swe_vanillux_source="${PROJECT_ROOT}/src/polar/agent/presets/mini_swe_vanillux.py"
         _mini_swe_vanillux_config_source="${PROJECT_ROOT}/src/polar/agent/presets/vanillux2.yaml"
         _mini_swe_vanillux_config_installed="${MINI_SWE_AGENT_RUNTIME_DIR}/config/vanillux2.yaml"
+        _mini_swe_site_packages_candidates=(
+            "${MINI_SWE_AGENT_RUNTIME_DIR}"/venv/lib/python*/site-packages
+        )
         _mini_swe_timing_installed=""
         _mini_swe_runner_installed=""
         _mini_swe_vanillux_installed=""
-        if [ -x "${_mini_swe_python}" ]; then
-            if ! _mini_swe_timing_installed="$(
-                "${_mini_swe_python}" -c \
-                  'import polar_mini_swe_timing as m; assert m.TIMING_SCHEMA_VERSION == 1; print(m.__file__)' \
-                  2>/dev/null | tail -n 1
-            )"; then
-                _mini_swe_timing_installed=""
-            fi
-            if ! _mini_swe_runner_installed="$(
-                "${_mini_swe_python}" -c \
-                  'import polar_mini_swe_runner as m; print(m.__file__)' \
-                  2>/dev/null | tail -n 1
-            )"; then
-                _mini_swe_runner_installed=""
-            fi
-            if ! _mini_swe_vanillux_installed="$(
-                "${_mini_swe_python}" -c \
-                  'import polar_mini_swe_vanillux as m; print(m.__file__)' \
-                  2>/dev/null | tail -n 1
-            )"; then
-                _mini_swe_vanillux_installed=""
-            fi
+        # Do not import these modules on the submission host.  A cold or
+        # contended Lustre page can leave Python in cl_sync_io_wait forever,
+        # which would stall the relaunch watcher before it reaches sbatch.
+        # The runtime builder installs these files directly in one purelib
+        # directory, and the cmp checks below are a stronger validation than
+        # importing them merely to discover __file__.
+        if [ "${#_mini_swe_site_packages_candidates[@]}" -eq 1 ] && \
+           [ -d "${_mini_swe_site_packages_candidates[0]}" ]; then
+            _mini_swe_site_packages="${_mini_swe_site_packages_candidates[0]}"
+            _mini_swe_timing_installed="${_mini_swe_site_packages}/polar_mini_swe_timing.py"
+            _mini_swe_runner_installed="${_mini_swe_site_packages}/polar_mini_swe_runner.py"
+            _mini_swe_vanillux_installed="${_mini_swe_site_packages}/polar_mini_swe_vanillux.py"
         fi
         if [ ! -x "${MINI_SWE_AGENT_BIN}" ] || \
            [ ! -x "${_mini_swe_python}" ] || \
@@ -200,7 +202,8 @@ case "${TMAX_AGENT_HARNESS}" in
         unset _mini_swe_python _mini_swe_timing_source _mini_swe_timing_installed \
             _mini_swe_runner_source _mini_swe_runner_installed \
             _mini_swe_vanillux_source _mini_swe_vanillux_installed \
-            _mini_swe_vanillux_config_source _mini_swe_vanillux_config_installed
+            _mini_swe_vanillux_config_source _mini_swe_vanillux_config_installed \
+            _mini_swe_site_packages _mini_swe_site_packages_candidates
         ;;
     codex)
         if [ ! -x "${AGENT_CLI_DIR}/bin/codex" ]; then
@@ -233,18 +236,49 @@ if [ -n "${LOAD_DIR:-}" ] && \
         exit 1
     fi
     _tmax_seed_iter="$(tr -d '[:space:]' <"${LOAD_DIR}/latest_checkpointed_iteration.txt")"
-    if ! [[ "${_tmax_seed_iter}" =~ ^[0-9]+$ ]]; then
+    if ! [[ "${_tmax_seed_iter}" =~ ^(0|[1-9][0-9]*)$ ]]; then
         echo "ERROR: LOAD_DIR must point to a numbered training checkpoint" >&2
         exit 1
     fi
+    # Format the already-canonical decimal tracker as a fixed-width string.
+    # Avoid eval/arithmetic expansion so the tracker can never alter the path.
+    printf -v _tmax_seed_iter_dirname 'iter_%07s' "${_tmax_seed_iter}"
+    _tmax_seed_iter_dirname="${_tmax_seed_iter_dirname// /0}"
+    _tmax_seed_model_dir="${LOAD_DIR}/${_tmax_seed_iter_dirname}"
+    if [ ! -d "${_tmax_seed_model_dir}" ]; then
+        echo "ERROR: numbered LOAD_DIR tracker ${_tmax_seed_iter} has no matching model checkpoint directory" >&2
+        echo "  Missing: ${_tmax_seed_model_dir}" >&2
+        exit 1
+    fi
+    for _tmax_seed_model_file in common.pt .metadata; do
+        _tmax_seed_model_path="${_tmax_seed_model_dir}/${_tmax_seed_model_file}"
+        if [ ! -f "${_tmax_seed_model_path}" ] || [ ! -s "${_tmax_seed_model_path}" ]; then
+            echo "ERROR: numbered LOAD_DIR model checkpoint ${_tmax_seed_iter} is incomplete" >&2
+            echo "  Missing or empty regular file: ${_tmax_seed_model_path}" >&2
+            exit 1
+        fi
+    done
+    _tmax_seed_rollout_state="${LOAD_DIR}/rollout/global_dataset_state_dict_${_tmax_seed_iter}.pt"
+    if [ ! -s "${_tmax_seed_rollout_state}" ]; then
+        echo "ERROR: numbered LOAD_DIR checkpoint ${_tmax_seed_iter} has no matching rollout state" >&2
+        echo "  Missing or empty: ${_tmax_seed_rollout_state}" >&2
+        echo "  Refusing to combine model weights with a different data-source cursor." >&2
+        exit 1
+    fi
     _tmax_seed_samples="$(awk 'NF { count += 1 } END { print count + 0 }' "${TMAX_TRAIN_DATA}")"
-    _tmax_seed_target="$(( (_tmax_seed_samples + ROLLOUT_BATCH_SIZE - 1) / ROLLOUT_BATCH_SIZE * NUM_EPOCH - 1 ))"
+    if [ -n "${TMAX_NUM_ROLLOUT:-}" ]; then
+        _tmax_seed_target="$((TMAX_NUM_ROLLOUT - 1))"
+    else
+        _tmax_seed_target="$(( (_tmax_seed_samples + ROLLOUT_BATCH_SIZE - 1) / ROLLOUT_BATCH_SIZE * NUM_EPOCH - 1 ))"
+    fi
     if [ "${_tmax_seed_iter}" -ge "${_tmax_seed_target}" ]; then
         echo "ERROR: seed iteration ${_tmax_seed_iter} has already reached target ${_tmax_seed_target} for ${_tmax_seed_samples} prompts" >&2
         echo "  This usually means TMAX_TRAIN_DATA does not match the checkpoint's rollout data-source state." >&2
         exit 1
     fi
-    unset _tmax_seed_iter _tmax_seed_samples _tmax_seed_target
+    unset _tmax_seed_iter _tmax_seed_iter_dirname _tmax_seed_model_dir \
+        _tmax_seed_model_file _tmax_seed_model_path _tmax_seed_rollout_state \
+        _tmax_seed_samples _tmax_seed_target
 fi
 
 PREPARE_ARGS=(
@@ -254,8 +288,10 @@ PREPARE_ARGS=(
     --start-index "${TMAX_TRAIN_START_INDEX}"
     --max-tasks "${TMAX_MAX_TASKS}"
 )
-if [ "${TMAX_EXTERNAL_EVAL_ENABLED}" = "1" ] && \
-   [ "${TMAX_REQUIRE_EXACT_TOTAL_TASKS}" = "1" ]; then
+if [ -n "${TMAX_EXCLUDE_DATA}" ]; then
+    PREPARE_ARGS+=(--exclude-data "${TMAX_EXCLUDE_DATA}")
+fi
+if [ "${TMAX_REQUIRE_EXACT_TOTAL_TASKS}" = "1" ]; then
     PREPARE_ARGS+=(--expected-total-tasks "${TMAX_TOTAL_TASKS}")
 fi
 if [ "${TMAX_ONLY_READY}" = "1" ]; then
@@ -263,9 +299,11 @@ if [ "${TMAX_ONLY_READY}" = "1" ]; then
 fi
 if [ "${TMAX_PREPARE_DATA:-1}" = "1" ] || [ ! -s "${TMAX_TRAIN_DATA}" ]; then
     "${TMAX_SIF_PYTHON_BIN}" "${SCRIPT_DIR}/prepare_data.py" "${PREPARE_ARGS[@]}"
-else
+elif [ "${TMAX_VALIDATE_EXISTING_ASSETS}" = "1" ]; then
     "${TMAX_SIF_PYTHON_BIN}" "${SCRIPT_DIR}/prepare_data.py" \
         "${PREPARE_ARGS[@]}" --validate-existing
+else
+    echo "[tmax submit] skipping deep validation of existing training assets"
 fi
 
 if [ "${TMAX_EVAL_ENABLED}" = "1" ]; then
@@ -309,16 +347,20 @@ if [ "${TMAX_EVAL_ENABLED}" = "1" ]; then
     fi
     if [ "${TMAX_PREPARE_EVAL_DATA}" = "1" ] || [ ! -s "${TMAX_EVAL_DATA}" ]; then
         "${TMAX_SIF_PYTHON_BIN}" "${EVAL_PREPARE_SCRIPT}" "${EVAL_PREPARE_ARGS[@]}"
-    else
+    elif [ "${TMAX_VALIDATE_EXISTING_ASSETS}" = "1" ]; then
         "${TMAX_SIF_PYTHON_BIN}" "${EVAL_PREPARE_SCRIPT}" \
             "${EVAL_PREPARE_ARGS[@]}" --validate-existing
+    else
+        echo "[tmax submit] skipping deep validation of existing primary eval assets"
     fi
     if [ "${TMAX_EXTERNAL_EVAL_ENABLED}" = "1" ]; then
         if [ "${TMAX_PREPARE_EVAL_DATA}" = "1" ] || [ ! -s "${TMAX_EXTERNAL_EVAL_DATA}" ]; then
             "${TMAX_SIF_PYTHON_BIN}" "${SCRIPT_DIR}/prepare_harbor_eval.py" "${EXTERNAL_PREPARE_ARGS[@]}"
-        else
+        elif [ "${TMAX_VALIDATE_EXISTING_ASSETS}" = "1" ]; then
             "${TMAX_SIF_PYTHON_BIN}" "${SCRIPT_DIR}/prepare_harbor_eval.py" \
                 "${EXTERNAL_PREPARE_ARGS[@]}" --validate-existing
+        else
+            echo "[tmax submit] skipping deep validation of existing external eval assets"
         fi
     fi
     _TMAX_DATA_INTEGRITY_CANDIDATE="${TMAX_DATA_INTEGRITY_MANIFEST}.candidate.$$"

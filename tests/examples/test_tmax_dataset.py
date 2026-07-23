@@ -47,6 +47,24 @@ def test_load_tasks_stops_parsing_after_requested_prefix(monkeypatch, tmp_path: 
     assert [task.name for task in tasks] == ["task_a"]
 
 
+def test_load_tasks_uses_bounded_scan_for_canonical_harbor_export(
+    monkeypatch, tmp_path: Path
+) -> None:
+    dataset = _dataset_module(monkeypatch)
+    export_root = tmp_path / dataset.HUB_EXPORT_DIRNAME
+    _write_task(export_root, "task_a")
+    _write_task(export_root, "task_b")
+
+    def reject_recursive_scan(self, pattern):
+        raise AssertionError(f"unexpected recursive scan: {self} {pattern}")
+
+    monkeypatch.setattr(Path, "rglob", reject_recursive_scan)
+
+    tasks = dataset.load_tasks(tmp_path)
+
+    assert [task.name for task in tasks] == ["task_a", "task_b"]
+
+
 def test_load_tasks_rejects_incomplete_task_in_selected_prefix(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -150,6 +168,57 @@ def test_prepare_data_full_mode_requires_requested_task_count(monkeypatch, tmp_p
     args.max_tasks = 2
 
     with pytest.raises(SystemExit, match="first 2 TMax task.*only 1 valid"):
+        prepare_data.select_tasks(args)
+
+
+def test_prepare_data_excludes_fixed_holdout_from_full_ready_population(
+    monkeypatch, tmp_path: Path
+) -> None:
+    prepare_data = _prepare_data_module(monkeypatch)
+    dataset_dir = tmp_path / "dataset"
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    for name in ("task_a", "task_b", "task_c", "task_d"):
+        _write_task(dataset_dir, name)
+        (image_dir / f"{name}.sif").write_bytes(b"sif")
+    holdout = tmp_path / "holdout.jsonl"
+    _write_prompt_row(holdout, "task_b", image_dir / "task_b.sif")
+    _write_prompt_row(holdout, "task_d", image_dir / "task_d.sif")
+    args = _selection_args(dataset_dir, image_dir, only_ready=True)
+    args.start_index = 0
+    args.max_tasks = -1
+    args.exclude_data = [str(holdout)]
+    args.expected_total_tasks = 4
+
+    selected, missing_count = prepare_data.select_tasks(args)
+
+    assert [task.name for task in selected] == ["task_a", "task_c"]
+    assert missing_count == 0
+
+
+def test_prepare_data_exclusion_is_fail_closed(monkeypatch, tmp_path: Path) -> None:
+    prepare_data = _prepare_data_module(monkeypatch)
+    dataset_dir = tmp_path / "dataset"
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    _write_task(dataset_dir, "task_a")
+    (image_dir / "task_a.sif").write_bytes(b"sif")
+    holdout = tmp_path / "holdout.jsonl"
+    _write_prompt_row(holdout, "unknown", image_dir / "unknown.sif")
+    args = _selection_args(dataset_dir, image_dir, only_ready=True)
+    args.start_index = 0
+    args.max_tasks = -1
+    args.exclude_data = [str(holdout)]
+    args.expected_total_tasks = 1
+
+    with pytest.raises(SystemExit, match="absent from the selected source"):
+        prepare_data.select_tasks(args)
+
+    args.start_index = 1
+    with pytest.raises(
+        SystemExit,
+        match="exclude-data requires the complete deterministic source population",
+    ):
         prepare_data.select_tasks(args)
 
 

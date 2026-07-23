@@ -213,6 +213,8 @@ def test_final_pack_failure_preserves_existing_target(monkeypatch, tmp_path: Pat
         if _fake_direct_build(command, env=env):
             return
         pack_calls += 1
+        if command[0] == "mksquashfs":
+            raise subprocess.CalledProcessError(1, command)
         Path(command[-2]).write_bytes(b"partial")
         raise subprocess.CalledProcessError(255, command)
 
@@ -222,7 +224,7 @@ def test_final_pack_failure_preserves_existing_target(monkeypatch, tmp_path: Pat
     with pytest.raises(subprocess.CalledProcessError):
         _build_one(build_sifs, task, tmp_path, force=True)
 
-    assert pack_calls == 3
+    assert pack_calls == 4
     assert target.read_bytes() == b"trusted-old-sif"
     assert list(image_dir.glob(".*.tmp-*")) == []
     assert list((tmp_path / "scratch").iterdir()) == []
@@ -307,3 +309,55 @@ def test_duplicate_fallback_preserves_existing_mksquashfs_args(monkeypatch):
 
     assert command[4] == "-processors 1 -mem 1024M"
     assert fallback[4] == "-processors 1 -mem 1024M -no-duplicates"
+
+
+def test_direct_squashfs_fallback_creates_system_partition(monkeypatch, tmp_path: Path):
+    build_sifs = _build_sifs_module(monkeypatch)
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    output = tmp_path / "image.sif"
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], *, env: dict[str, str] | None = None) -> None:
+        calls.append(command)
+        if command[0] == "mksquashfs":
+            Path(command[2]).write_bytes(b"squashfs")
+        elif command[1:3] == ["sif", "new"]:
+            Path(command[3]).write_bytes(b"sif-header")
+        elif command[1:3] == ["sif", "add"]:
+            Path(command[3]).write_bytes(b"complete-sif")
+
+    monkeypatch.setattr(build_sifs, "run_command", fake_run)
+    build_sifs.pack_sandbox_sif_without_reimport(
+        "apptainer",
+        sandbox,
+        output,
+        env={},
+        mksquashfs_args="-processors 1 -mem 1024M",
+    )
+
+    assert output.read_bytes() == b"complete-sif"
+    assert calls[0] == [
+        "mksquashfs",
+        str(sandbox),
+        f"{output}.rootfs.squashfs",
+        "-noappend",
+        "-processors",
+        "1",
+        "-mem",
+        "1024M",
+    ]
+    assert calls[1] == ["apptainer", "sif", "new", str(output)]
+    assert calls[2][-10:] == [
+        "--groupid",
+        "1",
+        "--datatype",
+        "4",
+        "--parttype",
+        "2",
+        "--partfs",
+        "1",
+        "--partarch",
+        "2",
+    ]
+    assert not Path(f"{output}.rootfs.squashfs").exists()

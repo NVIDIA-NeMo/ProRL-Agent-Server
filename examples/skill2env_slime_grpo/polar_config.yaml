@@ -1,21 +1,15 @@
-# Polar task template used by Slime's custom rollout bridge.
+# Skill2Env rollout template: deterministic Harbor outcome plus rubric PRM.
 polar_rollout_url: "${POLAR_ROLLOUT_URL}"
 polar_gateway_url: "${POLAR_GATEWAY_URL}"
 polar_reward_key: "score"
 polar_max_async_level: ${POLAR_MAX_ASYNC_LEVEL}
 polar_fully_async: ${POLAR_FULLY_ASYNC}
 polar_request_timeout: ${POLAR_REQUEST_TIMEOUT}
-# Infrastructure/session budget. The bridge takes max(dataset timeout, floor),
-# while metadata.agent_timeout remains a separate active RUN-stage model cap.
 polar_task_timeout_floor: ${POLAR_TASK_TIMEOUT_FLOOR_SECONDS}
-# Train-only active RUN-stage cap. Eval payloads deliberately keep each
-# dataset row's metadata.agent_timeout instead of inheriting this override.
 polar_train_agent_timeout: ${TMAX_TRAIN_AGENT_TIMEOUT_SECONDS}
 polar_callback_host: "${POLAR_CALLBACK_HOST}"
 polar_min_complete_accept_fraction: ${POLAR_MIN_COMPLETE_ACCEPT_FRACTION}
 polar_early_stop_grace_sessions: ${POLAR_EARLY_STOP_GRACE_SESSIONS}
-# Exact trainer-side acceptance cap. This is prompt (2,048) plus the complete
-# multi-turn response budget (65,536), not Slime's per-turn generation cap.
 polar_max_trajectory_tokens: ${TMAX_TRAIN_PACK_LENGTH}
 polar_agent_cli_dir: ${AGENT_CLI_DIR}
 polar_apptainer_image_dir: ${APPTAINER_IMAGE_DIR}
@@ -24,21 +18,10 @@ polar_task_template:
   timeout_seconds: "{sample.metadata.timeout_seconds}"
   runtime:
     backend: "apptainer"
-    # Each row pins its exact local image. This supports both TMax SIFs and
-    # external Harbor/Terminal-Bench raw SquashFS (.sqsh) images.
     image: "{sample.metadata.sif_path}"
     network: "${POLAR_SANDBOX_NETWORK}"
     allow_internet: "{sample.metadata.allow_internet}"
     workdir: "{sample.metadata.workdir}"
-    # Under nested direct Apptainer exec + --pid, image env hooks run under
-    # appinit. Re-run only TMax's standardized service hook in the actual
-    # workload shell (once in a broker owner, or once per fresh exec), so its
-    # background services remain alive while that command runs. No task SIF
-    # rebuild is required.
-    direct_exec_init_command: >-
-      if [ -f /.singularity.d/env/99-rogue.sh ]; then
-        . /.singularity.d/env/99-rogue.sh;
-      fi
     env:
       HOME: "/polar/session/home"
       PATH: "${POLAR_AGENT_PATH}"
@@ -47,15 +30,9 @@ polar_task_template:
       MKL_NUM_THREADS: "${MKL_NUM_THREADS}"
       NUMEXPR_NUM_THREADS: "${NUMEXPR_NUM_THREADS}"
       TOKENIZERS_PARALLELISM: "${TOKENIZERS_PARALLELISM}"
-      # With rootless network=none, the injected mini-SWE runner connects
-      # LiteLLM directly to the first UDS and exposes the second as a private
-      # loopback HTTP proxy for action subprocesses (pip/curl/git HTTP).
       POLAR_GATEWAY_UDS: "${POLAR_SANDBOX_GATEWAY_UDS}"
       POLAR_HTTP_PROXY_UDS: "${POLAR_SANDBOX_HTTP_PROXY_UDS}"
       POLAR_HTTP_PROXY_PORT: "${POLAR_SANDBOX_HTTP_PROXY_PORT}"
-      # The nested direct-exec broker is deliberately stdlib-only, but some
-      # task images do not ship Python. Reuse the read-only portable interpreter
-      # already mounted for mini-SWE-agent; no task SIF rebuild is required.
       POLAR_APPTAINER_BROKER_PYTHON: "/opt/polar-mini-swe-agent/venv/bin/python"
       POLAR_APT_HTTP_SOURCE_POLICY: "${POLAR_APT_HTTP_SOURCE_POLICY}"
       http_proxy: "${http_proxy}"
@@ -95,12 +72,24 @@ ${POLAR_INTERNET_RUNTIME_VOLUME}
           chat_template_kwargs:
             enable_thinking: ${POLAR_AGENT_ENABLE_THINKING}
   builder:
-    strategy: "prefix_merging"
+    strategy: "per_request"
   evaluator:
-    strategy: "harbor"
+    strategy: "harbor_rubric"
     refresh_runtime: false
     config:
       tests_dir: "{sample.metadata.tests_dir}"
       verifier_timeout: "{sample.metadata.verifier_timeout}"
+      judge_base_url: "${PRM_BASE_URL}"
+      judge_model: "${PRM_MODEL}"
+      judge_api: "responses"
+      judge_api_key_env: "PRM_KEY"
+      rubric_coefficient: ${PRM_RUBRIC_COEFFICIENT}
+      judge_timeout: ${PRM_TIMEOUT_SECONDS}
+      judge_max_retries: 2
+      judge_max_output_tokens: 16384
+      judge_include_tool_outputs: ${PRM_INCLUDE_TOOL_OUTPUTS}
+      judge_tool_output_max_chars: ${PRM_TOOL_OUTPUT_MAX_CHARS}
+      judge_max_traces_per_call: ${PRM_MAX_TRACES_PER_CALL}
+      max_section_chars: 120000
 
-polar_task_id_template: "polar-tmax-grpo-{rollout_id}-{sample.group_index}"
+polar_task_id_template: "polar-skill2env-grpo-{rollout_id}-{sample.group_index}"

@@ -5,15 +5,18 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 SPILOT_ROOT="$(cd -- "${PROJECT_ROOT}/../.." && pwd)"
 USER_ROOT="$(dirname "${SPILOT_ROOT}")"
+TMAX_SOURCE_SPILOT_ROOT="${TMAX_SOURCE_SPILOT_ROOT:-/lustre/fsw/portfolios/nvr/projects/nvr_lpr_llm/users/jiaruiy/spilot}"
+TMAX_SOURCE_DATA_ROOT="${TMAX_SOURCE_DATA_ROOT:-${TMAX_SOURCE_SPILOT_ROOT}/data}"
+TMAX_SOURCE_USER_ROOT="${TMAX_SOURCE_USER_ROOT:-$(dirname "${TMAX_SOURCE_SPILOT_ROOT}")}"
 # shellcheck source=./lifecycle.sh
 source "${SCRIPT_DIR}/lifecycle.sh"
 
-export POLAR_DATA_ROOT="${POLAR_DATA_ROOT:-${SPILOT_ROOT}/data}"
-export TMAX_DATASET_DIR="${TMAX_DATASET_DIR:-${POLAR_DATA_ROOT}/tmax-15k}"
-export APPTAINER_IMAGE_DIR="${APPTAINER_IMAGE_DIR:-${POLAR_DATA_ROOT}/tmax-15k-sif}"
-export AGENT_CLI_DIR="${AGENT_CLI_DIR:-${POLAR_DATA_ROOT}/agent_cli/opt_node}"
-export TMAX_SIF_PYTHON_BIN="${TMAX_SIF_PYTHON_BIN:-${USER_ROOT}/.python/polar/bin/python}"
-export MINI_SWE_AGENT_RUNTIME_DIR="${MINI_SWE_AGENT_RUNTIME_DIR:-${POLAR_DATA_ROOT}/mini_swe_agent_runtime}"
+export POLAR_DATA_ROOT="${POLAR_DATA_ROOT:-${PROJECT_ROOT}/local_data}"
+export TMAX_DATASET_DIR="${TMAX_DATASET_DIR:-${TMAX_SOURCE_DATA_ROOT}/tmax-15k}"
+export APPTAINER_IMAGE_DIR="${APPTAINER_IMAGE_DIR:-${TMAX_SOURCE_DATA_ROOT}/tmax-15k-sif}"
+export AGENT_CLI_DIR="${AGENT_CLI_DIR:-${TMAX_SOURCE_DATA_ROOT}/agent_cli/opt_node}"
+export TMAX_SIF_PYTHON_BIN="${TMAX_SIF_PYTHON_BIN:-${POLAR_DATA_ROOT}/train_runtime_venv/bin/python}"
+export MINI_SWE_AGENT_RUNTIME_DIR="${MINI_SWE_AGENT_RUNTIME_DIR:-${TMAX_SOURCE_DATA_ROOT}/mini_swe_agent_runtime}"
 export MINI_SWE_AGENT_CONTAINER_DIR="${MINI_SWE_AGENT_CONTAINER_DIR:-/opt/polar-mini-swe-agent}"
 export MINI_SWE_AGENT_PYTHON_ROOT="${MINI_SWE_AGENT_PYTHON_ROOT:-${USER_ROOT}/tb_runs/pyportable/cpython-3.12.13-linux-x86_64-gnu}"
 export MINI_SWE_AGENT_SPEC="${MINI_SWE_AGENT_SPEC:-mini-swe-agent==2.4.2}"
@@ -106,12 +109,12 @@ export CPUS_PER_TASK="${CPUS_PER_TASK:-128}"
 export SLURM_STEP_CPUS_PER_TASK="${SLURM_STEP_CPUS_PER_TASK:-120}"
 export SUBMIT_BACKEND="${SUBMIT_BACKEND:-sbatch}"
 
-DEFAULT_TRAIN_SQSH="${POLAR_DATA_ROOT}/container/flappydora-ubuntu22.04-cuda13.3.sqsh"
+DEFAULT_TRAIN_SQSH="${TMAX_SOURCE_DATA_ROOT}/container/flappydora-ubuntu22.04-cuda13.3.sqsh"
 if [ ! -f "${DEFAULT_TRAIN_SQSH}" ] && [ -f "${USER_ROOT}/spilot-router/container/polar_train.sqsh" ]; then
     DEFAULT_TRAIN_SQSH="${USER_ROOT}/spilot-router/container/polar_train.sqsh"
 fi
 export POLR_TRAIN_SQSH="${POLR_TRAIN_SQSH:-${DEFAULT_TRAIN_SQSH}}"
-export POLR_TRAIN_VENV="${POLR_TRAIN_VENV:-${USER_ROOT}/.python/polar}"
+export POLR_TRAIN_VENV="${POLR_TRAIN_VENV:-${POLAR_DATA_ROOT}/train_runtime_venv}"
 export TRAIN_CONTAINER_MOUNTS="${TRAIN_CONTAINER_MOUNTS:-/lustre/fsw:/lustre/fsw}"
 export POLAR_APPTAINER_BIN="${POLAR_APPTAINER_BIN:-/usr/bin/apptainer}"
 export POLAR_APPTAINER_NO_INSTANCE="${POLAR_APPTAINER_NO_INSTANCE:-1}"
@@ -164,7 +167,7 @@ case "${POLAR_SANDBOX_NETWORK}" in
         ;;
 esac
 
-export HF_HOME="${HF_HOME:-${USER_ROOT}/.cache/huggingface}"
+export HF_HOME="${HF_HOME:-${POLAR_DATA_ROOT}/hf-cache}"
 # FlashInfer ignores XDG_CACHE_HOME and otherwise compiles into the job-local
 # HOME that run_in_container.sh deliberately removes. Qwen3.5 TP>1 enables its
 # TensorRT-LLM all-reduce fusion automatically; compiling that operator took
@@ -172,14 +175,14 @@ export HF_HOME="${HF_HOME:-${USER_ROOT}/.cache/huggingface}"
 # namespace ABI-specific because FlashInfer's own cache key contains only its
 # version and GPU architecture, not the Torch/CUDA/compiler ABI.
 export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-${POLAR_DATA_ROOT}/kernel-cache/cuda13.3-py312-torch2.11-sglang0.5.13-fi0.6.12-d768c14e-gcc13}"
-export HF_CHECKPOINT="${HF_CHECKPOINT:-${POLAR_DATA_ROOT}/checkpoints/Qwen3.5-9B}"
-DEFAULT_REF_LOAD="${POLAR_DATA_ROOT}/checkpoints/Qwen3.5-9B_torch_dist"
+export HF_CHECKPOINT="${HF_CHECKPOINT:-${TMAX_SOURCE_DATA_ROOT}/checkpoints/Qwen3.5-9B}"
+DEFAULT_REF_LOAD="${TMAX_SOURCE_DATA_ROOT}/checkpoints/Qwen3.5-9B_torch_dist"
 export REF_LOAD="${REF_LOAD:-${DEFAULT_REF_LOAD}}"
 export TORCH_DIST_DIR="${TORCH_DIST_DIR:-${REF_LOAD}}"
-export SLIME_DIR="${SLIME_DIR:-${SPILOT_ROOT}/src/slime}"
+export SLIME_DIR="${SLIME_DIR:-${TMAX_SOURCE_SPILOT_ROOT}/src/slime}"
 export MODEL_ARGS_FILE="${MODEL_ARGS_FILE:-${SCRIPT_DIR}/model_args.sh}"
-DEFAULT_MEGATRON_DIR="${POLAR_DATA_ROOT}/Megatron-LM-slime-v0.3.0"
-ROUTER_MEGATRON_DIR="${USER_ROOT}/spilot-router/data/Megatron-LM-slime-v0.3.0"
+DEFAULT_MEGATRON_DIR="${TMAX_SOURCE_SPILOT_ROOT}/src/Megatron-LM"
+ROUTER_MEGATRON_DIR="${TMAX_SOURCE_USER_ROOT}/spilot-router/data/Megatron-LM-slime-v0.3.0"
 WORKSPACE_MEGATRON_DIR="${SPILOT_ROOT}/src/Megatron-LM"
 if [ ! -f "${DEFAULT_MEGATRON_DIR}/megatron/training/tokenizer/tokenizer.py" ] && \
    [ -f "${ROUTER_MEGATRON_DIR}/megatron/training/tokenizer/tokenizer.py" ]; then
@@ -195,15 +198,16 @@ export MEGATRON_DIR="${MEGATRON_DIR:-${DEFAULT_MEGATRON_DIR}}"
 # default.  Gateway fan-out is an independent infrastructure experiment and
 # must be opted into explicitly rather than being coupled to NUM_NODES.
 
-# The four-node TMax jobs use one complete eight-GPU learner node. TP4 plus
-# parallelism is the safe mapping for the pinned Qwen3.5 hybrid implementation:
-# its GatedDeltaNet path does not implement mathematically correct CP>1 state
-# propagation. One trainer node gives TP4 x DP2; the other 24 GPUs provide
-# independent TP1 rollout engines. One optimizer step still consumes all
-# 8*32=256 trajectories.
+# The four-node TMax jobs use one complete eight-GPU learner node. TP4 is the
+# largest safe tensor-parallel degree for Qwen3.5-9B's four query groups. PP2
+# splits model state and activations across the remaining learner dimension,
+# leaving room for complete 67,584-token packs without using unsafe CP on the
+# recurrent GatedDeltaNet path. The other 24 GPUs are independent TP1 rollout
+# engines. One optimizer step still consumes all 8*32=256 trajectories.
 export ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-1}"
 export ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
 export ACTOR_TENSOR_MODEL_PARALLEL_SIZE="${ACTOR_TENSOR_MODEL_PARALLEL_SIZE:-4}"
+export ACTOR_PIPELINE_MODEL_PARALLEL_SIZE="${ACTOR_PIPELINE_MODEL_PARALLEL_SIZE:-2}"
 # CP>1 would split the recurrent GatedDeltaNet state incorrectly in the pinned
 # Megatron checkout, so long-sequence capacity comes from TP4 sequence
 # parallelism and a one-sample dynamic microbatch rather than CP.
@@ -252,8 +256,33 @@ export SGLANG_ENABLE_FP32_LM_HEAD="${SGLANG_ENABLE_FP32_LM_HEAD:-1}"
 export SEQUENCE_PARALLEL="${SEQUENCE_PARALLEL:-1}"
 export DIST_CKPT_STRICTNESS="${DIST_CKPT_STRICTNESS:-log_all}"
 export ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
-export SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
+export SAVE_INTERVAL="${SAVE_INTERVAL:-1}"
+export LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-64}"
 export NUM_EPOCH="${NUM_EPOCH:-1}"
+# Optional absolute rollout-loop boundary. Slime treats --num-rollout as an
+# exclusive upper bound, so the matching final checkpoint/watcher target is
+# always TMAX_NUM_ROLLOUT - 1. Keep the derived target explicit in run state so
+# the trainer and watcher cannot silently follow different stopping contracts.
+if [ -n "${TMAX_TARGET_ITER:-}" ] && \
+   ! [[ "${TMAX_TARGET_ITER}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "ERROR: TMAX_TARGET_ITER must be a non-negative integer" >&2
+    return 1 2>/dev/null || exit 1
+fi
+if [ -n "${TMAX_NUM_ROLLOUT:-}" ]; then
+    if ! [[ "${TMAX_NUM_ROLLOUT}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: TMAX_NUM_ROLLOUT must be a positive integer" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    _tmax_explicit_target="$((TMAX_NUM_ROLLOUT - 1))"
+    if [ -n "${TMAX_TARGET_ITER:-}" ] && \
+       [ "${TMAX_TARGET_ITER}" -ne "${_tmax_explicit_target}" ]; then
+        echo "ERROR: TMAX_TARGET_ITER=${TMAX_TARGET_ITER} must equal TMAX_NUM_ROLLOUT-1=${_tmax_explicit_target}" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    export TMAX_NUM_ROLLOUT
+    export TMAX_TARGET_ITER="${_tmax_explicit_target}"
+    unset _tmax_explicit_target
+fi
 # Match the released TMax recipe: behavior-anchored DPPO with binary-TV 0.1,
 # no reference-policy KL term, and a constant 1e-6 learning rate. The shared
 # SWE-Gym launcher retains PPO+TIS unless these TMax overrides are present.
@@ -285,7 +314,8 @@ _tmax_validate_resource_topology() {
     local -a positive_names=(
         NUM_NODES SLURM_GPUS RAY_NUM_GPUS_PER_NODE
         ACTOR_NUM_NODES ACTOR_NUM_GPUS_PER_NODE
-        ACTOR_TENSOR_MODEL_PARALLEL_SIZE CONTEXT_PARALLEL_SIZE
+        ACTOR_TENSOR_MODEL_PARALLEL_SIZE ACTOR_PIPELINE_MODEL_PARALLEL_SIZE
+        CONTEXT_PARALLEL_SIZE
         ROLLOUT_NUM_GPUS ROLLOUT_NUM_GPUS_PER_ENGINE
         ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT NUM_STEPS_PER_ROLLOUT
         SEQ_LENGTH MAX_TOKENS_PER_GPU TMAX_TRAIN_PACK_LENGTH
@@ -340,9 +370,9 @@ _tmax_validate_resource_topology() {
         echo "ERROR: actor GPUs per node ${ACTOR_NUM_GPUS_PER_NODE} must be divisible by tensor parallel size ${ACTOR_TENSOR_MODEL_PARALLEL_SIZE}" >&2
         return 1
     fi
-    actor_parallel_size="$((ACTOR_TENSOR_MODEL_PARALLEL_SIZE * CONTEXT_PARALLEL_SIZE))"
+    actor_parallel_size="$((ACTOR_TENSOR_MODEL_PARALLEL_SIZE * ACTOR_PIPELINE_MODEL_PARALLEL_SIZE * CONTEXT_PARALLEL_SIZE))"
     if [ "$((actor_gpus % actor_parallel_size))" -ne 0 ]; then
-        echo "ERROR: total actor GPUs ${actor_gpus} must be divisible by tensor*context parallel size ${ACTOR_TENSOR_MODEL_PARALLEL_SIZE}*${CONTEXT_PARALLEL_SIZE}=${actor_parallel_size}" >&2
+        echo "ERROR: total actor GPUs ${actor_gpus} must be divisible by tensor*pipeline*context parallel size ${ACTOR_TENSOR_MODEL_PARALLEL_SIZE}*${ACTOR_PIPELINE_MODEL_PARALLEL_SIZE}*${CONTEXT_PARALLEL_SIZE}=${actor_parallel_size}" >&2
         return 1
     fi
     if [ "$((SEQ_LENGTH % (2 * CONTEXT_PARALLEL_SIZE)))" -ne 0 ]; then
@@ -358,10 +388,9 @@ _tmax_validate_resource_topology() {
         echo "ERROR: TMax requires SEQ_LENGTH=prompt+total_response=${TMAX_TRAIN_PACK_LENGTH}, got SEQ_LENGTH=${SEQ_LENGTH}" >&2
         return 1
     fi
-    if [ "$((MAX_TOKENS_PER_GPU * CONTEXT_PARALLEL_SIZE))" -lt "${TMAX_TRAIN_PACK_LENGTH}" ]; then
-        echo "ERROR: trainer token capacity MAX_TOKENS_PER_GPU*CP=$((MAX_TOKENS_PER_GPU * CONTEXT_PARALLEL_SIZE)) is smaller than the complete TMax pack ${TMAX_TRAIN_PACK_LENGTH}" >&2
-        return 1
-    fi
+    # MAX_TOKENS_PER_GPU controls multi-sample micro-batch packing. Slime
+    # intentionally schedules a single sample longer than the cap alone, so
+    # this may be lower than TMAX_TRAIN_PACK_LENGTH without truncating it.
     if [ "$((rollout_product % NUM_STEPS_PER_ROLLOUT))" -ne 0 ]; then
         echo "ERROR: rollout batch product must be divisible by NUM_STEPS_PER_ROLLOUT" >&2
         return 1
@@ -392,7 +421,7 @@ if ! _tmax_validate_resource_topology; then
 fi
 unset -f _tmax_validate_resource_topology
 
-export TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS:-1800}"
+export TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS:-3600}"
 export TMAX_ENABLE_GRACEFUL_EXIT="${TMAX_ENABLE_GRACEFUL_EXIT:-1}"
 export POLAR_FULLY_ASYNC="${POLAR_FULLY_ASYNC:-true}"
 export TMAX_MIN_ASYNC_LEVEL="${TMAX_MIN_ASYNC_LEVEL:-4}"
@@ -594,8 +623,15 @@ esac
 # usable SIF before submission.
 export TMAX_ONLY_READY="${TMAX_ONLY_READY:-0}"
 export TMAX_TRAIN_START_INDEX="${TMAX_TRAIN_START_INDEX:-0}"
+# Optional fail-closed complement selector. The file's task names are removed
+# from the complete deterministic source population before SIF readiness is
+# applied, so a fixed holdout cannot leak into an all-ready training set.
+export TMAX_EXCLUDE_DATA="${TMAX_EXCLUDE_DATA:-}"
 export TMAX_MAX_TASKS="${TMAX_MAX_TASKS:-14501}"
 export TMAX_EVAL_ENABLED="${TMAX_EVAL_ENABLED:-1}"
+# Keep the holdout/data-integrity contract independent from whether this
+# training run schedules baseline, periodic, or final evals.
+export TMAX_TRAINING_EVAL_ENABLED="${TMAX_TRAINING_EVAL_ENABLED:-${TMAX_EVAL_ENABLED}}"
 export TMAX_EVAL_SOURCE="${TMAX_EVAL_SOURCE:-tmax}"
 if [[ "${TMAX_TRAIN_START_INDEX}" =~ ^[0-9]+$ ]] && \
    [[ "${TMAX_MAX_TASKS}" =~ ^[1-9][0-9]*$ ]]; then
@@ -677,6 +713,7 @@ export TMAX_HARBOR_EVAL_AGENT_STEP_LIMIT="${TMAX_HARBOR_EVAL_AGENT_STEP_LIMIT:-$
 # A very large interval plus Slime's mandatory final-iteration trigger yields
 # exactly two comparable points: the pre-train baseline and final model.
 export TMAX_EVAL_INTERVAL="${TMAX_EVAL_INTERVAL:-1000000}"
+export TMAX_SKIP_EVAL_BEFORE_TRAIN="${TMAX_SKIP_EVAL_BEFORE_TRAIN:-1}"
 if [ -z "${TMAX_EVAL_MIN_VALID_SAMPLES+x}" ]; then
     if [ "${TMAX_EVAL_ENABLED}" = "1" ] && \
        [[ "${TMAX_EVAL_MAX_TASKS}" =~ ^[1-9][0-9]*$ ]] && \
@@ -747,7 +784,7 @@ fi
 unset -f _tmax_validate_generation_limits
 
 _tmax_validate_dataset_split() {
-    local name value train_end eval_end eval_total
+    local name value train_end eval_end eval_total complement_mode=0
     for name in TMAX_TRAIN_START_INDEX TMAX_EVAL_START_INDEX; do
         value="${!name}"
         if ! [[ "$value" =~ ^[0-9]+$ ]]; then
@@ -758,6 +795,25 @@ _tmax_validate_dataset_split() {
     if ! [[ "${TMAX_MAX_TASKS}" =~ ^[1-9][0-9]*$|^-1$ ]]; then
         echo "ERROR: TMAX_MAX_TASKS must be a positive integer or -1, got ${TMAX_MAX_TASKS}" >&2
         return 1
+    fi
+    if [ -n "${TMAX_EXCLUDE_DATA}" ]; then
+        complement_mode=1
+        if [ "${TMAX_TRAIN_START_INDEX}" -ne 0 ] || [ "${TMAX_MAX_TASKS}" != "-1" ]; then
+            echo "ERROR: TMAX_EXCLUDE_DATA requires TMAX_TRAIN_START_INDEX=0 and TMAX_MAX_TASKS=-1" >&2
+            return 1
+        fi
+        if [ "${TMAX_EVAL_ENABLED}" != "1" ] || [ "${TMAX_EVAL_SOURCE}" != "tmax" ]; then
+            echo "ERROR: TMAX_EXCLUDE_DATA requires an enabled TMax eval dataset" >&2
+            return 1
+        fi
+        if [ "${TMAX_EXTERNAL_EVAL_ENABLED}" != "0" ]; then
+            echo "ERROR: TMAX_EXCLUDE_DATA complement mode requires offline external benchmarks" >&2
+            return 1
+        fi
+        if [ ! -s "${TMAX_EXCLUDE_DATA}" ]; then
+            echo "ERROR: TMAX_EXCLUDE_DATA is missing or empty: ${TMAX_EXCLUDE_DATA}" >&2
+            return 1
+        fi
     fi
     for name in TMAX_TOTAL_TASKS TMAX_EVAL_MAX_TASKS TMAX_EVAL_INTERVAL \
         TMAX_EVAL_SAMPLES_PER_PROMPT TMAX_EVAL_MIN_VALID_SAMPLES \
@@ -770,7 +826,8 @@ _tmax_validate_dataset_split() {
             return 1
         fi
     done
-    for name in TMAX_EVAL_ENABLED TMAX_EXTERNAL_EVAL_ENABLED \
+    for name in TMAX_EVAL_ENABLED TMAX_TRAINING_EVAL_ENABLED \
+        TMAX_EXTERNAL_EVAL_ENABLED \
         TMAX_REQUIRE_EXACT_TOTAL_TASKS; do
         value="${!name}"
         if ! [[ "$value" =~ ^[01]$ ]]; then
@@ -778,6 +835,11 @@ _tmax_validate_dataset_split() {
             return 1
         fi
     done
+    if [ "${TMAX_TRAINING_EVAL_ENABLED}" = "1" ] && \
+       [ "${TMAX_EVAL_ENABLED}" != "1" ]; then
+        echo "ERROR: TMAX_TRAINING_EVAL_ENABLED=1 requires TMAX_EVAL_ENABLED=1" >&2
+        return 1
+    fi
     if ! [[ "${TMAX_PREPARE_EVAL_DATA}" =~ ^[01]$ ]]; then
         echo "ERROR: TMAX_PREPARE_EVAL_DATA must be 0 or 1, got ${TMAX_PREPARE_EVAL_DATA}" >&2
         return 1
@@ -788,15 +850,17 @@ _tmax_validate_dataset_split() {
             return 1
         fi
         if [ "${TMAX_EVAL_SOURCE}" = "tmax" ] && \
-           [ "${TMAX_MAX_TASKS}" = "-1" ]; then
-            echo "ERROR: TMAX_EVAL_ENABLED=1 requires a finite TMAX_MAX_TASKS for a disjoint holdout" >&2
+           [ "${TMAX_MAX_TASKS}" = "-1" ] && [ "${complement_mode}" -ne 1 ]; then
+            echo "ERROR: TMAX_EVAL_ENABLED=1 requires either a finite training window or TMAX_EXCLUDE_DATA" >&2
             return 1
         fi
-        train_end="$((TMAX_TRAIN_START_INDEX + TMAX_MAX_TASKS))"
-        if [ "${TMAX_EVAL_SOURCE}" = "tmax" ] && \
-           [ "${TMAX_EVAL_START_INDEX}" -lt "${train_end}" ]; then
-            echo "ERROR: fixed eval window begins at ${TMAX_EVAL_START_INDEX}, before the training window ends at ${train_end}" >&2
-            return 1
+        if [ "${complement_mode}" -ne 1 ]; then
+            train_end="$((TMAX_TRAIN_START_INDEX + TMAX_MAX_TASKS))"
+            if [ "${TMAX_EVAL_SOURCE}" = "tmax" ] && \
+               [ "${TMAX_EVAL_START_INDEX}" -lt "${train_end}" ]; then
+                echo "ERROR: fixed eval window begins at ${TMAX_EVAL_START_INDEX}, before the training window ends at ${train_end}" >&2
+                return 1
+            fi
         fi
         if [ -z "${TMAX_EVAL_DATASET_NAME}" ]; then
             echo "ERROR: TMAX_EVAL_DATASET_NAME must be non-empty" >&2
@@ -920,6 +984,6 @@ mkdir -p \
 
 echo "[tmax env] nodes=${NUM_NODES} gpus/node=${SLURM_GPUS} partition=${PARTITION} no_instance=${POLAR_APPTAINER_NO_INSTANCE} network=${POLAR_SANDBOX_NETWORK}"
 echo "[tmax env] dataset=${TMAX_DATASET_DIR} sif_dir=${APPTAINER_IMAGE_DIR} train_data=${TMAX_TRAIN_DATA}"
-echo "[tmax env] actor=${ACTOR_NUM_NODES}x${ACTOR_NUM_GPUS_PER_NODE}/tp${ACTOR_TENSOR_MODEL_PARALLEL_SIZE}/cp${CONTEXT_PARALLEL_SIZE} rollout_gpus=${ROLLOUT_NUM_GPUS}/tp${ROLLOUT_NUM_GPUS_PER_ENGINE} batch=${ROLLOUT_BATCH_SIZE}x${N_SAMPLES_PER_PROMPT}/${NUM_STEPS_PER_ROLLOUT} fully_async=${POLAR_FULLY_ASYNC}/${POLAR_MAX_ASYNC_LEVEL} active_sessions=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT * POLAR_MAX_ASYNC_LEVEL)) run_workers=${POLAR_MAX_RUN_WORKERS}"
+echo "[tmax env] actor=${ACTOR_NUM_NODES}x${ACTOR_NUM_GPUS_PER_NODE}/tp${ACTOR_TENSOR_MODEL_PARALLEL_SIZE}/pp${ACTOR_PIPELINE_MODEL_PARALLEL_SIZE}/cp${CONTEXT_PARALLEL_SIZE} rollout_gpus=${ROLLOUT_NUM_GPUS}/tp${ROLLOUT_NUM_GPUS_PER_ENGINE} batch=${ROLLOUT_BATCH_SIZE}x${N_SAMPLES_PER_PROMPT}/${NUM_STEPS_PER_ROLLOUT} fully_async=${POLAR_FULLY_ASYNC}/${POLAR_MAX_ASYNC_LEVEL} active_sessions=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT * POLAR_MAX_ASYNC_LEVEL)) run_workers=${POLAR_MAX_RUN_WORKERS}"
 echo "[tmax env] harness=${TMAX_AGENT_HARNESS} runtime=${MINI_SWE_AGENT_RUNTIME_DIR}"
 echo "[tmax env] train_sqsh=${POLR_TRAIN_SQSH} slime=${SLIME_DIR} ref_load=${REF_LOAD} run_id=${RUN_ID} sglang_base_port=${SLIME_ROLLOUT_BASE_PORT:-allocation-scoped}"

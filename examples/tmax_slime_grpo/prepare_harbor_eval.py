@@ -39,6 +39,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-tasks", type=int, default=-1)
     parser.add_argument(
+        "--only-ready",
+        action="store_true",
+        help="select only tasks with exactly one available local image",
+    )
+    parser.add_argument(
+        "--skip-unsupported",
+        action="store_true",
+        help="skip ready tasks whose container/process semantics are unsupported",
+    )
+    parser.add_argument(
+        "--exclude-task-id",
+        action="append",
+        default=[],
+        help="exclude a task directory name (repeatable)",
+    )
+    parser.add_argument(
         "--agent-timeout-cap",
         type=float,
         default=float(os.environ.get("TMAX_HARBOR_EVAL_AGENT_TIMEOUT_CAP", "900")),
@@ -325,7 +341,7 @@ def _squashfs_environment(image: Path) -> dict[str, str] | None:
             f"unsquashfs is required to verify OCI ENV metadata in {image}"
         )
     result = subprocess.run(
-        [unsquashfs, "-cat", str(image), "etc/environment"],
+        [unsquashfs, "-processors", "1", "-cat", str(image), "etc/environment"],
         text=True,
         capture_output=True,
         check=False,
@@ -442,7 +458,13 @@ def _tree_sha256(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _resolve_image(task_dir: Path, image_dir: Path, metadata: dict[str, Any]) -> Path:
+def _resolve_image(
+    task_dir: Path,
+    image_dir: Path,
+    metadata: dict[str, Any],
+    *,
+    required: bool = True,
+) -> Path | None:
     environment = metadata.get("environment", {})
     docker_image = environment.get("docker_image") if isinstance(environment, dict) else None
     candidates: list[Path] = []
@@ -469,6 +491,8 @@ def _resolve_image(task_dir: Path, image_dir: Path, metadata: dict[str, Any]) ->
         except OSError:
             pass
     if len(ready) != 1:
+        if not required and not ready:
+            return None
         rendered = ", ".join(str(path) for path in ready) or "none"
         raise SystemExit(
             f"Expected exactly one ready image for Harbor task {task_dir.name!r}; "
@@ -497,8 +521,42 @@ def _task_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
         if not math.isfinite(value) or value < 0:
             raise SystemExit(f"--{name.replace('_', '-')} must be finite and non-negative")
 
-    task_dirs = sorted({path.parent for path in tasks_dir.rglob("task.toml")})
+    excluded_task_ids = {str(value).strip() for value in args.exclude_task_id}
+    if "" in excluded_task_ids:
+        raise SystemExit("--exclude-task-id must be non-empty")
+    task_dirs = sorted(
+        path.parent
+        for path in tasks_dir.rglob("task.toml")
+        if path.parent.name not in excluded_task_ids
+    )
     available_task_count = len(task_dirs)
+    if args.only_ready:
+        ready_task_dirs: list[Path] = []
+        for task_dir in task_dirs:
+            try:
+                task_toml = tomllib.loads(
+                    (task_dir / "task.toml").read_text(encoding="utf-8")
+                )
+                if _resolve_image(task_dir, image_dir, task_toml, required=False) is None:
+                    continue
+                if args.skip_unsupported:
+                    _docker_runtime_metadata(task_dir)
+                    for section_name in ("agent", "verifier"):
+                        section = task_toml.get(section_name, {})
+                        if not isinstance(section, dict):
+                            raise SystemExit(
+                                f"Invalid Harbor task metadata section {section_name!r} "
+                                f"in {task_dir / 'task.toml'}"
+                            )
+                        _reject_unsupported_process_env(
+                            section, section_name=section_name, task_dir=task_dir
+                        )
+            except (OSError, UnicodeError, tomllib.TOMLDecodeError, SystemExit):
+                if args.skip_unsupported:
+                    continue
+                raise
+            ready_task_dirs.append(task_dir)
+        task_dirs = ready_task_dirs
     if args.max_tasks > 0:
         task_dirs = task_dirs[: args.max_tasks]
     if not task_dirs:

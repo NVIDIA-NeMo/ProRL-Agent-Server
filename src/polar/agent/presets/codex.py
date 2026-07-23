@@ -12,6 +12,7 @@ from polar.runtime.models import ExecInput
 DEFAULT_CODEX_VERSION = "0.125.0"
 DEFAULT_REASONING_EFFORT = "xhigh"
 DEFAULT_MODEL_NAME = "gpt-5.5"
+CODEX_GATEWAY_LOOPBACK_PORT = 18081
 
 
 class CodexHarness(BaseHarness):
@@ -100,6 +101,16 @@ class CodexHarness(BaseHarness):
         flags: list[str] = [
             "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",
+            # Codex 0.142.x can hang while snapshotting shell state in the
+            # heterogeneous TMax task images. The agent only needs unified
+            # exec here, so skip that optional startup optimization.
+            "--disable shell_snapshot",
+            # Polar exposes the OpenAI Responses API over HTTP. Newer Codex
+            # CLIs enable Responses WebSocket transports by default, which
+            # repeatedly reconnect and exit before falling back on this
+            # OpenAI-compatible gateway.
+            "--disable responses_websockets",
+            "--disable responses_websockets_v2",
         ]
         model = _cli_model_name(self.model_name)
         flags.append(f"--model {shlex.quote(model)}")
@@ -124,8 +135,12 @@ class CodexHarness(BaseHarness):
                     f'printf \'{{"OPENAI_API_KEY": "%s"}}\' "$OPENAI_API_KEY" '
                     f"> {self._codex_home}/auth.json && "
                     'if [ -n "${OPENAI_BASE_URL:-}" ]; then '
+                    'codex_base_url="$OPENAI_BASE_URL"; '
+                    'if [ -S "${POLAR_GATEWAY_UDS:-}" ]; then '
+                    f'codex_base_url="http://127.0.0.1:{CODEX_GATEWAY_LOOPBACK_PORT}/v1"; '
+                    "fi; "
                     f"cat >> {self._codex_home}/config.toml <<POLARCODEX\n"
-                    'openai_base_url = "${OPENAI_BASE_URL}"\n'
+                    'openai_base_url = "${codex_base_url}"\n'
                     "POLARCODEX\n"
                     "fi"
                 ),
@@ -133,7 +148,22 @@ class CodexHarness(BaseHarness):
             ),
             ExecInput(
                 command=(
+                    "set -o pipefail; "
                     "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
+                    'codex_gateway_pid=""; '
+                    'if [ -S "${POLAR_GATEWAY_UDS:-}" ]; then '
+                    "node -e 'const net=require(\"net\");"
+                    "const path=process.env.POLAR_GATEWAY_UDS;"
+                    "const server=net.createServer((down)=>{"
+                    "const up=net.createConnection(path);"
+                    "down.pipe(up);up.pipe(down);"
+                    "const close=()=>{down.destroy();up.destroy()};"
+                    "down.on(\"error\",close);up.on(\"error\",close)});"
+                    f"server.listen({CODEX_GATEWAY_LOOPBACK_PORT},\"127.0.0.1\")' & "
+                    'codex_gateway_pid="$!"; '
+                    'trap \'[ -z "$codex_gateway_pid" ] || kill "$codex_gateway_pid" 2>/dev/null || true\' EXIT; '
+                    "sleep 0.1; "
+                    "fi; "
                     f"codex exec {flags_str} -- {escaped} "
                     f"2>&1 </dev/null | tee {RUNTIME_AGENT_LOG_DIR}/codex.txt"
                 ),

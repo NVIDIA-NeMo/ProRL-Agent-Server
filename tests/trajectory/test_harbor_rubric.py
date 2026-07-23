@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import httpx
 
 from polar.runtime.base import BaseRuntime
 from polar.runtime.models import ExecResult, RuntimeSpec
@@ -259,6 +260,349 @@ def test_render_traces_keeps_tool_calls(tmp_path: Path) -> None:
 
     assert '<trace id="trace_0">' in rendered
     assert '[tool_call] run_shell({"cmd": "ls"})' in rendered
+
+
+def test_render_traces_optionally_attaches_matching_tool_outputs(tmp_path: Path) -> None:
+    evaluator = _make_evaluator(
+        _make_task_dir(tmp_path),
+        judge_include_tool_outputs=True,
+    )
+    traces = [
+        Trace(
+            response_messages=[
+                {
+                    "role": "assistant",
+                    "content": "inspect",
+                    "tool_calls": [
+                        {
+                            "id": "call-a",
+                            "function": {"name": "bash", "arguments": '{"cmd":"ls"}'},
+                        }
+                    ],
+                }
+            ],
+        ),
+        Trace(
+            # Cumulative prompts repeat old observations; the renderer must
+            # attach this result once, to trace_0 rather than trace_1.
+            prompt_messages=[
+                {"role": "tool", "tool_call_id": "call-a", "content": "a.py\nb.py"},
+                {"role": "tool", "tool_call_id": "unrelated", "content": "ignore"},
+            ],
+            response_messages=[{"role": "assistant", "content": "done"}],
+        ),
+    ]
+
+    rendered = evaluator._render_traces(traces)
+
+    trace_0, trace_1 = rendered.split('<trace id="trace_1">')
+    assert '<tool_output tool_call_id="call-a" tool_name="bash">' in trace_0
+    assert "a.py\nb.py" in trace_0
+    assert "unrelated" not in rendered
+    assert "a.py\nb.py" not in trace_1
+
+
+def test_render_traces_tool_outputs_default_off(tmp_path: Path) -> None:
+    evaluator = _make_evaluator(_make_task_dir(tmp_path))
+    traces = [
+        Trace(
+            response_messages=[
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "call-a", "function": {"name": "bash", "arguments": "{}"}}
+                    ],
+                }
+            ]
+        ),
+        Trace(
+            prompt_messages=[
+                {"role": "tool", "tool_call_id": "call-a", "content": "secret output"}
+            ],
+            response_messages=[{"role": "assistant", "content": "next"}],
+        ),
+    ]
+
+    rendered = evaluator._render_traces(traces)
+
+    assert "secret output" not in rendered
+    assert "<tool_outputs>" not in rendered
+
+
+def test_render_traces_truncates_each_tool_output(tmp_path: Path) -> None:
+    evaluator = _make_evaluator(
+        _make_task_dir(tmp_path),
+        judge_include_tool_outputs=True,
+        judge_tool_output_max_chars=20,
+    )
+    traces = [
+        Trace(
+            response_messages=[
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "call-a", "function": {"name": "bash", "arguments": "{}"}}
+                    ],
+                }
+            ]
+        ),
+        Trace(
+            prompt_messages=[
+                {"role": "tool", "tool_call_id": "call-a", "content": "A" * 100}
+            ],
+            response_messages=[{"role": "assistant", "content": "next"}],
+        ),
+    ]
+
+    rendered = evaluator._render_traces(traces)
+
+    assert "truncated" in rendered
+    assert "A" * 100 not in rendered
+
+
+def test_render_traces_preserves_all_trace_ids_under_total_cap(tmp_path: Path) -> None:
+    evaluator = _make_evaluator(
+        _make_task_dir(tmp_path),
+        judge_include_tool_outputs=True,
+        judge_tool_output_max_chars=10_000,
+        max_section_chars=1_000,
+    )
+    traces = []
+    for index in range(4):
+        call_id = f"call-{index}"
+        traces.append(
+            Trace(
+                prompt_messages=(
+                    []
+                    if index == 0
+                    else [
+                        {
+                            "role": "tool",
+                            "tool_call_id": f"call-{index - 1}",
+                            "content": str(index - 1) * 2_000,
+                        }
+                    ]
+                ),
+                response_messages=[
+                    {
+                        "role": "assistant",
+                        "content": f"step {index}",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "function": {"name": "bash", "arguments": "{}"},
+                            }
+                        ],
+                    }
+                ],
+            )
+        )
+
+    rendered = evaluator._render_traces(traces)
+
+    assert len(rendered) <= 1_000
+    for index in range(4):
+        assert f'<trace id="trace_{index}">' in rendered
+
+
+def test_long_rollout_is_scored_in_configured_chunks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evaluator = _make_evaluator(
+        _make_task_dir(tmp_path),
+        judge_max_traces_per_call=2,
+    )
+    trajectory = Trajectory(
+        status="COMPLETED",
+        metadata={"builder": "per_request"},
+        traces=[
+            Trace(response_messages=[{"role": "assistant", "content": f"step {i}"}])
+            for i in range(5)
+        ],
+    )
+    call_sizes: list[int] = []
+
+    async def fake_call_judge(
+        self: HarborEvaluatorWithRubric,
+        client: Any,
+        messages: list[dict[str, str]],
+        trace_count: int,
+    ) -> tuple[list[int | None], dict[str, Any]]:
+        call_sizes.append(trace_count)
+        return [trace_count] * trace_count, {"request": {}, "attempts": []}
+
+    monkeypatch.setattr(HarborEvaluatorWithRubric, "_call_judge", fake_call_judge)
+
+    result = asyncio.run(
+        evaluator.evaluate(
+            trajectory,
+            **_runtime_kwargs(tmp_path, FakeRuntime(tmp_path)),
+        )
+    )
+
+    assert call_sizes == [2, 2, 1]
+    assert result.metadata["judge_scores"] == [2, 2, 2, 2, 1]
+    record = json.loads((tmp_path / "artifacts" / "judge" / "rollout.json").read_text())
+    assert record["chunk_count"] == 3
+    assert [chunk["global_trace_start"] for chunk in record["chunks"]] == [0, 2, 4]
+    assert record["scores"] == [2, 2, 2, 2, 1]
+
+
+def test_chunk_boundary_keeps_preceding_trace_tool_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evaluator = _make_evaluator(
+        _make_task_dir(tmp_path),
+        judge_include_tool_outputs=True,
+        judge_max_traces_per_call=1,
+    )
+    trajectory = Trajectory(
+        status="COMPLETED",
+        metadata={"builder": "per_request"},
+        traces=[
+            Trace(
+                response_messages=[
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "boundary-call",
+                                "function": {"name": "bash", "arguments": "{}"},
+                            }
+                        ],
+                    }
+                ]
+            ),
+            Trace(
+                prompt_messages=[
+                    {
+                        "role": "tool",
+                        "tool_call_id": "boundary-call",
+                        "content": "boundary result",
+                    }
+                ],
+                response_messages=[{"role": "assistant", "content": "done"}],
+            ),
+        ],
+    )
+    judge_prompts: list[str] = []
+
+    async def fake_call_judge(
+        self: HarborEvaluatorWithRubric,
+        client: Any,
+        messages: list[dict[str, str]],
+        trace_count: int,
+    ) -> tuple[list[int | None], dict[str, Any]]:
+        judge_prompts.append(messages[-1]["content"])
+        return [1] * trace_count, {"request": {}, "attempts": []}
+
+    monkeypatch.setattr(HarborEvaluatorWithRubric, "_call_judge", fake_call_judge)
+
+    asyncio.run(
+        evaluator.evaluate(
+            trajectory,
+            **_runtime_kwargs(tmp_path, FakeRuntime(tmp_path)),
+        )
+    )
+
+    assert "boundary result" in judge_prompts[0]
+    assert "boundary result" not in judge_prompts[1]
+
+
+def test_responses_judge_uses_responses_protocol(tmp_path: Path) -> None:
+    evaluator = _make_evaluator(
+        _make_task_dir(tmp_path),
+        judge_base_url="https://judge.local/v1/responses",
+        judge_api="responses",
+    )
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": '{"trace_0": {"score": 4}}',
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+    async def call() -> tuple[list[int | None], dict[str, Any]]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await evaluator._call_judge(
+                client,
+                [{"role": "user", "content": "grade"}],
+                1,
+            )
+
+    scores, _record = asyncio.run(call())
+    assert scores == [4]
+    assert str(seen[0].url) == "https://judge.local/v1/responses"
+    assert json.loads(seen[0].content) == {
+        "model": "judge-1",
+        "input": [{"role": "user", "content": "grade"}],
+        "max_output_tokens": 8192,
+    }
+
+
+def test_partial_judge_output_retries_and_keeps_best_result(tmp_path: Path) -> None:
+    evaluator = _make_evaluator(
+        _make_task_dir(tmp_path),
+        judge_api="responses",
+        judge_max_retries=1,
+    )
+    replies = iter(
+        [
+            '{"trace_0": {"score": 2}}',
+            '{"trace_0": {"score": 2}, "trace_1": {"score": 4}}',
+        ]
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"output_text": next(replies)})
+
+    async def call() -> tuple[list[int | None], dict[str, Any]]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await evaluator._call_judge(
+                client,
+                [{"role": "user", "content": "grade"}],
+                2,
+            )
+
+    scores, record = asyncio.run(call())
+    assert scores == [2, 4]
+    assert len(record["attempts"]) == 2
+    assert "parsed 1/2" in record["attempts"][0]["error"]
+
+
+def test_rejects_unknown_judge_api(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="judge_api"):
+        _make_evaluator(_make_task_dir(tmp_path), judge_api="completions")
+
+
+def test_rejects_non_boolean_tool_output_option(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="judge_include_tool_outputs"):
+        _make_evaluator(
+            _make_task_dir(tmp_path),
+            judge_include_tool_outputs="true",
+        )
+
+
+def test_rejects_negative_trace_chunk_size(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="judge_max_traces_per_call"):
+        _make_evaluator(
+            _make_task_dir(tmp_path),
+            judge_max_traces_per_call=-1,
+        )
 
 
 @pytest.mark.parametrize(

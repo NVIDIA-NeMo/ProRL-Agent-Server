@@ -170,6 +170,118 @@ async def test_timeout_before_postprocess_does_not_create_coroutine(tmp_path: Pa
     postprocess.assert_not_called()
     assert managed.agent_result is not None
     assert managed.agent_result.status == "timeout"
+    assert managed.agent_result.metadata["timeout_source"] == "session"
+    assert managed.agent_result.metadata["timeout_stage"] == "exec"
+
+
+@pytest.mark.asyncio
+async def test_agent_budget_exhausted_before_postprocess_remains_exec_timeout(
+    tmp_path: Path,
+) -> None:
+    manager = object.__new__(GatewayNodeManager)
+    manager._start_eval_prewarm = lambda _managed: None  # type: ignore[method-assign]
+    manager._runtime_env = lambda *_args, **_kwargs: {}  # type: ignore[method-assign]
+
+    async def setup(_runtime: BaseRuntime) -> None:
+        pass
+
+    postprocess = Mock()
+    harness = SimpleNamespace(
+        setup=setup,
+        run_steps=Mock(return_value=[]),
+        postprocess=postprocess,
+        postrun_steps=Mock(return_value=[]),
+    )
+    manager._resolve_agent_harness = Mock(return_value=harness)  # type: ignore[method-assign]
+
+    request = SessionDispatchRequest(
+        session_id="session-agent-timeout-before-postprocess",
+        task_id="task-agent-timeout-before-postprocess",
+        instruction="test",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(image="task.sif"),
+        agent=AgentSpec(harness="codex"),
+        metadata={"agent_timeout": 60.0},
+    )
+    runtime = _PostrunRuntime(request.runtime, request.session_id, tmp_path)
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        runtime=runtime,
+        execution_deadline=asyncio.get_running_loop().time() + 60,
+        stage=SessionStage.RUNNING,
+    )
+
+    async def finish_agent_then_expire_budget(*_args) -> AgentRunResult:
+        managed.agent_deadline = asyncio.get_running_loop().time() - 1
+        return AgentRunResult(status="completed", return_code=0)
+
+    manager._run_exec_inputs = finish_agent_then_expire_budget  # type: ignore[method-assign]
+
+    await manager._handle_run(managed)
+
+    postprocess.assert_not_called()
+    assert managed.agent_result is not None
+    assert managed.agent_result.status == "timeout"
+    assert managed.agent_result.error == "agent execution timeout"
+    assert managed.agent_result.metadata["timeout_source"] == "agent"
+    assert managed.agent_result.metadata["timeout_stage"] == "exec"
+
+
+@pytest.mark.asyncio
+async def test_timeout_after_postprocess_starts_is_classified_as_postprocess(
+    tmp_path: Path,
+) -> None:
+    manager = object.__new__(GatewayNodeManager)
+    manager._start_eval_prewarm = lambda _managed: None  # type: ignore[method-assign]
+    manager._runtime_env = lambda *_args, **_kwargs: {}  # type: ignore[method-assign]
+
+    async def setup(_runtime: BaseRuntime) -> None:
+        pass
+
+    postprocess_started = asyncio.Event()
+
+    async def slow_postprocess(*_args) -> None:
+        postprocess_started.set()
+        await asyncio.sleep(1)
+
+    harness = SimpleNamespace(
+        setup=setup,
+        run_steps=Mock(return_value=[]),
+        postprocess=slow_postprocess,
+        postrun_steps=Mock(return_value=[]),
+    )
+    manager._resolve_agent_harness = Mock(return_value=harness)  # type: ignore[method-assign]
+
+    request = SessionDispatchRequest(
+        session_id="session-timeout-in-postprocess",
+        task_id="task-timeout-in-postprocess",
+        instruction="test",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(image="task.sif"),
+        agent=AgentSpec(harness="codex"),
+        metadata={"agent_timeout": 0.02},
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        runtime=_PostrunRuntime(request.runtime, request.session_id, tmp_path),
+        execution_deadline=asyncio.get_running_loop().time() + 60,
+        stage=SessionStage.RUNNING,
+    )
+
+    await asyncio.wait_for(manager._handle_run(managed), timeout=0.5)
+
+    assert postprocess_started.is_set()
+    assert managed.agent_result is not None
+    assert managed.agent_result.status == "timeout"
+    assert managed.agent_result.error == "agent execution timeout"
+    assert managed.agent_result.metadata["timeout_source"] == "agent"
+    assert managed.agent_result.metadata["timeout_stage"] == "postprocess"
 
 
 @pytest.mark.asyncio

@@ -33,6 +33,7 @@ unset \
 PROJECT_ROOT="${POLAR_TRAIN_PROJECT_ROOT:?set POLAR_TRAIN_PROJECT_ROOT}"
 TRAIN_RUN_SCRIPT="${POLAR_TRAIN_RUN_SCRIPT:?set POLAR_TRAIN_RUN_SCRIPT}"
 TRAIN_VENV="${POLR_TRAIN_VENV:-/opt/polr_venv}"
+TRAIN_PYTHON_OVERLAY="${POLR_TRAIN_PYTHON_OVERLAY:-}"
 DATA_ROOT="${POLAR_DATA_ROOT:-${PROJECT_ROOT}/tmp}"
 SLIME_DIR="${SLIME_DIR:-${PROJECT_ROOT}/slime}"
 MEGATRON_DIR="${MEGATRON_DIR:-${PROJECT_ROOT}/Megatron-LM}"
@@ -48,7 +49,24 @@ export PATH="${TRAIN_VENV}/bin:${PATH}"
 export PYTHON_BIN="${TRAIN_VENV}/bin/python3"
 export VIRTUAL_ENV="${TRAIN_VENV}"
 export PYTHONNOUSERSITE=1
+# Prefer the copied workspace over the source owner's editable-install .pth.
+export PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export LD_LIBRARY_PATH="/usr/local/cuda/compat:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}"
+if [ -n "${TRAIN_PYTHON_OVERLAY}" ]; then
+    case "${TRAIN_PYTHON_OVERLAY}" in
+        /*) ;;
+        *)
+            echo "FATAL: POLR_TRAIN_PYTHON_OVERLAY must be absolute: ${TRAIN_PYTHON_OVERLAY}" >&2
+            exit 1
+            ;;
+    esac
+    if [ ! -d "${TRAIN_PYTHON_OVERLAY}/transformer_engine" ]; then
+        echo "FATAL: invalid training Python overlay: ${TRAIN_PYTHON_OVERLAY}" >&2
+        exit 1
+    fi
+    export PYTHONPATH="${TRAIN_PYTHON_OVERLAY}:${PYTHONPATH}"
+    export LD_LIBRARY_PATH="${TRAIN_PYTHON_OVERLAY}/transformer_engine/wheel_lib:${LD_LIBRARY_PATH}"
+fi
 export HF_TOKEN="${HF_TOKEN:-}"
 export HUGGINGFACE_HUB_TOKEN="${HUGGINGFACE_HUB_TOKEN:-${HF_TOKEN}}"
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
@@ -71,6 +89,17 @@ mkdir -p \
 chmod 700 "${POLAR_JOB_CACHE_ROOT}/xdg-runtime"
 
 export HOME="${POLAR_JOB_CACHE_ROOT}/home"
+# Shared training venvs may contain owner-only __pycache__ entries. Point
+# importlib at our overlay cache so readable sources remain usable. Keeping
+# this cache across allocations also avoids repeatedly compiling the large
+# Torch/FLA import graph on Lustre.
+if [ -n "${TRAIN_PYTHON_OVERLAY}" ]; then
+    export PYTHONPYCACHEPREFIX="${TRAIN_PYTHON_OVERLAY}/python-pycache"
+else
+    export PYTHONPYCACHEPREFIX="${POLAR_JOB_CACHE_ROOT}/pycache"
+fi
+mkdir -p "${PYTHONPYCACHEPREFIX}"
+chmod 700 "${PYTHONPYCACHEPREFIX}"
 export APPTAINER_CACHEDIR="${POLAR_JOB_CACHE_ROOT}/apptainer-cache"
 export APPTAINER_TMPDIR="${POLAR_JOB_CACHE_ROOT}/apptainer-tmp"
 export APPTAINER_WORKDIR="${POLAR_JOB_CACHE_ROOT}/apptainer-work"
@@ -108,7 +137,7 @@ if [ ! -x "${PYTHON_BIN}" ]; then
     echo "FATAL: ${PYTHON_BIN} not found in the training container" >&2
     exit 1
 fi
-TRAIN_ABI_PYTHONPATH="${MEGATRON_DIR}:${SLIME_DIR}:${PROJECT_ROOT}/src"
+TRAIN_ABI_PYTHONPATH="${MEGATRON_DIR}:${SLIME_DIR}:${PYTHONPATH}"
 if ! PYTHONPATH="${TRAIN_ABI_PYTHONPATH}" "${PYTHON_BIN}" -c \
     "import torch, transformer_engine.pytorch, megatron.core.tensor_parallel, slime, polar, slime_bridge" \
     >/dev/null 2>&1; then

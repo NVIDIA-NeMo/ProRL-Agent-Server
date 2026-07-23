@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Keep every arm of a submitted 4-node TMax matrix progressing across the
+# Keep every arm of a submitted mixed-node TMax matrix progressing across the
 # cluster's four-hour GPU allocation limit.  Each logical run has an
 # independent run-state lock, so the selected watchers can safely share one
 # small CPU allocation. By default this discovers the settings actually
@@ -36,12 +36,24 @@ fi
 
 readonly -a ALL_SETTINGS=(
     qwen35-4b-fidelity
-    qwen35-9b-baseline-a2-mt4k
-    qwen35-9b-b16n16-a2-mt4k
-    qwen35-9b-async4-mt4k
-    qwen35-9b-lr5e7-a2-mt4k
-    qwen35-9b-a2-mt8k
+    qwen35-4b-fidelity-8n
+    qwen35-4b-fidelity-8n-b16n8-traj
+    qwen35-9b-baseline-a2-full65k
+    qwen35-9b-b16n16-a2-full65k
+    qwen35-9b-async4-full65k
+    qwen35-9b-lr5e7-a2-full65k
+    qwen35-9b-lr2e6-a2-full65k
 )
+
+matrix_run_id() {
+    local setting="$1" topology_tag=4n32
+    case "${setting}" in
+        qwen35-4b-fidelity-8n|qwen35-4b-fidelity-8n-b16n8-traj)
+            topology_tag=8n64
+            ;;
+    esac
+    printf "tmax-%s-%s-%s\n" "${topology_tag}" "${setting}" "${MATRIX_STAMP}"
+}
 
 is_known_setting() {
     local candidate="$1" setting
@@ -64,7 +76,7 @@ elif [ -n "${TMAX_MATRIX_WATCH_SETTINGS:-}" ]; then
     done
 else
     for setting in "${ALL_SETTINGS[@]}"; do
-        run_id="tmax-4n32-${setting}-${MATRIX_STAMP}"
+        run_id="$(matrix_run_id "${setting}")"
         state_file="${POLAR_DATA_ROOT}/runs/${run_id}/run_state.env"
         if [ -s "${state_file}" ]; then
             SETTINGS+=("${setting}")
@@ -86,7 +98,7 @@ terminate_children() {
 trap terminate_children TERM INT
 
 for setting in "${SETTINGS[@]}"; do
-    run_id="tmax-4n32-${setting}-${MATRIX_STAMP}"
+    run_id="$(matrix_run_id "${setting}")"
     state_file="${POLAR_DATA_ROOT}/runs/${run_id}/run_state.env"
     if [ ! -s "${state_file}" ]; then
         echo "ERROR: matrix run state is missing or empty: ${state_file}" >&2

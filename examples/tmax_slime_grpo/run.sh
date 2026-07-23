@@ -22,6 +22,14 @@ else
     PREPARE_DATA_DEFAULT=1
 fi
 TMAX_PREPARE_DATA="${TMAX_PREPARE_DATA:-${PREPARE_DATA_DEFAULT}}"
+export TMAX_VALIDATE_EXISTING_ASSETS="${TMAX_VALIDATE_EXISTING_ASSETS:-1}"
+case "${TMAX_VALIDATE_EXISTING_ASSETS}" in
+    0|1) ;;
+    *)
+        echo "ERROR: TMAX_VALIDATE_EXISTING_ASSETS must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
 
 export RUN_DIR="${RUN_DIR:-${POLAR_DATA_ROOT}/runs/${RUN_ID}/job-${SLURM_JOB_ID:-manual}}"
 mkdir -p "${RUN_DIR}"
@@ -39,8 +47,10 @@ PREPARE_ARGS=(
     --start-index "${TMAX_TRAIN_START_INDEX}"
     --max-tasks "${TMAX_MAX_TASKS}"
 )
-if [ "${TMAX_EXTERNAL_EVAL_ENABLED}" = "1" ] && \
-   [ "${TMAX_REQUIRE_EXACT_TOTAL_TASKS}" = "1" ]; then
+if [ -n "${TMAX_EXCLUDE_DATA}" ]; then
+    PREPARE_ARGS+=(--exclude-data "${TMAX_EXCLUDE_DATA}")
+fi
+if [ "${TMAX_REQUIRE_EXACT_TOTAL_TASKS}" = "1" ]; then
     PREPARE_ARGS+=(--expected-total-tasks "${TMAX_TOTAL_TASKS}")
 fi
 if [ "${TMAX_ONLY_READY}" = "1" ]; then
@@ -151,22 +161,36 @@ if [ "${SLURM_PROCID:-0}" = "0" ]; then
         "${TMAX_SIF_PYTHON_BIN}" "${SCRIPT_DIR}/prepare_data.py" "${PREPARE_ARGS[@]}"
     fi
     # Submission-time validation is not a runtime trust boundary: queued jobs
-    # can start much later and the shared JSONL/SIF files remain mutable.
-    "${TMAX_SIF_PYTHON_BIN}" "${SCRIPT_DIR}/prepare_data.py" \
-        "${PREPARE_ARGS[@]}" --validate-existing
+    # can start much later and the shared JSONL/SIF files remain mutable. The
+    # pinned matrix opts into the fast path explicitly after its source bundle
+    # has been deeply audited; other launchers retain runtime revalidation.
+    if [ "${TMAX_VALIDATE_EXISTING_ASSETS}" = "1" ]; then
+        "${TMAX_SIF_PYTHON_BIN}" "${SCRIPT_DIR}/prepare_data.py" \
+            "${PREPARE_ARGS[@]}" --validate-existing
+    else
+        echo "[tmax run] skipping deep validation of existing training assets"
+    fi
 
     if [ "${TMAX_EVAL_ENABLED}" = "1" ]; then
         if [ "${TMAX_PREPARE_EVAL_DATA}" = "1" ] || [ ! -s "${TMAX_EVAL_DATA}" ]; then
             "${TMAX_SIF_PYTHON_BIN}" "${EVAL_PREPARE_SCRIPT}" "${EVAL_PREPARE_ARGS[@]}"
         fi
-        "${TMAX_SIF_PYTHON_BIN}" "${EVAL_PREPARE_SCRIPT}" \
-            "${EVAL_PREPARE_ARGS[@]}" --validate-existing
+        if [ "${TMAX_VALIDATE_EXISTING_ASSETS}" = "1" ]; then
+            "${TMAX_SIF_PYTHON_BIN}" "${EVAL_PREPARE_SCRIPT}" \
+                "${EVAL_PREPARE_ARGS[@]}" --validate-existing
+        else
+            echo "[tmax run] skipping deep validation of existing primary eval assets"
+        fi
         if [ "${TMAX_EXTERNAL_EVAL_ENABLED}" = "1" ]; then
             if [ "${TMAX_PREPARE_EVAL_DATA}" = "1" ] || [ ! -s "${TMAX_EXTERNAL_EVAL_DATA}" ]; then
                 "${TMAX_SIF_PYTHON_BIN}" "${SCRIPT_DIR}/prepare_harbor_eval.py" "${EXTERNAL_PREPARE_ARGS[@]}"
             fi
-            "${TMAX_SIF_PYTHON_BIN}" "${SCRIPT_DIR}/prepare_harbor_eval.py" \
-                "${EXTERNAL_PREPARE_ARGS[@]}" --validate-existing
+            if [ "${TMAX_VALIDATE_EXISTING_ASSETS}" = "1" ]; then
+                "${TMAX_SIF_PYTHON_BIN}" "${SCRIPT_DIR}/prepare_harbor_eval.py" \
+                    "${EXTERNAL_PREPARE_ARGS[@]}" --validate-existing
+            else
+                echo "[tmax run] skipping deep validation of existing external eval assets"
+            fi
         fi
         _TMAX_DATA_INTEGRITY_CANDIDATE="${TMAX_DATA_INTEGRITY_MANIFEST}.candidate.$$"
         rm -f "${_TMAX_DATA_INTEGRITY_CANDIDATE}"

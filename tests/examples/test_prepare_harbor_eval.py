@@ -56,6 +56,9 @@ def _args(tasks: Path, images: Path, output: Path) -> SimpleNamespace:
         dataset_name="terminal_bench_2_1",
         dataset_revision="rev6",
         max_tasks=1,
+        only_ready=False,
+        skip_unsupported=False,
+        exclude_task_id=[],
         agent_timeout_cap=900.0,
         verifier_timeout_cap=600.0,
         timeout_overhead=120.0,
@@ -135,6 +138,61 @@ def test_harbor_eval_requires_requested_task_count(tmp_path: Path) -> None:
         module._task_rows(args)
 
 
+def test_harbor_eval_only_ready_skips_tasks_without_images(tmp_path: Path) -> None:
+    module = _module()
+    tasks = tmp_path / "tasks"
+    images = tmp_path / "images"
+    output = tmp_path / "eval.jsonl"
+    _task(tasks, images, name="task-a")
+    _task(tasks, images, name="task-b")
+    (images / "task-a+rev1.sqsh").unlink()
+    args = _args(tasks, images, output)
+    args.only_ready = True
+
+    rows = module._task_rows(args)
+
+    assert len(rows) == 1
+    assert rows[0]["metadata"]["task_name"].endswith("/task-b")
+
+
+def test_harbor_eval_can_skip_ready_tasks_with_unsupported_semantics(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    tasks = tmp_path / "tasks"
+    images = tmp_path / "images"
+    output = tmp_path / "eval.jsonl"
+    _task(tasks, images, name="task-a")
+    _task(tasks, images, name="task-b")
+    (tasks / "task-a" / "environment" / "Dockerfile").write_text(
+        "FROM ubuntu:24.04\nUSER analyst\n"
+    )
+    args = _args(tasks, images, output)
+    args.only_ready = True
+    args.skip_unsupported = True
+
+    rows = module._task_rows(args)
+
+    assert len(rows) == 1
+    assert rows[0]["metadata"]["task_name"].endswith("/task-b")
+
+
+def test_harbor_eval_excludes_named_tasks(tmp_path: Path) -> None:
+    module = _module()
+    tasks = tmp_path / "tasks"
+    images = tmp_path / "images"
+    output = tmp_path / "eval.jsonl"
+    _task(tasks, images, name="task-a")
+    _task(tasks, images, name="task-b")
+    args = _args(tasks, images, output)
+    args.exclude_task_id = ["task-a"]
+
+    rows = module._task_rows(args)
+
+    assert len(rows) == 1
+    assert rows[0]["metadata"]["task_name"].endswith("/task-b")
+
+
 def test_harbor_eval_requires_concrete_revision_and_valid_resources(
     tmp_path: Path,
 ) -> None:
@@ -205,15 +263,17 @@ def test_harbor_eval_uses_exported_sqsh_environment_values(
     image.write_bytes(b"hsqs-image")
     docker_metadata = module._docker_runtime_metadata(task)
     monkeypatch.setattr(module.shutil, "which", lambda _name: "/usr/bin/unsquashfs")
-    monkeypatch.setattr(
-        module.subprocess,
-        "run",
-        lambda *_args, **_kwargs: SimpleNamespace(
+    commands: list[list[str]] = []
+
+    def fake_run(args: list[str], **_kwargs: object) -> SimpleNamespace:
+        commands.append(args)
+        return SimpleNamespace(
             returncode=0,
             stdout="PATH=/usr/bin:/bin\nPYTHONPATH=/app:/base/python\n",
             stderr="",
-        ),
-    )
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
 
     runtime_env = module._runtime_environment(
         docker_metadata=docker_metadata,
@@ -223,6 +283,16 @@ def test_harbor_eval_uses_exported_sqsh_environment_values(
     )
 
     assert runtime_env == {"PYTHONPATH": "/app:/base/python"}
+    assert commands == [
+        [
+            "/usr/bin/unsquashfs",
+            "-processors",
+            "1",
+            "-cat",
+            str(image),
+            "etc/environment",
+        ]
+    ]
 
 
 @pytest.mark.parametrize(

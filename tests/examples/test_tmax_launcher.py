@@ -135,6 +135,20 @@ printf '{"prompt": [], "metadata": {"task_name": "%s"}}\n' "$task_name" > "$outp
     return env
 
 
+def tmax_numeric_seed_env(tmp_path: Path) -> dict[str, str]:
+    env = tmax_submit_env(tmp_path, load_pointer="47")
+    train_data = tmp_path / "reused.jsonl"
+    train_data.write_text("{}\n" * 100)
+    env.update(
+        TMAX_TRAIN_DATA=str(train_data),
+        TMAX_PREPARE_DATA="0",
+        TMAX_VALIDATE_EXISTING_ASSETS="0",
+        TMAX_EVAL_ENABLED="0",
+        TMAX_NUM_ROLLOUT="50",
+    )
+    return env
+
+
 def test_tmax_submit_fails_closed_on_training_abi_preflight(tmp_path: Path) -> None:
     env = tmax_submit_env(tmp_path, load_pointer="release")
     abi_python = tmp_path / "bin" / "abi-python"
@@ -408,6 +422,179 @@ def test_tmax_uses_paper_aligned_dppo_optimizer_defaults() -> None:
     assert "GRPO_STD_NORMALIZATION" in run_state
     assert "DPPO_DIVERGENCE_TYPE DPPO_DIVERGENCE_THRESHOLD" in run_state
     assert "TRAIN_LR|KL_LOSS_COEF|POLICY_LOSS_TYPE|USE_TIS" in shared_submit
+
+
+def test_sglang_deterministic_inference_is_opt_in_and_forwards_backend(
+    tmp_path: Path,
+) -> None:
+    shared_run = (SHARED / "run.sh").read_text()
+    start = shared_run.index("configure_sglang_inference_args() {")
+    end = shared_run.index("\n}\n", start) + 2
+    function_source = shared_run[start:end]
+    script = f"""
+set -euo pipefail
+{function_source}
+configure_sglang_inference_args
+printf '<%s>|<%s>' \
+    "${{SGLANG_DETERMINISTIC_ARGS[*]}}" \
+    "${{SGLANG_ATTENTION_BACKEND_ARGS[*]}}"
+"""
+
+    base_env = clean_env(tmp_path)
+    default = run_bash(script, env=base_env)
+    assert default.stdout == "<>|<>"
+
+    enabled_env = base_env.copy()
+    enabled_env.update(
+        SGLANG_ENABLE_DETERMINISTIC_INFERENCE="true",
+        SGLANG_ATTENTION_BACKEND="fa3",
+    )
+    enabled = run_bash(script, env=enabled_env)
+    assert enabled.stdout.splitlines()[-1] == (
+        "<--sglang-enable-deterministic-inference>|"
+        "<--sglang-attention-backend fa3>"
+    )
+    assert "Using SGLang deterministic inference" in enabled.stdout
+
+    invalid_env = base_env.copy()
+    invalid_env["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "yes"
+    invalid = run_bash(script, env=invalid_env, check=False)
+    assert invalid.returncode != 0
+    assert "must be 0/1/false/true" in invalid.stderr
+
+    assert '"${SGLANG_DETERMINISTIC_ARGS[@]}" \\' in shared_run
+    assert '"${SGLANG_ATTENTION_BACKEND_ARGS[@]}" \\' in shared_run
+
+
+def test_explicit_num_rollout_is_forwarded_persisted_and_targets_n_minus_one(
+    tmp_path: Path,
+) -> None:
+    env_script = (TMAX / "env.cwdfw.sh").read_text()
+    run_state = (TMAX / "run_state.sh").read_text()
+    watcher = (TMAX / "watch_training.sh").read_text()
+    shared_run = (SHARED / "run.sh").read_text()
+    submit = (TMAX / "submit_slurm.sh").read_text()
+
+    assert "TMAX_NUM_ROLLOUT TMAX_TARGET_ITER" in run_state
+    assert 'TRAIN_LENGTH_ARGS=(--num-epoch "${NUM_EPOCH:-1}")' in shared_run
+    assert 'TRAIN_LENGTH_ARGS=(--num-rollout "${TMAX_NUM_ROLLOUT}")' in shared_run
+    assert '"${TRAIN_LENGTH_ARGS[@]}" \\' in shared_run
+    assert shared_run.count('--num-epoch "${NUM_EPOCH:-1}"') == 1
+    assert 'printf \'%s\\n\' "$((TMAX_NUM_ROLLOUT - 1))"' in watcher
+    assert '_tmax_seed_target="$((TMAX_NUM_ROLLOUT - 1))"' in submit
+    assert "global_dataset_state_dict_${_tmax_seed_iter}.pt" in submit
+    assert "TMAX_NUM_ROLLOUT - 1" in env_script
+
+    env = clean_env(tmp_path)
+    env["TMAX_NUM_ROLLOUT"] = "50"
+    result = run_bash(
+        f"source {TMAX / 'env.cwdfw.sh'} >/dev/null; "
+        "printf '%s/%s' \"$TMAX_NUM_ROLLOUT\" \"$TMAX_TARGET_ITER\"",
+        env=env,
+    )
+    assert result.stdout == "50/49"
+
+    mismatch_env = env.copy()
+    mismatch_env["TMAX_TARGET_ITER"] = "48"
+    mismatch = run_bash(
+        f"source {TMAX / 'env.cwdfw.sh'} >/dev/null",
+        env=mismatch_env,
+        check=False,
+    )
+    assert mismatch.returncode != 0
+    assert "must equal TMAX_NUM_ROLLOUT-1=49" in mismatch.stderr
+
+
+def test_resumed_checkpoint_eval_flag_only_targets_first_external_numeric_seed(
+    tmp_path: Path,
+) -> None:
+    shared_run = (SHARED / "run.sh").read_text()
+    start = shared_run.index("configure_resumed_checkpoint_eval_args() {")
+    end = shared_run.index("\n}\n", start) + 2
+    function_source = shared_run[start:end]
+    seed_dir = tmp_path / "external-seed"
+    save_dir = tmp_path / "logical-run"
+    seed_dir.mkdir()
+    save_dir.mkdir()
+    tracker = seed_dir / "latest_checkpointed_iteration.txt"
+    tracker.write_text("39\n")
+
+    script = f"""
+set -euo pipefail
+polar_checkpoint_is_release_seed() {{
+    [ "$(tr -d '[:space:]' <"$1/latest_checkpointed_iteration.txt")" = release ]
+}}
+{function_source}
+configure_resumed_checkpoint_eval_args
+printf '<%s>' "${{RESUMED_CHECKPOINT_EVAL_ARGS[*]}}"
+"""
+    base_env = clean_env(tmp_path)
+    base_env.update(
+        TMAX_EVAL_RESUMED_CHECKPOINT_BEFORE_TRAIN="1",
+        TMAX_CONCURRENT_PRETRAIN_EVAL="0",
+        TMAX_EVAL_ENABLED="1",
+        REQUESTED_LOAD_DIR=str(seed_dir),
+        LOAD_DIR=str(seed_dir),
+        SAVE_DIR=str(save_dir),
+    )
+
+    external_seed = run_bash(script, env=base_env)
+    assert external_seed.stdout.splitlines()[-1] == (
+        "<--eval-resumed-checkpoint-before-train>"
+    )
+    assert "checkpoint 39 before rollout 40" in external_seed.stdout
+
+    internal_resume_env = base_env.copy()
+    internal_resume_env["LOAD_DIR"] = str(save_dir)
+    internal_resume = run_bash(script, env=internal_resume_env)
+    assert internal_resume.stdout == "<>"
+
+    tracker.write_text("release\n")
+    release_seed = run_bash(script, env=base_env)
+    assert release_seed.stdout == "<>"
+    tracker.write_text("39\n")
+
+    for name, value, expected_error in (
+        (
+            "TMAX_CONCURRENT_PRETRAIN_EVAL",
+            "1",
+            "requires TMAX_CONCURRENT_PRETRAIN_EVAL=0",
+        ),
+        (
+            "TMAX_EVAL_ENABLED",
+            "0",
+            "requires TMAX_EVAL_ENABLED=1",
+        ),
+    ):
+        invalid_env = base_env.copy()
+        invalid_env[name] = value
+        invalid = run_bash(script, env=invalid_env, check=False)
+        assert invalid.returncode != 0
+        assert expected_error in invalid.stderr
+
+
+def test_training_eval_schedule_can_be_disabled_without_disabling_holdout_contract(
+    tmp_path: Path,
+) -> None:
+    env = clean_env(tmp_path)
+    env.update(
+        TMAX_EVAL_ENABLED="1",
+        TMAX_TRAINING_EVAL_ENABLED="0",
+    )
+    result = run_bash(
+        f"source {TMAX / 'env.cwdfw.sh'} >/dev/null; "
+        "printf '%s|%s' \"$TMAX_EVAL_ENABLED\" \"$TMAX_TRAINING_EVAL_ENABLED\"",
+        env=env,
+    )
+
+    assert result.stdout == "1|0"
+    shared_run = (SHARED / "run.sh").read_text()
+    run_state = (TMAX / "run_state.sh").read_text()
+    watcher = (TMAX / "watch_training.sh").read_text()
+    assert 'TMAX_TRAINING_EVAL_ENABLED:-${TMAX_EVAL_ENABLED:-0}' in shared_run
+    assert "Training-time eval disabled" in shared_run
+    assert "TMAX_TRAINING_EVAL_ENABLED" in run_state
+    assert 'TMAX_TRAINING_EVAL_ENABLED:-${TMAX_EVAL_ENABLED}' in watcher
 
 
 def test_tmax_uses_paper_faithful_full_groups_and_dynamic_sampling() -> None:
@@ -878,6 +1065,86 @@ def test_tmax_submit_numeric_seed_still_requires_explicit_matching_data(
     assert result.returncode == 1
     assert "requires explicit TMAX_TRAIN_DATA and TMAX_PREPARE_DATA=0" in result.stderr
     assert not (tmp_path / "data" / "runs" / "fresh-release" / "tmax-train.jsonl").exists()
+
+
+def test_tmax_submit_numeric_seed_requires_complete_model_checkpoint(
+    tmp_path: Path,
+) -> None:
+    env = tmax_numeric_seed_env(tmp_path)
+
+    missing = subprocess.run(
+        ["bash", str(TMAX / "submit_slurm.sh")],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert missing.returncode == 1
+    assert "has no matching model checkpoint directory" in missing.stderr
+    assert "iter_0000047" in missing.stderr
+    assert "Dry run only" not in missing.stdout
+
+    model_dir = Path(env["LOAD_DIR"]) / "iter_0000047"
+    model_dir.mkdir()
+    (model_dir / "common.pt").write_bytes(b"model")
+    broken_metadata = subprocess.run(
+        ["bash", str(TMAX / "submit_slurm.sh")],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert broken_metadata.returncode == 1
+    assert "model checkpoint 47 is incomplete" in broken_metadata.stderr
+    assert ".metadata" in broken_metadata.stderr
+
+    (model_dir / ".metadata").write_bytes(b"metadata")
+    (model_dir / "common.pt").write_bytes(b"")
+    broken_common = subprocess.run(
+        ["bash", str(TMAX / "submit_slurm.sh")],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert broken_common.returncode == 1
+    assert "model checkpoint 47 is incomplete" in broken_common.stderr
+    assert "common.pt" in broken_common.stderr
+
+
+def test_tmax_submit_numeric_seed_requires_matching_rollout_state(
+    tmp_path: Path,
+) -> None:
+    env = tmax_numeric_seed_env(tmp_path)
+    model_dir = Path(env["LOAD_DIR"]) / "iter_0000047"
+    model_dir.mkdir()
+    (model_dir / "common.pt").write_bytes(b"model")
+    (model_dir / ".metadata").write_bytes(b"metadata")
+
+    missing = subprocess.run(
+        ["bash", str(TMAX / "submit_slurm.sh")],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert missing.returncode == 1
+    assert "has no matching rollout state" in missing.stderr
+    assert "global_dataset_state_dict_47.pt" in missing.stderr
+    assert "Dry run only" not in missing.stdout
+
+    rollout_state = Path(env["LOAD_DIR"]) / "rollout" / "global_dataset_state_dict_47.pt"
+    rollout_state.parent.mkdir()
+    rollout_state.write_bytes(b"state")
+    accepted = subprocess.run(
+        ["bash", str(TMAX / "submit_slurm.sh")],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    assert "Dry run only; sbatch wrapper:" in accepted.stdout
 
 
 def test_tmax_submit_validates_sifs_in_reused_prompt_file(tmp_path: Path) -> None:

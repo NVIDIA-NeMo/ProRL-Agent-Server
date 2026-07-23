@@ -297,7 +297,22 @@ def _apply_sample_runtime_metadata(payload: dict[str, Any], metadata: dict[str, 
         environment = runtime.setdefault("env", {})
         if not isinstance(environment, dict):
             raise ValueError("rendered runtime.env must be a mapping")
-        environment.update(runtime_env)
+        # Some locally built Harbor images preserve an OCI declaration such as
+        # ``ENV PATH=/workspace/bin:$PATH`` as ``/workspace/bin:``.  Replacing
+        # the trusted launcher PATH with that value makes even ``mkdir``
+        # unavailable and every prepare action exits 127.  A leading/trailing
+        # empty PATH component here represents the inherited image PATH, so
+        # splice in the launcher PATH instead of treating it as the current
+        # directory.  Other environment variables retain their exact OCI
+        # values (an empty PYTHONPATH component, for example, is meaningful).
+        merged_runtime_env = dict(runtime_env)
+        inherited_path = environment.get("PATH")
+        runtime_path = merged_runtime_env.get("PATH")
+        if inherited_path and runtime_path is not None:
+            path_parts = runtime_path.split(":")
+            path_parts = [inherited_path if part == "" else part for part in path_parts]
+            merged_runtime_env["PATH"] = ":".join(path_parts)
+        environment.update(merged_runtime_env)
 
     if runtime_init is not None:
         if not isinstance(runtime_init, str) or not runtime_init.strip():

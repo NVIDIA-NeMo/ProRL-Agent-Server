@@ -526,3 +526,24 @@ def test_session_result_to_samples_requires_logprobs_for_trainable_tokens(monkey
             group_index=1,
             trajectory_index=2,
         )
+
+
+@pytest.mark.parametrize("nonfinite_logprob", [float("nan"), float("inf"), float("-inf")])
+def test_session_result_to_samples_rejects_nonfinite_logprobs(
+    monkeypatch,
+    nonfinite_logprob: float,
+) -> None:
+    monkeypatch.setattr(adapter, "_load_sample_type", lambda: FakeSample)
+    trace = Trace(
+        prompt_ids=[1],
+        response_ids=[2, 3],
+        loss_mask=[1, 1],
+        response_logprobs=[-0.1, nonfinite_logprob],
+    )
+
+    with pytest.raises(RolloutLogprobError, match="non-finite rollout_log_probs"):
+        session_result_to_samples(
+            _session_result(trace=trace),
+            group_index=1,
+            trajectory_index=2,
+        )

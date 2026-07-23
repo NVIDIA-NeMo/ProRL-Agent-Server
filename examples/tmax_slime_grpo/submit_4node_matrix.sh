@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Build or explicitly submit the fixed 4-node TMax comparison matrix.
+# Build or explicitly submit the TMax comparison matrix. Most historical arms
+# remain fixed at four nodes; the explicitly named 8n arm weak-scales the 4B
+# fidelity run to two trainer nodes and six rollout nodes.
 #
 # This script is intentionally inert by default:
 #
 #   bash submit_4node_matrix.sh
 #   bash submit_4node_matrix.sh plan
 #
-# Both commands only validate assets and print the six planned runs. To submit,
+# Both commands only validate assets and print the planned runs. To submit,
 # name either `all` or one or more exact settings and provide the confirmation
 # token. Every invocation gets fresh RUN_ID/SAVE_DIR paths unless the caller pins
 # TMAX_MATRIX_STAMP to a reviewed plan stamp.
@@ -27,6 +29,8 @@ readonly DYNAMIC_FILTER="slime.rollout.filter_hub.dynamic_sampling_filters.check
 readonly CONFIRM_TOKEN="SUBMIT_4NODE_MATRIX"
 readonly -a MATRIX_SETTINGS=(
     qwen35-4b-fidelity
+    qwen35-4b-fidelity-8n
+    qwen35-4b-fidelity-8n-b16n8-traj
     qwen35-9b-baseline-a2-full65k
     qwen35-9b-b16n16-a2-full65k
     qwen35-9b-async4-full65k
@@ -42,6 +46,8 @@ Usage:
 
 Settings:
   qwen35-4b-fidelity
+  qwen35-4b-fidelity-8n
+  qwen35-4b-fidelity-8n-b16n8-traj
   qwen35-9b-baseline-a2-full65k
   qwen35-9b-b16n16-a2-full65k
   qwen35-9b-async4-full65k
@@ -52,7 +58,8 @@ Settings:
 TMAX_MATRIX_CONFIRM=SUBMIT_4NODE_MATRIX is present. Pin TMAX_MATRIX_STAMP to
 submit the exact fresh RUN_ID values shown by an earlier plan. Optionally set
 TMAX_MATRIX_DEPENDENCY=afterok:JOBID (or a colon-separated list of numeric job
-ids) to queue every arm behind a successful smoke job.
+ids) to queue every arm behind successful completion of existing jobs. Set
+TMAX_MATRIX_NUM_ROLLOUT=N to bound only the b16n8 trajectory diagnostic arm.
 EOF
 }
 
@@ -113,6 +120,7 @@ reset_matrix_overrides() {
     # silently changing one arm of the comparison.
     unset \
         LOAD_DIR SBATCH_DEPENDENCY SUBMIT_DRY_RUN \
+        TMAX_NUM_ROLLOUT TMAX_TARGET_ITER \
         POLAR_GATEWAY_MAX_INIT_WORKERS \
         POLAR_GATEWAY_MAX_RUN_WORKERS \
         POLAR_GATEWAY_MAX_POSTRUN_WORKERS \
@@ -121,14 +129,19 @@ reset_matrix_overrides() {
 }
 
 configure_common() {
-    local setting="$1"
+    local setting="$1" topology_tag=4n32
     reset_matrix_overrides
     if [ -n "${MATRIX_DEPENDENCY}" ]; then
         export SBATCH_DEPENDENCY="${MATRIX_DEPENDENCY}"
     fi
 
-    export RUN_ID="tmax-4n32-${setting}-${MATRIX_STAMP}"
-    export EXPERIMENT_NAME="tmax-4n32-${setting}"
+    case "${setting}" in
+        qwen35-4b-fidelity-8n|qwen35-4b-fidelity-8n-b16n8-traj)
+            topology_tag=8n64
+            ;;
+    esac
+    export RUN_ID="tmax-${topology_tag}-${setting}-${MATRIX_STAMP}"
+    export EXPERIMENT_NAME="tmax-${topology_tag}-${setting}"
     export JOB_NAME="polar-${RUN_ID}"
     export POLAR_DATA_ROOT="${MATRIX_DATA_ROOT}"
     export SAVE_DIR="${POLAR_DATA_ROOT}/ckpt/${RUN_ID}"
@@ -139,23 +152,31 @@ configure_common() {
     export TMAX_DATA_INTEGRITY_MANIFEST="${POLAR_DATA_ROOT}/runs/${RUN_ID}/tmax-data-integrity.json"
     export TMAX_EVAL_CONFIG_PATH="${POLAR_DATA_ROOT}/runs/${RUN_ID}/tmax-eval-config.json"
 
-    # Reuse the exact, already-audited 900/100/TB2.0 pass@1 files in every arm.
+    # Train on every currently usable TMax task except the exact pinned
+    # 100-row holdout. External benchmarks are evaluated offline.
     export TMAX_TRAIN_DATA="${MATRIX_SOURCE_RUN}/tmax-train.jsonl"
     export TMAX_EVAL_DATA="${MATRIX_SOURCE_RUN}/tmax_holdout-eval.jsonl"
-    export TMAX_EXTERNAL_EVAL_DATA="${MATRIX_SOURCE_RUN}/terminal_bench_2_0-eval.jsonl"
+    export TMAX_EXCLUDE_DATA="${TMAX_EVAL_DATA}"
     export TMAX_TRAIN_DATA_SHA256="${MATRIX_TRAIN_SHA256}"
     export TMAX_EVAL_DATA_SHA256="${MATRIX_HOLDOUT_SHA256}"
-    export TMAX_EXTERNAL_EVAL_DATA_SHA256="${MATRIX_TB20_SHA256}"
+    unset TMAX_EXTERNAL_EVAL_DATA_SHA256
     export TMAX_EVAL_BUNDLE_SHA256="${MATRIX_EVAL_BUNDLE_SHA256}"
     export TMAX_PREPARE_DATA=0
     export TMAX_PREPARE_EVAL_DATA=0
+    # These matrix datasets and images are pinned and were already deeply
+    # audited when the source run was built. Keep only fast hash/path checks on
+    # each submission; set this to 1 after changing any JSONL or image bundle.
+    export TMAX_VALIDATE_EXISTING_ASSETS=0
     export TMAX_TRAIN_START_INDEX=0
-    export TMAX_MAX_TASKS=900
+    export TMAX_MAX_TASKS=-1
     export TMAX_EVAL_START_INDEX=900
     export TMAX_EVAL_MAX_TASKS=100
-    export TMAX_TOTAL_TASKS=1000
-    export TMAX_REQUIRE_EXACT_TOTAL_TASKS=0
-    export TMAX_ONLY_READY=0
+    # The source tree still contains 14,601 tasks. Three missing SIFs are
+    # deliberately ignored, leaving 14,598 usable tasks and 14,498 train rows
+    # after excluding the fixed holdout.
+    export TMAX_TOTAL_TASKS=14601
+    export TMAX_REQUIRE_EXACT_TOTAL_TASKS=1
+    export TMAX_ONLY_READY=1
 
     export TMAX_EVAL_ENABLED=1
     export TMAX_EVAL_SOURCE=tmax
@@ -165,7 +186,7 @@ configure_common() {
     export TMAX_EVAL_TEMPERATURE=0.2
     export TMAX_EVAL_TOP_P=1.0
     export TMAX_EVAL_MAX_RESPONSE_LEN=16384
-    export TMAX_EXTERNAL_EVAL_ENABLED=1
+    export TMAX_EXTERNAL_EVAL_ENABLED=0
     export TMAX_EXTERNAL_EVAL_SOURCE=harbor
     export TMAX_EXTERNAL_EVAL_DATASET_NAME=terminal_bench_2_0
     export TMAX_EXTERNAL_EVAL_MAX_TASKS=89
@@ -182,6 +203,11 @@ configure_common() {
     export TMAX_EVAL_WEIGHT=100
     export TMAX_EXTERNAL_EVAL_WEIGHT=89
     export TMAX_EVAL_INTERVAL=20
+    export TMAX_OVERRIDE_OPT_PARAM_SCHEDULER=0
+    # Individual arms may require a strict baseline barrier before rollout 0.
+    # Keep the historical concurrent behavior by default for the 9B sweep.
+    export TMAX_CONCURRENT_PRETRAIN_EVAL=1
+    export TMAX_EVAL_RESUMED_CHECKPOINT_BEFORE_TRAIN=0
 
     export NUM_NODES=4
     export SLURM_GPUS=8
@@ -194,6 +220,7 @@ configure_common() {
     export ACCOUNT=nvr_lpr_llm
     export PARTITION="${TMAX_MATRIX_PARTITIONS:-backfill,batch}"
     export SLURM_CONSTRAINT=H100
+    export SLURM_EXCLUDE="${TMAX_MATRIX_EXCLUDE_NODES:-pool0-00642}"
     export WALL_TIME=4:00:00
     export TMAX_MIN_WALL_TIME=4:00:00
     export CPUS_PER_TASK=128
@@ -207,11 +234,13 @@ configure_common() {
     export EVAL_GLOBAL_BATCH_SIZE=256
     export NUM_EPOCH=1
     export SAVE_INTERVAL=10
-    # Every four-node arm reserves one complete trainer node (TP4 x DP2) and
-    # uses all remaining 24 GPUs as independent TP1 rollout engines.
+    # Four-node arms reserve one complete trainer node (TP4 x DP2) and use all
+    # remaining 24 GPUs as TP1 rollout engines. The explicit 8n arm overrides
+    # this below to two trainer nodes (TP4 x DP4) plus 48 rollout engines.
     export ACTOR_NUM_NODES=1
     export ACTOR_NUM_GPUS_PER_NODE=8
     export ACTOR_TENSOR_MODEL_PARALLEL_SIZE=4
+    export ACTOR_PIPELINE_MODEL_PARALLEL_SIZE=1
     export CONTEXT_PARALLEL_SIZE=1
     export SEQUENCE_PARALLEL=1
     export ROLLOUT_NUM_GPUS=24
@@ -225,13 +254,15 @@ configure_common() {
     export SEQ_LENGTH=67584
     export ROLLOUT_MAX_PROMPT_LEN=2048
     export ROLLOUT_MAX_RESPONSE_LEN=16384
-    # Slime multiplies this cap by CP only. CP=1 therefore needs the complete
-    # 67,584-token pack even though TP4 sequence-parallels the actual compute.
-    export MAX_TOKENS_PER_GPU=67584
+    # This is a micro-batch packing cap, not a trajectory truncation limit.
+    # Slime places an individual sample above the cap alone in its own
+    # micro-batch.  Keep enough headroom for the GatedDeltaNet backward
+    # autotuner and the FP32 LM head on the last pipeline stage.
+    export MAX_TOKENS_PER_GPU=45056
     # Keep full-trajectory fidelity while bounding per-chunk vocabulary
     # temporaries.  The prior 256-token chunks contributed directly to the
     # first-backward OOM on a worst-case 65k trajectory.
-    export LOG_PROBS_CHUNK_SIZE=64
+    export LOG_PROBS_CHUNK_SIZE=32
     export TMAX_MODEL_MAX_CONTEXT_LENGTH=262144
     export SGLANG_CONTEXT_LENGTH=262144
     export SGLANG_MEM_FRACTION_STATIC=0.7
@@ -331,22 +362,110 @@ configure_setting() {
             # architecture. Keep native projection precision on both sides.
             export TMAX_ENABLE_FP32_LM_HEAD=0
             export SGLANG_ENABLE_FP32_LM_HEAD=0
-            # Reproduce the completed 8-trainer/24-rollout sampling topology
-            # from Slurm job 13241355.  Twenty-four groups of eight trajectories
-            # feed three global batches of 64 while async=3 keeps 576 sessions
-            # available to the 24 rollout engines.  Accepting a mixed group
-            # after at least 50% completion plus two grace sessions prevents a
-            # single long-tail trajectory from idling the entire trainer node.
-            export ROLLOUT_BATCH_SIZE=24
+            # Keep the 8-trainer/24-rollout topology, but close each rollout
+            # after eight groups so the trainer is exercised comfortably before
+            # cw-dfw's 30-minute idle-GPU reaper. async=3 still keeps a bounded
+            # 24-group/192-session terminal window in flight. Run the complete
+            # fixed baseline synchronously before rollout 0; periodic evals keep
+            # the same strict barrier semantics.
+            export ROLLOUT_BATCH_SIZE=8
             export N_SAMPLES_PER_PROMPT=8
-            export NUM_STEPS_PER_ROLLOUT=3
+            export NUM_STEPS_PER_ROLLOUT=1
             export GLOBAL_BATCH_SIZE=64
             export EVAL_GLOBAL_BATCH_SIZE=64
+            export SAVE_INTERVAL=5
             export TRAIN_LR=5e-7
             export TMAX_MIN_ASYNC_LEVEL=3
             export POLAR_MAX_ASYNC_LEVEL=3
+            export TMAX_MIN_ACTIVE_SESSIONS_PER_ROLLOUT_GPU=8
             export POLAR_MIN_COMPLETE_ACCEPT_FRACTION=0.5
             export POLAR_EARLY_STOP_GRACE_SESSIONS=2
+            export TMAX_TRAIN_AGENT_TIMEOUT_SECONDS=600
+            export TMAX_CONCURRENT_PRETRAIN_EVAL=0
+            export MAX_TRAIN_ROLLOUT_LOGPROB_ABS_DIFF=0.5
+            ;;
+        qwen35-4b-fidelity-8n)
+            export HF_CHECKPOINT=Qwen/Qwen3.5-4B
+            export REF_LOAD="${QWEN4_REF_LOAD}"
+            export TORCH_DIST_DIR="${REF_LOAD}"
+            export MODEL_ARGS_FILE="${PROJECT_ROOT}/examples/swegym_slime_grpo/model_args.sh"
+            export POLAR_AGENT_MODEL_NAME=Qwen/Qwen3.5-4B
+            export TMAX_ENABLE_FP32_LM_HEAD=0
+            export SGLANG_ENABLE_FP32_LM_HEAD=0
+            # Weak-scale the proven 4B arm: TP4/CP1 grows from DP2 to DP4,
+            # while 48 TP1 rollout engines double the group size without
+            # changing prompts per step or sessions per rollout GPU. Use one
+            # local gateway per node so 384 active sessions do not bottleneck
+            # on the trainer head node.
+            export NUM_NODES=8
+            export ACTOR_NUM_NODES=2
+            export ROLLOUT_NUM_GPUS=48
+            export POLAR_MULTI_GATEWAY=1
+            export ROLLOUT_BATCH_SIZE=8
+            export N_SAMPLES_PER_PROMPT=16
+            export NUM_STEPS_PER_ROLLOUT=1
+            export GLOBAL_BATCH_SIZE=128
+            export EVAL_GLOBAL_BATCH_SIZE=128
+            export TMAX_EVAL_INTERVAL=10
+            if [ -n "${MATRIX_QWEN4_LOAD_DIR}" ]; then
+                export LOAD_DIR="${MATRIX_QWEN4_LOAD_DIR}"
+                export TMAX_OVERRIDE_OPT_PARAM_SCHEDULER=1
+            fi
+            export SAVE_INTERVAL=5
+            export TRAIN_LR=5e-7
+            export TMAX_MIN_ASYNC_LEVEL=3
+            export POLAR_MAX_ASYNC_LEVEL=3
+            export TMAX_MIN_ACTIVE_SESSIONS_PER_ROLLOUT_GPU=8
+            export POLAR_MIN_COMPLETE_ACCEPT_FRACTION=0.5
+            # Preserve the current 75% early-stop target: 6/8 becomes 12/16.
+            export POLAR_EARLY_STOP_GRACE_SESSIONS=4
+            export TMAX_TRAIN_AGENT_TIMEOUT_SECONDS=600
+            export TMAX_CONCURRENT_PRETRAIN_EVAL=0
+            export MAX_TRAIN_ROLLOUT_LOGPROB_ABS_DIFF=0.5
+            ;;
+        qwen35-4b-fidelity-8n-b16n8-traj)
+            export HF_CHECKPOINT=Qwen/Qwen3.5-4B
+            export REF_LOAD="${QWEN4_REF_LOAD}"
+            export TORCH_DIST_DIR="${REF_LOAD}"
+            export MODEL_ARGS_FILE="${PROJECT_ROOT}/examples/swegym_slime_grpo/model_args.sh"
+            export POLAR_AGENT_MODEL_NAME=Qwen/Qwen3.5-4B
+            export TMAX_ENABLE_FP32_LM_HEAD=0
+            export SGLANG_ENABLE_FP32_LM_HEAD=0
+            # Keep the existing 8-node GPU topology and total 128 rollout
+            # slots, but double independent prompts and make each trajectory
+            # one exchangeable loss unit. With group8, grace4 deliberately
+            # requires all 8 sessions so this diagnostic arm has no completion-
+            # speed selection bias.
+            export NUM_NODES=8
+            export ACTOR_NUM_NODES=2
+            export ROLLOUT_NUM_GPUS=48
+            export POLAR_MULTI_GATEWAY=1
+            export ROLLOUT_BATCH_SIZE=16
+            export N_SAMPLES_PER_PROMPT=8
+            export NUM_STEPS_PER_ROLLOUT=1
+            export GLOBAL_BATCH_SIZE=128
+            export EVAL_GLOBAL_BATCH_SIZE=128
+            export CALCULATE_PER_TOKEN_LOSS=0
+            export GRPO_STD_NORMALIZATION=0
+            export TMAX_EVAL_INTERVAL=10
+            if [ -n "${MATRIX_NUM_ROLLOUT}" ]; then
+                export TMAX_NUM_ROLLOUT="${MATRIX_NUM_ROLLOUT}"
+                export TMAX_TARGET_ITER="$((TMAX_NUM_ROLLOUT - 1))"
+            fi
+            if [ -n "${MATRIX_QWEN4_LOAD_DIR}" ]; then
+                export LOAD_DIR="${MATRIX_QWEN4_LOAD_DIR}"
+                export TMAX_OVERRIDE_OPT_PARAM_SCHEDULER=1
+            fi
+            export SAVE_INTERVAL=5
+            export TRAIN_LR=5e-7
+            export TMAX_MIN_ASYNC_LEVEL=3
+            export POLAR_MAX_ASYNC_LEVEL=3
+            export TMAX_MIN_ACTIVE_SESSIONS_PER_ROLLOUT_GPU=8
+            export POLAR_MIN_COMPLETE_ACCEPT_FRACTION=0.5
+            export POLAR_EARLY_STOP_GRACE_SESSIONS=4
+            export TMAX_TRAIN_AGENT_TIMEOUT_SECONDS=600
+            export TMAX_CONCURRENT_PRETRAIN_EVAL=0
+            export TMAX_EVAL_RESUMED_CHECKPOINT_BEFORE_TRAIN=1
             export MAX_TRAIN_ROLLOUT_LOGPROB_ABS_DIFF=0.5
             ;;
         qwen35-9b-baseline-a2-full65k)
@@ -392,8 +511,9 @@ configure_qwen9b() {
 }
 
 validate_configured_setting() {
+    local setting="${1:?missing matrix setting}"
     local actor_gpus total_gpus active_sessions minimum_sessions expected_postrun_workers
-    local actor_dp pack_tokens trainer_token_capacity
+    local actor_dp pack_tokens trainer_token_capacity expected_train_agent_timeout expected_scheduler_override
     actor_gpus="$((ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE))"
     total_gpus="$((NUM_NODES * SLURM_GPUS))"
     active_sessions="$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT * POLAR_MAX_ASYNC_LEVEL))"
@@ -403,23 +523,64 @@ validate_configured_setting() {
         echo "ERROR: ${RUN_ID} uses actor=${actor_gpus} + rollout=${ROLLOUT_NUM_GPUS}, expected ${total_gpus}" >&2
         return 1
     fi
+    if [ "${TMAX_MAX_TASKS}" != "-1" ] || \
+       [ "${TMAX_TOTAL_TASKS}" -ne 14601 ] || \
+       [ "${TMAX_ONLY_READY}" -ne 1 ] || \
+       [ "${TMAX_REQUIRE_EXACT_TOTAL_TASKS}" -ne 1 ] || \
+       [ "${TMAX_EVAL_MAX_TASKS}" -ne 100 ] || \
+       [ "${TMAX_EXTERNAL_EVAL_ENABLED}" -ne 0 ] || \
+       [ "${TMAX_EXCLUDE_DATA}" != "${TMAX_EVAL_DATA}" ]; then
+        echo "ERROR: ${RUN_ID} must use the 14,498-train/fixed-100-holdout complement with offline external eval" >&2
+        return 1
+    fi
     if [ "$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))" -ne \
          "$((GLOBAL_BATCH_SIZE * NUM_STEPS_PER_ROLLOUT))" ]; then
         echo "ERROR: ${RUN_ID} rollout samples must exactly feed its configured optimizer steps" >&2
         return 1
     fi
-    actor_dp="$((actor_gpus / (ACTOR_TENSOR_MODEL_PARALLEL_SIZE * CONTEXT_PARALLEL_SIZE)))"
+    actor_dp="$((actor_gpus / (ACTOR_TENSOR_MODEL_PARALLEL_SIZE * ACTOR_PIPELINE_MODEL_PARALLEL_SIZE * CONTEXT_PARALLEL_SIZE)))"
     pack_tokens="$((ROLLOUT_MAX_PROMPT_LEN + TMAX_MAX_TOTAL_RESPONSE_LEN))"
     trainer_token_capacity="$((MAX_TOKENS_PER_GPU * CONTEXT_PARALLEL_SIZE))"
-    if [ "${actor_gpus}" -ne 8 ] || \
-       [ "${ACTOR_TENSOR_MODEL_PARALLEL_SIZE}" -ne 4 ] || \
-       [ "${CONTEXT_PARALLEL_SIZE}" -ne 1 ] || \
-       [ "${actor_dp}" -ne 2 ] || \
-       [ "${ROLLOUT_NUM_GPUS}" -ne 24 ] || \
-       [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -ne 1 ]; then
-        echo "ERROR: ${RUN_ID} matrix topology must be 8 trainer TP4/CP1/DP2 + 24 TP1 rollout GPUs" >&2
+    expected_scheduler_override=0
+    if [ "${NUM_NODES}" -eq 8 ] && [ -n "${LOAD_DIR:-}" ]; then
+        expected_scheduler_override=1
+    fi
+    if [ "${TMAX_OVERRIDE_OPT_PARAM_SCHEDULER}" -ne "${expected_scheduler_override}" ]; then
+        echo "ERROR: ${RUN_ID} scheduler override must be enabled only for an 8n continuation" >&2
         return 1
     fi
+    case "${NUM_NODES}" in
+        4)
+            if [ "${actor_gpus}" -ne 8 ] || \
+               [ "${ACTOR_TENSOR_MODEL_PARALLEL_SIZE}" -ne 4 ] || \
+               [ "${ACTOR_PIPELINE_MODEL_PARALLEL_SIZE}" -ne 1 ] || \
+               [ "${CONTEXT_PARALLEL_SIZE}" -ne 1 ] || \
+               [ "${actor_dp}" -ne 2 ] || \
+               [ "${ROLLOUT_NUM_GPUS}" -ne 24 ] || \
+               [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -ne 1 ]; then
+                echo "ERROR: ${RUN_ID} 4-node topology must be 8 trainer TP4/CP1/DP2 + 24 TP1 rollout GPUs" >&2
+                return 1
+            fi
+            ;;
+        8)
+            if [[ "${POLAR_AGENT_MODEL_NAME}" != *4B ]] || \
+               [ "${actor_gpus}" -ne 16 ] || \
+               [ "${ACTOR_NUM_NODES}" -ne 2 ] || \
+               [ "${ACTOR_TENSOR_MODEL_PARALLEL_SIZE}" -ne 4 ] || \
+               [ "${ACTOR_PIPELINE_MODEL_PARALLEL_SIZE}" -ne 1 ] || \
+               [ "${CONTEXT_PARALLEL_SIZE}" -ne 1 ] || \
+               [ "${actor_dp}" -ne 4 ] || \
+               [ "${ROLLOUT_NUM_GPUS}" -ne 48 ] || \
+               [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -ne 1 ]; then
+                echo "ERROR: ${RUN_ID} 8-node 4B topology must be 16 trainer TP4/CP1/DP4 + 48 TP1 rollout GPUs" >&2
+                return 1
+            fi
+            ;;
+        *)
+            echo "ERROR: ${RUN_ID} matrix NUM_NODES must be 4 or 8" >&2
+            return 1
+            ;;
+    esac
     if [ "${SEQUENCE_PARALLEL}" != 1 ]; then
         echo "ERROR: ${RUN_ID} full65k trainer requires Megatron sequence parallelism" >&2
         return 1
@@ -433,19 +594,28 @@ validate_configured_setting() {
         echo "ERROR: ${RUN_ID} token budget must be per-turn 16384, total response 65536, prompt 2048, pack 67584" >&2
         return 1
     fi
-    if [ "${MAX_TOKENS_PER_GPU}" -ne 67584 ] || \
-       [ "${trainer_token_capacity}" -lt "${pack_tokens}" ]; then
-        echo "ERROR: ${RUN_ID} dynamic trainer cap must preserve the full 67584-token pack" >&2
+    if [ "${MAX_TOKENS_PER_GPU}" -ne 45056 ]; then
+        echo "ERROR: ${RUN_ID} dynamic trainer cap must be the OOM-safe 45056-token packing cap" >&2
         return 1
     fi
-    if [ "${LOG_PROBS_CHUNK_SIZE}" -ne 64 ]; then
-        echo "ERROR: ${RUN_ID} full65k trainer requires 64-token log-prob chunks" >&2
+    if [ "${LOG_PROBS_CHUNK_SIZE}" -ne 32 ]; then
+        echo "ERROR: ${RUN_ID} full65k trainer requires OOM-safe 32-token log-prob chunks" >&2
         return 1
     fi
-    if [ "${CALCULATE_PER_TOKEN_LOSS}" -ne 1 ]; then
-        echo "ERROR: ${RUN_ID} full65k run requires token-level loss" >&2
-        return 1
-    fi
+    case "${TMAX_CONCURRENT_PRETRAIN_EVAL}" in
+        0|1) ;;
+        *)
+            echo "ERROR: ${RUN_ID} TMAX_CONCURRENT_PRETRAIN_EVAL must be 0 or 1" >&2
+            return 1
+            ;;
+    esac
+    case "${TMAX_EVAL_RESUMED_CHECKPOINT_BEFORE_TRAIN}" in
+        0|1) ;;
+        *)
+            echo "ERROR: ${RUN_ID} TMAX_EVAL_RESUMED_CHECKPOINT_BEFORE_TRAIN must be 0 or 1" >&2
+            return 1
+            ;;
+    esac
     case "${POLAR_AGENT_MODEL_NAME}" in
         *4B)
             if [ "${TMAX_ENABLE_FP32_LM_HEAD}" -ne 0 ] || \
@@ -453,32 +623,101 @@ validate_configured_setting() {
                 echo "ERROR: ${RUN_ID} tied 4B model must keep native LM-head precision" >&2
                 return 1
             fi
-            if [ "${ROLLOUT_BATCH_SIZE}" -ne 24 ] || \
-               [ "${N_SAMPLES_PER_PROMPT}" -ne 8 ] || \
-               [ "${NUM_STEPS_PER_ROLLOUT}" -ne 3 ] || \
-               [ "${GLOBAL_BATCH_SIZE}" -ne 64 ] || \
-               [ "${EVAL_GLOBAL_BATCH_SIZE}" -ne 64 ] || \
+            if [ "${NUM_STEPS_PER_ROLLOUT}" -ne 1 ] || \
+               [ "${SAVE_INTERVAL}" -ne 5 ] || \
+               [ "${TMAX_MIN_ASYNC_LEVEL}" -ne 3 ] || \
                [ "${POLAR_MAX_ASYNC_LEVEL}" -ne 3 ] || \
+               [ "${TMAX_MIN_ACTIVE_SESSIONS_PER_ROLLOUT_GPU}" -ne 8 ] || \
                [ "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION}" != 0.5 ] || \
-               [ "${POLAR_EARLY_STOP_GRACE_SESSIONS}" -ne 2 ] || \
+               [ "${TMAX_TRAIN_AGENT_TIMEOUT_SECONDS}" -ne 600 ] || \
+               [ "${TMAX_CONCURRENT_PRETRAIN_EVAL}" -ne 0 ] || \
                [ "${TRAIN_LR}" != 5e-7 ]; then
-                echo "ERROR: ${RUN_ID} 4B arm must reproduce job 13241355 sampling/early-stop settings" >&2
+                echo "ERROR: ${RUN_ID} 4B arm must preserve the weak-scaling optimizer and async settings" >&2
                 return 1
             fi
+            case "${setting}" in
+                qwen35-4b-fidelity)
+                    if [ "${NUM_NODES}" -ne 4 ] || \
+                       [ "${ROLLOUT_BATCH_SIZE}" -ne 8 ] || \
+                       [ "${N_SAMPLES_PER_PROMPT}" -ne 8 ] || \
+                       [ "${GLOBAL_BATCH_SIZE}" -ne 64 ] || \
+                       [ "${EVAL_GLOBAL_BATCH_SIZE}" -ne 64 ] || \
+                       [ "${CALCULATE_PER_TOKEN_LOSS}" -ne 1 ] || \
+                       [ "${TMAX_EVAL_INTERVAL}" -ne 20 ] || \
+                       [ "${POLAR_EARLY_STOP_GRACE_SESSIONS}" -ne 2 ] || \
+                       [ "${TMAX_EVAL_RESUMED_CHECKPOINT_BEFORE_TRAIN}" -ne 0 ] || \
+                       [ "${POLAR_MULTI_GATEWAY}" -ne 0 ]; then
+                        echo "ERROR: ${RUN_ID} 4-node 4B arm must use group8/global64/eval20/grace2/single-gateway" >&2
+                        return 1
+                    fi
+                    ;;
+                qwen35-4b-fidelity-8n)
+                    if [ "${NUM_NODES}" -ne 8 ] || \
+                       [ "${ROLLOUT_BATCH_SIZE}" -ne 8 ] || \
+                       [ "${N_SAMPLES_PER_PROMPT}" -ne 16 ] || \
+                       [ "${GLOBAL_BATCH_SIZE}" -ne 128 ] || \
+                       [ "${EVAL_GLOBAL_BATCH_SIZE}" -ne 128 ] || \
+                       [ "${CALCULATE_PER_TOKEN_LOSS}" -ne 1 ] || \
+                       [ "${TMAX_EVAL_INTERVAL}" -ne 10 ] || \
+                       [ "${POLAR_EARLY_STOP_GRACE_SESSIONS}" -ne 4 ] || \
+                       [ "${TMAX_EVAL_RESUMED_CHECKPOINT_BEFORE_TRAIN}" -ne 0 ] || \
+                       [ "${POLAR_MULTI_GATEWAY}" -ne 1 ]; then
+                        echo "ERROR: ${RUN_ID} existing 8-node 4B arm must use 8 prompts x group16/global128/eval10/grace4/token loss/multi-gateway" >&2
+                        return 1
+                    fi
+                    ;;
+                qwen35-4b-fidelity-8n-b16n8-traj)
+                    if [ "${NUM_NODES}" -ne 8 ] || \
+                       [ "${ROLLOUT_BATCH_SIZE}" -ne 16 ] || \
+                       [ "${N_SAMPLES_PER_PROMPT}" -ne 8 ] || \
+                       [ "${GLOBAL_BATCH_SIZE}" -ne 128 ] || \
+                       [ "${EVAL_GLOBAL_BATCH_SIZE}" -ne 128 ] || \
+                       [ "${CALCULATE_PER_TOKEN_LOSS}" -ne 0 ] || \
+                       [ "${GRPO_STD_NORMALIZATION}" -ne 0 ] || \
+                       [ "${TMAX_EVAL_INTERVAL}" -ne 10 ] || \
+                       [ "${POLAR_EARLY_STOP_GRACE_SESSIONS}" -ne 4 ] || \
+                       [ "${TMAX_EVAL_RESUMED_CHECKPOINT_BEFORE_TRAIN}" -ne 1 ] || \
+                       [ "${POLAR_MULTI_GATEWAY}" -ne 1 ]; then
+                        echo "ERROR: ${RUN_ID} trajectory arm must use 16 prompts x group8/global128/eval10/grace4/trajectory loss/multi-gateway" >&2
+                        return 1
+                    fi
+                    ;;
+                *)
+                    echo "ERROR: ${RUN_ID} unknown 4B matrix setting ${setting}" >&2
+                    return 1
+                    ;;
+            esac
             ;;
         *)
             if [ "${TMAX_ENABLE_FP32_LM_HEAD}" -ne 1 ] || \
-               [ "${SGLANG_ENABLE_FP32_LM_HEAD}" -ne 1 ]; then
-                echo "ERROR: ${RUN_ID} untied 9B model requires matching FP32 LM heads" >&2
+               [ "${SGLANG_ENABLE_FP32_LM_HEAD}" -ne 1 ] || \
+               [ "${CALCULATE_PER_TOKEN_LOSS}" -ne 1 ] || \
+               [ "${TMAX_EVAL_RESUMED_CHECKPOINT_BEFORE_TRAIN}" -ne 0 ] || \
+               [ "${POLAR_MULTI_GATEWAY}" -ne 0 ]; then
+                echo "ERROR: ${RUN_ID} untied 9B arm requires matching FP32 LM heads, token loss, and single gateway" >&2
                 return 1
             fi
             ;;
     esac
-    if [ "${POLAR_MULTI_GATEWAY}" -ne 0 ] || \
-       [ "${POLAR_APPTAINER_PERSISTENT_BROKER}" -ne 0 ] || \
+    if [ "${setting}" = qwen35-4b-fidelity-8n-b16n8-traj ]; then
+        if [ -n "${MATRIX_NUM_ROLLOUT}" ]; then
+            if [ "${TMAX_NUM_ROLLOUT:-}" != "${MATRIX_NUM_ROLLOUT}" ] || \
+               [ "${TMAX_TARGET_ITER:-}" != "$((MATRIX_NUM_ROLLOUT - 1))" ]; then
+                echo "ERROR: ${RUN_ID} trajectory bound must map TMAX_MATRIX_NUM_ROLLOUT to trainer and watcher state" >&2
+                return 1
+            fi
+        elif [ -n "${TMAX_NUM_ROLLOUT:-}" ] || [ -n "${TMAX_TARGET_ITER:-}" ]; then
+            echo "ERROR: ${RUN_ID} has an unexpected trajectory bound" >&2
+            return 1
+        fi
+    elif [ -n "${TMAX_NUM_ROLLOUT:-}" ] || [ -n "${TMAX_TARGET_ITER:-}" ]; then
+        echo "ERROR: ${RUN_ID} inherited the trajectory arm's rollout bound" >&2
+        return 1
+    fi
+    if [ "${POLAR_APPTAINER_PERSISTENT_BROKER}" -ne 0 ] || \
        [ "${POLAR_APPTAINER_NO_INSTANCE}" -ne 1 ] || \
        [ "${POLAR_APPTAINER_DIRECT_EXEC_RETRIES}" -ne 3 ]; then
-        echo "ERROR: ${RUN_ID} must use single-gateway fresh direct Apptainer exec with three retries" >&2
+        echo "ERROR: ${RUN_ID} must use fresh direct Apptainer exec with three retries" >&2
         return 1
     fi
     if [ "${active_sessions}" -lt "${minimum_sessions}" ]; then
@@ -489,8 +728,12 @@ validate_configured_setting() {
         echo "ERROR: ${RUN_ID} postrun workers ${POLAR_MAX_POSTRUN_WORKERS} != required ${expected_postrun_workers}" >&2
         return 1
     fi
-    if [ "${TMAX_TRAIN_AGENT_TIMEOUT_SECONDS}" -ne 1200 ]; then
-        echo "ERROR: ${RUN_ID} training agent timeout must match the official 1200-second backend timeout" >&2
+    case "${POLAR_AGENT_MODEL_NAME}" in
+        *4B) expected_train_agent_timeout=600 ;;
+        *) expected_train_agent_timeout=1200 ;;
+    esac
+    if [ "${TMAX_TRAIN_AGENT_TIMEOUT_SECONDS}" -ne "${expected_train_agent_timeout}" ]; then
+        echo "ERROR: ${RUN_ID} training agent timeout must be ${expected_train_agent_timeout}s" >&2
         return 1
     fi
     if [ "${POLAR_TASK_TIMEOUT_FLOOR_SECONDS}" -lt \
@@ -515,15 +758,16 @@ validate_configured_setting() {
 }
 
 print_plan_header() {
-    echo "TMax 4-node x 8-GPU matrix (read-only plan)"
+    echo "TMax mixed 4/8-node x 8-GPU matrix (read-only plan)"
     echo "  stamp:       ${MATRIX_STAMP}"
     echo "  W&B:         ${TMAX_MATRIX_WANDB_PROJECT:-polar-tmax-grpo} / ${MATRIX_WANDB_GROUP}"
     echo "  dependency:  ${MATRIX_DEPENDENCY:-none}"
-    echo "  train/eval:  900 train, 100 TMax holdout pass@1, 89 TB2.0 pass@1, eval every 20 train steps"
+    echo "  exclude:     ${TMAX_MATRIX_EXCLUDE_NODES:-pool0-00642}"
+    echo "  train/eval:  14,498 train (14,598 ready minus fixed 100), TMax holdout pass@1 only; 4n eval every 20 steps, 8n every 10"
     echo "  data source: ${MATRIX_SOURCE_RUN}"
-    echo "  filtering:   trajectory-level reward variance; 4B early-stop=50%+2 grace"
-    echo "  timeouts:    train agent 1200s; eval per-row caps unchanged; task floor 1800s; HTTP envelope 3600s"
-    echo "  runtime:     single gateway; fresh direct Apptainer exec; no broker/instance; retries=3"
+    echo "  filtering:   trajectory-level reward variance; standard 4B early-stop=50%; trajectory arm requires full group8"
+    echo "  timeouts:    4B train agent 600s; 9B 1200s; eval per-row caps unchanged; task floor 1800s; HTTP envelope 3600s"
+    echo "  runtime:     4n single gateway; 8n one gateway per node; fresh direct Apptainer exec; no broker/instance; retries=3"
     printf '\n%-31s %-4s %-8s %-5s %-10s %-7s %-9s %-10s %-17s %-17s\n' \
         setting model lr async batch max_tok trainer rollout fleet_workers gateway_workers
 }
@@ -531,7 +775,7 @@ print_plan_header() {
 print_setting_plan() {
     local setting="$1" model actor_gpus engines per_init per_run per_post
     configure_setting "${setting}"
-    validate_configured_setting
+    validate_configured_setting "${setting}"
     actor_gpus="$((ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE))"
     engines="$((ROLLOUT_NUM_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))"
     if [ "${POLAR_MULTI_GATEWAY}" -eq 1 ]; then
@@ -555,6 +799,7 @@ print_setting_plan() {
         "${POLAR_MAX_INIT_WORKERS}/${POLAR_MAX_RUN_WORKERS}/${POLAR_MAX_POSTRUN_WORKERS}" \
         "${per_init}/${per_run}/${per_post}"
     echo "  tokens=turn${ROLLOUT_MAX_RESPONSE_LEN}/total_response${TMAX_MAX_TOTAL_RESPONSE_LEN}+prompt${ROLLOUT_MAX_PROMPT_LEN}=pack${SEQ_LENGTH} trainer=tp${ACTOR_TENSOR_MODEL_PARALLEL_SIZE}/cp${CONTEXT_PARALLEL_SIZE}/sp${SEQUENCE_PARALLEL} cap=$((MAX_TOKENS_PER_GPU * CONTEXT_PARALLEL_SIZE))"
+    echo "  eval_interval=${TMAX_EVAL_INTERVAL} resume_seed_eval=${TMAX_EVAL_RESUMED_CHECKPOINT_BEFORE_TRAIN} scheduler_override=${TMAX_OVERRIDE_OPT_PARAM_SCHEDULER} load_dir=${LOAD_DIR:-release} num_rollout=${TMAX_NUM_ROLLOUT:-epoch-derived} target_iter=${TMAX_TARGET_ITER:-epoch-derived}"
     echo "  RUN_ID=${RUN_ID}"
 }
 
@@ -572,7 +817,7 @@ submit_setting() {
     local setting="$1"
     (
         configure_setting "${setting}"
-        validate_configured_setting
+        validate_configured_setting "${setting}"
         ensure_fresh_run
         echo "[matrix] submitting ${setting}: ${RUN_ID}"
         bash "${SUBMIT_SCRIPT}"
@@ -602,26 +847,57 @@ if ! [[ "${MATRIX_STAMP}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
     exit 2
 fi
 MATRIX_DATA_ROOT="${POLAR_DATA_ROOT:-${SPILOT_ROOT}/data}"
-MATRIX_SOURCE_RUN="${TMAX_MATRIX_SOURCE_RUN:-${MATRIX_DATA_ROOT}/runs/tmax-900t100h-tb20-qwen35-9b-gate32-20260630T001625Z}"
-MATRIX_WANDB_GROUP="${TMAX_MATRIX_WANDB_GROUP:-tmax-4n32-fidelity-sweep-${MATRIX_STAMP}}"
+MATRIX_SOURCE_RUN="${TMAX_MATRIX_SOURCE_RUN:-${MATRIX_DATA_ROOT}/runs/tmax-14598r-14498t100h-20260701T011143Z}"
+MATRIX_WANDB_GROUP="${TMAX_MATRIX_WANDB_GROUP:-tmax-fidelity-matrix-${MATRIX_STAMP}}"
 MATRIX_DEPENDENCY="${TMAX_MATRIX_DEPENDENCY:-}"
+MATRIX_QWEN4_LOAD_DIR="${TMAX_MATRIX_QWEN4_LOAD_DIR:-}"
+MATRIX_NUM_ROLLOUT="${TMAX_MATRIX_NUM_ROLLOUT:-}"
 if [ -n "${MATRIX_DEPENDENCY}" ] && \
    ! [[ "${MATRIX_DEPENDENCY}" =~ ^afterok:[0-9]+(:[0-9]+)*$ ]]; then
     echo "ERROR: TMAX_MATRIX_DEPENDENCY must match afterok:<jobid>[:<jobid>...], got ${MATRIX_DEPENDENCY}" >&2
     exit 2
 fi
-MATRIX_TRAIN_SHA256="${TMAX_MATRIX_TRAIN_SHA256:-d637733af3968461cd7b4763028874fea75d410eeca2d524133e61188789ee66}"
+if [ -n "${MATRIX_NUM_ROLLOUT}" ] && \
+   ! [[ "${MATRIX_NUM_ROLLOUT}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: TMAX_MATRIX_NUM_ROLLOUT must be a positive integer, got ${MATRIX_NUM_ROLLOUT}" >&2
+    exit 2
+fi
+MATRIX_TRAIN_SHA256="${TMAX_MATRIX_TRAIN_SHA256:-96a1c5929de64516eecc8a7b7ae012ccb888a2d575f15e28b8806ae6804826c8}"
 MATRIX_HOLDOUT_SHA256="${TMAX_MATRIX_HOLDOUT_SHA256:-b1fe3e3311c66370c62f73272198c557f6afd3774a456dd1008e35d0153cbec3}"
-MATRIX_TB20_SHA256="${TMAX_MATRIX_TB20_SHA256:-d9afac33203a673ab3a2904b68dd3316f34473cb73afc2336f915afece5a27cc}"
-MATRIX_EVAL_BUNDLE_SHA256="${TMAX_MATRIX_EVAL_BUNDLE_SHA256:-3d7380816c8e5a98ad78ed9a012232aa9aac876221c6f2b3886b680de4d680ae}"
+MATRIX_EVAL_BUNDLE_SHA256="${TMAX_MATRIX_EVAL_BUNDLE_SHA256:-b1fe3e3311c66370c62f73272198c557f6afd3774a456dd1008e35d0153cbec3}"
 QWEN4_REF_LOAD="${TMAX_MATRIX_QWEN4_REF_LOAD:-${USER_ROOT}/spilot-router/data/checkpoints/Qwen3.5-4B_torch_dist}"
 QWEN9_HF_CHECKPOINT="${TMAX_MATRIX_QWEN9_HF_CHECKPOINT:-${MATRIX_DATA_ROOT}/checkpoints/Qwen3.5-9B}"
 QWEN9_REF_LOAD="${TMAX_MATRIX_QWEN9_REF_LOAD:-${MATRIX_DATA_ROOT}/checkpoints/Qwen3.5-9B_torch_dist}"
 
-verify_jsonl train "${MATRIX_SOURCE_RUN}/tmax-train.jsonl" 900 "${MATRIX_TRAIN_SHA256}"
+verify_jsonl train "${MATRIX_SOURCE_RUN}/tmax-train.jsonl" 14498 "${MATRIX_TRAIN_SHA256}"
 verify_jsonl tmax_holdout "${MATRIX_SOURCE_RUN}/tmax_holdout-eval.jsonl" 100 "${MATRIX_HOLDOUT_SHA256}"
-verify_jsonl terminal_bench_2_0 "${MATRIX_SOURCE_RUN}/terminal_bench_2_0-eval.jsonl" 89 "${MATRIX_TB20_SHA256}"
 require_file "Qwen3.5-4B release marker" "${QWEN4_REF_LOAD}/latest_checkpointed_iteration.txt"
+if [ -n "${MATRIX_QWEN4_LOAD_DIR}" ]; then
+    require_file "Qwen3.5-4B continuation marker" "${MATRIX_QWEN4_LOAD_DIR}/latest_checkpointed_iteration.txt"
+    _matrix_seed_iter="$(tr -d '[:space:]' <"${MATRIX_QWEN4_LOAD_DIR}/latest_checkpointed_iteration.txt")"
+    if ! [[ "${_matrix_seed_iter}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+        echo "ERROR: invalid continuation checkpoint iteration: ${_matrix_seed_iter}" >&2
+        exit 1
+    fi
+    printf -v _matrix_seed_iter_dirname 'iter_%07s' "${_matrix_seed_iter}"
+    _matrix_seed_iter_dirname="${_matrix_seed_iter_dirname// /0}"
+    _matrix_seed_model_dir="${MATRIX_QWEN4_LOAD_DIR}/${_matrix_seed_iter_dirname}"
+    if [ ! -d "${_matrix_seed_model_dir}" ]; then
+        echo "ERROR: Qwen3.5-4B continuation model checkpoint directory is missing: ${_matrix_seed_model_dir}" >&2
+        exit 1
+    fi
+    for _matrix_seed_model_file in common.pt .metadata; do
+        _matrix_seed_model_path="${_matrix_seed_model_dir}/${_matrix_seed_model_file}"
+        if [ ! -f "${_matrix_seed_model_path}" ] || [ ! -s "${_matrix_seed_model_path}" ]; then
+            echo "ERROR: Qwen3.5-4B continuation model checkpoint is incomplete" >&2
+            echo "  Missing or empty regular file: ${_matrix_seed_model_path}" >&2
+            exit 1
+        fi
+    done
+    require_file "Qwen3.5-4B continuation rollout state" "${MATRIX_QWEN4_LOAD_DIR}/rollout/global_dataset_state_dict_${_matrix_seed_iter}.pt"
+    unset _matrix_seed_iter _matrix_seed_iter_dirname _matrix_seed_model_dir \
+        _matrix_seed_model_file _matrix_seed_model_path
+fi
 require_file "Qwen3.5-9B config" "${QWEN9_HF_CHECKPOINT}/config.json"
 require_file "Qwen3.5-9B release marker" "${QWEN9_REF_LOAD}/latest_checkpointed_iteration.txt"
 require_file "Qwen3.5-4B model args" "${PROJECT_ROOT}/examples/swegym_slime_grpo/model_args.sh"
@@ -640,6 +916,12 @@ if [ "${ACTION}" = plan ]; then
     printf '  TMAX_MATRIX_STAMP=%q' "${MATRIX_STAMP}"
     if [ -n "${MATRIX_DEPENDENCY}" ]; then
         printf ' TMAX_MATRIX_DEPENDENCY=%q' "${MATRIX_DEPENDENCY}"
+    fi
+    if [ -n "${MATRIX_QWEN4_LOAD_DIR}" ]; then
+        printf ' TMAX_MATRIX_QWEN4_LOAD_DIR=%q' "${MATRIX_QWEN4_LOAD_DIR}"
+    fi
+    if [ -n "${MATRIX_NUM_ROLLOUT}" ]; then
+        printf ' TMAX_MATRIX_NUM_ROLLOUT=%q' "${MATRIX_NUM_ROLLOUT}"
     fi
     printf ' TMAX_MATRIX_CONFIRM=%q bash %q submit' "${CONFIRM_TOKEN}" "$0"
     printf ' %q' "${SELECTED_SETTINGS[@]}"

@@ -3,8 +3,9 @@
 Extends :class:`~polar.trajectory.evaluator.harbor.HarborEvaluator`: the task's
 ``tests/test.sh`` still produces the outcome reward, but when the task ships a
 ``tests/rubric.md`` alongside it, the rollout is additionally scored by an
-external judge model (an OpenAI-compatible ``/chat/completions`` endpoint) in
-**one call per rollout**. The judge sees the task instruction
+external judge model (an OpenAI-compatible Chat Completions or Responses
+endpoint) in one call per rollout, or bounded calls when trace chunking is
+configured. The judge sees the task instruction
 (``instruction.md`` next to ``tests/``), a unified meta rubric, the task
 rubric, the verifier's raw scoring (``reward.json`` when available), and every
 trace's ``response_messages`` in chronological order, each tagged with a
@@ -26,9 +27,11 @@ is saved under ``artifacts_dir/judge/rollout.json``.
 
 Config schema (extends the ``harbor`` evaluator config)
 --------------------------------------------------------
-- ``judge_base_url`` *(str, required)* — endpoint root; the evaluator POSTs to
-  ``{judge_base_url}/chat/completions``.
+- ``judge_base_url`` *(str, required)* — endpoint root (for example ``.../v1``)
+  or the complete Responses endpoint (``.../v1/responses``).
 - ``judge_model`` *(str, required)* — model name sent to the endpoint.
+- ``judge_api`` *(str, default ``chat_completions``)* — either
+  ``chat_completions`` or ``responses``.
 - ``rubric_coefficient`` *(float, default 0.2)* — weight of the normalized
   judge score.
 - ``judge_api_key_env`` *(str, default ``JUDGE_API_KEY``)* — env var holding
@@ -36,7 +39,14 @@ Config schema (extends the ``harbor`` evaluator config)
 - ``judge_timeout`` *(float, default 60)* — per-request timeout, clamped to
   the session budget.
 - ``judge_max_retries`` *(int, default 2)* — retries on failure.
+- ``judge_max_output_tokens`` *(int, default 8192)* — judge response budget.
 - ``judge_temperature`` *(float, default 0.0)*.
+- ``judge_include_tool_outputs`` *(bool, default false)* — attach each tool
+  result observed in the following prompt to the trace that issued the call.
+- ``judge_tool_output_max_chars`` *(int, default 12000)* — middle-truncation
+  cap for each individual tool result when tool outputs are enabled.
+- ``judge_max_traces_per_call`` *(int, default 0)* — split long rollouts into
+  independent judge calls of at most this many traces; zero keeps one call.
 - ``max_section_chars`` *(int, default 40000)* — middle-truncation cap for
   each prompt section (instruction, rubric, verifier scoring, trace list).
 """
@@ -125,11 +135,16 @@ class HarborEvaluatorWithRubric(HarborEvaluator):
         *,
         judge_base_url: str,
         judge_model: str,
+        judge_api: str = "chat_completions",
         rubric_coefficient: float = 0.2,
         judge_api_key_env: str = "JUDGE_API_KEY",
         judge_timeout: float = 60.0,
         judge_max_retries: int = 2,
+        judge_max_output_tokens: int = 8_192,
         judge_temperature: float = 0.0,
+        judge_include_tool_outputs: bool = False,
+        judge_tool_output_max_chars: int = 12_000,
+        judge_max_traces_per_call: int = 0,
         max_section_chars: int = 40_000,
         **harbor_config: Any,
     ) -> None:
@@ -140,13 +155,30 @@ class HarborEvaluatorWithRubric(HarborEvaluator):
         self.judge_model = str(judge_model).strip()
         if not self.judge_model:
             raise ValueError("harbor_rubric evaluator requires a non-empty 'judge_model'")
+        self.judge_api = str(judge_api).strip().lower()
+        if self.judge_api not in {"chat_completions", "responses"}:
+            raise ValueError(
+                "harbor_rubric 'judge_api' must be 'chat_completions' or 'responses'"
+            )
         self.rubric_coefficient = float(rubric_coefficient)
         self.judge_api_key_env = judge_api_key_env
         self.judge_timeout = float(judge_timeout)
         if self.judge_timeout <= 0:
             raise ValueError("judge_timeout must be greater than 0")
         self.judge_max_retries = max(0, int(judge_max_retries))
+        self.judge_max_output_tokens = int(judge_max_output_tokens)
+        if self.judge_max_output_tokens <= 0:
+            raise ValueError("judge_max_output_tokens must be greater than 0")
         self.judge_temperature = float(judge_temperature)
+        if not isinstance(judge_include_tool_outputs, bool):
+            raise ValueError("judge_include_tool_outputs must be a boolean")
+        self.judge_include_tool_outputs = judge_include_tool_outputs
+        self.judge_tool_output_max_chars = int(judge_tool_output_max_chars)
+        if self.judge_tool_output_max_chars <= 0:
+            raise ValueError("judge_tool_output_max_chars must be greater than 0")
+        self.judge_max_traces_per_call = int(judge_max_traces_per_call)
+        if self.judge_max_traces_per_call < 0:
+            raise ValueError("judge_max_traces_per_call must be non-negative")
         self.max_section_chars = max(1_000, int(max_section_chars))
 
     async def evaluate(self, trajectory: Trajectory, **runtime: Any) -> EvalResult:
@@ -224,14 +256,47 @@ class HarborEvaluatorWithRubric(HarborEvaluator):
                     return result.stdout.strip()
         return json.dumps({"reward": outcome})
 
-    def _render_traces(self, traces: list[Trace]) -> str:
-        blocks = [
-            f'<trace id="trace_{index}">\n'
-            f"{_render_messages(trace.response_messages)}\n"
-            f"</trace>"
-            for index, trace in enumerate(traces)
-        ]
-        return self._clip("\n\n".join(blocks))
+    def _render_traces(
+        self,
+        traces: list[Trace],
+        *,
+        tool_outputs: dict[int, list[tuple[str, str, str]]] | None = None,
+    ) -> str:
+        if tool_outputs is None:
+            tool_outputs = (
+                _tool_outputs_by_trace(traces) if self.judge_include_tool_outputs else {}
+            )
+        blocks: list[str] = []
+        for index, trace in enumerate(traces):
+            body = _render_messages(trace.response_messages)
+            outputs = tool_outputs.get(index, [])
+            if outputs:
+                rendered_outputs = []
+                for tool_call_id, tool_name, content in outputs:
+                    clipped = _truncate_middle(content, self.judge_tool_output_max_chars)
+                    rendered_outputs.append(
+                        f'<tool_output tool_call_id="{tool_call_id}" '
+                        f'tool_name="{tool_name}">\n{clipped}\n</tool_output>'
+                    )
+                body = f"{body}\n<tool_outputs>\n" + "\n".join(rendered_outputs) + "\n</tool_outputs>"
+            blocks.append(f'<trace id="trace_{index}">\n{body}\n</trace>')
+        rendered = "\n\n".join(blocks)
+        if len(rendered) <= self.max_section_chars or not blocks:
+            return rendered
+
+        # Preserve every trace id when the combined section is large. A single
+        # middle truncation over the whole rollout can remove complete traces,
+        # making the requested one-score-per-trace JSON impossible. Divide the
+        # budget evenly instead; each block keeps its opening id and closing
+        # content while oversized response/tool text is shortened locally.
+        separator_chars = 2 * (len(blocks) - 1)
+        per_trace_limit = max(
+            80,
+            (self.max_section_chars - separator_chars) // len(blocks),
+        )
+        return "\n\n".join(
+            _truncate_middle(block, per_trace_limit) for block in blocks
+        )
 
     def _build_judge_messages(
         self,
@@ -240,13 +305,14 @@ class HarborEvaluatorWithRubric(HarborEvaluator):
         instruction: str,
         rubric: str,
         verifier_scoring: str,
+        tool_outputs: dict[int, list[tuple[str, str, str]]] | None = None,
     ) -> list[dict[str, str]]:
         user_prompt = JUDGE_USER_PROMPT_TEMPLATE.format(
             instruction=self._clip(instruction) or "(no instruction provided)",
             meta_rubric=META_RUBRIC,
             rubric=self._clip(rubric),
             verifier_scoring=self._clip(verifier_scoring),
-            traces=self._render_traces(traces),
+            traces=self._render_traces(traces, tool_outputs=tool_outputs),
         )
         return [
             {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
@@ -279,24 +345,55 @@ class HarborEvaluatorWithRubric(HarborEvaluator):
         cap = runtime.get("timeout_seconds")
         timeout = self.judge_timeout if cap is None else min(self.judge_timeout, float(cap))
 
-        messages = self._build_judge_messages(
-            traces,
-            instruction=instruction,
-            rubric=rubric,
-            verifier_scoring=verifier_scoring,
+        chunk_size = self.judge_max_traces_per_call or len(traces)
+        chunks = [traces[start : start + chunk_size] for start in range(0, len(traces), chunk_size)]
+        all_tool_outputs = (
+            _tool_outputs_by_trace(traces) if self.judge_include_tool_outputs else {}
         )
+        all_scores: list[int | None] = []
+        records: list[dict[str, Any]] = []
         async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-            scores, record = await self._call_judge(client, messages, len(traces))
+            for chunk_index, chunk in enumerate(chunks):
+                chunk_start = chunk_index * chunk_size
+                messages = self._build_judge_messages(
+                    chunk,
+                    instruction=instruction,
+                    rubric=rubric,
+                    verifier_scoring=verifier_scoring,
+                    tool_outputs={
+                        global_index - chunk_start: outputs
+                        for global_index, outputs in all_tool_outputs.items()
+                        if chunk_start <= global_index < chunk_start + len(chunk)
+                    },
+                )
+                chunk_scores, chunk_record = await self._call_judge(
+                    client, messages, len(chunk)
+                )
+                chunk_record["chunk_index"] = chunk_index
+                chunk_record["global_trace_start"] = chunk_start
+                chunk_record["global_trace_end"] = chunk_start + len(chunk)
+                records.append(chunk_record)
+                all_scores.extend(chunk_scores)
+
+        record: dict[str, Any]
+        if len(records) == 1:
+            record = records[0]
+        else:
+            record = {
+                "chunk_size": chunk_size,
+                "chunk_count": len(records),
+                "chunks": records,
+            }
 
         artifacts = runtime.get("artifacts_dir")
         if artifacts:
             judge_dir = Path(artifacts) / "judge"
             judge_dir.mkdir(parents=True, exist_ok=True)
-            record["scores"] = scores
+            record["scores"] = all_scores
             (judge_dir / "rollout.json").write_text(
                 json.dumps(record, indent=2, default=str)
             )
-        return scores
+        return all_scores
 
     async def _call_judge(
         self,
@@ -305,35 +402,130 @@ class HarborEvaluatorWithRubric(HarborEvaluator):
         trace_count: int,
     ) -> tuple[list[int | None], dict[str, Any]]:
         """POST one judge request for the whole rollout, with retries."""
-        payload = {
-            "model": self.judge_model,
-            "messages": messages,
-            "temperature": self.judge_temperature,
-        }
+        if self.judge_api == "responses":
+            payload = {
+                "model": self.judge_model,
+                "input": messages,
+                "max_output_tokens": self.judge_max_output_tokens,
+            }
+            url = (
+                self.judge_base_url
+                if self.judge_base_url.endswith("/responses")
+                else f"{self.judge_base_url}/responses"
+            )
+        else:
+            payload = {
+                "model": self.judge_model,
+                "messages": messages,
+                "temperature": self.judge_temperature,
+                "max_tokens": self.judge_max_output_tokens,
+            }
+            url = f"{self.judge_base_url}/chat/completions"
         record: dict[str, Any] = {"request": payload, "attempts": []}
-        url = f"{self.judge_base_url}/chat/completions"
 
+        best_scores: list[int | None] = [None] * trace_count
         for attempt in range(self.judge_max_retries + 1):
             try:
                 response = await client.post(url, json=payload)
                 response.raise_for_status()
                 data = response.json()
-                content = data["choices"][0]["message"]["content"] or ""
+                content = (
+                    _responses_output_text(data)
+                    if self.judge_api == "responses"
+                    else data["choices"][0]["message"]["content"] or ""
+                )
                 record["attempts"].append({"status": response.status_code, "content": content})
                 scores = _parse_trace_scores(content, trace_count)
-                if any(score is not None for score in scores):
+                if sum(score is not None for score in scores) > sum(
+                    score is not None for score in best_scores
+                ):
+                    best_scores = scores
+                if all(score is not None for score in scores):
                     return scores, record
-                record["attempts"][-1]["error"] = "no parseable trace scores in judge output"
+                parsed = sum(score is not None for score in scores)
+                record["attempts"][-1]["error"] = (
+                    f"incomplete judge output: parsed {parsed}/{trace_count} trace scores"
+                )
             except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
                 record["attempts"].append({"error": f"{type(exc).__name__}: {exc}"})
             if attempt < self.judge_max_retries:
                 await asyncio.sleep(min(2.0**attempt, 8.0))
-        return [None] * trace_count, record
+        return best_scores, record
 
 
 # ---------------------------------------------------------------------------
 # Rendering / parsing helpers
 # ---------------------------------------------------------------------------
+
+
+def _responses_output_text(data: dict[str, Any]) -> str:
+    """Extract assistant text from an OpenAI Responses API result."""
+    output_text = data.get("output_text")
+    if isinstance(output_text, str) and output_text:
+        return output_text
+    chunks: list[str] = []
+    for item in data.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for part in item.get("content") or []:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if part.get("type") == "output_text" and isinstance(text, str):
+                chunks.append(text)
+    if not chunks:
+        raise KeyError("Responses result contains no output_text")
+    return "".join(chunks)
+
+
+def _tool_outputs_by_trace(
+    traces: list[Trace],
+) -> dict[int, list[tuple[str, str, str]]]:
+    """Associate observed tool results with the trace that issued each call.
+
+    Agent traces store a turn's assistant response separately, while its tool
+    result first appears in the *next* trace's cumulative ``prompt_messages``.
+    Match by tool-call id rather than prompt position so parallel/multi-tool
+    turns remain unambiguous, and keep only the first observation to avoid
+    duplicating results repeated in every later cumulative prompt.
+    """
+
+    calls: dict[str, tuple[int, str]] = {}
+    for trace_index, trace in enumerate(traces):
+        for message in trace.response_messages:
+            for tool_call in message.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                tool_call_id = tool_call.get("id")
+                function = tool_call.get("function")
+                if not isinstance(tool_call_id, str) or not tool_call_id:
+                    continue
+                tool_name = "unknown"
+                if isinstance(function, dict) and function.get("name"):
+                    tool_name = str(function["name"])
+                calls.setdefault(tool_call_id, (trace_index, tool_name))
+
+    observed: dict[str, str] = {}
+    for trace in traces:
+        for message in trace.prompt_messages:
+            if message.get("role") != "tool":
+                continue
+            tool_call_id = message.get("tool_call_id")
+            if tool_call_id not in calls or tool_call_id in observed:
+                continue
+            content = message.get("content", "")
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False, default=str)
+            observed[tool_call_id] = content
+
+    by_trace: dict[int, list[tuple[str, str, str]]] = {}
+    for tool_call_id, (trace_index, tool_name) in calls.items():
+        content = observed.get(tool_call_id)
+        if content is not None:
+            by_trace.setdefault(trace_index, []).append(
+                (tool_call_id, tool_name, content)
+            )
+    return by_trace
 
 
 def _render_messages(messages: list[dict[str, Any]]) -> str:

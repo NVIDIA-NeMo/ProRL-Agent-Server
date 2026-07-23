@@ -526,6 +526,60 @@ def _disable_mksquashfs_duplicates(command: list[str]) -> list[str]:
     return fallback
 
 
+def pack_sandbox_sif_without_reimport(
+    binary: str,
+    sandbox: Path,
+    tmp: Path,
+    *,
+    env: dict[str, str],
+    mksquashfs_args: str,
+) -> None:
+    """Pack an already-built sandbox without Apptainer's tar reimport.
+
+    Some security-oriented TMax tasks intentionally contain symlinks whose
+    lexical target escapes the rootfs. They are inert inside the container
+    mount namespace, and SquashFS represents them faithfully, but Apptainer's
+    sandbox-to-SIF path first copies the rootfs through an archive extractor
+    that rejects those links. Build the standard SIF system partition directly
+    from SquashFS as a compatibility fallback.
+    """
+
+    squashfs = tmp.with_name(f"{tmp.name}.rootfs.squashfs")
+    tmp.unlink(missing_ok=True)
+    squashfs.unlink(missing_ok=True)
+    try:
+        command = ["mksquashfs", str(sandbox), str(squashfs), "-noappend"]
+        command.extend(shlex.split(mksquashfs_args))
+        run_command(command, env=env)
+        run_command([binary, "sif", "new", str(tmp)], env=env)
+        run_command(
+            [
+                binary,
+                "sif",
+                "add",
+                str(tmp),
+                str(squashfs),
+                "--groupid",
+                "1",
+                "--datatype",
+                "4",
+                "--parttype",
+                "2",
+                "--partfs",
+                "1",
+                "--partarch",
+                "2",
+            ],
+            env=env,
+        )
+        if not sif_ready(tmp):
+            raise RuntimeError(
+                f"direct SquashFS packaging returned no non-empty SIF: {tmp}"
+            )
+    finally:
+        squashfs.unlink(missing_ok=True)
+
+
 def build_one(
     task: TmaxTask,
     *,
@@ -608,16 +662,33 @@ def build_one(
                 else:
                     raise RuntimeError(f"unknown builder: {builder}")
                 try:
-                    pack_final_sif(
-                        cmd,
-                        env=build_env,
-                        tmp=tmp,
-                        attempts=(
-                            DIRECT_FINAL_PACK_ATTEMPTS
-                            if builder == "direct-apptainer"
-                            else 1
-                        ),
-                    )
+                    try:
+                        pack_final_sif(
+                            cmd,
+                            env=build_env,
+                            tmp=tmp,
+                            attempts=(
+                                DIRECT_FINAL_PACK_ATTEMPTS
+                                if builder == "direct-apptainer"
+                                else 1
+                            ),
+                        )
+                    except subprocess.CalledProcessError:
+                        if builder != "direct-apptainer":
+                            raise
+                        print(
+                            "WARNING: Apptainer sandbox reimport failed; "
+                            f"packing SquashFS system partition directly: {task.name}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        pack_sandbox_sif_without_reimport(
+                            binary,
+                            sandbox,
+                            tmp,
+                            env=build_env,
+                            mksquashfs_args=mksquashfs_args,
+                        )
                     tmp.replace(target)
                 finally:
                     tmp.unlink(missing_ok=True)

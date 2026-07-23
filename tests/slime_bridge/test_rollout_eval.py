@@ -83,6 +83,45 @@ async def test_external_eval_dataset_metrics_keep_terminal_bench_namespace(
 
 
 @pytest.mark.asyncio
+async def test_fixed_eval_does_not_touch_resumed_training_cursor(monkeypatch) -> None:
+    dataset = SimpleNamespace(name="tmax_holdout")
+    args = _args(eval_datasets=[dataset])
+
+    class CursorSentinel:
+        cursor = 40
+
+        def __getattr__(self, name):
+            raise AssertionError(f"fixed eval touched training data source: {name}")
+
+        def __iter__(self):
+            raise AssertionError("fixed eval iterated the training data source")
+
+        def __len__(self):
+            raise AssertionError("fixed eval measured the training data source")
+
+    async def run_dataset(*, rollout_id, dataset_cfg, **_kwargs):
+        assert rollout_id == 39
+        assert dataset_cfg is dataset
+        return (
+            "tmax_holdout",
+            {"rewards": [0.0], "valid_count": 1},
+            {"polar/reward_mean": 0.0},
+        )
+
+    monkeypatch.setattr(rollout_module, "_run_eval_dataset", run_dataset)
+    monkeypatch.setattr(
+        rollout_module,
+        "_load_rollout_eval_output_type",
+        lambda: _EvalOutput,
+    )
+    source = CursorSentinel()
+
+    await rollout_module._run_eval_rollout(args, 39, source)
+
+    assert source.cursor == 40
+
+
+@pytest.mark.asyncio
 async def test_multiple_external_eval_datasets_keep_disjoint_metric_namespaces(
     monkeypatch,
 ) -> None:
@@ -365,6 +404,7 @@ async def test_all_failed_eval_zero_fills_rewards_and_returns_error_counts(
     assert metrics["polar/min_valid_count"] == 2.0
     assert metrics["polar/reward_mean"] == 0.0
     assert metrics["polar/reward_std"] == 0.0
+    assert "polar/reward_mean_valid" not in metrics
 
 
 @pytest.mark.asyncio
@@ -458,6 +498,8 @@ async def test_eval_payload_build_error_is_isolated_and_zero_filled(
     assert data["accounted_count"] == 2
     assert data["error_count"] == 1
     assert metrics["polar/reward_mean"] == 0.5
+    assert metrics["polar/reward_mean_valid"] == 1.0
+    assert metrics["polar/reward_std_valid"] == 0.0
     assert "payload-error-eval-holdout-3-0" in caplog.text
     assert "sample metadata is malformed" in caplog.text
 
@@ -566,6 +608,7 @@ async def test_eval_optional_metric_error_does_not_discard_valid_reward(
     assert data["valid_count"] == 1
     assert data["error_count"] == 0
     assert metrics["polar/reward_mean"] == 1.0
+    assert metrics["polar/reward_mean_valid"] == 1.0
     assert "optional metric aggregation failed" in caplog.text
     assert "bad timing field" in caplog.text
 
@@ -651,6 +694,8 @@ async def test_eval_error_with_positive_verifier_reward_is_zero_filled_and_logge
     assert data["error_count"] == 1
     assert metrics["polar/reward_mean"] == 0.5
     assert metrics["polar/reward_std"] == 0.5
+    assert metrics["polar/reward_mean_valid"] == 1.0
+    assert metrics["polar/reward_std_valid"] == 0.0
     assert metrics["polar/valid_count"] == 1.0
     assert metrics["polar/accounted_count"] == 2.0
     assert metrics["polar/completed_count"] == 1.0

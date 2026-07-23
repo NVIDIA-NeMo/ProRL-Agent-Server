@@ -306,6 +306,7 @@ def test_render_task_payload_merges_harbor_oci_runtime_metadata() -> None:
                 "USER": "root",
                 "PASSWORD": "password1",
                 "PYTHONPATH": "/app:",
+                "PATH": "/workspace/bin:",
             },
             "runtime_init_command": (
                 "mkdir -p /polar/session/logs && "
@@ -328,7 +329,7 @@ def test_render_task_payload_merges_harbor_oci_runtime_metadata() -> None:
 
     assert payload["runtime"]["env"] == {
         "HOME": "/polar/session/home",
-        "PATH": "/agent:/usr/bin",
+        "PATH": "/workspace/bin:/agent:/usr/bin",
         "USER": "root",
         "PASSWORD": "password1",
         "PYTHONPATH": "/app:",

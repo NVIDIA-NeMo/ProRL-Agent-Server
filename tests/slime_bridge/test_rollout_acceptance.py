@@ -258,7 +258,7 @@ def test_explicit_trajectory_cap_preserves_complete_tmax_pack() -> None:
     assert _resolve_max_tokens(args) == 67_584
 
 
-def test_explicit_trajectory_cap_fails_instead_of_silently_clipping() -> None:
+def test_explicit_trajectory_cap_may_exceed_microbatch_packing_target() -> None:
     args = SimpleNamespace(
         max_tokens_per_gpu=16_384,
         context_parallel_size=1,
@@ -266,7 +266,18 @@ def test_explicit_trajectory_cap_fails_instead_of_silently_clipping() -> None:
         polar_max_trajectory_tokens=67_584,
     )
 
-    with pytest.raises(ValueError, match="exceeds trainer capacity"):
+    assert _resolve_max_tokens(args) == 67_584
+
+
+def test_explicit_trajectory_cap_fails_above_model_sequence_length() -> None:
+    args = SimpleNamespace(
+        max_tokens_per_gpu=16_384,
+        context_parallel_size=1,
+        seq_length=67_584,
+        polar_max_trajectory_tokens=67_585,
+    )
+
+    with pytest.raises(ValueError, match="exceeds model sequence length"):
         _resolve_max_tokens(args)
 
 
