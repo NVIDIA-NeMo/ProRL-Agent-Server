@@ -56,6 +56,7 @@ def test_slurm_submit_preserves_controller_topology_template() -> None:
     assert '"CONTROLLER_V3_SMALL_ROUTER_BASE_URL",' in run
     assert '"CONTROLLER_V3_QWEN_GATEWAY_MAX_CONCURRENCY",' in run
     assert '"CONTROLLER_V3_GPT_GATEWAY_MAX_CONCURRENCY",' in run
+    assert '"HF_CHECKPOINT",' in run
 
 
 def test_controller_v3_requires_persistent_apptainer_broker() -> None:
