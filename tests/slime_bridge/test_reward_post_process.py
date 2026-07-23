@@ -47,6 +47,7 @@ def _args(**overrides):
         "advantage_estimator": "grpo",
         "grpo_std_normalization": False,
         "dvao_reward_keys": None,
+        "gdpo_reward_keys": None,
     }
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -68,6 +69,34 @@ def test_dynamic_trace_loo_keeps_per_trace_rewards() -> None:
 
     assert raw == [2.0, 4.0, 10.0]
     assert rewards == [-8.0, -6.0, 7.0]
+
+
+def test_gdpo_is_invariant_to_reward_component_scale() -> None:
+    def advantages(cost_scale: float) -> list[float]:
+        reward_vectors = [
+            (1.0, 0.0),
+            (0.0, 0.0),
+            (1.0, cost_scale),
+            (0.0, cost_scale),
+        ]
+        samples = [
+            FakeSample(
+                group_id=trajectory_id,
+                reward=0.0,
+                reward_components={
+                    "accuracy": accuracy,
+                    "cost": cost,
+                },
+            )
+            for trajectory_id, (accuracy, cost) in enumerate(reward_vectors)
+        ]
+        _raw, normalized = post_process_rewards(
+            _args(gdpo_reward_keys=["accuracy", "cost"]),
+            samples,
+        )
+        return normalized
+
+    assert advantages(1.0) == pytest.approx(advantages(100.0), abs=2e-4)
 
 
 def test_dvao_matches_paper_formula_for_two_rewards() -> None:

@@ -27,6 +27,10 @@ def post_process_rewards(
     samples: list[Any],
 ) -> tuple[list[float], list[float]]:
     """Slime reward-post-process hook. Returns (raw_rewards, rewards)."""
+    gdpo_reward_keys = getattr(args, "gdpo_reward_keys", None)
+    if gdpo_reward_keys is not None:
+        return _post_process_gdpo(samples, tuple(gdpo_reward_keys))
+
     dvao_reward_keys = getattr(args, "dvao_reward_keys", None)
     if dvao_reward_keys is not None:
         return _post_process_dvao(samples, tuple(dvao_reward_keys))
@@ -109,6 +113,122 @@ def post_process_rewards(
     return raw_rewards, normalized_by_sample
 
 
+def _post_process_gdpo(
+    samples: list[Any],
+    reward_keys: tuple[str, ...],
+) -> tuple[list[float], list[float]]:
+    """Compute equal-weight GDPO advantages for named reward components.
+
+    Each component is normalized independently within its prompt rollout
+    group, the normalized components are summed, and the resulting advantages
+    are normalized once more across the training batch. Trajectories, rather
+    than their variable number of Polar trace samples, remain the exchangeable
+    units for both normalization stages.
+    """
+
+    if len(reward_keys) != 2 or len(set(reward_keys)) != 2:
+        raise ValueError("GDPO requires exactly two distinct reward keys")
+
+    components_by_sample: list[tuple[float, ...]] = []
+    for sample in samples:
+        if (
+            _is_failed_trajectory(sample)
+            or bool(getattr(sample, "remove_sample", False))
+            or _is_trainable_negative(sample)
+        ):
+            components_by_sample.append((0.0, 0.0))
+        else:
+            components_by_sample.append(
+                tuple(
+                    _finite_named_reward(sample, reward_key, algorithm="GDPO")
+                    for reward_key in reward_keys
+                )
+            )
+
+    raw_rewards = [sum(components) / len(components) for components in components_by_sample]
+
+    traj_sample_indices: dict[tuple[Any, Any], list[int]] = {}
+    traj_component_values: dict[tuple[Any, Any], list[tuple[float, ...]]] = {}
+    traj_failed: dict[tuple[Any, Any], bool] = {}
+    group_keys: dict[Any, list[tuple[Any, Any]]] = {}
+
+    for sample_index, sample in enumerate(samples):
+        group_idx, key = _trajectory_key(sample, sample_index)
+        if key not in traj_sample_indices:
+            traj_sample_indices[key] = []
+            traj_component_values[key] = []
+            traj_failed[key] = False
+            group_keys.setdefault(group_idx, []).append(key)
+        if _is_failed_trajectory(sample):
+            traj_failed[key] = True
+        elif _has_trainable_tokens(sample):
+            traj_sample_indices[key].append(sample_index)
+            traj_component_values[key].append(components_by_sample[sample_index])
+
+    pre_batch_advantages = [0.0] * len(samples)
+    valid_trajectory_keys: list[tuple[Any, Any]] = []
+    epsilon = 1e-4
+
+    for keys in group_keys.values():
+        valid_keys = [key for key in keys if not traj_failed[key] and traj_component_values[key]]
+        if not valid_keys:
+            continue
+        valid_trajectory_keys.extend(valid_keys)
+
+        trajectory_means = {
+            key: tuple(
+                statistics.fmean(values[component_index] for values in traj_component_values[key])
+                for component_index in range(len(reward_keys))
+            )
+            for key in valid_keys
+        }
+        component_means = tuple(
+            statistics.fmean(trajectory_means[key][component_index] for key in valid_keys)
+            for component_index in range(len(reward_keys))
+        )
+        component_stds = tuple(
+            statistics.stdev(
+                trajectory_means[key][component_index] for key in valid_keys
+            )
+            if len(valid_keys) > 1
+            else 0.0
+            for component_index in range(len(reward_keys))
+        )
+
+        for key in valid_keys:
+            for sample_index in traj_sample_indices[key]:
+                components = components_by_sample[sample_index]
+                pre_batch_advantages[sample_index] = sum(
+                    (value - component_means[component_index])
+                    / (component_stds[component_index] + epsilon)
+                    for component_index, value in enumerate(components)
+                )
+
+    trajectory_advantages = [
+        statistics.fmean(
+            pre_batch_advantages[sample_index]
+            for sample_index in traj_sample_indices[key]
+        )
+        for key in valid_trajectory_keys
+    ]
+    if len(trajectory_advantages) <= 1:
+        return raw_rewards, [0.0] * len(samples)
+
+    batch_mean = statistics.fmean(trajectory_advantages)
+    batch_std = statistics.stdev(trajectory_advantages)
+    if batch_std == 0.0:
+        return raw_rewards, [0.0] * len(samples)
+
+    advantages = [0.0] * len(samples)
+    for key in valid_trajectory_keys:
+        for sample_index in traj_sample_indices[key]:
+            advantages[sample_index] = (
+                pre_batch_advantages[sample_index] - batch_mean
+            ) / (batch_std + epsilon)
+
+    return raw_rewards, advantages
+
+
 def _post_process_dvao(
     samples: list[Any],
     reward_keys: tuple[str, ...],
@@ -142,7 +262,10 @@ def _post_process_dvao(
             components_by_sample.append((0.0, 0.0))
         else:
             components_by_sample.append(
-                tuple(_finite_named_reward(sample, reward_key) for reward_key in reward_keys)
+                tuple(
+                    _finite_named_reward(sample, reward_key, algorithm="DVAO")
+                    for reward_key in reward_keys
+                )
             )
 
     # Equal-weight scalarization is diagnostic only. The optimizer consumes
@@ -211,19 +334,26 @@ def _post_process_dvao(
     return raw_rewards, advantages
 
 
-def _finite_named_reward(sample: Any, reward_key: str) -> float:
+def _finite_named_reward(
+    sample: Any,
+    reward_key: str,
+    *,
+    algorithm: str,
+) -> float:
     reward = getattr(sample, "reward", None)
     if not isinstance(reward, dict) or reward_key not in reward:
-        raise ValueError(f"DVAO reward {reward_key!r} is missing from a trainable sample")
+        raise ValueError(
+            f"{algorithm} reward {reward_key!r} is missing from a trainable sample"
+        )
     value = reward[reward_key]
     if isinstance(value, bool):
-        raise ValueError(f"DVAO reward {reward_key!r} must be numeric")
+        raise ValueError(f"{algorithm} reward {reward_key!r} must be numeric")
     try:
         parsed = float(value)
     except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"DVAO reward {reward_key!r} must be numeric") from exc
+        raise ValueError(f"{algorithm} reward {reward_key!r} must be numeric") from exc
     if not math.isfinite(parsed):
-        raise ValueError(f"DVAO reward {reward_key!r} must be finite")
+        raise ValueError(f"{algorithm} reward {reward_key!r} must be finite")
     return parsed
 
 

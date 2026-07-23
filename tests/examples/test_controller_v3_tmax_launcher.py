@@ -90,18 +90,18 @@ def test_actor_expert_parallelism_reaches_megatron() -> None:
     assert "ACTOR_*|EXPERT_*|ROLLOUT_*" in submit
 
 
-def test_controller_profile_enables_harbor_cost_dvao() -> None:
+def test_controller_profile_enables_harbor_cost_gdpo() -> None:
     profile = (EXAMPLE / "profile.sh").read_text()
     polar_config = (EXAMPLE / "polar_config.yaml").read_text()
     shared_run = (ROOT / "examples/swegym_slime_grpo/run.sh").read_text()
     shared_submit = (ROOT / "examples/swegym_slime_grpo/submit_slurm.sh").read_text()
 
-    assert 'DVAO_REWARD_KEY_1="${DVAO_REWARD_KEY_1:-harbor_reward}"' in profile
-    assert 'DVAO_REWARD_KEY_2="${DVAO_REWARD_KEY_2:-negative_cost}"' in profile
+    assert 'GDPO_REWARD_KEY_1="${GDPO_REWARD_KEY_1:-harbor_reward}"' in profile
+    assert 'GDPO_REWARD_KEY_2="${GDPO_REWARD_KEY_2:-negative_cost}"' in profile
     assert "emit_cost_reward: true" in polar_config
-    assert "--dvao-reward-keys" in shared_run
-    assert "DVAO_*|" in shared_submit
-    assert "DVAO_REWARD_KEY_1 and DVAO_REWARD_KEY_2 must be set together" in shared_run
+    assert "--gdpo-reward-keys" in shared_run
+    assert "GDPO_*|" in shared_submit
+    assert "GDPO_REWARD_KEY_1 and GDPO_REWARD_KEY_2 must be set together" in shared_run
 
 
 def test_slurm_dry_run_is_side_effect_free_and_reports_full_topology() -> None:

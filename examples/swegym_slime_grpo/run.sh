@@ -1512,6 +1512,27 @@ if [ -n "${DVAO_REWARD_KEY_1:-}" ] || [ -n "${DVAO_REWARD_KEY_2:-}" ]; then
     )
     echo "Using DVAO rewards: ${DVAO_REWARD_KEY_1}, ${DVAO_REWARD_KEY_2}"
 fi
+GDPO_REWARD_ARGS=()
+if [ -n "${GDPO_REWARD_KEY_1:-}" ] || [ -n "${GDPO_REWARD_KEY_2:-}" ]; then
+    if [ -z "${GDPO_REWARD_KEY_1:-}" ] || [ -z "${GDPO_REWARD_KEY_2:-}" ]; then
+        echo "ERROR: GDPO_REWARD_KEY_1 and GDPO_REWARD_KEY_2 must be set together" >&2
+        exit 1
+    fi
+    if [ "${GDPO_REWARD_KEY_1}" = "${GDPO_REWARD_KEY_2}" ]; then
+        echo "ERROR: GDPO reward keys must be distinct" >&2
+        exit 1
+    fi
+    GDPO_REWARD_ARGS=(
+        --gdpo-reward-keys
+        "${GDPO_REWARD_KEY_1}"
+        "${GDPO_REWARD_KEY_2}"
+    )
+    echo "Using GDPO rewards: ${GDPO_REWARD_KEY_1}, ${GDPO_REWARD_KEY_2}"
+fi
+if [ "${#DVAO_REWARD_ARGS[@]}" -ne 0 ] && [ "${#GDPO_REWARD_ARGS[@]}" -ne 0 ]; then
+    echo "ERROR: DVAO and GDPO reward modes are mutually exclusive" >&2
+    exit 1
+fi
 OPTIMIZER_MEMORY_ARGS=()
 case "${TMAX_OPTIMIZER_CPU_OFFLOAD:-0}" in
     0) ;;
@@ -2130,6 +2151,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     --rollout-shuffle \
     --reward-key score \
     "${DVAO_REWARD_ARGS[@]}" \
+    "${GDPO_REWARD_ARGS[@]}" \
     "${TRAIN_LENGTH_ARGS[@]}" \
     --rollout-batch-size "$ROLLOUT_BATCH_SIZE" \
     --n-samples-per-prompt "$N_SAMPLES_PER_PROMPT" \
