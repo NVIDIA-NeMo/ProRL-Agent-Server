@@ -233,6 +233,37 @@ def test_large_worker_prices_cached_uncached_and_output_tokens() -> None:
     assert agent.usage["large"]["cached_input_tokens"] == 250_000
 
 
+def test_capability_guards_initialize_zero_gpt_cost_usage() -> None:
+    runner = _load_runner()
+
+    class Model:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(model_kwargs={})
+
+        def query(self, _messages):
+            return {}
+
+    agent = SimpleNamespace(
+        small_model=Model(),
+        large_model=Model(),
+        controller_model=Model(),
+        usage={"large": {"n_calls": 0, "cost": 0.0}},
+        _query_controller_model=lambda _messages: {},
+    )
+
+    runner._install_capability_guards(
+        agent,
+        router_capability="router-secret",
+        pool_capability="pool-secret",
+    )
+
+    assert agent.usage["large"]["cost"] == 0.0
+    assert agent.usage["large"]["input_tokens"] == 0
+    assert agent.usage["large"]["cached_input_tokens"] == 0
+    assert agent.usage["large"]["uncached_input_tokens"] == 0
+    assert agent.usage["large"]["output_tokens"] == 0
+
+
 def test_controller_harness_collects_gpt_cost(tmp_path: Path) -> None:
     harness = ControllerV3Harness(_spec())
     trajectory = tmp_path / "mini-swe-agent.traj.json"

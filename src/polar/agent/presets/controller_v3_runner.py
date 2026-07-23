@@ -254,6 +254,24 @@ def _install_capability_guards(
     pool_capability: str,
     responses_client: Any | None = None,
 ) -> None:
+    large_usage = agent.usage["large"]
+    for key in (
+        "input_tokens",
+        "cached_input_tokens",
+        "uncached_input_tokens",
+        "output_tokens",
+    ):
+        large_usage.setdefault(key, 0)
+    large_usage.setdefault(
+        "pricing",
+        {
+            "currency": "USD",
+            "input_per_million": _GPT_INPUT_USD_PER_MILLION,
+            "cached_input_per_million": _GPT_CACHED_INPUT_USD_PER_MILLION,
+            "output_per_million": _GPT_OUTPUT_USD_PER_MILLION,
+            "as_of": _GPT_PRICING_AS_OF,
+        },
+    )
     for model in (agent.small_model, agent.large_model):
         original_query = model.query
         config = model.config
