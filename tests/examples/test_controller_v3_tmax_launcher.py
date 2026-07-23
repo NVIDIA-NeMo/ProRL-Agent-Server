@@ -35,7 +35,7 @@ def test_controller_v3_topology_routes_local_qwen_and_nvidia_luna() -> None:
 def test_split_wrapper_reserves_exact_gpu_layout() -> None:
     text = (EXAMPLE / "run.sh").read_text()
     assert 'export RAY_LAST_NODE_NUM_GPUS="${RAY_LAST_NODE_NUM_GPUS:-2}"' in text
-    assert 'export RAY_NUM_GPUS_PER_NODE=8' in text
+    assert "export RAY_NUM_GPUS_PER_NODE=8" in text
     assert 'CUDA_VISIBLE_DEVICES="${first_gpu},${second_gpu}"' in text
     assert "for replica in 0 1 2" in text
     assert "--tp-size 2" in text
@@ -62,11 +62,8 @@ def test_slurm_submit_preserves_controller_topology_template() -> None:
 def test_controller_v3_requires_persistent_apptainer_broker() -> None:
     profile = (EXAMPLE / "profile.sh").read_text()
     submit = (EXAMPLE / "submit_slurm.sh").read_text()
-    assert 'POLAR_APPTAINER_PERSISTENT_BROKER:-1' in profile
-    assert (
-        'if [ "${POLAR_APPTAINER_PERSISTENT_BROKER:-}" != "1" ]; then'
-        in submit
-    )
+    assert "POLAR_APPTAINER_PERSISTENT_BROKER:-1" in profile
+    assert 'if [ "${POLAR_APPTAINER_PERSISTENT_BROKER:-}" != "1" ]; then' in submit
     result = subprocess.run(
         ["bash", str(EXAMPLE / "submit_slurm.sh"), "--dry-run"],
         cwd=ROOT,
@@ -87,10 +84,20 @@ def test_actor_expert_parallelism_reaches_megatron() -> None:
     profile = (EXAMPLE / "profile.sh").read_text()
     shared_run = (ROOT / "examples/swegym_slime_grpo/run.sh").read_text()
     submit = (ROOT / "examples/swegym_slime_grpo/submit_slurm.sh").read_text()
-    assert 'ACTOR_TENSOR_MODEL_PARALLEL_SIZE:-2' in profile
-    assert 'export EXPERT_MODEL_PARALLEL_SIZE=8' in profile
+    assert "ACTOR_TENSOR_MODEL_PARALLEL_SIZE:-2" in profile
+    assert "export EXPERT_MODEL_PARALLEL_SIZE=8" in profile
     assert '--expert-model-parallel-size "${EXPERT_MODEL_PARALLEL_SIZE:-1}"' in shared_run
     assert "ACTOR_*|EXPERT_*|ROLLOUT_*" in submit
+
+
+def test_controller_profile_exposes_optional_dvao_reward_keys() -> None:
+    profile = (EXAMPLE / "profile.sh").read_text()
+    shared_run = (ROOT / "examples/swegym_slime_grpo/run.sh").read_text()
+
+    assert 'DVAO_REWARD_KEY_1="${DVAO_REWARD_KEY_1:-}"' in profile
+    assert 'DVAO_REWARD_KEY_2="${DVAO_REWARD_KEY_2:-}"' in profile
+    assert "--dvao-reward-keys" in shared_run
+    assert "DVAO_REWARD_KEY_1 and DVAO_REWARD_KEY_2 must be set together" in shared_run
 
 
 def test_slurm_dry_run_is_side_effect_free_and_reports_full_topology() -> None:

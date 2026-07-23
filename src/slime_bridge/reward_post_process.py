@@ -27,6 +27,10 @@ def post_process_rewards(
     samples: list[Any],
 ) -> tuple[list[float], list[float]]:
     """Slime reward-post-process hook. Returns (raw_rewards, rewards)."""
+    dvao_reward_keys = getattr(args, "dvao_reward_keys", None)
+    if dvao_reward_keys is not None:
+        return _post_process_dvao(samples, tuple(dvao_reward_keys))
+
     # Enforce the failure policy again at the training boundary so replaying
     # an artifact produced by an older adapter cannot resurrect a positive
     # reward. Fully failed/removed trajectories stay excluded; aligned model
@@ -103,6 +107,124 @@ def post_process_rewards(
                 ) / group_scale
 
     return raw_rewards, normalized_by_sample
+
+
+def _post_process_dvao(
+    samples: list[Any],
+    reward_keys: tuple[str, ...],
+) -> tuple[list[float], list[float]]:
+    """Compute the paper's equal-prior-weight DVAO advantage.
+
+    DVAO normalizes each named reward within a prompt's rollout group, then
+    combines its per-objective advantages with weights proportional to the
+    corresponding group standard deviations. With equal prior weights this is
+    equivalent to::
+
+        sum_k (reward_k - group_mean_k) / sum_k group_std_k
+
+    A Polar trajectory may fan out into several trace samples. Group statistics
+    use one mean vector per trajectory, preserving trajectories as the
+    exchangeable units. Each trace keeps its own centered reward vector; Slime's
+    existing rollout-id reducer averages the trace losses back to the exact
+    trajectory-level DVAO signal.
+    """
+
+    if len(reward_keys) != 2 or len(set(reward_keys)) != 2:
+        raise ValueError("DVAO requires exactly two distinct reward keys")
+
+    components_by_sample: list[tuple[float, ...]] = []
+    for sample in samples:
+        if (
+            _is_failed_trajectory(sample)
+            or bool(getattr(sample, "remove_sample", False))
+            or _is_trainable_negative(sample)
+        ):
+            components_by_sample.append((0.0, 0.0))
+        else:
+            components_by_sample.append(
+                tuple(_finite_named_reward(sample, reward_key) for reward_key in reward_keys)
+            )
+
+    # Equal-weight scalarization is diagnostic only. The optimizer consumes
+    # ``advantages`` below, not these raw values.
+    raw_rewards = [sum(components) / len(components) for components in components_by_sample]
+
+    traj_sample_indices: dict[tuple[Any, Any], list[int]] = {}
+    traj_component_values: dict[
+        tuple[Any, Any],
+        list[tuple[float, ...]],
+    ] = {}
+    traj_failed: dict[tuple[Any, Any], bool] = {}
+    group_keys: dict[Any, list[tuple[Any, Any]]] = {}
+
+    for sample_index, sample in enumerate(samples):
+        group_idx, key = _trajectory_key(sample, sample_index)
+        if key not in traj_sample_indices:
+            traj_sample_indices[key] = []
+            traj_component_values[key] = []
+            traj_failed[key] = False
+            group_keys.setdefault(group_idx, []).append(key)
+        if _is_failed_trajectory(sample):
+            traj_failed[key] = True
+        elif _has_trainable_tokens(sample):
+            traj_sample_indices[key].append(sample_index)
+            traj_component_values[key].append(components_by_sample[sample_index])
+
+    advantages = [0.0] * len(samples)
+    for keys in group_keys.values():
+        valid_keys = [key for key in keys if not traj_failed[key] and traj_component_values[key]]
+        if not valid_keys:
+            continue
+
+        trajectory_means = {
+            key: tuple(
+                statistics.fmean(values[component_index] for values in traj_component_values[key])
+                for component_index in range(len(reward_keys))
+            )
+            for key in valid_keys
+        }
+        component_means = tuple(
+            statistics.fmean(trajectory_means[key][component_index] for key in valid_keys)
+            for component_index in range(len(reward_keys))
+        )
+        # The paper's derivation uses population group standard deviation
+        # (its derivative carries the 1/G factor), so use pstdev here.
+        component_stds = tuple(
+            statistics.pstdev(trajectory_means[key][component_index] for key in valid_keys)
+            for component_index in range(len(reward_keys))
+        )
+        denominator = sum(component_stds)
+        if denominator == 0.0:
+            continue
+
+        for key in valid_keys:
+            for sample_index in traj_sample_indices[key]:
+                components = components_by_sample[sample_index]
+                advantages[sample_index] = (
+                    sum(
+                        value - component_means[component_index]
+                        for component_index, value in enumerate(components)
+                    )
+                    / denominator
+                )
+
+    return raw_rewards, advantages
+
+
+def _finite_named_reward(sample: Any, reward_key: str) -> float:
+    reward = getattr(sample, "reward", None)
+    if not isinstance(reward, dict) or reward_key not in reward:
+        raise ValueError(f"DVAO reward {reward_key!r} is missing from a trainable sample")
+    value = reward[reward_key]
+    if isinstance(value, bool):
+        raise ValueError(f"DVAO reward {reward_key!r} must be numeric")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"DVAO reward {reward_key!r} must be numeric") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"DVAO reward {reward_key!r} must be finite")
+    return parsed
 
 
 def _finite_reward_or_zero(sample: Any, args: Any) -> float:

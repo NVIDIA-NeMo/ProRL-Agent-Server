@@ -20,11 +20,14 @@ class FakeSample:
         loss_mask: list[int] | None = None,
         remove_sample: bool = False,
         training_filter: dict | None = None,
+        reward_components: dict[str, Any] | None = None,
     ) -> None:
         self.group_index = group_index
         self.group_id = group_id
         self.index = group_id
         self.reward = {"score": reward}
+        if reward_components is not None:
+            self.reward.update(reward_components)
         self.status = status
         self.loss_mask = [1] if loss_mask is None else loss_mask
         self.response_length = len(self.loss_mask)
@@ -43,6 +46,7 @@ def _args(**overrides):
         "rewards_normalization": True,
         "advantage_estimator": "grpo",
         "grpo_std_normalization": False,
+        "dvao_reward_keys": None,
     }
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -64,6 +68,127 @@ def test_dynamic_trace_loo_keeps_per_trace_rewards() -> None:
 
     assert raw == [2.0, 4.0, 10.0]
     assert rewards == [-8.0, -6.0, 7.0]
+
+
+def test_dvao_matches_paper_formula_for_two_rewards() -> None:
+    reward_vectors = [
+        (1.0, 0.0),
+        (0.0, 0.0),
+        (1.0, 1.0),
+        (0.0, 1.0),
+    ]
+    samples = [
+        FakeSample(
+            group_id=trajectory_id,
+            reward=0.0,
+            reward_components={
+                "reward_1": reward_1,
+                "reward_2": reward_2,
+            },
+        )
+        for trajectory_id, (reward_1, reward_2) in enumerate(reward_vectors)
+    ]
+
+    raw, advantages = post_process_rewards(
+        _args(dvao_reward_keys=["reward_1", "reward_2"]),
+        samples,
+    )
+
+    assert raw == [0.5, 0.0, 1.0, 0.5]
+    assert advantages == pytest.approx([0.0, -1.0, 1.0, 0.0])
+
+
+def test_dvao_zero_variance_component_has_zero_weight() -> None:
+    samples = [
+        FakeSample(
+            group_id=0,
+            reward=0.0,
+            reward_components={"reward_1": 0.0, "reward_2": 1.0},
+        ),
+        FakeSample(
+            group_id=1,
+            reward=0.0,
+            reward_components={"reward_1": 1.0, "reward_2": 1.0},
+        ),
+    ]
+
+    _raw, advantages = post_process_rewards(
+        _args(dvao_reward_keys=["reward_1", "reward_2"]),
+        samples,
+    )
+
+    assert advantages == pytest.approx([-1.0, 1.0])
+
+
+def test_dvao_uses_trajectory_means_for_fanout_group_statistics() -> None:
+    samples = [
+        FakeSample(
+            group_id=0,
+            reward=0.0,
+            reward_components={"reward_1": 0.0, "reward_2": 0.0},
+        ),
+        FakeSample(
+            group_id=0,
+            reward=0.0,
+            reward_components={"reward_1": 1.0, "reward_2": 0.0},
+        ),
+        FakeSample(
+            group_id=1,
+            reward=0.0,
+            reward_components={"reward_1": 1.0, "reward_2": 1.0},
+        ),
+    ]
+
+    _raw, advantages = post_process_rewards(
+        _args(dvao_reward_keys=["reward_1", "reward_2"]),
+        samples,
+    )
+
+    # Trajectory vectors are (0.5, 0.0) and (1.0, 1.0). The two traces in
+    # trajectory 0 retain distinct signals whose mean is its exact
+    # trajectory-level DVAO advantage.
+    assert advantages == pytest.approx([-5.0 / 3.0, -1.0 / 3.0, 1.0])
+    assert statistics.fmean(advantages[:2]) == pytest.approx(-1.0)
+
+
+def test_dvao_missing_trainable_reward_fails_fast() -> None:
+    samples = [
+        FakeSample(
+            group_id=0,
+            reward=0.0,
+            reward_components={"reward_1": 1.0},
+        ),
+        FakeSample(
+            group_id=1,
+            reward=0.0,
+            reward_components={"reward_1": 0.0, "reward_2": 1.0},
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="reward_2.*missing"):
+        post_process_rewards(
+            _args(dvao_reward_keys=["reward_1", "reward_2"]),
+            samples,
+        )
+
+
+def test_dvao_failed_sample_does_not_require_components() -> None:
+    samples = [
+        FakeSample(group_id=0, reward=1.0, status="FAILED"),
+        FakeSample(
+            group_id=1,
+            reward=0.0,
+            reward_components={"reward_1": 0.0, "reward_2": 1.0},
+        ),
+    ]
+
+    raw, advantages = post_process_rewards(
+        _args(dvao_reward_keys=["reward_1", "reward_2"]),
+        samples,
+    )
+
+    assert raw == [0.0, 0.5]
+    assert advantages == [0.0, 0.0]
 
 
 def test_production_grpo_single_winner_uses_common_group_std() -> None:

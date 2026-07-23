@@ -1495,6 +1495,23 @@ case "${GRPO_STD_NORMALIZATION:-1}" in
         exit 1
         ;;
 esac
+DVAO_REWARD_ARGS=()
+if [ -n "${DVAO_REWARD_KEY_1:-}" ] || [ -n "${DVAO_REWARD_KEY_2:-}" ]; then
+    if [ -z "${DVAO_REWARD_KEY_1:-}" ] || [ -z "${DVAO_REWARD_KEY_2:-}" ]; then
+        echo "ERROR: DVAO_REWARD_KEY_1 and DVAO_REWARD_KEY_2 must be set together" >&2
+        exit 1
+    fi
+    if [ "${DVAO_REWARD_KEY_1}" = "${DVAO_REWARD_KEY_2}" ]; then
+        echo "ERROR: DVAO reward keys must be distinct" >&2
+        exit 1
+    fi
+    DVAO_REWARD_ARGS=(
+        --dvao-reward-keys
+        "${DVAO_REWARD_KEY_1}"
+        "${DVAO_REWARD_KEY_2}"
+    )
+    echo "Using DVAO rewards: ${DVAO_REWARD_KEY_1}, ${DVAO_REWARD_KEY_2}"
+fi
 OPTIMIZER_MEMORY_ARGS=()
 case "${TMAX_OPTIMIZER_CPU_OFFLOAD:-0}" in
     0) ;;
@@ -2112,6 +2129,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     --metadata-key metadata \
     --rollout-shuffle \
     --reward-key score \
+    "${DVAO_REWARD_ARGS[@]}" \
     "${TRAIN_LENGTH_ARGS[@]}" \
     --rollout-batch-size "$ROLLOUT_BATCH_SIZE" \
     --n-samples-per-prompt "$N_SAMPLES_PER_PROMPT" \
