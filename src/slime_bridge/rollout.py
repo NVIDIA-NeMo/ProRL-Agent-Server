@@ -4161,10 +4161,15 @@ def generate_rollout_polar_async(
             completed.reservation_id for completed in accepted_completions
         )
 
+    from slime_bridge.group_selection import select_training_groups
+
+    data, group_selection_metrics = select_training_groups(args, data, rollout_id=rollout_id)
+
     RolloutFnTrainOutput = _load_rollout_train_output_type()
     flat = [s for g in data for s in g]
     rewards = [_extract_sample_reward(s, async_worker.config.reward_key) for s in flat]
     metrics: dict[str, Any] = dict(dynamic_filter_metrics)
+    metrics.update(group_selection_metrics)
     metrics.update(dynamic_filter_reservation_metrics)
     metrics.update(partial_recovery_metrics)
     if candidate_pool_health_report is not None:

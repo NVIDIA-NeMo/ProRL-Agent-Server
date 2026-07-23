@@ -1552,6 +1552,18 @@ if [ "${POLAR_GDPO_COST_GATE_ALL_CORRECT:-}" = "1" ]; then
     POLAR_CONTROLLER_ARGS+=(--polar-gdpo-cost-gate-all-correct)
     echo "Using GDPO cost gate: cost applies only to fully-correct groups"
 fi
+if [ "${POLAR_DROP_ALL_WRONG_GROUPS:-}" = "1" ]; then
+    POLAR_CONTROLLER_ARGS+=(--polar-drop-all-wrong-groups)
+    echo "Group selection: dropping all-wrong groups"
+fi
+if [ "${POLAR_DROP_ALL_KEEP_GROUPS:-}" = "1" ]; then
+    POLAR_CONTROLLER_ARGS+=(--polar-drop-all-keep-groups)
+    echo "Group selection: dropping groups with no realized escalate/deescalate"
+fi
+if [ "${POLAR_BALANCE_ALL_CORRECT_GROUPS:-}" = "1" ]; then
+    POLAR_CONTROLLER_ARGS+=(--polar-balance-all-correct-groups)
+    echo "Group selection: downsampling all-correct groups to mixed count"
+fi
 OPTIMIZER_MEMORY_ARGS=()
 case "${TMAX_OPTIMIZER_CPU_OFFLOAD:-0}" in
     0) ;;
