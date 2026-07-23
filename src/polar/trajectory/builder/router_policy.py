@@ -17,7 +17,7 @@ from typing import Iterable
 
 from polar.trajectory.builder.base import BaseTrajectoryBuilder
 from polar.trajectory.builder.prefix_merging import PrefixMergingBuilder
-from polar.trajectory.models import CompletionSession, Trajectory
+from polar.trajectory.models import CompletionSession, Trace, Trajectory
 
 
 class RouterPolicyBuilder(BaseTrajectoryBuilder):
@@ -76,6 +76,7 @@ class RouterPolicyBuilder(BaseTrajectoryBuilder):
             }
         )
         trajectory = await self._delegate.build(filtered_session)
+        _annotate_controller_actions(trajectory.traces)
         metadata = dict(trajectory.metadata)
         metadata.update(
             {
@@ -91,3 +92,36 @@ class RouterPolicyBuilder(BaseTrajectoryBuilder):
         if not trusted:
             error = "no trusted router-policy completions"
         return trajectory.model_copy(update={"metadata": metadata, "error": error})
+
+
+def _annotate_controller_actions(traces: list[Trace]) -> None:
+    """Stamp each controller trace with its realized routing action.
+
+    ``controller_worker_before`` (set by the gateway from the controller's
+    request) is the worker active when the controller was consulted for a turn.
+    A switch confirmed by that turn's decision appears as a different worker on
+    the next trace, so the realized action of turn ``i`` is read from the
+    transition into turn ``i + 1``. The final turn has no successor and is
+    recorded as a no-switch ``keep``. Traces are left untouched when none carry
+    a worker, so the annotation is inert for non-controller trajectories.
+    """
+    workers = [
+        trace.metadata.get("controller_worker_before")
+        if isinstance(trace.metadata, dict)
+        else None
+        for trace in traces
+    ]
+    if not any(worker in ("small", "large") for worker in workers):
+        return
+    for position, trace in enumerate(traces):
+        current = workers[position]
+        if current not in ("small", "large") or not isinstance(trace.metadata, dict):
+            continue
+        following = workers[position + 1] if position + 1 < len(workers) else None
+        if current == "small" and following == "large":
+            action = "escalate"
+        elif current == "large" and following == "small":
+            action = "deescalate"
+        else:
+            action = "keep"
+        trace.metadata["controller_actual_action"] = action

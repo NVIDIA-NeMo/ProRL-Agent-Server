@@ -98,6 +98,54 @@ async def test_router_policy_excludes_pool_and_unlabelled_completions() -> None:
 
 
 @pytest.mark.asyncio
+async def test_router_policy_annotates_realized_routing_actions() -> None:
+    def controller_turn(
+        completion_id: str,
+        worker: str,
+        prompt_ids: list[int],
+        response_ids: list[int],
+    ) -> CompletionRecord:
+        record = _completion(
+            completion_id,
+            role="router_policy",
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+        )
+        record.metadata["controller_worker_before"] = worker
+        return record
+
+    # Distinct, non-prefix prompts keep every turn its own trace, in order.
+    session = CompletionSession(
+        session_id="session-actions",
+        completions=[
+            controller_turn("t0", "small", [1, 2], [10]),
+            controller_turn("t1", "large", [3, 4], [11]),
+            controller_turn("t2", "small", [5, 6], [12]),
+            controller_turn("t3", "small", [7, 8], [13]),
+        ],
+    )
+
+    trajectory = await RouterPolicyBuilder().build(session)
+
+    actions = [trace.metadata.get("controller_actual_action") for trace in trajectory.traces]
+    assert actions == ["escalate", "deescalate", "keep", "keep"]
+
+
+@pytest.mark.asyncio
+async def test_router_policy_leaves_actions_unset_without_workers() -> None:
+    session = CompletionSession(
+        session_id="session-no-workers",
+        completions=[
+            _completion("t0", role="router_policy", prompt_ids=[1, 2], response_ids=[10]),
+        ],
+    )
+
+    trajectory = await RouterPolicyBuilder().build(session)
+
+    assert "controller_actual_action" not in trajectory.traces[0].metadata
+
+
+@pytest.mark.asyncio
 async def test_router_policy_fails_closed_without_trusted_completions() -> None:
     session = CompletionSession(
         session_id="session-2",

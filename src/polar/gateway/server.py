@@ -756,6 +756,7 @@ def _policy_completion_metadata(
     response: dict[str, Any],
     *,
     completion_role: str,
+    original_request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     metadata = _completion_metadata(session_info, response)
     # Stamp this at the gateway persistence boundary and deliberately overwrite
@@ -764,6 +765,12 @@ def _policy_completion_metadata(
     # requests remain persisted for legacy builders but are excluded by the
     # RouterPolicyBuilder.
     metadata["completion_role"] = completion_role
+    # Record the controller's active worker for this turn so training can
+    # recover the realized routing action per trace. The reserved request field
+    # is stripped from the upstream body but preserved on the original request.
+    worker_before = (original_request or {}).get("_polar_controller_worker_before")
+    if worker_before in ("small", "large"):
+        metadata["controller_worker_before"] = worker_before
     return metadata
 
 
@@ -1469,6 +1476,9 @@ async def proxy_request(request: Request, path: str):
             else "policy"
         )
         transformed_body = body.copy()
+        # Reserved controller annotation: recorded on the completion for training,
+        # never forwarded upstream. ``body`` (the original request) keeps it.
+        transformed_body.pop("_polar_controller_worker_before", None)
         transformed_body["_polar_model_served"] = served_model
         openai_request = transformer.transform_request(transformed_body)
         openai_request["model"] = served_model
@@ -1627,6 +1637,7 @@ async def _handle_non_streaming(
                 session_info,
                 response,
                 completion_role=completion_role,
+                original_request=original_request,
             ),
         )
     transformed = transformer.transform_response(response, original_request)
@@ -1686,6 +1697,7 @@ async def _handle_streaming(
                 session_info,
                 response,
                 completion_role=completion_role,
+                original_request=original_request,
             ),
         )
 

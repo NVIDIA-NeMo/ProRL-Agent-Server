@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 # set, so the format signal treats any other shape as a malformed turn.
 _CONTROLLER_STRENGTHS = frozenset({"keep", "escalate", "deescalate"})
 _CONTROLLER_CONFIDENCES = frozenset({"unknown", "high", "low"})
+# Realized routing actions a builder stamps onto each controller trace.
+_ACTUAL_ACTIONS = ("keep", "escalate", "deescalate")
 
 
 def post_process_rewards(
@@ -36,6 +38,7 @@ def post_process_rewards(
 ) -> tuple[list[float], list[float]]:
     """Slime reward-post-process hook. Returns (raw_rewards, rewards)."""
     raw_rewards, rewards = _reward_advantages(args, samples)
+    _apply_controller_credit_mode(args, samples, rewards)
     _apply_controller_invalid_turn_penalty(args, samples, rewards)
     return raw_rewards, rewards
 
@@ -458,6 +461,99 @@ def _is_trainable_negative(sample: Any) -> bool:
         and training_filter.get("trainable") is True
         and training_filter.get("masked") is not True
     )
+
+
+def _apply_controller_credit_mode(
+    args: Any,
+    samples: list[Any],
+    rewards: list[float],
+) -> None:
+    """Rescale advantages according to the configured controller credit mode."""
+    mode = str(getattr(args, "polar_controller_credit_mode", "standard") or "standard")
+    if mode == "standard":
+        return
+    if mode != "actual_action_balanced":
+        raise ValueError(
+            "polar_controller_credit_mode must be standard or actual_action_balanced"
+        )
+    _apply_actual_action_balancing(samples, rewards)
+
+
+def _apply_actual_action_balancing(
+    samples: list[Any],
+    rewards: list[float],
+) -> None:
+    """Make each realized routing action an equal policy-loss stratum.
+
+    Slime reduces all controller traces in one trajectory with a shared
+    token-count denominator, then averages trajectories. Scaling each trace's
+    scalar advantage implements the equivalent hierarchy: turn token mean ->
+    trajectory/action mean -> action mean. When no trace carries a realized
+    action the batch is left unchanged; when some do, eligible turns whose
+    action cannot be recovered contribute no gradient.
+    """
+
+    turns_by_trajectory_action: dict[tuple[Any, Any], dict[str, list[int]]] = {}
+    trajectory_total_tokens: dict[tuple[Any, Any], int] = {}
+    no_action_indices: list[int] = []
+    for index, sample in enumerate(samples):
+        if _is_failed_trajectory(sample) or _trainable_token_count(sample) <= 0:
+            continue
+        _, trajectory_key = _trajectory_key(sample, index)
+        trajectory_total_tokens[trajectory_key] = (
+            trajectory_total_tokens.get(trajectory_key, 0)
+            + _trainable_token_count(sample)
+        )
+        action = _controller_actual_action(sample)
+        if action is None:
+            no_action_indices.append(index)
+            continue
+        turns_by_trajectory_action.setdefault(trajectory_key, {}).setdefault(
+            action, []
+        ).append(index)
+
+    present_actions = [
+        action
+        for action in _ACTUAL_ACTIONS
+        if any(action in turns for turns in turns_by_trajectory_action.values())
+    ]
+    if not present_actions:
+        return
+
+    trajectory_count = len(turns_by_trajectory_action)
+    action_trajectory_counts = {
+        action: sum(action in turns for turns in turns_by_trajectory_action.values())
+        for action in present_actions
+    }
+    action_count = len(present_actions)
+
+    for trajectory_key, action_turns in turns_by_trajectory_action.items():
+        total_tokens = trajectory_total_tokens[trajectory_key]
+        for action, indices in action_turns.items():
+            action_trajectory_count = action_trajectory_counts[action]
+            turn_count = len(indices)
+            for index in indices:
+                token_count = _trainable_token_count(samples[index])
+                scale = (trajectory_count * total_tokens) / (
+                    action_count * action_trajectory_count * turn_count * token_count
+                )
+                rewards[index] *= scale
+
+    for index in no_action_indices:
+        rewards[index] = 0.0
+
+
+def _controller_actual_action(sample: Any) -> str | None:
+    """Read the realized routing action a builder stamped onto the trace."""
+    metadata = getattr(sample, "metadata", None)
+    polar = metadata.get("polar") if isinstance(metadata, dict) else None
+    trace_metadata = polar.get("trace_metadata") if isinstance(polar, dict) else None
+    action = (
+        trace_metadata.get("controller_actual_action")
+        if isinstance(trace_metadata, dict)
+        else None
+    )
+    return action if action in _ACTUAL_ACTIONS else None
 
 
 def _apply_controller_invalid_turn_penalty(

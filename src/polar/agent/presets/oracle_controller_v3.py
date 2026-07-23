@@ -1319,8 +1319,15 @@ class OracleControllerV3Agent(DefaultAgent):
         endpoint_kwargs = (
             self.controller_model.request_kwargs() if hasattr(self.controller_model, "request_kwargs") else {}
         )
+        # Carry the worker active for this turn to the gateway so training can
+        # recover the realized routing action per trace. The gateway strips this
+        # reserved field before the upstream call and records it on the completion.
+        call_kwargs = {**config.model_kwargs, **endpoint_kwargs}
+        extra_body = dict(call_kwargs.get("extra_body") or {})
+        extra_body["_polar_controller_worker_before"] = self.active_worker
+        call_kwargs["extra_body"] = extra_body
         response = _completion_with_hard_timeout(
-            model=config.model_name, messages=prepared, **config.model_kwargs, **endpoint_kwargs
+            model=config.model_name, messages=prepared, **call_kwargs
         )
         try:
             cost = litellm.cost_calculator.completion_cost(response, model=config.model_name)

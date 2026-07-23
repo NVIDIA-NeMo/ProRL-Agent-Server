@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from slime_bridge.reward_post_process import (
+    _apply_actual_action_balancing,
     _controller_turn_is_valid,
     post_process_rewards,
 )
@@ -25,6 +26,7 @@ class FakeSample:
         training_filter: dict | None = None,
         reward_components: dict[str, Any] | None = None,
         response: str | None = None,
+        actual_action: str | None = None,
     ) -> None:
         self.group_index = group_index
         self.group_id = group_id
@@ -37,9 +39,12 @@ class FakeSample:
         self.response_length = len(self.loss_mask)
         self.response = response
         self.remove_sample = remove_sample
-        self.metadata = {
-            "polar": {"training_filter": training_filter} if training_filter is not None else {}
-        }
+        polar: dict[str, Any] = {}
+        if training_filter is not None:
+            polar["training_filter"] = training_filter
+        if actual_action is not None:
+            polar["trace_metadata"] = {"controller_actual_action": actual_action}
+        self.metadata = {"polar": polar}
 
     def get_reward_value(self, args) -> Any:
         return self.reward[args.reward_key]
@@ -534,3 +539,68 @@ def test_invalid_turn_penalty_rejects_negative_weight() -> None:
 def test_controller_turn_validity(response: str | None, expected: bool) -> None:
     sample = FakeSample(group_id=0, reward=0.0, response=response)
     assert _controller_turn_is_valid(sample) is expected
+
+
+def test_actual_action_balancing_equalizes_action_strata() -> None:
+    # One trajectory, three turns: two keeps and one escalate. Balancing must
+    # downweight the two keeps and upweight the lone escalate so each realized
+    # action contributes an equal total.
+    samples = [
+        FakeSample(group_id=0, reward=0.0, actual_action="keep"),
+        FakeSample(group_id=0, reward=0.0, actual_action="keep"),
+        FakeSample(group_id=0, reward=0.0, actual_action="escalate"),
+    ]
+    rewards = [1.0, 1.0, 1.0]
+
+    _apply_actual_action_balancing(samples, rewards)
+
+    assert rewards == pytest.approx([0.75, 0.75, 1.5])
+    assert rewards[0] + rewards[1] == pytest.approx(rewards[2])
+
+
+def test_actual_action_balancing_is_noop_without_actions() -> None:
+    samples = [
+        FakeSample(group_id=0, reward=0.0),
+        FakeSample(group_id=1, reward=0.0),
+    ]
+    rewards = [3.0, 5.0]
+
+    _apply_actual_action_balancing(samples, rewards)
+
+    assert rewards == [3.0, 5.0]
+
+
+def test_actual_action_balancing_zeros_unrecoverable_turns_when_active() -> None:
+    # With the mode active (some turn carries an action), a turn whose action
+    # cannot be recovered must not leak its base advantage into training.
+    samples = [
+        FakeSample(group_id=0, reward=0.0, actual_action="escalate"),
+        FakeSample(group_id=1, reward=0.0, actual_action=None),
+    ]
+    rewards = [2.0, 9.0]
+
+    _apply_actual_action_balancing(samples, rewards)
+
+    assert rewards[1] == 0.0
+
+
+def test_credit_mode_actual_action_balanced_runs_via_hook() -> None:
+    def rewards(mode: str) -> list[float]:
+        samples = [
+            FakeSample(group_id=0, reward=1.0, actual_action="keep"),
+            FakeSample(group_id=0, reward=1.0, actual_action="keep"),
+            FakeSample(group_id=0, reward=3.0, actual_action="escalate"),
+        ]
+        _raw, out = post_process_rewards(
+            _args(polar_controller_credit_mode=mode), samples
+        )
+        return out
+
+    assert rewards("actual_action_balanced") != pytest.approx(rewards("standard"))
+
+
+def test_credit_mode_rejects_unknown_value() -> None:
+    samples = [FakeSample(group_id=0, reward=1.0, actual_action="keep")]
+
+    with pytest.raises(ValueError, match="standard or actual_action_balanced"):
+        post_process_rewards(_args(polar_controller_credit_mode="bogus"), samples)

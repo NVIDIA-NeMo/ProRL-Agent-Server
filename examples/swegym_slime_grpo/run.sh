@@ -1541,6 +1541,13 @@ if [ -n "${POLAR_CONTROLLER_INVALID_TURN_PENALTY:-}" ]; then
     )
     echo "Using controller invalid-turn penalty: ${POLAR_CONTROLLER_INVALID_TURN_PENALTY}"
 fi
+if [ -n "${POLAR_CONTROLLER_CREDIT_MODE:-}" ]; then
+    POLAR_CONTROLLER_ARGS+=(
+        --polar-controller-credit-mode
+        "${POLAR_CONTROLLER_CREDIT_MODE}"
+    )
+    echo "Using controller credit mode: ${POLAR_CONTROLLER_CREDIT_MODE}"
+fi
 OPTIMIZER_MEMORY_ARGS=()
 case "${TMAX_OPTIMIZER_CPU_OFFLOAD:-0}" in
     0) ;;
