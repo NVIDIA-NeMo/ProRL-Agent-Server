@@ -47,6 +47,11 @@ def test_slurm_submit_preserves_last_node_ray_gpu_limit() -> None:
     assert "RAY_NUM_*|RAY_LAST_NODE_NUM_GPUS|" in text
 
 
+def test_slurm_submit_preserves_controller_topology_template() -> None:
+    text = (ROOT / "examples/swegym_slime_grpo/submit_slurm.sh").read_text()
+    assert "TRAIN_CONTAINER_MOUNTS|TOPOLOGY_TEMPLATE|" in text
+
+
 def test_controller_v3_requires_persistent_apptainer_broker() -> None:
     profile = (EXAMPLE / "profile.sh").read_text()
     submit = (EXAMPLE / "submit_slurm.sh").read_text()
