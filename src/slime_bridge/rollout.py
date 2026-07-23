@@ -6061,6 +6061,21 @@ def _polar_extra_metrics(
         graded_sessions = len(session_report)
         resolved = sum(1 for r in session_report.values() if r.get("resolved"))
         out["polar/resolved_rate"] = resolved / graded_sessions
+    # Realized keep/escalate/deescalate distribution across controller traces.
+    # Emitted only when a builder stamped actions, so this is inert otherwise.
+    action_counts = {action: 0 for action in ("keep", "escalate", "deescalate")}
+    for sample in flat_samples:
+        polar_meta = sample.metadata.get("polar", {})
+        trace_metadata = polar_meta.get("trace_metadata") if isinstance(polar_meta, dict) else None
+        action = trace_metadata.get("controller_actual_action") if isinstance(trace_metadata, dict) else None
+        if action in action_counts:
+            action_counts[action] += 1
+    action_total = sum(action_counts.values())
+    if action_total:
+        out["polar/routing/actual_action_count/total"] = float(action_total)
+        for action, count in action_counts.items():
+            out[f"polar/routing/actual_action_count/{action}"] = float(count)
+            out[f"polar/routing/actual_action_ratio/{action}"] = count / action_total
     return out
 
 
