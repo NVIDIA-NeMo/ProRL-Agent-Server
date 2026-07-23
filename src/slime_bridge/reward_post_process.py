@@ -40,6 +40,7 @@ def post_process_rewards(
     raw_rewards, rewards = _reward_advantages(args, samples)
     _apply_controller_credit_mode(args, samples, rewards)
     _apply_controller_invalid_turn_penalty(args, samples, rewards)
+    _apply_controller_require_routing_action(args, samples, rewards)
     return raw_rewards, rewards
 
 
@@ -50,7 +51,13 @@ def _reward_advantages(
     """Select and run the configured advantage estimator for a sample batch."""
     gdpo_reward_keys = getattr(args, "gdpo_reward_keys", None)
     if gdpo_reward_keys is not None:
-        return _post_process_gdpo(samples, tuple(gdpo_reward_keys))
+        return _post_process_gdpo(
+            samples,
+            tuple(gdpo_reward_keys),
+            cost_gate_all_correct=bool(
+                getattr(args, "polar_gdpo_cost_gate_all_correct", False)
+            ),
+        )
 
     dvao_reward_keys = getattr(args, "dvao_reward_keys", None)
     if dvao_reward_keys is not None:
@@ -137,6 +144,8 @@ def _reward_advantages(
 def _post_process_gdpo(
     samples: list[Any],
     reward_keys: tuple[str, ...],
+    *,
+    cost_gate_all_correct: bool = False,
 ) -> tuple[list[float], list[float]]:
     """Compute equal-weight GDPO advantages for named reward components.
 
@@ -145,6 +154,11 @@ def _post_process_gdpo(
     are normalized once more across the training batch. Trajectories, rather
     than their variable number of Polar trace samples, remain the exchangeable
     units for both normalization stages.
+
+    ``cost_gate_all_correct`` treats the first reward key as the correctness
+    signal and the remaining key(s) as cost: within a prompt group that is not
+    fully correct the cost component is dropped, so only accuracy is optimized
+    until every trajectory in the group succeeds.
     """
 
     if len(reward_keys) != 2 or len(set(reward_keys)) != 2:
@@ -216,6 +230,12 @@ def _post_process_gdpo(
             for component_index in range(len(reward_keys))
         )
 
+        # Cost gate: outside a fully correct group keep only the first
+        # (accuracy) component, so cost never trades away correctness.
+        drop_cost = cost_gate_all_correct and not all(
+            trajectory_means[key][0] >= 1.0 for key in valid_keys
+        )
+
         for key in valid_keys:
             for sample_index in traj_sample_indices[key]:
                 components = components_by_sample[sample_index]
@@ -223,6 +243,7 @@ def _post_process_gdpo(
                     (value - component_means[component_index])
                     / (component_stds[component_index] + epsilon)
                     for component_index, value in enumerate(components)
+                    if component_index == 0 or not drop_cost
                 )
 
     trajectory_advantages = [
@@ -554,6 +575,41 @@ def _controller_actual_action(sample: Any) -> str | None:
         else None
     )
     return action if action in _ACTUAL_ACTIONS else None
+
+
+def _apply_controller_require_routing_action(
+    args: Any,
+    samples: list[Any],
+    rewards: list[float],
+) -> None:
+    """Zero the advantages of prompt groups with no realized escalate/deescalate.
+
+    A group in which the controller never actually switched workers carries no
+    routing signal worth training on, so it is dropped regardless of reward.
+    Inert when no trace in the batch carries a realized action, so a batch built
+    without action stamping is never masked wholesale.
+    """
+    if not getattr(args, "polar_controller_require_routing_action", False):
+        return
+
+    group_sample_indices: dict[Any, list[int]] = {}
+    group_has_switch: dict[Any, bool] = {}
+    any_action = False
+    for index, sample in enumerate(samples):
+        group_idx, _ = _trajectory_key(sample, index)
+        group_sample_indices.setdefault(group_idx, []).append(index)
+        action = _controller_actual_action(sample)
+        if action is not None:
+            any_action = True
+        if action in ("escalate", "deescalate"):
+            group_has_switch[group_idx] = True
+    if not any_action:
+        return
+
+    for group_idx, indices in group_sample_indices.items():
+        if not group_has_switch.get(group_idx):
+            for index in indices:
+                rewards[index] = 0.0
 
 
 def _apply_controller_invalid_turn_penalty(

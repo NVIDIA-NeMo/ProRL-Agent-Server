@@ -604,3 +604,77 @@ def test_credit_mode_rejects_unknown_value() -> None:
 
     with pytest.raises(ValueError, match="standard or actual_action_balanced"):
         post_process_rewards(_args(polar_controller_credit_mode="bogus"), samples)
+
+
+def _gdpo_cost_gate_advantages(accuracy, costs, *, gate) -> list[float]:
+    samples = [
+        FakeSample(
+            group_id=trajectory_id,
+            reward=0.0,
+            reward_components={"accuracy": a, "cost": c},
+        )
+        for trajectory_id, (a, c) in enumerate(zip(accuracy, costs))
+    ]
+    _raw, advantages = post_process_rewards(
+        _args(
+            gdpo_reward_keys=["accuracy", "cost"],
+            polar_gdpo_cost_gate_all_correct=gate,
+        ),
+        samples,
+    )
+    return advantages
+
+
+def test_gdpo_cost_gate_drops_cost_outside_fully_correct_group() -> None:
+    accuracy = [1.0, 0.0, 1.0, 0.0]  # group is not fully correct
+    gated_with_cost = _gdpo_cost_gate_advantages(accuracy, [0.0, -5.0, 0.0, -9.0], gate=True)
+    gated_zero_cost = _gdpo_cost_gate_advantages(accuracy, [0.0, 0.0, 0.0, 0.0], gate=True)
+    assert gated_with_cost == pytest.approx(gated_zero_cost)
+
+
+def test_gdpo_cost_gate_keeps_cost_in_fully_correct_group() -> None:
+    accuracy = [1.0, 1.0, 1.0, 1.0]  # fully correct -> cost differentiates
+    with_cost = _gdpo_cost_gate_advantages(accuracy, [0.0, -5.0, -1.0, -9.0], gate=True)
+    zero_cost = _gdpo_cost_gate_advantages(accuracy, [0.0, 0.0, 0.0, 0.0], gate=True)
+    assert with_cost != pytest.approx(zero_cost)
+
+
+def test_require_routing_action_zeros_group_without_switch() -> None:
+    samples = [
+        FakeSample(group_id=0, reward=2.0, actual_action="keep"),
+        FakeSample(group_id=1, reward=8.0, actual_action="keep"),
+    ]
+
+    _raw, baseline = post_process_rewards(_args(), samples)
+    _raw2, filtered = post_process_rewards(
+        _args(polar_controller_require_routing_action=True), samples
+    )
+
+    assert baseline == pytest.approx([-6.0, 6.0])
+    assert filtered == [0.0, 0.0]
+
+
+def test_require_routing_action_keeps_group_with_switch() -> None:
+    samples = [
+        FakeSample(group_id=0, reward=2.0, actual_action="escalate"),
+        FakeSample(group_id=1, reward=8.0, actual_action="keep"),
+    ]
+
+    _raw, filtered = post_process_rewards(
+        _args(polar_controller_require_routing_action=True), samples
+    )
+
+    assert filtered == pytest.approx([-6.0, 6.0])
+
+
+def test_require_routing_action_is_noop_without_any_action() -> None:
+    samples = [
+        FakeSample(group_id=0, reward=2.0),
+        FakeSample(group_id=1, reward=8.0),
+    ]
+
+    _raw, filtered = post_process_rewards(
+        _args(polar_controller_require_routing_action=True), samples
+    )
+
+    assert filtered == pytest.approx([-6.0, 6.0])

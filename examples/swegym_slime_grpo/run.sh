@@ -1548,6 +1548,14 @@ if [ -n "${POLAR_CONTROLLER_CREDIT_MODE:-}" ]; then
     )
     echo "Using controller credit mode: ${POLAR_CONTROLLER_CREDIT_MODE}"
 fi
+if [ "${POLAR_GDPO_COST_GATE_ALL_CORRECT:-}" = "1" ]; then
+    POLAR_CONTROLLER_ARGS+=(--polar-gdpo-cost-gate-all-correct)
+    echo "Using GDPO cost gate: cost applies only to fully-correct groups"
+fi
+if [ "${POLAR_CONTROLLER_REQUIRE_ROUTING_ACTION:-}" = "1" ]; then
+    POLAR_CONTROLLER_ARGS+=(--polar-controller-require-routing-action)
+    echo "Dropping groups with no realized escalate/deescalate"
+fi
 OPTIMIZER_MEMORY_ARGS=()
 case "${TMAX_OPTIMIZER_CPU_OFFLOAD:-0}" in
     0) ;;
