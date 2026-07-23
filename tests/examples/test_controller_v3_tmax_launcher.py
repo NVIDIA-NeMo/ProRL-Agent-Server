@@ -48,9 +48,13 @@ def test_slurm_submit_preserves_last_node_ray_gpu_limit() -> None:
 
 
 def test_slurm_submit_preserves_controller_topology_template() -> None:
-    text = (ROOT / "examples/swegym_slime_grpo/submit_slurm.sh").read_text()
-    assert "TRAIN_CONTAINER_MOUNTS|TOPOLOGY_TEMPLATE|" in text
-    assert "TOPOLOGY_TEMPLATE|CONTROLLER_V3_*|" in text
+    submit = (ROOT / "examples/swegym_slime_grpo/submit_slurm.sh").read_text()
+    run = (ROOT / "examples/swegym_slime_grpo/run.sh").read_text()
+    assert "TRAIN_CONTAINER_MOUNTS|TOPOLOGY_TEMPLATE|" in submit
+    assert "TOPOLOGY_TEMPLATE|CONTROLLER_V3_*|" in submit
+    assert '"CONTROLLER_V3_SMALL_ROUTER_BASE_URL",' in run
+    assert '"CONTROLLER_V3_QWEN_GATEWAY_MAX_CONCURRENCY",' in run
+    assert '"CONTROLLER_V3_GPT_GATEWAY_MAX_CONCURRENCY",' in run
 
 
 def test_controller_v3_requires_persistent_apptainer_broker() -> None:
