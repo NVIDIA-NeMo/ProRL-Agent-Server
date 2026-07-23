@@ -49,6 +49,11 @@ export DVAO_REWARD_KEY_1="${DVAO_REWARD_KEY_1:-}"
 export DVAO_REWARD_KEY_2="${DVAO_REWARD_KEY_2:-}"
 export GDPO_REWARD_KEY_1="${GDPO_REWARD_KEY_1:-harbor_reward}"
 export GDPO_REWARD_KEY_2="${GDPO_REWARD_KEY_2:-negative_cost}"
+# Controller V3 keeps fully-correct groups for the cost signal, so disable the
+# default reward-std dynamic sampling filter, which drops zero-variance groups
+# (all-correct groups included). Set before env.cwdfw.sh so its ``-`` default
+# does not re-enable it; an explicit override is still honored.
+export TMAX_DYNAMIC_SAMPLING_FILTER_PATH="${TMAX_DYNAMIC_SAMPLING_FILTER_PATH-}"
 export POLAR_MAX_INIT_WORKERS="${POLAR_MAX_INIT_WORKERS:-96}"
 export POLAR_MAX_RUN_WORKERS="${POLAR_MAX_RUN_WORKERS:-258}"
 export POLAR_MAX_POSTRUN_WORKERS="${POLAR_MAX_POSTRUN_WORKERS:-96}"
