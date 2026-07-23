@@ -50,6 +50,7 @@ def test_slurm_submit_preserves_last_node_ray_gpu_limit() -> None:
 def test_slurm_submit_preserves_controller_topology_template() -> None:
     text = (ROOT / "examples/swegym_slime_grpo/submit_slurm.sh").read_text()
     assert "TRAIN_CONTAINER_MOUNTS|TOPOLOGY_TEMPLATE|" in text
+    assert "TOPOLOGY_TEMPLATE|CONTROLLER_V3_*|" in text
 
 
 def test_controller_v3_requires_persistent_apptainer_broker() -> None:
