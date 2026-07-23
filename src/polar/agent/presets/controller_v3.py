@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
+import math
 from pathlib import Path
 
 from polar.agent.base import BaseHarness
-from polar.agent.models import AgentSpec
+from polar.agent.models import AgentRunResult, AgentSpec
 from polar.runtime.base import BaseRuntime, RUNTIME_AGENT_LOG_DIR, RUNTIME_SESSION_DIR
 from polar.runtime.models import ExecInput
 
@@ -85,3 +87,29 @@ class ControllerV3Harness(BaseHarness):
                 env=env,
             )
         ]
+
+    async def postprocess(
+        self, runtime: BaseRuntime, result: AgentRunResult
+    ) -> None:
+        host_path = runtime.resolve_host_path(CONTROLLER_V3_TRAJECTORY_PATH)
+        if host_path is None or not host_path.is_file():
+            return
+        try:
+            document = json.loads(host_path.read_text())
+            usage = document["info"]["oracle_controller_v3"]["usage"]["large"]
+            cost = float(usage["cost"])
+            if not math.isfinite(cost) or cost < 0:
+                raise ValueError("invalid GPT cost")
+            result.metadata["controller_v3_cost"] = {
+                key: usage[key]
+                for key in (
+                    "cost",
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "uncached_input_tokens",
+                    "output_tokens",
+                    "pricing",
+                )
+            }
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            result.metadata["controller_v3_cost_error"] = str(exc)

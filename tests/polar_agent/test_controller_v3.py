@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import importlib.util
 import os
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ import yaml
 
 from polar.agent.factory import create_harness
 from polar.agent.models import AgentSpec
+from polar.agent.models import AgentRunResult
 from polar.agent.presets.controller_v3 import (
     CONTROLLER_V3_CONFIG_PATH,
     CONTROLLER_V3_MODULE_PATH,
@@ -153,7 +155,13 @@ def test_capability_guards_cover_all_three_model_queries() -> None:
                     self.config.model_kwargs.get("client"),
                 )
             )
-            return {}
+            return {
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "input_tokens_details": {"cached_tokens": 40},
+                }
+            }
 
     small = Model()
     large = Model()
@@ -163,6 +171,7 @@ def test_capability_guards_cover_all_three_model_queries() -> None:
         small_model = small
         large_model = large
         controller_model = controller
+        usage = {"large": {}}
 
         def _query_controller_model(self, _messages):
             controller.seen.append(
@@ -187,6 +196,70 @@ def test_capability_guards_cover_all_three_model_queries() -> None:
     assert small.seen == [("Bearer pool-secret", None)]
     assert large.seen == [("Bearer pool-secret", responses_client)]
     assert controller.seen == [("Bearer router-secret", None)]
+    assert agent.usage["large"] == {
+        "input_tokens": 100,
+        "cached_input_tokens": 40,
+        "uncached_input_tokens": 60,
+        "output_tokens": 20,
+        "pricing": {
+            "currency": "USD",
+            "input_per_million": 1.0,
+            "cached_input_per_million": 0.1,
+            "output_per_million": 6.0,
+            "as_of": "2026-07-09",
+        },
+    }
     for model in (small, large, controller):
         assert "extra_headers" not in model.config.model_kwargs
         assert "client" not in model.config.model_kwargs
+
+
+def test_large_worker_prices_cached_uncached_and_output_tokens() -> None:
+    runner = _load_runner()
+    agent = SimpleNamespace(usage={"large": {"n_calls": 0, "cost": 0.0}})
+    message = {
+        "usage": {
+            "input_tokens": 1_000_000,
+            "output_tokens": 1_000_000,
+            "input_tokens_details": {"cached_tokens": 250_000},
+        },
+        "extra": {"cost": 0.0},
+    }
+
+    runner._price_large_worker_response(agent, message)
+
+    assert message["extra"]["cost"] == pytest.approx(6.775)
+    assert agent.usage["large"]["uncached_input_tokens"] == 750_000
+    assert agent.usage["large"]["cached_input_tokens"] == 250_000
+
+
+def test_controller_harness_collects_gpt_cost(tmp_path: Path) -> None:
+    harness = ControllerV3Harness(_spec())
+    trajectory = tmp_path / "mini-swe-agent.traj.json"
+    trajectory.write_text(
+        json.dumps(
+            {
+                "info": {
+                    "oracle_controller_v3": {
+                        "usage": {
+                            "large": {
+                                "cost": 0.0123,
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 400,
+                                "uncached_input_tokens": 600,
+                                "output_tokens": 20,
+                                "pricing": {"currency": "USD"},
+                            }
+                        }
+                    }
+                }
+            }
+        )
+    )
+    runtime = SimpleNamespace(resolve_host_path=lambda _path: trajectory)
+    result = AgentRunResult(status="completed", return_code=0)
+
+    asyncio.run(harness.postprocess(runtime, result))
+
+    assert result.metadata["controller_v3_cost"]["cost"] == 0.0123
+    assert "controller_v3_cost_error" not in result.metadata

@@ -32,6 +32,10 @@ _CONFIG_FD_ENV = "POLAR_CONTROLLER_V3_CONFIG_FD"
 _PR_SET_DUMPABLE = 4
 _PR_GET_DUMPABLE = 3
 _MAX_SECRET_BYTES = 16 * 1024
+_GPT_INPUT_USD_PER_MILLION = 1.0
+_GPT_CACHED_INPUT_USD_PER_MILLION = 0.1
+_GPT_OUTPUT_USD_PER_MILLION = 6.0
+_GPT_PRICING_AS_OF = "2026-07-09"
 
 
 class ProtectedExecutionError(RuntimeError):
@@ -187,6 +191,62 @@ def _with_capability(
         config.model_kwargs = original
 
 
+def _nonnegative_int(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("token count must be an integer")
+    parsed = int(value or 0)
+    if parsed < 0:
+        raise ValueError("token count must be nonnegative")
+    return parsed
+
+
+def _price_large_worker_response(agent: Any, message: dict[str, Any]) -> None:
+    usage = message.get("usage")
+    if not isinstance(usage, dict):
+        response = (message.get("extra") or {}).get("response")
+        usage = response.get("usage") if isinstance(response, dict) else None
+    if not isinstance(usage, dict):
+        raise RuntimeError("GPT response is missing usage")
+
+    input_tokens = _nonnegative_int(
+        usage.get("input_tokens", usage.get("prompt_tokens"))
+    )
+    output_tokens = _nonnegative_int(
+        usage.get("output_tokens", usage.get("completion_tokens"))
+    )
+    details = usage.get("input_tokens_details")
+    if not isinstance(details, dict):
+        details = usage.get("prompt_tokens_details")
+    cached_tokens = _nonnegative_int(
+        details.get("cached_tokens") if isinstance(details, dict) else 0
+    )
+    if cached_tokens > input_tokens:
+        raise RuntimeError("GPT cached input tokens exceed total input tokens")
+    uncached_tokens = input_tokens - cached_tokens
+    cost = (
+        uncached_tokens * _GPT_INPUT_USD_PER_MILLION
+        + cached_tokens * _GPT_CACHED_INPUT_USD_PER_MILLION
+        + output_tokens * _GPT_OUTPUT_USD_PER_MILLION
+    ) / 1_000_000
+
+    message.setdefault("extra", {})["cost"] = cost
+    totals = agent.usage["large"]
+    for key, value in (
+        ("input_tokens", input_tokens),
+        ("cached_input_tokens", cached_tokens),
+        ("uncached_input_tokens", uncached_tokens),
+        ("output_tokens", output_tokens),
+    ):
+        totals[key] = int(totals.get(key, 0)) + value
+    totals["pricing"] = {
+        "currency": "USD",
+        "input_per_million": _GPT_INPUT_USD_PER_MILLION,
+        "cached_input_per_million": _GPT_CACHED_INPUT_USD_PER_MILLION,
+        "output_per_million": _GPT_OUTPUT_USD_PER_MILLION,
+        "as_of": _GPT_PRICING_AS_OF,
+    }
+
+
 def _install_capability_guards(
     agent: Any,
     *,
@@ -198,15 +258,17 @@ def _install_capability_guards(
         original_query = model.query
         config = model.config
         request_client = responses_client if model is agent.large_model else None
+        price_response = model is agent.large_model
 
         def guarded_query(
             messages: list[dict[str, Any]],
             _query: Callable[..., Any] = original_query,
             _config: Any = config,
             _request_client: Any | None = request_client,
+            _price_response: bool = price_response,
             **kwargs: Any,
         ) -> dict[str, Any]:
-            return _with_capability(
+            message = _with_capability(
                 _config,
                 pool_capability,
                 _query,
@@ -214,6 +276,9 @@ def _install_capability_guards(
                 request_client=_request_client,
                 **kwargs,
             )
+            if _price_response:
+                _price_large_worker_response(agent, message)
+            return message
 
         model.query = guarded_query
 
