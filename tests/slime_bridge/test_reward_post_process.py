@@ -639,19 +639,19 @@ def test_gdpo_cost_gate_keeps_cost_in_fully_correct_group() -> None:
     assert with_cost != pytest.approx(zero_cost)
 
 
-def test_require_routing_action_zeros_group_without_switch() -> None:
+def test_require_routing_action_removes_group_without_switch() -> None:
+    # Same-group trajectories that only ever "keep" carry no routing signal.
     samples = [
         FakeSample(group_id=0, reward=2.0, actual_action="keep"),
         FakeSample(group_id=1, reward=8.0, actual_action="keep"),
     ]
 
-    _raw, baseline = post_process_rewards(_args(), samples)
-    _raw2, filtered = post_process_rewards(
+    _raw, rewards = post_process_rewards(
         _args(polar_controller_require_routing_action=True), samples
     )
 
-    assert baseline == pytest.approx([-6.0, 6.0])
-    assert filtered == [0.0, 0.0]
+    assert all(sample.remove_sample for sample in samples)
+    assert rewards == [0.0, 0.0]
 
 
 def test_require_routing_action_keeps_group_with_switch() -> None:
@@ -660,11 +660,12 @@ def test_require_routing_action_keeps_group_with_switch() -> None:
         FakeSample(group_id=1, reward=8.0, actual_action="keep"),
     ]
 
-    _raw, filtered = post_process_rewards(
+    _raw, rewards = post_process_rewards(
         _args(polar_controller_require_routing_action=True), samples
     )
 
-    assert filtered == pytest.approx([-6.0, 6.0])
+    assert not any(sample.remove_sample for sample in samples)
+    assert rewards == pytest.approx([-6.0, 6.0])
 
 
 def test_require_routing_action_is_noop_without_any_action() -> None:
@@ -673,8 +674,9 @@ def test_require_routing_action_is_noop_without_any_action() -> None:
         FakeSample(group_id=1, reward=8.0),
     ]
 
-    _raw, filtered = post_process_rewards(
+    _raw, rewards = post_process_rewards(
         _args(polar_controller_require_routing_action=True), samples
     )
 
-    assert filtered == pytest.approx([-6.0, 6.0])
+    assert not any(sample.remove_sample for sample in samples)
+    assert rewards == pytest.approx([-6.0, 6.0])

@@ -37,10 +37,10 @@ def post_process_rewards(
     samples: list[Any],
 ) -> tuple[list[float], list[float]]:
     """Slime reward-post-process hook. Returns (raw_rewards, rewards)."""
+    _drop_controller_groups_without_routing_action(args, samples)
     raw_rewards, rewards = _reward_advantages(args, samples)
     _apply_controller_credit_mode(args, samples, rewards)
     _apply_controller_invalid_turn_penalty(args, samples, rewards)
-    _apply_controller_require_routing_action(args, samples, rewards)
     return raw_rewards, rewards
 
 
@@ -577,17 +577,18 @@ def _controller_actual_action(sample: Any) -> str | None:
     return action if action in _ACTUAL_ACTIONS else None
 
 
-def _apply_controller_require_routing_action(
+def _drop_controller_groups_without_routing_action(
     args: Any,
     samples: list[Any],
-    rewards: list[float],
 ) -> None:
-    """Zero the advantages of prompt groups with no realized escalate/deescalate.
+    """Remove from training any prompt group with no realized escalate/deescalate.
 
     A group in which the controller never actually switched workers carries no
-    routing signal worth training on, so it is dropped regardless of reward.
-    Inert when no trace in the batch carries a realized action, so a batch built
-    without action stamping is never masked wholesale.
+    routing signal worth training on, so every sample in it is flagged
+    ``remove_sample`` before advantages are computed: it is excluded from GDPO
+    normalization and its tokens are loss-masked out downstream. Inert when no
+    trace in the batch carries a realized action, so a batch built without
+    action stamping is never dropped wholesale.
     """
     if not getattr(args, "polar_controller_require_routing_action", False):
         return
@@ -609,7 +610,7 @@ def _apply_controller_require_routing_action(
     for group_idx, indices in group_sample_indices.items():
         if not group_has_switch.get(group_idx):
             for index in indices:
-                rewards[index] = 0.0
+                samples[index].remove_sample = True
 
 
 def _apply_controller_invalid_turn_penalty(
