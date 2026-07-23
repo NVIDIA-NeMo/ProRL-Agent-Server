@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -14,9 +15,9 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
+import yaml
+
 RUNNER_DIR = Path(__file__).resolve().parent
-MODULE_PATH = RUNNER_DIR / "oracle_controller_v3.py"
-CONFIG_PATH = RUNNER_DIR / "controller_v3_one_vote.yaml"
 BASE_CONFIG_PATH = Path("/opt/polar-mini-swe-agent/config/controller-v3-v1.yaml")
 OUTPUT_PATH = Path("/polar/session/logs/agent/mini-swe-agent.traj.json")
 
@@ -26,6 +27,8 @@ _SOCKET_ENV = "POLAR_PROTECTED_EXEC_SOCKET"
 _BROKER_PID_ENV = "POLAR_PROTECTED_EXEC_BROKER_PID"
 _REQUEST_ID_ENV = "POLAR_PROTECTED_EXEC_REQUEST_ID"
 _READY_FD_ENV = "POLAR_PROTECTED_EXEC_READY_FD"
+_MODULE_FD_ENV = "POLAR_CONTROLLER_V3_MODULE_FD"
+_CONFIG_FD_ENV = "POLAR_CONTROLLER_V3_CONFIG_FD"
 _PR_SET_DUMPABLE = 4
 _PR_GET_DUMPABLE = 3
 _MAX_SECRET_BYTES = 16 * 1024
@@ -33,6 +36,23 @@ _MAX_SECRET_BYTES = 16 * 1024
 
 class ProtectedExecutionError(RuntimeError):
     pass
+
+
+def _protected_source_path(env_name: str, fallback: Path) -> Path:
+    descriptor = os.environ.pop(env_name, "")
+    if not descriptor:
+        return fallback
+    if not descriptor.isdigit() or int(descriptor) < 3:
+        raise ProtectedExecutionError(f"invalid protected file descriptor: {env_name}")
+    return Path("/proc/self/fd") / descriptor
+
+
+MODULE_PATH = _protected_source_path(
+    _MODULE_FD_ENV, RUNNER_DIR / "oracle_controller_v3.py"
+)
+CONFIG_PATH = _protected_source_path(
+    _CONFIG_FD_ENV, RUNNER_DIR / "controller_v3_one_vote.yaml"
+)
 
 
 def _set_non_dumpable() -> None:
@@ -115,7 +135,8 @@ def _receive_capabilities() -> dict[str, str]:
 
 def _load_controller_module() -> None:
     name = "minisweagent.agents.oracle_controller_v3"
-    spec = importlib.util.spec_from_file_location(name, MODULE_PATH)
+    loader = importlib.machinery.SourceFileLoader(name, str(MODULE_PATH))
+    spec = importlib.util.spec_from_loader(name, loader)
     if spec is None or spec.loader is None:
         raise RuntimeError("could not load dynamic Controller V3 module")
     module = importlib.util.module_from_spec(spec)
@@ -237,7 +258,7 @@ def _build_agent(task: str) -> Any:
 
     config = recursive_merge(
         get_config_from_spec(str(BASE_CONFIG_PATH)),
-        get_config_from_spec(str(CONFIG_PATH)),
+        yaml.safe_load(CONFIG_PATH.read_text()),
         overrides,
     )
     # A Responses request must not inherit the chat-completions token field.

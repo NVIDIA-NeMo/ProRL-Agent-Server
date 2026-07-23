@@ -168,6 +168,114 @@ def test_protected_runner_rejects_replacement_digest_and_symlink(tmp_path: Path)
         )
 
 
+def test_controller_v3_protected_exec_has_exact_sealed_file_contract() -> None:
+    expected = apptainer_broker._protected_exec_expected_paths(  # noqa: SLF001
+        [
+            "/opt/polar-mini-swe-agent/python/bin/python3.10",
+            "/polar/session/controller_v3_runner.py",
+        ]
+    )
+    assert expected == {
+        "/polar/session/controller_v3_runner.py",
+        "/polar/session/oracle_controller_v3.py",
+        "/polar/session/controller_v3_one_vote.yaml",
+    }
+    assert (
+        apptainer_broker._protected_exec_expected_paths(  # noqa: SLF001
+            [
+                "/opt/polar-mini-swe-agent/python/bin/python3.10",
+                "/polar/session/untrusted.py",
+            ]
+        )
+        is None
+    )
+
+
+def test_controller_v3_protected_exec_exposes_only_sealed_auxiliary_fds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = tmp_path / "controller_v3_runner.py"
+    module = tmp_path / "oracle_controller_v3.py"
+    config = tmp_path / "controller_v3_one_vote.yaml"
+    module.write_text("sealed-module")
+    config.write_text("sealed-config")
+    runner.write_text(
+        """
+import ctypes
+import json
+import os
+import socket
+
+assert ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) == 0
+ready_fd = int(os.environ.pop("POLAR_PROTECTED_EXEC_READY_FD"))
+assert os.read(ready_fd, 1) == b"1"
+os.close(ready_fd)
+connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+connection.connect(os.environ.pop("POLAR_PROTECTED_EXEC_SOCKET"))
+request_id = os.environ.pop("POLAR_PROTECTED_EXEC_REQUEST_ID")
+connection.sendall(
+    json.dumps({"operation": "protected_child_ready", "id": request_id}).encode()
+    + b"\\n"
+)
+response = json.loads(connection.makefile("rb").readline())
+connection.close()
+module_fd = os.environ.pop("POLAR_CONTROLLER_V3_MODULE_FD")
+config_fd = os.environ.pop("POLAR_CONTROLLER_V3_CONFIG_FD")
+print(
+    open("/proc/self/fd/" + module_fd).read()
+    + "|"
+    + open("/proc/self/fd/" + config_fd).read()
+    + "|"
+    + response["protected_env"]["TEST_SECRET"]
+)
+""".lstrip()
+    )
+    monkeypatch.setattr(apptainer_broker, "_CONTROLLER_V3_PYTHON", sys.executable)
+    monkeypatch.setattr(apptainer_broker, "_CONTROLLER_V3_RUNNER", str(runner))
+    monkeypatch.setattr(apptainer_broker, "_CONTROLLER_V3_MODULE", str(module))
+    monkeypatch.setattr(apptainer_broker, "_CONTROLLER_V3_CONFIG", str(config))
+    socket_path = tmp_path / "protected.sock"
+    result_dir = tmp_path / "results"
+    server = apptainer_broker._BrokerServer(  # noqa: SLF001
+        str(socket_path),
+        result_dir,
+        base_environment={},
+        proxy=None,
+        proxy_url=None,
+        allow_internet=False,
+        protected_only=True,
+        runtime_socket_path=str(socket_path),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    request_id = "controller-v3-sealed-files"
+    files = (runner, module, config)
+    try:
+        result = server.execute_protected(
+            {
+                "id": request_id,
+                "argv": [sys.executable, str(runner)],
+                "env": {},
+                "protected_env": {"TEST_SECRET": "secret"},
+                "file_digests": {
+                    str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in files
+                },
+                "timeout_sec": 5,
+            }
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result == {"return_code": 0}
+    assert (result_dir / f"{request_id}.stdout").read_text().strip() == (
+        "sealed-module|sealed-config|secret"
+    )
+
+
 def test_protected_broker_executes_sealed_runner_and_delivers_after_child_ready(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

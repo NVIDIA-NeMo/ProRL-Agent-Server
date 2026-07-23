@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import importlib.util
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,6 +39,30 @@ def _load_runner():
 
 def test_factory_registers_controller_v3() -> None:
     assert isinstance(create_harness(_spec()), ControllerV3Harness)
+
+
+def test_runner_uses_protected_auxiliary_file_descriptors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = tmp_path / "module-without-required-suffix"
+    config = tmp_path / "config-without-required-suffix"
+    module.write_text("SEALED_CONTROLLER_VALUE = 7\n")
+    config.write_text("agent:\n  window_events: 8\n")
+    module_fd = os.open(module, os.O_RDONLY)
+    config_fd = os.open(config, os.O_RDONLY)
+    try:
+        monkeypatch.setenv("POLAR_CONTROLLER_V3_MODULE_FD", str(module_fd))
+        monkeypatch.setenv("POLAR_CONTROLLER_V3_CONFIG_FD", str(config_fd))
+        runner = _load_runner()
+        runner._load_controller_module()
+        loaded = importlib.import_module("minisweagent.agents.oracle_controller_v3")
+        assert loaded.SEALED_CONTROLLER_VALUE == 7
+        assert yaml.safe_load(runner.CONFIG_PATH.read_text()) == {
+            "agent": {"window_events": 8}
+        }
+    finally:
+        os.close(module_fd)
+        os.close(config_fd)
 
 
 def test_harness_uploads_dynamic_sources_and_uses_protected_capabilities() -> None:

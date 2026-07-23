@@ -65,6 +65,12 @@ _SHA256_RE = re.compile(r"^[A-Fa-f0-9]{64}$")
 _PROTECTED_PYTHON = "/opt/polar-mini-swe-agent/venv/bin/python"
 _SPILOT_RUNNER = "/polar/session/spilot_router_runner.py"
 _SPILOT_FORCED_RUNNER = "/polar/session/spilot_forced_route_eval_runner.py"
+_CONTROLLER_V3_PYTHON = "/opt/polar-mini-swe-agent/python/bin/python3.10"
+_CONTROLLER_V3_RUNNER = "/polar/session/controller_v3_runner.py"
+_CONTROLLER_V3_MODULE = "/polar/session/oracle_controller_v3.py"
+_CONTROLLER_V3_CONFIG = "/polar/session/controller_v3_one_vote.yaml"
+_CONTROLLER_V3_MODULE_FD_ENV = "POLAR_CONTROLLER_V3_MODULE_FD"
+_CONTROLLER_V3_CONFIG_FD_ENV = "POLAR_CONTROLLER_V3_CONFIG_FD"
 _PROTECTED_FILE_MAX_BYTES = 8 * 1024 * 1024
 _MFD_CLOEXEC = 0x0001
 _MFD_ALLOW_SEALING = 0x0002
@@ -75,6 +81,22 @@ _F_SEAL_SHRINK = 0x0002
 _F_SEAL_GROW = 0x0004
 _F_SEAL_WRITE = 0x0008
 _ALL_FILE_SEALS = _F_SEAL_SEAL | _F_SEAL_SHRINK | _F_SEAL_GROW | _F_SEAL_WRITE
+
+
+def _protected_exec_expected_paths(argv: list[str]) -> set[str] | None:
+    specs = {
+        (_PROTECTED_PYTHON, _SPILOT_RUNNER): {_SPILOT_RUNNER},
+        (_PROTECTED_PYTHON, _SPILOT_FORCED_RUNNER): {
+            _SPILOT_RUNNER,
+            _SPILOT_FORCED_RUNNER,
+        },
+        (_CONTROLLER_V3_PYTHON, _CONTROLLER_V3_RUNNER): {
+            _CONTROLLER_V3_RUNNER,
+            _CONTROLLER_V3_MODULE,
+            _CONTROLLER_V3_CONFIG,
+        },
+    }
+    return specs.get(tuple(argv))
 _FORCED_RUNNER_BOOTSTRAP = (
     "import importlib.machinery,importlib.util,runpy,sys;"
     "p='/proc/self/fd/'+sys.argv[2];"
@@ -96,6 +118,8 @@ _PROTECTED_ENV_DENYLIST = frozenset(
         "PYTHONINSPECT",
         "PYTHONPATH",
         "PYTHONSTARTUP",
+        _CONTROLLER_V3_MODULE_FD_ENV,
+        _CONTROLLER_V3_CONFIG_FD_ENV,
     }
 )
 _PROXY_START_TIMEOUT_SECONDS = 5.0
@@ -683,10 +707,8 @@ class _BrokerServer(socketserver.ThreadingUnixStreamServer):
         ):
             raise ValueError("protected exec requires an exact two-element argv")
         argv = list(raw_argv)
-        if argv[0] != _PROTECTED_PYTHON or argv[1] not in {
-            _SPILOT_RUNNER,
-            _SPILOT_FORCED_RUNNER,
-        }:
+        expected_paths = _protected_exec_expected_paths(argv)
+        if expected_paths is None:
             raise ValueError("protected exec runner argv is not allowlisted")
 
         raw_file_digests = request.get("file_digests", {})
@@ -695,9 +717,6 @@ class _BrokerServer(socketserver.ThreadingUnixStreamServer):
             for path, digest in raw_file_digests.items()
         ):
             raise ValueError("protected exec file digests must be an object")
-        expected_paths = {argv[1]}
-        if argv[1] == _SPILOT_FORCED_RUNNER:
-            expected_paths.add(_SPILOT_RUNNER)
         if set(raw_file_digests) != expected_paths:
             raise ValueError("protected exec file digest set is incomplete")
 
@@ -770,6 +789,13 @@ class _BrokerServer(socketserver.ThreadingUnixStreamServer):
                         raw_file_digests[path],
                     )
                 entry_fd = pinned_files[argv[1]]
+                if argv[1] == _CONTROLLER_V3_RUNNER:
+                    environment[_CONTROLLER_V3_MODULE_FD_ENV] = str(
+                        pinned_files[_CONTROLLER_V3_MODULE]
+                    )
+                    environment[_CONTROLLER_V3_CONFIG_FD_ENV] = str(
+                        pinned_files[_CONTROLLER_V3_CONFIG]
+                    )
                 if argv[1] == _SPILOT_FORCED_RUNNER:
                     core_fd = pinned_files[_SPILOT_RUNNER]
                     trusted_argv = [
