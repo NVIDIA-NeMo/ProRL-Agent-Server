@@ -70,6 +70,8 @@ ${POLAR_INTERNET_RUNTIME_VOLUME}
       wall_time_limit_seconds: ${TMAX_TRAIN_AGENT_TIMEOUT_SECONDS}
   builder:
     strategy: "router_policy"
+    config:
+      tokenizer_name_or_path: "${HF_CHECKPOINT}"
   evaluator:
     strategy: "harbor"
     refresh_runtime: false

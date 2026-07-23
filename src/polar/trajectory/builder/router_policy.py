@@ -32,6 +32,9 @@ class RouterPolicyBuilder(BaseTrajectoryBuilder):
         empty allowlist is rejected.
     end_of_turn_token_id:
         Optional explicit EOT id forwarded to :class:`PrefixMergingBuilder`.
+    tokenizer_name_or_path:
+        Optional tokenizer used to strictly reconstruct token IDs when an older
+        SGLang OpenAI endpoint returns token strings and logprobs without IDs.
     """
 
     def __init__(
@@ -39,6 +42,7 @@ class RouterPolicyBuilder(BaseTrajectoryBuilder):
         *,
         trusted_roles: Iterable[str] = ("router_policy",),
         end_of_turn_token_id: int | None = None,
+        tokenizer_name_or_path: str | None = None,
     ) -> None:
         if isinstance(trusted_roles, str):
             trusted_roles = (trusted_roles,)
@@ -52,6 +56,7 @@ class RouterPolicyBuilder(BaseTrajectoryBuilder):
         self._trusted_roles = normalized
         self._delegate = PrefixMergingBuilder(
             end_of_turn_token_id=end_of_turn_token_id,
+            tokenizer_name_or_path=tokenizer_name_or_path,
         )
 
     async def build(self, session: CompletionSession) -> Trajectory:

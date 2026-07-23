@@ -13,6 +13,7 @@ def test_controller_v3_polar_contract() -> None:
     text = (EXAMPLE / "polar_config.yaml").read_text()
     assert 'harness: "controller_v3"' in text
     assert 'strategy: "router_policy"' in text
+    assert 'tokenizer_name_or_path: "${HF_CHECKPOINT}"' in text
     assert 'strategy: "harbor"' in text
     assert "polar_max_consecutive_infrastructure_failures:" in text
     assert "cost_penalty" not in text

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 from copy import deepcopy
+from functools import lru_cache
 from typing import Any
 
 from polar.trajectory.builder.base import BaseTrajectoryBuilder
@@ -49,6 +50,16 @@ logger = logging.getLogger(__name__)
 
 # finish_reasons where the model emitted the natural end-of-turn token itself.
 _NATURAL_STOP_REASONS = frozenset({"stop", "tool_calls", "stop_sequence"})
+
+
+@lru_cache(maxsize=4)
+def _load_tokenizer(name_or_path: str) -> Any:
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(
+        name_or_path,
+        trust_remote_code=True,
+    )
 
 
 class PrefixMergingBuilder(BaseTrajectoryBuilder):
@@ -69,8 +80,12 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
         self,
         *,
         end_of_turn_token_id: int | None = None,
+        tokenizer_name_or_path: str | None = None,
     ) -> None:
         self._configured_eot_id = end_of_turn_token_id
+        self._tokenizer = None
+        if tokenizer_name_or_path:
+            self._tokenizer = _load_tokenizer(tokenizer_name_or_path)
 
     async def build(self, session: CompletionSession) -> Trajectory:
         if not session.completions:
@@ -91,7 +106,10 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
         chain_tips: list[list[int]] = []  # last completion's prompt_ids, per chain
 
         for completion in session.completions:
-            prompt_ids = build_trace_from_completion(completion).prompt_ids
+            prompt_ids = build_trace_from_completion(
+                completion,
+                tokenizer=self._tokenizer,
+            ).prompt_ids
             chain_idx = self._find_extendable_chain(prompt_ids, chain_tips)
             if chain_idx is None:
                 chain_idx = len(chains)
@@ -142,7 +160,10 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
         # constraint on the initial conversation — a harness preamble like
         # codex's [system, user, user, assistant, tool, ...] is treated as
         # static context.
-        first_trace = build_trace_from_completion(chain[0])
+        first_trace = build_trace_from_completion(
+            chain[0],
+            tokenizer=self._tokenizer,
+        )
         eot_id = self._resolve_eot_id(chain)
 
         prompt_ids = list(first_trace.prompt_ids)
@@ -165,7 +186,10 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
         kept = 1
 
         for i in range(1, len(chain)):
-            Ci_trace = build_trace_from_completion(chain[i])
+            Ci_trace = build_trace_from_completion(
+                chain[i],
+                tokenizer=self._tokenizer,
+            )
             Ci_prompt_ids = list(Ci_trace.prompt_ids)
 
             # Canonical-vs-canonical prefix check: both sides are server-side
@@ -227,7 +251,10 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
 
         response_ids = stream_ids[len(prompt_ids):]
         response_logprobs = self._finalize_logprobs(response_slots, loss_mask)
-        last_kept_trace = build_trace_from_completion(chain[kept - 1])
+        last_kept_trace = build_trace_from_completion(
+            chain[kept - 1],
+            tokenizer=self._tokenizer,
+        )
 
         return Trace(
             prompt_ids=prompt_ids,
@@ -255,7 +282,10 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
         if self._configured_eot_id is not None:
             return self._configured_eot_id
         for completion in chain:
-            trace = build_trace_from_completion(completion)
+            trace = build_trace_from_completion(
+                completion,
+                tokenizer=self._tokenizer,
+            )
             if (
                 trace.finish_reason in _NATURAL_STOP_REASONS
                 and trace.response_ids

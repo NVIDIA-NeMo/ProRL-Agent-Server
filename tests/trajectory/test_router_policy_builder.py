@@ -1,9 +1,26 @@
 from __future__ import annotations
 
+from collections import UserDict
+
 import pytest
 
 from polar.trajectory.builder.router_policy import RouterPolicyBuilder
 from polar.trajectory.models import CompletionRecord, CompletionSession
+
+
+class _Tokenizer:
+    def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+        assert add_special_tokens is False
+        return [ord(char) for char in text]
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        **kwargs: object,
+    ) -> UserDict[str, list[int]]:
+        assert kwargs["tokenize"] is True
+        assert kwargs["add_generation_prompt"] is True
+        return UserDict({"input_ids": [1, 2, 3]})
 
 
 def _completion(
@@ -125,3 +142,87 @@ async def test_router_policy_allows_explicit_migration_role() -> None:
 def test_router_policy_rejects_empty_role_allowlist() -> None:
     with pytest.raises(ValueError, match="trusted_roles must not be empty"):
         RouterPolicyBuilder(trusted_roles=[])
+
+
+@pytest.mark.asyncio
+async def test_router_policy_reconstructs_missing_sglang_token_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "polar.trajectory.builder.prefix_merging._load_tokenizer",
+        lambda *_args, **_kwargs: _Tokenizer(),
+    )
+    completion = CompletionRecord(
+        completion_id="router",
+        request={
+            "messages": [{"role": "user", "content": "route"}],
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        response={
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "{}"},
+                    "finish_reason": "length",
+                    "logprobs": {
+                        "content": [
+                            {"token": "{", "logprob": -0.1},
+                            {"token": "}", "logprob": -0.2},
+                        ]
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        },
+        metadata={"completion_role": "router_policy"},
+    )
+
+    trajectory = await RouterPolicyBuilder(
+        tokenizer_name_or_path="/model",
+    ).build(CompletionSession(session_id="session-4", completions=[completion]))
+
+    trace = trajectory.traces[0]
+    assert trace.prompt_ids == [1, 2, 3]
+    assert trace.response_ids == [ord("{"), ord("}")]
+    assert trace.response_logprobs == [-0.1, -0.2]
+    assert trace.loss_mask == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_router_policy_reconstruction_fails_closed_on_length_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MismatchedTokenizer(_Tokenizer):
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            return [1]
+
+    monkeypatch.setattr(
+        "polar.trajectory.builder.prefix_merging._load_tokenizer",
+        lambda *_args, **_kwargs: MismatchedTokenizer(),
+    )
+    completion = CompletionRecord(
+        completion_id="router",
+        request={"messages": [{"role": "user", "content": "route"}]},
+        response={
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "{}"},
+                    "finish_reason": "length",
+                    "logprobs": {
+                        "content": [
+                            {"token": "{", "logprob": -0.1},
+                            {"token": "}", "logprob": -0.2},
+                        ]
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        },
+        metadata={"completion_role": "router_policy"},
+    )
+
+    trajectory = await RouterPolicyBuilder(
+        tokenizer_name_or_path="/model",
+    ).build(CompletionSession(session_id="session-5", completions=[completion]))
+
+    assert trajectory.traces[0].response_ids == []
+    assert trajectory.traces[0].loss_mask == []
