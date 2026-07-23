@@ -144,19 +144,22 @@ def _load_controller_module() -> None:
     spec.loader.exec_module(module)
 
 
-def _configure_gateway_transport() -> Any | None:
+def _configure_gateway_transport() -> tuple[Any | None, Any | None]:
     socket_path = os.environ.get("POLAR_GATEWAY_UDS", "").strip()
     if not socket_path:
-        return None
+        return None, None
     import httpx
     import litellm
+    from litellm.llms.custom_httpx.http_handler import HTTPHandler
 
     client = httpx.Client(
         transport=httpx.HTTPTransport(uds=socket_path),
         trust_env=False,
     )
     litellm.client_session = client
-    return client
+    # LiteLLM's native Responses path does not consult client_session.  It
+    # accepts its own HTTPHandler via the per-request ``client`` argument.
+    return client, HTTPHandler(client=client)
 
 
 def _with_capability(
@@ -164,6 +167,7 @@ def _with_capability(
     capability: str,
     call: Callable[..., Any],
     *args: Any,
+    request_client: Any | None = None,
     **kwargs: Any,
 ) -> Any:
     original = config.model_kwargs
@@ -171,6 +175,7 @@ def _with_capability(
     headers = headers if isinstance(headers, dict) else {}
     config.model_kwargs = {
         **original,
+        **({"client": request_client} if request_client is not None else {}),
         "extra_headers": {
             **headers,
             "Authorization": f"Bearer {capability}",
@@ -183,20 +188,31 @@ def _with_capability(
 
 
 def _install_capability_guards(
-    agent: Any, *, router_capability: str, pool_capability: str
+    agent: Any,
+    *,
+    router_capability: str,
+    pool_capability: str,
+    responses_client: Any | None = None,
 ) -> None:
     for model in (agent.small_model, agent.large_model):
         original_query = model.query
         config = model.config
+        request_client = responses_client if model is agent.large_model else None
 
         def guarded_query(
             messages: list[dict[str, Any]],
             _query: Callable[..., Any] = original_query,
             _config: Any = config,
+            _request_client: Any | None = request_client,
             **kwargs: Any,
         ) -> dict[str, Any]:
             return _with_capability(
-                _config, pool_capability, _query, messages, **kwargs
+                _config,
+                pool_capability,
+                _query,
+                messages,
+                request_client=_request_client,
+                **kwargs,
             )
 
         model.query = guarded_query
@@ -279,13 +295,14 @@ def main() -> int:
     capabilities = _receive_capabilities()
     task = _decode_task()
     _load_controller_module()
-    gateway_client = _configure_gateway_transport()
+    gateway_client, responses_client = _configure_gateway_transport()
     try:
         agent = _build_agent(task)
         _install_capability_guards(
             agent,
             router_capability=capabilities.pop(_ROUTER_CAPABILITY),
             pool_capability=capabilities.pop(_POOL_CAPABILITY),
+            responses_client=responses_client,
         )
         agent.run(task)
         return 0

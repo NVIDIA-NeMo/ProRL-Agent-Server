@@ -139,14 +139,20 @@ def test_capability_header_is_temporary_on_success_and_failure() -> None:
 
 def test_capability_guards_cover_all_three_model_queries() -> None:
     runner = _load_runner()
+    responses_client = object()
 
     class Model:
         def __init__(self) -> None:
             self.config = SimpleNamespace(model_kwargs={})
-            self.seen: list[str] = []
+            self.seen: list[tuple[str, object | None]] = []
 
         def query(self, _messages):
-            self.seen.append(self.config.model_kwargs["extra_headers"]["Authorization"])
+            self.seen.append(
+                (
+                    self.config.model_kwargs["extra_headers"]["Authorization"],
+                    self.config.model_kwargs.get("client"),
+                )
+            )
             return {}
 
     small = Model()
@@ -160,20 +166,27 @@ def test_capability_guards_cover_all_three_model_queries() -> None:
 
         def _query_controller_model(self, _messages):
             controller.seen.append(
-                controller.config.model_kwargs["extra_headers"]["Authorization"]
+                (
+                    controller.config.model_kwargs["extra_headers"]["Authorization"],
+                    controller.config.model_kwargs.get("client"),
+                )
             )
             return {}
 
     agent = Agent()
     runner._install_capability_guards(
-        agent, router_capability="router-secret", pool_capability="pool-secret"
+        agent,
+        router_capability="router-secret",
+        pool_capability="pool-secret",
+        responses_client=responses_client,
     )
     small.query([])
     large.query([])
     agent._query_controller_model([])
 
-    assert small.seen == ["Bearer pool-secret"]
-    assert large.seen == ["Bearer pool-secret"]
-    assert controller.seen == ["Bearer router-secret"]
+    assert small.seen == [("Bearer pool-secret", None)]
+    assert large.seen == [("Bearer pool-secret", responses_client)]
+    assert controller.seen == [("Bearer router-secret", None)]
     for model in (small, large, controller):
         assert "extra_headers" not in model.config.model_kwargs
+        assert "client" not in model.config.model_kwargs
