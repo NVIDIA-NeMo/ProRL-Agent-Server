@@ -2380,3 +2380,75 @@ def test_task_level_remains_the_default_routing_mode() -> None:
     assert result["termination_reason"] == "router_submit"
     final_prompt = router.requests[1]["messages"][-1]["content"]
     assert "VERIFY" in final_prompt
+
+
+def test_markov_router_memory_hides_own_prior_actions() -> None:
+    router = FakeRouter(
+        '{"action":"ROUTE","model_slot":"qwen3.6-27b"}',
+        '{"action":"ROUTE","model_slot":"gpt-5.5"}',
+        '{"action":"SUBMIT"}',
+    )
+    pool = FakeStepPool({}, {})
+    result = SpilotOrchestrator(
+        config=_runner_config(
+            routing_mode="turn_level", pool_step_limit=4, router_memory="markov"
+        ),
+        task="Task",
+        router=router,
+        pool=pool,
+        model_pool_capability="session-pool-capability",
+    ).run()
+
+    assert result["submitted"] is True
+    assert result["termination_reason"] == "router_submit"
+    # Every continue-decision context is rebuilt fresh: no assistant messages
+    # (the copy template) and an aggregate route history instead.
+    for request in router.requests[1:]:
+        roles = [m["role"] for m in request["messages"]]
+        assert "assistant" not in roles
+        prompt = request["messages"][-1]["content"]
+        assert "ROUTE HISTORY" in prompt
+        assert "STEP RESULT:" in prompt
+    second = router.requests[1]["messages"][-1]["content"]
+    assert "qwen3.6-27b x1" in second
+    third = router.requests[2]["messages"][-1]["content"]
+    assert "gpt-5.5 x1" in third and "qwen3.6-27b x1" in third
+    # The initial ROUTE decision is unchanged.
+    assert router.requests[0]["messages"][0]["role"] == "system"
+
+
+def test_full_router_memory_keeps_prior_actions_byte_identical() -> None:
+    router = FakeRouter(
+        '{"action":"ROUTE","model_slot":"qwen3.6-27b"}',
+        '{"action":"SUBMIT"}',
+    )
+    pool = FakeStepPool({})
+    SpilotOrchestrator(
+        config=_runner_config(routing_mode="turn_level", pool_step_limit=2),
+        task="Task",
+        router=router,
+        pool=pool,
+        model_pool_capability="session-pool-capability",
+    ).run()
+    roles = [m["role"] for m in router.requests[1]["messages"]]
+    assert roles.count("assistant") == 1  # historical behaviour untouched
+    assert "ROUTE HISTORY" not in router.requests[1]["messages"][-1]["content"]
+
+
+def test_router_memory_is_validated() -> None:
+    with pytest.raises(ValueError, match="router_memory"):
+        SpilotOrchestrator(
+            config=_runner_config(routing_mode="turn_level", router_memory="amnesia"),
+            task="Task",
+            router=FakeRouter('{"action":"SUBMIT"}'),
+            pool=FakePool(),
+            model_pool_capability="session-pool-capability",
+        )
+    with pytest.raises(ValueError, match="turn_level"):
+        SpilotOrchestrator(
+            config=_runner_config(router_memory="markov"),
+            task="Task",
+            router=FakeRouter('{"action":"SUBMIT"}'),
+            pool=FakePool(),
+            model_pool_capability="session-pool-capability",
+        )

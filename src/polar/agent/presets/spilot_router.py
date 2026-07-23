@@ -237,6 +237,13 @@ def _build_runner_config(agent_spec: AgentSpec) -> dict[str, Any]:
         "context_handoff": _context_handoff(
             settings.pop("context_handoff", "shared"), routing_mode_setting
         ),
+        # turn_level only: "full" (default) keeps the router's own past ROUTE
+        # completions in its context; "markov" rebuilds a fresh decision
+        # context every step (task + cards + aggregate route history + latest
+        # digest) so the policy cannot verbatim-copy its previous action.
+        "router_memory": _router_memory(
+            settings.pop("router_memory", "full"), routing_mode_setting
+        ),
         "shuffle_seed": _bounded_int(
             settings.pop("shuffle_seed", 0),
             name="shuffle_seed",
@@ -486,6 +493,18 @@ def _routing_mode(value: object) -> str:
         raise ValueError(
             "spilot_router routing_mode must be 'task_level' or 'turn_level'; "
             f"got {value!r}"
+        )
+    return str(value)
+
+
+def _router_memory(value: object, routing_mode: str) -> str:
+    if value not in ("full", "markov"):
+        raise ValueError(
+            f"spilot_router router_memory must be 'full' or 'markov'; got {value!r}"
+        )
+    if value != "full" and routing_mode != "turn_level":
+        raise ValueError(
+            "spilot_router router_memory='markov' requires routing_mode='turn_level'"
         )
     return str(value)
 

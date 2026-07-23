@@ -325,6 +325,10 @@ export SPILOT_MAX_POOL_CALLS="${SPILOT_MAX_POOL_CALLS:-2}"
 # "reset_context" collapses history into a bounded executed-step digest at
 # each switch.  Non-shared values are rejected under task_level.
 export SPILOT_CONTEXT_HANDOFF="${SPILOT_CONTEXT_HANDOFF:-shared}"
+# turn_level only: "full" keeps the router's own past ROUTE completions in
+# context (historical default; acts as a copy template and drives same-model
+# stickiness); "markov" rebuilds a fresh decision context every step.
+export SPILOT_ROUTER_MEMORY="${SPILOT_ROUTER_MEMORY:-full}"
 # Per-step digest budget for the Router's own trajectory under turn_level
 # (chars of executed-step output shown to the Router between decisions; the
 # executing pool models still see full Vanillux2 observations).

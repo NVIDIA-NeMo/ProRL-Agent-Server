@@ -1132,6 +1132,7 @@ def render_polar_config(
         # declares them for turn_level lanes.
         "SPILOT_ROUTER_OBS_MAX_CHARS": "1500",
         "SPILOT_CONTEXT_HANDOFF": "shared",
+        "SPILOT_ROUTER_MEMORY": "full",
         "SPILOT_COST_PENALTY_MODE": "multiplicative",
         "SPILOT_DIFFICULTY_LEDGER_PATH": "",
         "SPILOT_DIFFICULTY_EASY_MULT": "1.0",

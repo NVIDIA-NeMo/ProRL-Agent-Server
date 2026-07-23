@@ -1810,6 +1810,8 @@ class SpilotOrchestrator:
         """
 
         step_budget = int(self.config["pool_step_limit"])
+        router_memory = str(self.config.get("router_memory", "full"))
+        route_counts: dict[str, int] = {}
         response_budget = int(self.config["pool_response_token_budget"])
         max_format_errors = int(self.config["pool_max_format_errors"])
         digest_chars = int(
@@ -1877,20 +1879,45 @@ class SpilotOrchestrator:
                 steps_remaining=step_budget - step_index - 1,
                 max_chars=digest_chars,
             )
-            messages = [
-                *messages,
-                {"role": "assistant", "content": completion.content},
-                {
-                    "role": "user",
-                    "content": (
-                        "The routed agent step has executed. This digest contains "
-                        "only public execution state; hidden evaluator tests have "
-                        "not run.\n"
-                        f"STEP RESULT:\n{digest}\n\n"
-                        f"{self._turn_level_instruction()}"
-                    ),
-                },
-            ]
+            route_counts[candidate.slot] = route_counts.get(candidate.slot, 0) + 1
+            if router_memory == "markov":
+                # Fresh decision context every step: the router sees the task,
+                # the candidate cards, an aggregate route history, and the
+                # latest step digest — but never its own previous ROUTE
+                # completions, which under "full" memory act as a verbatim
+                # copy template and drive degenerate same-model stickiness.
+                history_text = ", ".join(
+                    f"{slot} x{count}" for slot, count in sorted(route_counts.items())
+                )
+                messages = [
+                    *self._initial_messages(),
+                    {
+                        "role": "user",
+                        "content": (
+                            f"ROUTE HISTORY (executed steps per model): {history_text}\n"
+                            "The most recent routed agent step has executed. This "
+                            "digest contains only public execution state; hidden "
+                            "evaluator tests have not run.\n"
+                            f"STEP RESULT:\n{digest}\n\n"
+                            f"{self._turn_level_instruction()}"
+                        ),
+                    },
+                ]
+            else:
+                messages = [
+                    *messages,
+                    {"role": "assistant", "content": completion.content},
+                    {
+                        "role": "user",
+                        "content": (
+                            "The routed agent step has executed. This digest contains "
+                            "only public execution state; hidden evaluator tests have "
+                            "not run.\n"
+                            f"STEP RESULT:\n{digest}\n\n"
+                            f"{self._turn_level_instruction()}"
+                        ),
+                    },
+                ]
             completion = self._router_completion(messages)
             action = self._record_action(completion, expected="CONTINUE", step=step_index + 1)
             if action is None:
@@ -2493,6 +2520,13 @@ def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
             )
     elif config["max_pool_calls"] not in (1, 2):
         raise ValueError("task_level max_pool_calls must be 1 or 2")
+    router_memory = config.get("router_memory", "full")
+    if router_memory not in ("full", "markov"):
+        raise ValueError(
+            f"router_memory must be 'full' or 'markov'; got {router_memory!r}"
+        )
+    if router_memory != "full" and routing_mode != "turn_level":
+        raise ValueError("router_memory='markov' requires routing_mode=turn_level")
     context_handoff = config.get("context_handoff", "shared")
     if context_handoff not in _CONTEXT_HANDOFF_POLICIES:
         raise ValueError(
