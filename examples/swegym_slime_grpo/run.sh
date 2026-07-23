@@ -1533,6 +1533,14 @@ if [ "${#DVAO_REWARD_ARGS[@]}" -ne 0 ] && [ "${#GDPO_REWARD_ARGS[@]}" -ne 0 ]; t
     echo "ERROR: DVAO and GDPO reward modes are mutually exclusive" >&2
     exit 1
 fi
+POLAR_CONTROLLER_ARGS=()
+if [ -n "${POLAR_CONTROLLER_INVALID_TURN_PENALTY:-}" ]; then
+    POLAR_CONTROLLER_ARGS+=(
+        --polar-controller-invalid-turn-penalty
+        "${POLAR_CONTROLLER_INVALID_TURN_PENALTY}"
+    )
+    echo "Using controller invalid-turn penalty: ${POLAR_CONTROLLER_INVALID_TURN_PENALTY}"
+fi
 OPTIMIZER_MEMORY_ARGS=()
 case "${TMAX_OPTIMIZER_CPU_OFFLOAD:-0}" in
     0) ;;
@@ -2152,6 +2160,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     --reward-key score \
     "${DVAO_REWARD_ARGS[@]}" \
     "${GDPO_REWARD_ARGS[@]}" \
+    "${POLAR_CONTROLLER_ARGS[@]}" \
     "${TRAIN_LENGTH_ARGS[@]}" \
     --rollout-batch-size "$ROLLOUT_BATCH_SIZE" \
     --n-samples-per-prompt "$N_SAMPLES_PER_PROMPT" \

@@ -6,7 +6,10 @@ from typing import Any
 
 import pytest
 
-from slime_bridge.reward_post_process import post_process_rewards
+from slime_bridge.reward_post_process import (
+    _controller_turn_is_valid,
+    post_process_rewards,
+)
 
 
 class FakeSample:
@@ -21,6 +24,7 @@ class FakeSample:
         remove_sample: bool = False,
         training_filter: dict | None = None,
         reward_components: dict[str, Any] | None = None,
+        response: str | None = None,
     ) -> None:
         self.group_index = group_index
         self.group_id = group_id
@@ -31,6 +35,7 @@ class FakeSample:
         self.status = status
         self.loss_mask = [1] if loss_mask is None else loss_mask
         self.response_length = len(self.loss_mask)
+        self.response = response
         self.remove_sample = remove_sample
         self.metadata = {
             "polar": {"training_filter": training_filter} if training_filter is not None else {}
@@ -424,3 +429,108 @@ def test_disabled_normalization_returns_raw_rewards() -> None:
 
     assert raw == [2.0, 5.0]
     assert rewards == [2.0, 5.0]
+
+
+_VALID_DECISION = (
+    '{"required_model_strength": "keep", "state_confidence": "high", '
+    '"evidence_event_ids": [1]}'
+)
+
+
+def test_invalid_turn_penalty_centers_valid_above_invalid() -> None:
+    # Two single-turn trajectories with equal reward -> zero GRPO advantage, so
+    # the returned rewards isolate the centered format signal: batch invalid
+    # rate 0.5, weight 2.0, turn-equal scale 1.
+    samples = [
+        FakeSample(group_id=0, reward=1.0, response=_VALID_DECISION),
+        FakeSample(group_id=1, reward=1.0, response="no json here"),
+    ]
+
+    _raw, rewards = post_process_rewards(
+        _args(polar_controller_invalid_turn_penalty=2.0), samples
+    )
+
+    assert rewards == pytest.approx([1.0, -1.0])
+
+
+def test_invalid_turn_penalty_is_noop_when_all_turns_valid() -> None:
+    samples = [
+        FakeSample(group_id=0, reward=2.0, response=_VALID_DECISION),
+        FakeSample(group_id=1, reward=4.0, response=_VALID_DECISION),
+    ]
+
+    _raw, penalized = post_process_rewards(
+        _args(polar_controller_invalid_turn_penalty=5.0), samples
+    )
+    _raw2, baseline = post_process_rewards(_args(), samples)
+
+    assert penalized == pytest.approx(baseline)
+
+
+def test_invalid_turn_penalty_applies_under_gdpo() -> None:
+    def advantages(penalty: float) -> list[float]:
+        samples = [
+            FakeSample(
+                group_id=0,
+                reward=0.0,
+                reward_components={"accuracy": 1.0, "cost": 0.0},
+                response=_VALID_DECISION,
+            ),
+            FakeSample(
+                group_id=1,
+                reward=0.0,
+                reward_components={"accuracy": 0.0, "cost": 0.0},
+                response="malformed",
+            ),
+        ]
+        _raw, rewards = post_process_rewards(
+            _args(
+                gdpo_reward_keys=["accuracy", "cost"],
+                polar_controller_invalid_turn_penalty=penalty,
+            ),
+            samples,
+        )
+        return rewards
+
+    assert advantages(1.0) != pytest.approx(advantages(0.0))
+
+
+def test_invalid_turn_penalty_rejects_negative_weight() -> None:
+    samples = [FakeSample(group_id=0, reward=1.0, response=_VALID_DECISION)]
+
+    with pytest.raises(ValueError, match="non-negative"):
+        post_process_rewards(_args(polar_controller_invalid_turn_penalty=-1.0), samples)
+
+
+@pytest.mark.parametrize(
+    "response, expected",
+    [
+        (_VALID_DECISION, True),
+        (
+            'reasoning...\n{"required_model_strength": "escalate", '
+            '"state_confidence": "low", "evidence_event_ids": [3, 4]}',
+            True,
+        ),
+        ("plain text, no json", False),
+        ('{"required_model_strength": "keep"}', False),
+        (
+            '{"required_model_strength": "sideways", "state_confidence": "high", '
+            '"evidence_event_ids": [1]}',
+            False,
+        ),
+        (
+            '{"required_model_strength": "keep", "state_confidence": "high", '
+            '"evidence_event_ids": [1, 2, 3]}',
+            False,
+        ),
+        (
+            '{"required_model_strength": "keep", "state_confidence": "high", '
+            '"evidence_event_ids": []}',
+            False,
+        ),
+        (None, False),
+    ],
+)
+def test_controller_turn_validity(response: str | None, expected: bool) -> None:
+    sample = FakeSample(group_id=0, reward=0.0, response=response)
+    assert _controller_turn_is_valid(sample) is expected

@@ -14,12 +14,20 @@ Adapter contract:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import re
 import statistics
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# A controller turn emits one JSON routing decision. These are the field values
+# a sample-local validity check can confirm without the engine's visible-event
+# set, so the format signal treats any other shape as a malformed turn.
+_CONTROLLER_STRENGTHS = frozenset({"keep", "escalate", "deescalate"})
+_CONTROLLER_CONFIDENCES = frozenset({"unknown", "high", "low"})
 
 
 def post_process_rewards(
@@ -27,6 +35,16 @@ def post_process_rewards(
     samples: list[Any],
 ) -> tuple[list[float], list[float]]:
     """Slime reward-post-process hook. Returns (raw_rewards, rewards)."""
+    raw_rewards, rewards = _reward_advantages(args, samples)
+    _apply_controller_invalid_turn_penalty(args, samples, rewards)
+    return raw_rewards, rewards
+
+
+def _reward_advantages(
+    args: Any,
+    samples: list[Any],
+) -> tuple[list[float], list[float]]:
+    """Select and run the configured advantage estimator for a sample batch."""
     gdpo_reward_keys = getattr(args, "gdpo_reward_keys", None)
     if gdpo_reward_keys is not None:
         return _post_process_gdpo(samples, tuple(gdpo_reward_keys))
@@ -440,3 +458,87 @@ def _is_trainable_negative(sample: Any) -> bool:
         and training_filter.get("trainable") is True
         and training_filter.get("masked") is not True
     )
+
+
+def _apply_controller_invalid_turn_penalty(
+    args: Any,
+    samples: list[Any],
+    rewards: list[float],
+) -> None:
+    """Add a centered, trajectory- and turn-equal signal for malformed turns.
+
+    Controller turns whose response does not parse into a legal routing
+    decision receive a negative signal and well-formed turns a small positive
+    one, centered on the batch's malformed rate so a batch with no malformed
+    turns is left exactly unchanged. The signal is scaled to be turn-equal
+    rather than token-weighted, and the base advantage is never rescaled.
+    Disabled (no-op) when the weight is not positive.
+    """
+
+    weight = float(getattr(args, "polar_controller_invalid_turn_penalty", 0.0) or 0.0)
+    if weight < 0.0:
+        raise ValueError("polar_controller_invalid_turn_penalty must be non-negative")
+    if weight == 0.0:
+        return
+
+    trajectory_turns: dict[tuple[Any, Any], list[int]] = {}
+    for index, sample in enumerate(samples):
+        if _is_failed_trajectory(sample) or _trainable_token_count(sample) <= 0:
+            continue
+        _, key = _trajectory_key(sample, index)
+        trajectory_turns.setdefault(key, []).append(index)
+    if not trajectory_turns:
+        return
+
+    valid_by_sample: dict[int, bool] = {}
+    invalid_rates: list[float] = []
+    for indices in trajectory_turns.values():
+        invalid = 0
+        for index in indices:
+            is_valid = _controller_turn_is_valid(samples[index])
+            valid_by_sample[index] = is_valid
+            invalid += int(not is_valid)
+        invalid_rates.append(invalid / len(indices))
+    batch_invalid_rate = statistics.fmean(invalid_rates)
+
+    for indices in trajectory_turns.values():
+        token_counts = {index: _trainable_token_count(samples[index]) for index in indices}
+        trajectory_token_count = sum(token_counts.values())
+        turn_count = len(indices)
+        for index in indices:
+            centered_signal = batch_invalid_rate - float(not valid_by_sample[index])
+            turn_equal_scale = trajectory_token_count / (turn_count * token_counts[index])
+            rewards[index] += weight * centered_signal * turn_equal_scale
+
+
+def _controller_turn_is_valid(sample: Any) -> bool:
+    """True if the controller response parses into a legal routing decision."""
+    text = getattr(sample, "response", None)
+    if not isinstance(text, str):
+        return False
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match is None:
+        return False
+    try:
+        decision = json.loads(match.group(0))
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(decision, dict):
+        return False
+    evidence = decision.get("evidence_event_ids")
+    return (
+        decision.get("required_model_strength") in _CONTROLLER_STRENGTHS
+        and decision.get("state_confidence") in _CONTROLLER_CONFIDENCES
+        and isinstance(evidence, list)
+        and 1 <= len(evidence) <= 2
+        and all(isinstance(item, int) and not isinstance(item, bool) for item in evidence)
+    )
+
+
+def _trainable_token_count(sample: Any) -> int:
+    if bool(getattr(sample, "remove_sample", False)):
+        return 0
+    loss_mask = getattr(sample, "loss_mask", None)
+    if loss_mask is None:
+        return int(getattr(sample, "response_length", 0) or 0)
+    return sum(1 for value in loss_mask if int(value) != 0)
