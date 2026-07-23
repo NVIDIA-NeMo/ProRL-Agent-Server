@@ -1886,14 +1886,26 @@ class SpilotOrchestrator:
                 # latest step digest — but never its own previous ROUTE
                 # completions, which under "full" memory act as a verbatim
                 # copy template and drive degenerate same-model stickiness.
+                # Deliberately NOT reusing the initial user message: its
+                # first-action instruction ("action must be ROUTE, no default
+                # choice") contradicts the continue instruction's SUBMIT
+                # option, so the context is rebuilt as one user message with
+                # only the continue-decision instruction.
                 history_text = ", ".join(
                     f"{slot} x{count}" for slot, count in sorted(route_counts.items())
                 )
+                cards = [
+                    {"model_slot": c.slot, "model_card": c.card}
+                    for c in self.candidates
+                ]
                 messages = [
-                    *self._initial_messages(),
+                    self._initial_messages()[0],
                     {
                         "role": "user",
                         "content": (
+                            f"TASK:\n{self.task}\n\n"
+                            "AVAILABLE MODEL SLOTS:\n"
+                            f"{json.dumps(cards, ensure_ascii=False, sort_keys=True)}\n\n"
                             f"ROUTE HISTORY (executed steps per model): {history_text}\n"
                             "The most recent routed agent step has executed. This "
                             "digest contains only public execution state; hidden "

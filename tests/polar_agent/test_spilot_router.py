@@ -2406,9 +2406,14 @@ def test_markov_router_memory_hides_own_prior_actions() -> None:
     for request in router.requests[1:]:
         roles = [m["role"] for m in request["messages"]]
         assert "assistant" not in roles
+        assert roles == ["system", "user"]  # one fresh user msg, no reuse
         prompt = request["messages"][-1]["content"]
         assert "ROUTE HISTORY" in prompt
         assert "STEP RESULT:" in prompt
+        assert "TASK:" in prompt and "AVAILABLE MODEL SLOTS:" in prompt
+        # No contradictory first-action instruction alongside SUBMIT option.
+        assert "There is no default choice" not in prompt
+        assert '{"action":"SUBMIT"}' in prompt
     second = router.requests[1]["messages"][-1]["content"]
     assert "qwen3.6-27b x1" in second
     third = router.requests[2]["messages"][-1]["content"]
