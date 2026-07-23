@@ -121,6 +121,60 @@ def test_session_result_to_samples_converts_trace_to_slime_like_sample(monkeypat
     assert sample.metadata["polar"]["rollout_step"] == 7
 
 
+def test_adapter_preserves_named_reward_components(monkeypatch) -> None:
+    monkeypatch.setattr(adapter, "_load_sample_type", lambda: FakeSample)
+    trace = Trace(
+        prompt_ids=[1],
+        response_ids=[2],
+        loss_mask=[1],
+        response_logprobs=[-0.1],
+        reward=0.75,
+        reward_components={"reward_1": 1.0, "reward_2": 0.5},
+    )
+
+    [sample] = session_result_to_samples(
+        _session_result(trace=trace),
+        group_index=0,
+        trajectory_index=0,
+        reward_key="score",
+    )
+
+    assert sample.reward == {
+        "score": 0.75,
+        "reward_1": 1.0,
+        "reward_2": 0.5,
+    }
+
+
+def test_failed_execution_zeros_named_reward_components(monkeypatch) -> None:
+    monkeypatch.setattr(adapter, "_load_sample_type", lambda: FakeSample)
+    trace = Trace(
+        prompt_ids=[1],
+        response_ids=[2],
+        loss_mask=[1],
+        response_logprobs=[-0.1],
+        reward=1.0,
+        reward_components={"reward_1": 1.0, "reward_2": 0.5},
+    )
+
+    [sample] = session_result_to_samples(
+        _session_result(
+            trace=trace,
+            status=SessionStatus.ERROR,
+            error="synthetic failure",
+        ),
+        group_index=0,
+        trajectory_index=0,
+        reward_key="score",
+    )
+
+    assert sample.reward == {
+        "score": 0.0,
+        "reward_1": 0.0,
+        "reward_2": 0.0,
+    }
+
+
 @pytest.mark.parametrize(
     "malformed_reward",
     [float("nan"), float("inf"), float("-inf"), True, False],

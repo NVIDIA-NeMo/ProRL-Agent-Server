@@ -82,6 +82,53 @@ class _BlockingEvaluator:
             raise
 
 
+def test_merge_eval_result_broadcasts_named_reward_components() -> None:
+    trajectory = Trajectory(
+        status="COMPLETED",
+        traces=[Trace(), Trace()],
+    )
+    merged = GatewayNodeManager._merge_eval_result(
+        trajectory,
+        EvalResult(
+            outcome_reward=0.75,
+            outcome_reward_components={
+                "reward_1": 1.0,
+                "reward_2": 0.5,
+            },
+        ),
+        EvaluatorSpec(strategy="test"),
+    )
+
+    assert [trace.reward for trace in merged.traces] == [0.75, 0.75]
+    assert [trace.reward_components for trace in merged.traces] == [
+        {"reward_1": 1.0, "reward_2": 0.5},
+        {"reward_1": 1.0, "reward_2": 0.5},
+    ]
+    assert merged.metadata["evaluation"]["outcome_reward_components"] == {
+        "reward_1": 1.0,
+        "reward_2": 0.5,
+    }
+
+
+def test_merge_eval_result_rejects_misaligned_trace_reward_components() -> None:
+    trajectory = Trajectory(
+        status="COMPLETED",
+        traces=[Trace(), Trace()],
+    )
+    merged = GatewayNodeManager._merge_eval_result(
+        trajectory,
+        EvalResult(
+            trace_reward_components=[
+                {"reward_1": 1.0, "reward_2": 0.5},
+            ],
+        ),
+        EvaluatorSpec(strategy="test"),
+    )
+
+    assert merged.status == "ERROR"
+    assert "trace_reward_components" in str(merged.error)
+
+
 @pytest.mark.asyncio
 async def test_node_close_propagates_dispatcher_containment_failure() -> None:
     manager = object.__new__(GatewayNodeManager)

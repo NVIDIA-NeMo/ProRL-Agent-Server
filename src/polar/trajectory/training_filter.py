@@ -114,11 +114,19 @@ def zero_reward_parser_invalid_tool_call_trace(
         }
     )
     training_filter.setdefault("original_reward", trace.reward)
+    if trace.reward_components:
+        training_filter.setdefault(
+            "original_reward_components",
+            dict(trace.reward_components),
+        )
     metadata["training_filter"] = training_filter
 
     return trace.model_copy(
         update={
             "reward": 0.0,
+            "reward_components": {
+                key: 0.0 for key in trace.reward_components
+            },
             "metadata": metadata,
         }
     ), detail

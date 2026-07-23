@@ -978,11 +978,19 @@ class GatewayNodeManager:
                 }
             )
             training_filter.setdefault("original_reward", trace.reward)
+            if trace.reward_components:
+                training_filter.setdefault(
+                    "original_reward_components",
+                    dict(trace.reward_components),
+                )
             trace_metadata["training_filter"] = training_filter
             filtered_traces.append(
                 trace.model_copy(
                     update={
                         "reward": 0.0,
+                        "reward_components": {
+                            key: 0.0 for key in trace.reward_components
+                        },
                         "loss_mask": [0] * len(trace.response_ids),
                         "metadata": trace_metadata,
                     }
@@ -1209,6 +1217,38 @@ class GatewayNodeManager:
                 trace.model_copy(update={"reward": eval_result.outcome_reward}) for trace in traces
             ]
 
+        if eval_result.trace_reward_components is not None:
+            if len(eval_result.trace_reward_components) != len(traces):
+                return trajectory.model_copy(
+                    update={
+                        "status": "ERROR",
+                        "error": (
+                            f"evaluator returned {len(eval_result.trace_reward_components)} "
+                            f"trace_reward_components but trajectory has {len(traces)} traces"
+                        ),
+                    }
+                )
+            traces = [
+                trace.model_copy(update={"reward_components": components or {}})
+                for trace, components in zip(
+                    traces,
+                    eval_result.trace_reward_components,
+                )
+            ]
+        elif eval_result.outcome_reward_components is not None and traces:
+            # Broadcast trajectory-level reward components independently of
+            # the legacy scalar reward.
+            traces = [
+                trace.model_copy(
+                    update={
+                        "reward_components": dict(
+                            eval_result.outcome_reward_components
+                        )
+                    }
+                )
+                for trace in traces
+            ]
+
         # A successful session can contain abandoned retry chains. Never let a
         # terminal outcome positively reinforce a chain whose attempted tool
         # call could not be parsed. This is still a sampled policy action: if
@@ -1227,6 +1267,8 @@ class GatewayNodeManager:
             "strategy": evaluator_spec.strategy,
             "outcome_reward": eval_result.outcome_reward,
             "trace_rewards": eval_result.trace_rewards,
+            "outcome_reward_components": eval_result.outcome_reward_components,
+            "trace_reward_components": eval_result.trace_reward_components,
             **eval_result.metadata,
         }
         if parser_invalid_traces_zero_rewarded:
@@ -1280,9 +1322,17 @@ class GatewayNodeManager:
                 filter_update["trainable"] = aligned_agent_timeout
             training_filter.update(filter_update)
             training_filter.setdefault("original_reward", trace.reward)
+            if trace.reward_components:
+                training_filter.setdefault(
+                    "original_reward_components",
+                    dict(trace.reward_components),
+                )
             trace_metadata["training_filter"] = training_filter
             updates: dict[str, Any] = {
                 "reward": 0.0,
+                "reward_components": {
+                    key: 0.0 for key in trace.reward_components
+                },
                 "metadata": trace_metadata,
             }
             if not aligned_agent_timeout:
@@ -1295,10 +1345,24 @@ class GatewayNodeManager:
             evaluation = dict(evaluation)
             outcome_reward = evaluation.get("outcome_reward")
             trace_rewards = evaluation.get("trace_rewards")
+            outcome_reward_components = evaluation.get(
+                "outcome_reward_components"
+            )
+            trace_reward_components = evaluation.get("trace_reward_components")
             if outcome_reward is not None:
                 evaluation.setdefault("discarded_outcome_reward", outcome_reward)
             if trace_rewards is not None:
                 evaluation.setdefault("discarded_trace_rewards", trace_rewards)
+            if outcome_reward_components is not None:
+                evaluation.setdefault(
+                    "discarded_outcome_reward_components",
+                    outcome_reward_components,
+                )
+            if trace_reward_components is not None:
+                evaluation.setdefault(
+                    "discarded_trace_reward_components",
+                    trace_reward_components,
+                )
             # ``reward`` and ``resolved`` are common evaluator convenience
             # fields (including Harbor).  Keep verifier_reported_reward intact
             # as the raw diagnostic while making these effective fields agree
@@ -1311,6 +1375,19 @@ class GatewayNodeManager:
             evaluation["outcome_reward"] = 0.0
             if isinstance(trace_rewards, list):
                 evaluation["trace_rewards"] = [0.0] * len(trace_rewards)
+            if isinstance(outcome_reward_components, dict):
+                evaluation["outcome_reward_components"] = {
+                    key: 0.0 for key in outcome_reward_components
+                }
+            if isinstance(trace_reward_components, list):
+                evaluation["trace_reward_components"] = [
+                    (
+                        {key: 0.0 for key in components}
+                        if isinstance(components, dict)
+                        else None
+                    )
+                    for components in trace_reward_components
+                ]
             evaluation["reward_discarded"] = True
             evaluation["reward_discard_reason"] = filter_reason
             metadata["evaluation"] = evaluation
