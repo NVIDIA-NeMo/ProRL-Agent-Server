@@ -78,5 +78,6 @@ ${POLAR_INTERNET_RUNTIME_VOLUME}
     config:
       tests_dir: "{sample.metadata.tests_dir}"
       verifier_timeout: "{sample.metadata.verifier_timeout}"
+      emit_cost_reward: true
 
 polar_task_id_template: "polar-controller-v3-{rollout_id}-{sample.group_index}"

@@ -45,10 +45,8 @@ export SGLANG_ENABLE_FP32_LM_HEAD=0
 
 export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
 export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
-# Set both names to enable DVAO once the evaluator supplies two named rewards.
-# Their semantics are evaluator-owned; the optimizer only consumes the values.
-export DVAO_REWARD_KEY_1="${DVAO_REWARD_KEY_1:-}"
-export DVAO_REWARD_KEY_2="${DVAO_REWARD_KEY_2:-}"
+export DVAO_REWARD_KEY_1="${DVAO_REWARD_KEY_1:-harbor_reward}"
+export DVAO_REWARD_KEY_2="${DVAO_REWARD_KEY_2:-negative_cost}"
 export POLAR_MAX_INIT_WORKERS="${POLAR_MAX_INIT_WORKERS:-96}"
 export POLAR_MAX_RUN_WORKERS="${POLAR_MAX_RUN_WORKERS:-258}"
 export POLAR_MAX_POSTRUN_WORKERS="${POLAR_MAX_POSTRUN_WORKERS:-96}"
