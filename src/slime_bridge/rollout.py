@@ -6088,7 +6088,7 @@ def _polar_extra_metrics(
         if session_id and isinstance(reward, dict) and "negative_cost" in reward:
             cost_by_session[str(session_id)] = -_finite_float_or_zero(reward["negative_cost"])
     if cost_by_session:
-        out["polar/controller/gpt_cost_usd_mean"] = sum(cost_by_session.values()) / len(
+        out["polar/controller/cost_usd_mean"] = sum(cost_by_session.values()) / len(
             cost_by_session
         )
     return out
