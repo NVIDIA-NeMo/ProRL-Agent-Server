@@ -94,11 +94,13 @@ def test_controller_profile_enables_harbor_cost_dvao() -> None:
     profile = (EXAMPLE / "profile.sh").read_text()
     polar_config = (EXAMPLE / "polar_config.yaml").read_text()
     shared_run = (ROOT / "examples/swegym_slime_grpo/run.sh").read_text()
+    shared_submit = (ROOT / "examples/swegym_slime_grpo/submit_slurm.sh").read_text()
 
     assert 'DVAO_REWARD_KEY_1="${DVAO_REWARD_KEY_1:-harbor_reward}"' in profile
     assert 'DVAO_REWARD_KEY_2="${DVAO_REWARD_KEY_2:-negative_cost}"' in profile
     assert "emit_cost_reward: true" in polar_config
     assert "--dvao-reward-keys" in shared_run
+    assert "DVAO_*|" in shared_submit
     assert "DVAO_REWARD_KEY_1 and DVAO_REWARD_KEY_2 must be set together" in shared_run
 
 
