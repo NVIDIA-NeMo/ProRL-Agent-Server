@@ -24,8 +24,16 @@ unset actual_session_dir
 export RAY_LAST_NODE_NUM_GPUS="${RAY_LAST_NODE_NUM_GPUS:-2}"
 
 SMALL_NODE_RANK="$((NUM_NODES - 1))"
-SMALL_NODE_FILE="${RUN_DIR}/startup/controller-v3-small-node"
-mkdir -p "${RUN_DIR}/startup"
+# Namespace the startup handshake by restart count. A Slurm requeue reuses
+# SLURM_JOB_ID (hence RUN_DIR), so a previous attempt's node/ready files would
+# still be present at launch: a rank could read the old small-node hostname
+# (routing pool/qwen traffic at a dead host) or the old ready file (skipping the
+# readiness gate and starting the gateway before the small workers are up). A
+# per-restart subdir is empty on each attempt, so those stale files are never
+# seen -- race-free, with no cleanup to coordinate across ranks.
+STARTUP_DIR="${RUN_DIR}/startup/restart-${SLURM_RESTART_COUNT:-0}"
+SMALL_NODE_FILE="${STARTUP_DIR}/controller-v3-small-node"
+mkdir -p "${STARTUP_DIR}"
 if [ "${SLURM_NODEID}" = "${SMALL_NODE_RANK}" ]; then
     SMALL_NODE="$(hostname -s)"
     printf '%s\n' "${SMALL_NODE}" >"${SMALL_NODE_FILE}.tmp"
@@ -47,7 +55,7 @@ if ! [[ "${SMALL_NODE}" =~ ^[A-Za-z0-9._-]+$ ]]; then
 fi
 SMALL_ROUTER_PORT="${CONTROLLER_V3_SMALL_ROUTER_PORT:-19090}"
 export CONTROLLER_V3_SMALL_ROUTER_BASE_URL="http://${SMALL_NODE}:${SMALL_ROUTER_PORT}/v1"
-READY_FILE="${RUN_DIR}/startup/controller-v3-small-ready"
+READY_FILE="${STARTUP_DIR}/controller-v3-small-ready"
 PYTHON_BIN="${POLR_TRAIN_VENV}/bin/python3"
 LOCAL_NO_PROXY="0.0.0.0,127.0.0.1,localhost"
 PIDS=()
@@ -86,7 +94,7 @@ start_group() {
 }
 
 if [ "${SLURM_NODEID}" = "${SMALL_NODE_RANK}" ]; then
-    mkdir -p "${RUN_DIR}/startup" "${RUN_DIR}/controller-v3-small"
+    mkdir -p "${STARTUP_DIR}" "${RUN_DIR}/controller-v3-small"
     rm -f "${READY_FILE}"
 
     server_args=(
