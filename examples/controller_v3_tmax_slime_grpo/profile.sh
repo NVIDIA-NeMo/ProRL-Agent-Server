@@ -49,11 +49,45 @@ export DVAO_REWARD_KEY_1="${DVAO_REWARD_KEY_1:-}"
 export DVAO_REWARD_KEY_2="${DVAO_REWARD_KEY_2:-}"
 export GDPO_REWARD_KEY_1="${GDPO_REWARD_KEY_1:-harbor_reward}"
 export GDPO_REWARD_KEY_2="${GDPO_REWARD_KEY_2:-negative_cost}"
-# Controller V3 keeps fully-correct groups for the cost signal, so disable the
-# default reward-std dynamic sampling filter, which drops zero-variance groups
-# (all-correct groups included). Set before env.cwdfw.sh so its ``-`` default
-# does not re-enable it; an explicit override is still honored.
+
+# ==========================================================================
+# Controller reward-shaping knobs. The defaults below run plain GDPO over every
+# task: accuracy + cost on every prompt group, no group filtering, no group
+# dropping. Every knob is independent and OFF by default; enable one by
+# exporting the value shown in its comment (e.g. before calling submit).
+# ==========================================================================
+
+# No dynamic sampling filter by default -> train on every rollout group. The
+# stock default (env.cwdfw.sh) is check_reward_nonzero_std, which drops
+# zero-variance groups (all-correct AND all-wrong); plain GDPO instead keeps the
+# fully-correct groups for the cost signal. Set before env.cwdfw.sh so its ``-``
+# fallback cannot re-enable it. To restore it: export the filter path.
 export TMAX_DYNAMIC_SAMPLING_FILTER_PATH="${TMAX_DYNAMIC_SAMPLING_FILTER_PATH-}"
+
+# Penalty weight for controller turns whose response is not a parseable routing
+# decision (centered, turn-equal format signal). Empty = off; e.g. set 0.1.
+export POLAR_CONTROLLER_INVALID_TURN_PENALTY="${POLAR_CONTROLLER_INVALID_TURN_PENALTY:-}"
+
+# Credit assignment across realized keep/escalate/deescalate actions. Empty =
+# off (standard); set to actual_action_balanced to make each realized action an
+# equal policy-loss stratum.
+export POLAR_CONTROLLER_CREDIT_MODE="${POLAR_CONTROLLER_CREDIT_MODE:-}"
+
+# GDPO cost gate. 0 = off: cost applies to every group (plain GDPO). Set to 1 to
+# apply the cost component only within fully-correct groups.
+export POLAR_GDPO_COST_GATE_ALL_CORRECT="${POLAR_GDPO_COST_GATE_ALL_CORRECT:-0}"
+
+# Post-rollout group selection: drop/subsample groups before training. Each only
+# shrinks the batch (no backfill); an emptied batch keeps the original for that
+# step. 0 = off.
+#   D: drop groups whose trajectories are all wrong.
+export POLAR_DROP_ALL_WRONG_GROUPS="${POLAR_DROP_ALL_WRONG_GROUPS:-0}"
+#   B: drop groups that never realized an escalate/deescalate (needs routing
+#      actions stamped, i.e. the controller_v3 harness).
+export POLAR_DROP_ALL_KEEP_GROUPS="${POLAR_DROP_ALL_KEEP_GROUPS:-0}"
+#   C: downsample fully-correct groups to the mixed-group count so the cost
+#      signal does not dominate accuracy.
+export POLAR_BALANCE_ALL_CORRECT_GROUPS="${POLAR_BALANCE_ALL_CORRECT_GROUPS:-0}"
 export POLAR_MAX_INIT_WORKERS="${POLAR_MAX_INIT_WORKERS:-96}"
 export POLAR_MAX_RUN_WORKERS="${POLAR_MAX_RUN_WORKERS:-258}"
 export POLAR_MAX_POSTRUN_WORKERS="${POLAR_MAX_POSTRUN_WORKERS:-96}"
