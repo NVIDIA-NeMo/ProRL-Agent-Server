@@ -254,7 +254,12 @@ def _install_capability_guards(
     pool_capability: str,
     responses_client: Any | None = None,
 ) -> None:
-    from minisweagent.exceptions import FormatError
+    try:
+        from minisweagent.exceptions import FormatError
+    except ImportError:  # pragma: no cover - always present in the sealed runtime
+
+        class FormatError(Exception):  # type: ignore[no-redef]
+            """Stand-in so the guards import outside the runtime; never raised there."""
 
     large_usage = agent.usage["large"]
     for key in (
