@@ -13,6 +13,9 @@ class _Tokenizer:
         assert add_special_tokens is False
         return [ord(char) for char in text]
 
+    def decode(self, ids: list[int]) -> str:
+        return "".join(chr(token_id) for token_id in ids)
+
     def apply_chat_template(
         self,
         messages: list[dict[str, str]],
@@ -271,6 +274,56 @@ async def test_router_policy_reconstruction_fails_closed_on_length_mismatch(
     trajectory = await RouterPolicyBuilder(
         tokenizer_name_or_path="/model",
     ).build(CompletionSession(session_id="session-5", completions=[completion]))
+
+    assert trajectory.traces[0].response_ids == []
+    assert trajectory.traces[0].loss_mask == []
+
+
+@pytest.mark.asyncio
+async def test_router_policy_reconstruction_fails_closed_on_segmentation_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The sampled split is "12" + "3", but "123" re-encodes to the canonical
+    # "1" + "23": equal token count, ids that were never sampled. Decoding them
+    # back does not reproduce the original token strings, so reconstruction must
+    # be abandoned rather than mis-pair ids with the sampled logprobs.
+    class NonCanonicalTokenizer(_Tokenizer):
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            assert add_special_tokens is False
+            return [1, 23]
+
+        def decode(self, ids: list[int]) -> str:
+            table = {1: "1", 23: "23"}
+            return "".join(table[token_id] for token_id in ids)
+
+    monkeypatch.setattr(
+        "polar.trajectory.builder.prefix_merging._load_tokenizer",
+        lambda *_args, **_kwargs: NonCanonicalTokenizer(),
+    )
+    completion = CompletionRecord(
+        completion_id="router",
+        request={"messages": [{"role": "user", "content": "route"}]},
+        response={
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "123"},
+                    "finish_reason": "length",
+                    "logprobs": {
+                        "content": [
+                            {"token": "12", "logprob": -0.1},
+                            {"token": "3", "logprob": -0.2},
+                        ]
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        },
+        metadata={"completion_role": "router_policy"},
+    )
+
+    trajectory = await RouterPolicyBuilder(
+        tokenizer_name_or_path="/model",
+    ).build(CompletionSession(session_id="session-6", completions=[completion]))
 
     assert trajectory.traces[0].response_ids == []
     assert trajectory.traces[0].loss_mask == []

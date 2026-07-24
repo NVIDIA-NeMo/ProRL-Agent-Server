@@ -145,6 +145,19 @@ def _reconstruct_response_tokens(
     expected = _usage_token_count(response, "completion_tokens")
     if expected is not None and expected != len(token_ids):
         return None
+    # Equal counts do not imply the re-encoding reproduced the sampled
+    # segmentation: a non-canonical sampled split (["12", "3"] vs ["1", "23"])
+    # or a U+FFFD-mangled multibyte token can re-encode to a different id
+    # sequence of coincidentally equal length. Those ids were never sampled, so
+    # pairing them with the sampled per-token logprobs would corrupt the
+    # importance ratio. Require each id to decode back to its original token
+    # string, and abandon reconstruction otherwise.
+    try:
+        decoded = [tokenizer.decode([token_id]) for token_id in token_ids]
+    except Exception:
+        return None
+    if decoded != pieces:
+        return None
     return token_ids, token_logprobs
 
 
