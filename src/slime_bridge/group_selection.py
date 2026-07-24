@@ -1,15 +1,16 @@
 """Post-rollout prompt-group selection for the Polar controller training batch.
 
 Applied once, after a rollout step has assembled its groups and before they
-become training data, so dropped groups never reach the reference or policy
-forward. Every stage only shrinks the batch (no backfill); if the whole batch
-would be emptied the original is kept for that step so the training loop, which
-cannot consume an empty batch, is never handed one.
+become training data. An excluded group is not dropped but kept in the batch
+and fully masked (``remove_sample``), so training draws no gradient from it
+while the batch size is preserved: a shorter batch trips slime dp_schedule's
+``num_steps >= 1`` assertion and kills the run. If every group would be
+excluded the whole batch is left trainable for that step.
 
 Stages, in order (each gated by a default-off arg):
-  D  ``polar_drop_all_wrong_groups``      drop groups whose trajectories are all wrong
-  B  ``polar_drop_all_keep_groups``       drop groups that never realized a switch
-  C  ``polar_balance_all_correct_groups`` downsample fully-correct groups to the
+  D  ``polar_drop_all_wrong_groups``      mask groups whose trajectories are all wrong
+  B  ``polar_drop_all_keep_groups``       mask groups that never realized a switch
+  C  ``polar_balance_all_correct_groups`` mask surplus fully-correct groups down to the
                                           number of mixed groups
 """
 
@@ -77,7 +78,13 @@ def select_training_groups(
     *,
     rollout_id: Any = None,
 ) -> tuple[list[list[Any]], dict[str, float]]:
-    """Apply the D -> B -> C group selection; never return an empty batch."""
+    """Apply D -> B -> C group selection by masking, never shrinking the batch.
+
+    Excluded groups stay in the returned batch but are fully masked
+    (``remove_sample``) so training draws no gradient from them; dropping them
+    would shorten the batch and trip dp_schedule's ``num_steps >= 1`` assertion.
+    A fully-excluded batch is left entirely trainable.
+    """
     drop_all_wrong = bool(getattr(args, "polar_drop_all_wrong_groups", False))
     drop_all_keep = bool(getattr(args, "polar_drop_all_keep_groups", False))
     balance_all_correct = bool(getattr(args, "polar_balance_all_correct_groups", False))
@@ -90,25 +97,25 @@ def select_training_groups(
     metrics["polar/group_selection/mixed_before"] = float(classes.count("mixed"))
     metrics["polar/group_selection/all_wrong_before"] = float(classes.count("all_wrong"))
 
-    kept = list(zip(groups, classes))
+    kept = list(range(len(groups)))
 
-    # D: drop all-wrong groups.
+    # D: exclude all-wrong groups.
     if drop_all_wrong:
         before = len(kept)
-        kept = [(group, cls) for group, cls in kept if cls != "all_wrong"]
+        kept = [i for i in kept if classes[i] != "all_wrong"]
         metrics["polar/group_selection/dropped_all_wrong"] = float(before - len(kept))
 
-    # B: drop groups that never realized an escalate/deescalate.
+    # B: exclude groups that never realized an escalate/deescalate.
     if drop_all_keep:
         before = len(kept)
-        kept = [(group, cls) for group, cls in kept if _group_realized_a_switch(group)]
+        kept = [i for i in kept if _group_realized_a_switch(groups[i])]
         metrics["polar/group_selection/dropped_all_keep"] = float(before - len(kept))
 
     # C: downsample fully-correct groups to the mixed-group count.
     if balance_all_correct:
-        mixed = [(group, cls) for group, cls in kept if cls == "mixed"]
-        all_correct = [(group, cls) for group, cls in kept if cls == "all_correct"]
-        other = [(group, cls) for group, cls in kept if cls not in ("mixed", "all_correct")]
+        mixed = [i for i in kept if classes[i] == "mixed"]
+        all_correct = [i for i in kept if classes[i] == "all_correct"]
+        other = [i for i in kept if classes[i] not in ("mixed", "all_correct")]
         if len(all_correct) > len(mixed):
             seed = rollout_id if isinstance(rollout_id, int) else None
             all_correct = random.Random(seed).sample(all_correct, len(mixed))
@@ -117,13 +124,29 @@ def select_training_groups(
         )
         kept = mixed + all_correct + other
 
-    selected = [group for group, _cls in kept]
-    if not selected and groups:
-        # The training loop cannot consume an empty batch; keep the original for
-        # this step. Under GDPO with the cost gate an all-wrong/all-keep batch
-        # yields near-zero advantage anyway, so this is close to a no-op.
+    kept_set = set(kept)
+    if not kept_set:
+        # Nothing survived; a fully-masked batch has no training signal, so keep
+        # every group trainable for this step (the historical fallback).
         metrics["polar/group_selection/empty_fallback"] = 1.0
         return groups, metrics
 
-    metrics["polar/group_selection/kept"] = float(len(selected))
-    return selected, metrics
+    excluded = [i for i in range(len(groups)) if i not in kept_set]
+    for index in excluded:
+        _mask_group(groups[index])
+
+    metrics["polar/group_selection/kept"] = float(len(kept_set))
+    metrics["polar/group_selection/masked"] = float(len(excluded))
+    return groups, metrics
+
+
+def _mask_group(group: list[Any]) -> None:
+    """Keep a group scheduled in the batch but contribute no gradient from it.
+
+    slime zeroes a ``remove_sample`` sample's loss mask (leaving it scheduled as
+    a placeholder that does not dilute the loss denominator), and the reward
+    post-processor already gives such samples a zero advantage and drops them
+    from group statistics.
+    """
+    for sample in group:
+        sample.remove_sample = True
