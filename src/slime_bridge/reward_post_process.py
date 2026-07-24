@@ -695,6 +695,30 @@ def _apply_controller_invalid_turn_penalty(
             rewards[index] += weight * centered_signal * turn_equal_scale
 
 
+def _coerces_to_int(value: Any) -> bool:
+    """Match the engine's pydantic lax int coercion for an evidence id.
+
+    ``ControllerV3Decision.evidence_event_ids`` is ``list[int]`` parsed by
+    pydantic v2 in lax mode, which accepts an int, an integer-valued float, or a
+    numeric integer string (12, 12.0, "12") and rejects bools. The invalid-turn
+    penalty must not flag a decision the engine validated and executed as
+    malformed, so mirror that acceptance here instead of requiring ``int``.
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value) and value.is_integer()
+    if isinstance(value, str):
+        try:
+            int(value.strip())
+        except ValueError:
+            return False
+        return True
+    return False
+
+
 def _controller_turn_is_valid(sample: Any) -> bool:
     """True if the controller response parses into a legal routing decision."""
     text = getattr(sample, "response", None)
@@ -715,7 +739,7 @@ def _controller_turn_is_valid(sample: Any) -> bool:
         and decision.get("state_confidence") in _CONTROLLER_CONFIDENCES
         and isinstance(evidence, list)
         and 1 <= len(evidence) <= 2
-        and all(isinstance(item, int) and not isinstance(item, bool) for item in evidence)
+        and all(_coerces_to_int(item) for item in evidence)
     )
 
 
