@@ -2234,17 +2234,23 @@ printf '%s\n' \
         env=env.copy(),
         check=False,
     )
+    # The dataset-asset check sits AFTER the admission block, so in this
+    # hermetic env it doubles as a progress marker: present means the
+    # admission guards were reached and cleared; absent means validation
+    # short-circuited inside (or before) the admission block.
+    past_admission_marker = "TMAX_EXCLUDE_DATA is missing or empty"
+
     assert rejected.returncode != 0
     assert (
         "canonical SPilot admission requires PARTITION=backfill" in rejected.stderr
     )
+    assert past_admission_marker not in rejected.stderr
 
-    # Both real launch shapes must clear every admission guard (sourcing
-    # still stops later at the dataset-asset checks in this hermetic env,
-    # which itself proves the admission block was passed): the campaign
-    # lanes keep the batch/4h defaults with episode admission disabled, and
-    # the durable canonical admission runs override to backfill with a
-    # checkpoint-reserve buffer and matching wall time.
+    # Both real launch shapes must clear every admission guard AND provably
+    # reach the post-admission asset checks: the campaign lanes keep the
+    # batch/4h defaults with episode admission disabled, and the durable
+    # canonical admission runs override to backfill with a checkpoint-reserve
+    # buffer and matching wall time.
     admission_guards = (
         "canonical SPilot admission requires PARTITION=backfill",
         "SPilot admission timeout formula requires",
@@ -2260,6 +2266,7 @@ printf '%s\n' \
         env=campaign_env,
         check=False,
     )
+    assert past_admission_marker in campaign.stderr, campaign.stderr
     for guard in admission_guards:
         assert guard not in campaign.stderr, campaign.stderr
 
@@ -2277,6 +2284,7 @@ printf '%s\n' \
         env=durable_env,
         check=False,
     )
+    assert past_admission_marker in durable.stderr, durable.stderr
     for guard in admission_guards:
         assert guard not in durable.stderr, durable.stderr
 
