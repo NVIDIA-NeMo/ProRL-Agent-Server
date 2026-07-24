@@ -26,8 +26,35 @@ from slime_bridge.reward_post_process import (
 )
 
 
+def _outcome_accuracy(sample: Any, args: Any) -> float:
+    """Raw task accuracy for a trajectory, before any cost/latency shaping.
+
+    In a spilot cost/latency-penalty lane the shaped ``score`` returned by
+    ``get_reward_value`` is the accuracy minus the penalty, so a solved-but-
+    penalized trajectory reads below 1.0 and would be misclassified as wrong.
+    The unpenalized outcome is preserved as ``harbor_outcome_reward`` in the
+    evaluation metadata; prefer it so group classification tracks correctness,
+    not cost. Lanes that never shape the score (controller_v3) do not set the
+    field, so fall back to the reward value.
+    """
+    metadata = getattr(sample, "metadata", None)
+    polar = metadata.get("polar") if isinstance(metadata, dict) else None
+    trajectory_metadata = polar.get("trajectory_metadata") if isinstance(polar, dict) else None
+    evaluation = (
+        trajectory_metadata.get("evaluation") if isinstance(trajectory_metadata, dict) else None
+    )
+    if isinstance(evaluation, dict):
+        raw = evaluation.get("harbor_outcome_reward")
+        if raw is not None and not isinstance(raw, bool):
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                pass
+    return float(sample.get_reward_value(args))
+
+
 def _trajectory_accuracies(group: list[Any], args: Any) -> list[float]:
-    """One accuracy per trainable trajectory (traces of a trajectory share it)."""
+    """One outcome accuracy per trainable trajectory (its traces share it)."""
     accuracy_by_trajectory: dict[Any, float] = {}
     for position, sample in enumerate(group):
         if not _has_trainable_tokens(sample):
@@ -36,7 +63,7 @@ def _trajectory_accuracies(group: list[Any], args: Any) -> list[float]:
         if key in accuracy_by_trajectory:
             continue
         try:
-            accuracy_by_trajectory[key] = float(sample.get_reward_value(args))
+            accuracy_by_trajectory[key] = _outcome_accuracy(sample, args)
         except (TypeError, ValueError):
             continue
     return list(accuracy_by_trajectory.values())
