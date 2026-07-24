@@ -441,7 +441,7 @@ def test_runtime_prepare_retries_configured_transient_exec_failure(tmp_path) -> 
 
 
 @pytest.mark.asyncio
-async def test_timeout_before_postprocess_does_not_create_coroutine(tmp_path: Path) -> None:
+async def test_session_timeout_during_exec_harvests_cost_via_postprocess(tmp_path: Path) -> None:
     manager = object.__new__(GatewayNodeManager)
     manager._start_eval_prewarm = lambda _managed: None  # type: ignore[method-assign]
     manager._runtime_env = lambda *_args, **_kwargs: {}  # type: ignore[method-assign]
@@ -449,7 +449,7 @@ async def test_timeout_before_postprocess_does_not_create_coroutine(tmp_path: Pa
     async def setup(_runtime: BaseRuntime) -> None:
         pass
 
-    postprocess = Mock()
+    postprocess = AsyncMock()
     harness = SimpleNamespace(
         setup=setup,
         run_steps=Mock(return_value=[]),
@@ -485,8 +485,10 @@ async def test_timeout_before_postprocess_does_not_create_coroutine(tmp_path: Pa
 
     await manager._handle_run(managed)
 
-    postprocess.assert_not_called()
+    # The exec-stage timeout handler re-runs postprocess (properly awaited, no
+    # stray coroutine) to harvest the partial cost the agent already persisted.
     assert managed.agent_result is not None
+    postprocess.assert_awaited_once_with(managed.runtime, managed.agent_result)
     assert managed.agent_result.status == "timeout"
     assert managed.agent_result.metadata["timeout_source"] == "session"
     assert managed.agent_result.metadata["timeout_stage"] == "exec"
@@ -495,7 +497,7 @@ async def test_timeout_before_postprocess_does_not_create_coroutine(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_agent_budget_exhausted_before_postprocess_remains_exec_timeout(
+async def test_agent_budget_exhausted_harvests_cost_and_remains_exec_timeout(
     tmp_path: Path,
 ) -> None:
     manager = object.__new__(GatewayNodeManager)
@@ -505,7 +507,7 @@ async def test_agent_budget_exhausted_before_postprocess_remains_exec_timeout(
     async def setup(_runtime: BaseRuntime) -> None:
         pass
 
-    postprocess = Mock()
+    postprocess = AsyncMock()
     harness = SimpleNamespace(
         setup=setup,
         run_steps=Mock(return_value=[]),
@@ -542,8 +544,11 @@ async def test_agent_budget_exhausted_before_postprocess_remains_exec_timeout(
 
     await manager._handle_run(managed)
 
-    postprocess.assert_not_called()
+    # The agent-budget timeout is the trainable-negative case: postprocess is
+    # re-run (awaited) to harvest the partial GPT cost, and the result must
+    # still read as an exec-stage agent timeout afterwards.
     assert managed.agent_result is not None
+    postprocess.assert_awaited_once_with(managed.runtime, managed.agent_result)
     assert managed.agent_result.status == "timeout"
     assert managed.agent_result.error == "agent execution timeout"
     assert managed.agent_result.metadata["timeout_source"] == "agent"
