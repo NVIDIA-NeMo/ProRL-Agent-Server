@@ -2224,6 +2224,62 @@ printf '%s\n' \
         "batch|04:00:00|04:00:00|1800|1800|5",
     ]
 
+    # The batch/4h defaults are NOT launchable with durable canonical
+    # admission as-is: the timeout formula needs >= 2*REQUEST + 3600 seconds
+    # of wall time, which batch's four-hour cap can never fit. The launcher
+    # must keep refusing that combination loudly.
+    rejected = run_bash(
+        f"source {SPILOT / 'experiment_defaults.sh'}; "
+        f"source {TMAX / 'env.cwdfw.sh'}",
+        env=env.copy(),
+        check=False,
+    )
+    assert rejected.returncode != 0
+    assert (
+        "canonical SPilot admission requires PARTITION=backfill" in rejected.stderr
+    )
+
+    # Both real launch shapes must clear every admission guard (sourcing
+    # still stops later at the dataset-asset checks in this hermetic env,
+    # which itself proves the admission block was passed): the campaign
+    # lanes keep the batch/4h defaults with episode admission disabled, and
+    # the durable canonical admission runs override to backfill with a
+    # checkpoint-reserve buffer and matching wall time.
+    admission_guards = (
+        "canonical SPilot admission requires PARTITION=backfill",
+        "SPilot admission timeout formula requires",
+        "SPilot TMAX_GRACEFUL_EXIT_BUFFER_SECONDS must cover",
+        "SPilot WALL_TIME must cover",
+    )
+
+    campaign_env = env.copy()
+    campaign_env["SPILOT_EPISODE_ADMISSION_ENABLED"] = "false"
+    campaign = run_bash(
+        f"source {SPILOT / 'experiment_defaults.sh'}; "
+        f"source {TMAX / 'env.cwdfw.sh'}",
+        env=campaign_env,
+        check=False,
+    )
+    for guard in admission_guards:
+        assert guard not in campaign.stderr, campaign.stderr
+
+    durable_env = env.copy()
+    durable_env.update(
+        PARTITION="backfill",
+        WALL_TIME="2-00:00:00",
+        TMAX_MIN_WALL_TIME="2-00:00:00",
+        TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="43200",
+        TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS="43200",
+    )
+    durable = run_bash(
+        f"source {SPILOT / 'experiment_defaults.sh'}; "
+        f"source {TMAX / 'env.cwdfw.sh'}",
+        env=durable_env,
+        check=False,
+    )
+    for guard in admission_guards:
+        assert guard not in durable.stderr, durable.stderr
+
 
 def test_spilot_defaults_reject_nondivisible_aggregate_episode_cap(
     tmp_path: Path,
