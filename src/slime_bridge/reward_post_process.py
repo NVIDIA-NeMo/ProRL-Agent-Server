@@ -165,12 +165,14 @@ def _post_process_gdpo(
 
     components_by_sample: list[tuple[float, ...]] = []
     for sample in samples:
-        if (
-            _is_failed_trajectory(sample)
-            or bool(getattr(sample, "remove_sample", False))
-            or _is_trainable_negative(sample)
-        ):
+        if _is_failed_trajectory(sample) or bool(getattr(sample, "remove_sample", False)):
             components_by_sample.append((0.0, 0.0))
+        elif _is_trainable_negative(sample):
+            # Fail closed on the outcome, but keep the real cost the sample
+            # incurred so a cheap-looking zero never rewards the failure.
+            components_by_sample.append(
+                _trainable_negative_components(sample, reward_keys)
+            )
         else:
             components_by_sample.append(
                 tuple(
@@ -238,11 +240,19 @@ def _post_process_gdpo(
         for key in valid_keys:
             for sample_index in traj_sample_indices[key]:
                 components = components_by_sample[sample_index]
+                # A component whose trajectory means are all equal has zero
+                # within-group variance, hence no preference signal. Skip it
+                # (contribute zero) rather than dividing a per-trace deviation
+                # by ``epsilon`` and manufacturing a ~1e4 advantage, matching
+                # the degenerate-group handling in DVAO and ``_group_scale``.
+                # A single-trajectory group makes every component degenerate,
+                # so its pre-batch advantage is zero.
                 pre_batch_advantages[sample_index] = sum(
                     (value - component_means[component_index])
                     / (component_stds[component_index] + epsilon)
                     for component_index, value in enumerate(components)
-                    if component_index == 0 or not drop_cost
+                    if (component_index == 0 or not drop_cost)
+                    and component_stds[component_index] > 0.0
                 )
 
     trajectory_advantages = [
@@ -295,12 +305,14 @@ def _post_process_dvao(
 
     components_by_sample: list[tuple[float, ...]] = []
     for sample in samples:
-        if (
-            _is_failed_trajectory(sample)
-            or bool(getattr(sample, "remove_sample", False))
-            or _is_trainable_negative(sample)
-        ):
+        if _is_failed_trajectory(sample) or bool(getattr(sample, "remove_sample", False)):
             components_by_sample.append((0.0, 0.0))
+        elif _is_trainable_negative(sample):
+            # Fail closed on the outcome, but keep the real cost the sample
+            # incurred so a cheap-looking zero never rewards the failure.
+            components_by_sample.append(
+                _trainable_negative_components(sample, reward_keys)
+            )
         else:
             components_by_sample.append(
                 tuple(
@@ -480,6 +492,56 @@ def _is_trainable_negative(sample: Any) -> bool:
         training_filter.get("reason") in {"agent_timeout", "parser_invalid_tool_call"}
         and training_filter.get("trainable") is True
         and training_filter.get("masked") is not True
+    )
+
+
+def _original_reward_components(sample: Any) -> dict[str, Any]:
+    """Real reward components a sample earned before it was zero-rewarded.
+
+    ``zero_reward_parser_invalid_tool_call_trace`` / the aligned agent-timeout
+    filter blank a sample's effective reward but stash the pre-zeroing values
+    under ``training_filter.original_reward_components``. Returns ``{}`` when
+    nothing was preserved.
+    """
+    metadata = getattr(sample, "metadata", None)
+    polar = metadata.get("polar") if isinstance(metadata, dict) else None
+    training_filter = polar.get("training_filter") if isinstance(polar, dict) else None
+    originals = (
+        training_filter.get("original_reward_components")
+        if isinstance(training_filter, dict)
+        else None
+    )
+    return originals if isinstance(originals, dict) else {}
+
+
+def _finite_component_or_zero(value: Any) -> float:
+    if isinstance(value, bool) or value is None:
+        return 0.0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
+
+
+def _trainable_negative_components(
+    sample: Any,
+    reward_keys: tuple[str, ...],
+) -> tuple[float, ...]:
+    """Fail-closed components for an aligned parser-invalid / agent-timeout sample.
+
+    The outcome key (first reward key) is forced to zero so centered group
+    advantages push the malformed/timed-out action's probability down. Every
+    other component keeps the REAL value the sample earned, recovered from
+    ``training_filter.original_reward_components``. Zeroing them too is wrong for
+    a cost objective: ``negative_cost`` of 0 is the cheapest (best) value in the
+    group, so a fail-closed zero rewards the failure for being cheap. Missing
+    originals fall back to zero, which is no worse than the prior behavior.
+    """
+    originals = _original_reward_components(sample)
+    return tuple(
+        0.0 if index == 0 else _finite_component_or_zero(originals.get(reward_key))
+        for index, reward_key in enumerate(reward_keys)
     )
 
 
