@@ -707,6 +707,7 @@ for name in (
     "POLAR_MAX_INIT_WORKERS",
     "POLAR_MAX_RUN_WORKERS",
     "POLAR_MAX_POSTRUN_WORKERS",
+    "POLAR_MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES",
     "POLAR_GATEWAY_MAX_INIT_WORKERS",
     "POLAR_GATEWAY_MAX_RUN_WORKERS",
     "POLAR_GATEWAY_MAX_POSTRUN_WORKERS",
@@ -720,11 +721,15 @@ for name in (
     "SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES",
     "SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY",
     "SPILOT_GPT_GATEWAY_MAX_CONCURRENCY",
+    "CONTROLLER_V3_SMALL_ROUTER_BASE_URL",
+    "CONTROLLER_V3_QWEN_GATEWAY_MAX_CONCURRENCY",
+    "CONTROLLER_V3_GPT_GATEWAY_MAX_CONCURRENCY",
     "POLAR_COMPLETION_BATCH_SIZE",
     "POLAR_COMPLETION_WRITE_MAX_ATTEMPTS",
     "POLAR_COMPLETION_RETRY_BACKOFF_SECONDS",
     "POLAR_AGENT_HARNESS",
     "POLAR_AGENT_MODEL_NAME",
+    "HF_CHECKPOINT",
     "POLAR_AGENT_PATH",
     "POLAR_AGENT_RUNTIME_VOLUME",
     "POLAR_AGENT_STEP_LIMIT",
@@ -1496,6 +1501,75 @@ case "${GRPO_STD_NORMALIZATION:-1}" in
         exit 1
         ;;
 esac
+DVAO_REWARD_ARGS=()
+if [ -n "${DVAO_REWARD_KEY_1:-}" ] || [ -n "${DVAO_REWARD_KEY_2:-}" ]; then
+    if [ -z "${DVAO_REWARD_KEY_1:-}" ] || [ -z "${DVAO_REWARD_KEY_2:-}" ]; then
+        echo "ERROR: DVAO_REWARD_KEY_1 and DVAO_REWARD_KEY_2 must be set together" >&2
+        exit 1
+    fi
+    if [ "${DVAO_REWARD_KEY_1}" = "${DVAO_REWARD_KEY_2}" ]; then
+        echo "ERROR: DVAO reward keys must be distinct" >&2
+        exit 1
+    fi
+    DVAO_REWARD_ARGS=(
+        --dvao-reward-keys
+        "${DVAO_REWARD_KEY_1}"
+        "${DVAO_REWARD_KEY_2}"
+    )
+    echo "Using DVAO rewards: ${DVAO_REWARD_KEY_1}, ${DVAO_REWARD_KEY_2}"
+fi
+GDPO_REWARD_ARGS=()
+if [ -n "${GDPO_REWARD_KEY_1:-}" ] || [ -n "${GDPO_REWARD_KEY_2:-}" ]; then
+    if [ -z "${GDPO_REWARD_KEY_1:-}" ] || [ -z "${GDPO_REWARD_KEY_2:-}" ]; then
+        echo "ERROR: GDPO_REWARD_KEY_1 and GDPO_REWARD_KEY_2 must be set together" >&2
+        exit 1
+    fi
+    if [ "${GDPO_REWARD_KEY_1}" = "${GDPO_REWARD_KEY_2}" ]; then
+        echo "ERROR: GDPO reward keys must be distinct" >&2
+        exit 1
+    fi
+    GDPO_REWARD_ARGS=(
+        --gdpo-reward-keys
+        "${GDPO_REWARD_KEY_1}"
+        "${GDPO_REWARD_KEY_2}"
+    )
+    echo "Using GDPO rewards: ${GDPO_REWARD_KEY_1}, ${GDPO_REWARD_KEY_2}"
+fi
+if [ "${#DVAO_REWARD_ARGS[@]}" -ne 0 ] && [ "${#GDPO_REWARD_ARGS[@]}" -ne 0 ]; then
+    echo "ERROR: DVAO and GDPO reward modes are mutually exclusive" >&2
+    exit 1
+fi
+POLAR_CONTROLLER_ARGS=()
+if [ -n "${POLAR_CONTROLLER_INVALID_TURN_PENALTY:-}" ]; then
+    POLAR_CONTROLLER_ARGS+=(
+        --polar-controller-invalid-turn-penalty
+        "${POLAR_CONTROLLER_INVALID_TURN_PENALTY}"
+    )
+    echo "Using controller invalid-turn penalty: ${POLAR_CONTROLLER_INVALID_TURN_PENALTY}"
+fi
+if [ -n "${POLAR_CONTROLLER_CREDIT_MODE:-}" ]; then
+    POLAR_CONTROLLER_ARGS+=(
+        --polar-controller-credit-mode
+        "${POLAR_CONTROLLER_CREDIT_MODE}"
+    )
+    echo "Using controller credit mode: ${POLAR_CONTROLLER_CREDIT_MODE}"
+fi
+if [ "${POLAR_GDPO_COST_GATE_ALL_CORRECT:-}" = "1" ]; then
+    POLAR_CONTROLLER_ARGS+=(--polar-gdpo-cost-gate-all-correct)
+    echo "Using GDPO cost gate: cost applies only to fully-correct groups"
+fi
+if [ "${POLAR_DROP_ALL_WRONG_GROUPS:-}" = "1" ]; then
+    POLAR_CONTROLLER_ARGS+=(--polar-drop-all-wrong-groups)
+    echo "Group selection: dropping all-wrong groups"
+fi
+if [ "${POLAR_DROP_ALL_KEEP_GROUPS:-}" = "1" ]; then
+    POLAR_CONTROLLER_ARGS+=(--polar-drop-all-keep-groups)
+    echo "Group selection: dropping groups with no realized escalate/deescalate"
+fi
+if [ "${POLAR_BALANCE_ALL_CORRECT_GROUPS:-}" = "1" ]; then
+    POLAR_CONTROLLER_ARGS+=(--polar-balance-all-correct-groups)
+    echo "Group selection: downsampling all-correct groups to mixed count"
+fi
 OPTIMIZER_MEMORY_ARGS=()
 case "${TMAX_OPTIMIZER_CPU_OFFLOAD:-0}" in
     0) ;;
@@ -1745,6 +1819,19 @@ if [ -z "$RAY_NUM_GPUS_PER_NODE" ]; then
         RAY_NUM_GPUS_PER_NODE=$((ACTOR_NUM_GPUS_PER_NODE + ROLLOUT_NUM_GPUS))
     fi
 fi
+RAY_TOTAL_GPUS="$((RAY_NUM_NODES * RAY_NUM_GPUS_PER_NODE))"
+if [ -n "${RAY_LAST_NODE_NUM_GPUS:-}" ]; then
+    if ! [[ "${RAY_LAST_NODE_NUM_GPUS}" =~ ^[1-9][0-9]*$ ]] || \
+       [ "${RAY_LAST_NODE_NUM_GPUS}" -gt "${RAY_NUM_GPUS_PER_NODE}" ] || \
+       [ "${RAY_NUM_NODES}" -lt 2 ]; then
+        echo "ERROR: RAY_LAST_NODE_NUM_GPUS must be positive, no larger than RAY_NUM_GPUS_PER_NODE, and used with at least two nodes" >&2
+        exit 1
+    fi
+    RAY_TOTAL_GPUS="$(((RAY_NUM_NODES - 1) * RAY_NUM_GPUS_PER_NODE + RAY_LAST_NODE_NUM_GPUS))"
+    if [ "${RAY_NODE_RANK}" = "$((RAY_NUM_NODES - 1))" ]; then
+        RAY_NUM_GPUS_PER_NODE="${RAY_LAST_NODE_NUM_GPUS}"
+    fi
+fi
 
 echo "=== Ray node rank ${RAY_NODE_RANK}/${RAY_NUM_NODES} head=${RAY_HEAD_IP} local=${RAY_NODE_IP} gpus/node=${RAY_NUM_GPUS_PER_NODE} ==="
 RAY_READY_DIR="${RUN_DIR}/startup/ray-${SLURM_JOB_ID:-manual}"
@@ -1822,7 +1909,7 @@ if [ "${RAY_NODE_RANK}" = "0" ]; then
     fi
     ray status || true
     wait_ray_dashboard
-    "${PYTHON_BIN}" - "${RAY_NUM_NODES}" "$((RAY_NUM_NODES * RAY_NUM_GPUS_PER_NODE))" <<'PY'
+    "${PYTHON_BIN}" - "${RAY_NUM_NODES}" "${RAY_TOTAL_GPUS}" <<'PY'
 import sys
 import time
 
@@ -1852,7 +1939,7 @@ PY
     # register with it and retain their node-local sandbox/UDS lifecycle.
     export SLIME_ROLLOUT_SERVICE_START_UNIX_NS="$(date +%s%N)"
     echo "=== Starting Polar rollout server (${POLAR_ROLLOUT_URL}) ==="
-    polar serve_rollout -c "${TOPOLOGY_PATH}" &
+    "${PYTHON_BIN}" -m polar.cli serve_rollout -c "${TOPOLOGY_PATH}" &
     POLAR_ROLLOUT_PID=$!
     PIDS+=("${POLAR_ROLLOUT_PID}")
     wait_http_ok "Polar rollout server" "${POLAR_ROLLOUT_LOCAL_URL}/health" 60
@@ -2100,6 +2187,9 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     --metadata-key metadata \
     --rollout-shuffle \
     --reward-key score \
+    "${DVAO_REWARD_ARGS[@]}" \
+    "${GDPO_REWARD_ARGS[@]}" \
+    "${POLAR_CONTROLLER_ARGS[@]}" \
     "${TRAIN_LENGTH_ARGS[@]}" \
     --rollout-batch-size "$ROLLOUT_BATCH_SIZE" \
     --n-samples-per-prompt "$N_SAMPLES_PER_PROMPT" \
@@ -2116,7 +2206,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     "${SEQUENCE_PARALLEL_ARGS[@]}" \
     --pipeline-model-parallel-size 1 \
     --context-parallel-size "$CONTEXT_PARALLEL_SIZE" \
-    --expert-model-parallel-size 1 \
+    --expert-model-parallel-size "${EXPERT_MODEL_PARALLEL_SIZE:-1}" \
     --expert-tensor-parallel-size 1 \
     --recompute-granularity full \
     --recompute-method uniform \

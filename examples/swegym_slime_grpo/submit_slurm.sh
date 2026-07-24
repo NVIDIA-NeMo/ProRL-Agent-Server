@@ -138,9 +138,10 @@ umask 077
     while IFS= read -r name; do
         case "$name" in
             POLAR_*|POLR_*|TMAX_*|MINI_SWE_*|WANDB_*|HF_*|HUGGINGFACE_*|\
+            APPTAINER_ENV|\
             SPILOT_*|\
-            ACTOR_*|ROLLOUT_*|RAY_NUM_*|GPU_MONITOR_*|SGLANG_*|FLASHINFER_*|\
-            APPTAINER_IMAGE_DIR|AGENT_CLI_DIR|TRAIN_CONTAINER_MOUNTS|\
+            ACTOR_*|EXPERT_*|ROLLOUT_*|RAY_NUM_*|RAY_LAST_NODE_NUM_GPUS|GPU_MONITOR_*|SGLANG_*|FLASHINFER_*|\
+            APPTAINER_IMAGE_DIR|AGENT_CLI_DIR|TRAIN_CONTAINER_MOUNTS|TOPOLOGY_TEMPLATE|CONTROLLER_V3_*|\
             SLIME_DIR|SLIME_ROLLOUT_BASE_PORT|SLIME_ROLLOUT_BASE_PORT_FALLBACK|\
             SLIME_EPHEMERAL_PORT_LOWER_BOUND|SLIME_IP_LOCAL_PORT_RANGE_PATH|\
             SLIME_GRACEFUL_EXIT_AT_UNIX_TIME|SLIME_PROFILE_CUDA_PHASES|\
@@ -151,7 +152,7 @@ umask 077
             SAVE_HF_ENABLED|SAVE_MEGATRON|SAVE_HF_TEMPLATE|SEQUENCE_PARALLEL|CONTEXT_PARALLEL_SIZE|\
             TRAIN_LR|KL_LOSS_COEF|POLICY_LOSS_TYPE|USE_TIS|GRPO_STD_NORMALIZATION|\
             DPPO_DIVERGENCE_TYPE|DPPO_DIVERGENCE_THRESHOLD|\
-            MAX_TRAIN_ROLLOUT_LOGPROB_ABS_DIFF|\
+            MAX_TRAIN_ROLLOUT_LOGPROB_ABS_DIFF|DVAO_*|GDPO_*|\
             CALCULATE_PER_TOKEN_LOSS|\
             DIST_CKPT_STRICTNESS|ATTENTION_BACKEND|\
             GLOBAL_BATCH_SIZE|EVAL_GLOBAL_BATCH_SIZE|EXPERIMENT_NAME|RUN_ID|\
@@ -176,13 +177,24 @@ printf -v ENTRY_Q '%q' "$CONTAINER_ENTRYPOINT"
 printf -v LOG_Q   '%q' "$LOG_DIR"
 SRUN_BIN="$(command -v srun)"
 printf -v SRUN_Q '%q' "$SRUN_BIN"
+BASH_BIN="$(command -v bash)"
+printf -v BASH_Q '%q' "$BASH_BIN"
+if [ "${POLAR_APPTAINER_JOB_SESSION_MOUNT:-0}" = "1" ]; then
+    APPTAINER_SESSIONDIR="${POLAR_APPTAINER_SESSIONDIR:?set POLAR_APPTAINER_SESSIONDIR}"
+    printf -v APPTAINER_SESSIONDIR_Q '%q' "${APPTAINER_SESSIONDIR}"
+    APPTAINER_SESSION_SETUP="APPTAINER_SESSION_HOST=/tmp/polar-apptainer-session-\${SLURM_JOB_ID}-\${SLURM_RESTART_COUNT:-0}-\${UID}; ${SRUN_Q} --overlap --nodes=${NUM_NODES} --ntasks=${NUM_NODES} --ntasks-per-node=1 --cpus-per-task=1 --cpu-bind=none ${BASH_Q} -c 'set -euo pipefail; root=\"\$1\"; if [ -e \"\${root}\" ] || [ -L \"\${root}\" ]; then echo \"ERROR: refusing existing Apptainer session root: \${root}\" >&2; exit 1; fi; install -d -m 700 -- \"\${root}\"' bash \"\${APPTAINER_SESSION_HOST}\"; MNT_Q_WITH_SESSION=${MNT_Q},\${APPTAINER_SESSION_HOST}:${APPTAINER_SESSIONDIR_Q}:rw"
+    MNT_ARG='${MNT_Q_WITH_SESSION}'
+else
+    APPTAINER_SESSION_SETUP=:
+    MNT_ARG="${MNT_Q}"
+fi
 CPUS_PER_TASK="${CPUS_PER_TASK:-128}"
 SLURM_STEP_CPUS_PER_TASK="${SLURM_STEP_CPUS_PER_TASK:-96}"
 # The job allocation already owns all requested CPU/GPU/memory TRES. Repeating
 # the entire 128-CPU allocation on an overlapping step makes the NVIDIA select
 # plugin reject step creation. Leave CPU headroom for the batch shell and let
 # the step inherit job-level GPU and memory TRES.
-WRAP_CMD="umask 077; chmod 600 ${LOG_Q}/\"\${SLURM_JOB_NAME}-\${SLURM_JOB_ID}.out\" ${LOG_Q}/\"\${SLURM_JOB_NAME}-\${SLURM_JOB_ID}.err\" 2>/dev/null || true; export SLIME_SLURM_BATCH_START_UNIX_NS=\$(date +%s%N); ${SRUN_Q} --overlap --nodes=${NUM_NODES} --ntasks=${NUM_NODES} --ntasks-per-node=1 --cpus-per-task=${SLURM_STEP_CPUS_PER_TASK} --cpu-bind=none --kill-on-bad-exit=1 --container-image=${SQSH_Q} --container-mounts=${MNT_Q} --container-workdir=${PR_Q} --container-writable --no-container-mount-home bash ${ENTRY_Q}"
+WRAP_CMD="set -euo pipefail; umask 077; chmod 600 ${LOG_Q}/\"\${SLURM_JOB_NAME}-\${SLURM_JOB_ID}.out\" ${LOG_Q}/\"\${SLURM_JOB_NAME}-\${SLURM_JOB_ID}.err\" 2>/dev/null || true; export SLIME_SLURM_BATCH_START_UNIX_NS=\$(date +%s%N); ${APPTAINER_SESSION_SETUP}; ${SRUN_Q} --overlap --nodes=${NUM_NODES} --ntasks=${NUM_NODES} --ntasks-per-node=1 --cpus-per-task=${SLURM_STEP_CPUS_PER_TASK} --cpu-bind=none --kill-on-bad-exit=1 --container-image=${SQSH_Q} --container-mounts=${MNT_ARG} --container-workdir=${PR_Q} --container-writable --no-container-mount-home bash ${ENTRY_Q}"
 
 SBATCH_CONSTRAINT_ARG=()
 if [ -n "${SLURM_CONSTRAINT}" ]; then

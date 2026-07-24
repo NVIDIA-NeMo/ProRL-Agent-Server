@@ -15,6 +15,7 @@ See ``polar/agent/README.md`` for the contract and a "bring your own" guide.
 
 from polar.agent.presets.claude_code import ClaudeCodeHarness
 from polar.agent.presets.codex import CodexHarness
+from polar.agent.presets.controller_v3 import ControllerV3Harness
 from polar.agent.presets.gemini_cli import GeminiCliHarness
 from polar.agent.presets.hermes import HermesHarness
 from polar.agent.presets.mini_swe_agent import MiniSweAgentHarness
@@ -29,6 +30,7 @@ from polar.agent.presets.spilot_router import SpilotRouterHarness
 __all__ = [
     "ClaudeCodeHarness",
     "CodexHarness",
+    "ControllerV3Harness",
     "GeminiCliHarness",
     "HermesHarness",
     "MiniSweAgentHarness",

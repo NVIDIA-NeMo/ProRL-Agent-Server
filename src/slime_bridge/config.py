@@ -27,6 +27,7 @@ class PolarSlimeConfig:
     max_async_level: int
     fully_async: bool
     max_off_policy_steps: int
+    max_consecutive_infrastructure_failures: int
     request_timeout: float | None
     task_timeout_floor: float | None
     train_agent_timeout: float | None
@@ -88,6 +89,28 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
     max_concurrency = rollout_batch_size * max_async_level
     max_session_concurrency = max_concurrency * group_size
     max_off_policy_steps = max_async_level + update_weights_interval
+
+    raw_failure_limit = getattr(
+        args, "polar_max_consecutive_infrastructure_failures", 0
+    )
+    if isinstance(raw_failure_limit, bool):
+        raise ValueError(
+            "polar_max_consecutive_infrastructure_failures must be a non-negative integer"
+        )
+    try:
+        max_consecutive_infrastructure_failures = int(raw_failure_limit)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "polar_max_consecutive_infrastructure_failures must be a non-negative integer"
+        ) from exc
+    if (
+        max_consecutive_infrastructure_failures < 0
+        or isinstance(raw_failure_limit, float)
+        and not raw_failure_limit.is_integer()
+    ):
+        raise ValueError(
+            "polar_max_consecutive_infrastructure_failures must be a non-negative integer"
+        )
 
     request_timeout = getattr(args, "polar_request_timeout", None)
     if request_timeout is not None:
@@ -215,6 +238,9 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
         max_async_level=max_async_level,
         fully_async=fully_async,
         max_off_policy_steps=max_off_policy_steps,
+        max_consecutive_infrastructure_failures=(
+            max_consecutive_infrastructure_failures
+        ),
         request_timeout=request_timeout,
         task_timeout_floor=task_timeout_floor,
         train_agent_timeout=train_agent_timeout,

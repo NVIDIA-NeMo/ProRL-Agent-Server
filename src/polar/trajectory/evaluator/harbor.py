@@ -61,6 +61,7 @@ class HarborEvaluator(BaseTrajectoryEvaluator):
         test_command: str = "bash /tests/test.sh",
         upload_attempts: int = 3,
         upload_retry_backoff_seconds: float = 0.1,
+        emit_cost_reward: bool = False,
     ) -> None:
         self.tests_dir = str(tests_dir).strip()
         if not self.tests_dir:
@@ -81,6 +82,7 @@ class HarborEvaluator(BaseTrajectoryEvaluator):
         self.upload_retry_backoff_seconds = float(upload_retry_backoff_seconds)
         if not 0.0 <= self.upload_retry_backoff_seconds <= 60.0:
             raise ValueError("upload_retry_backoff_seconds must be between 0 and 60")
+        self.emit_cost_reward = bool(emit_cost_reward)
 
     async def evaluate(self, trajectory: Trajectory, **runtime: Any) -> EvalResult:
         rt = runtime.get("runtime")
@@ -135,7 +137,19 @@ class HarborEvaluator(BaseTrajectoryEvaluator):
             "verifier_timeout": result.return_code == -1,
             "test_output_path": str(test_output_path),
         }
-        return EvalResult(outcome_reward=reward, metadata=metadata)
+        reward_components = None
+        if self.emit_cost_reward:
+            cost = _controller_v3_cost(runtime.get("agent_result"))
+            reward_components = {
+                "harbor_reward": reward,
+                "negative_cost": -cost,
+            }
+            metadata["gpt_cost_usd"] = cost
+        return EvalResult(
+            outcome_reward=reward,
+            outcome_reward_components=reward_components,
+            metadata=metadata,
+        )
 
     async def _upload_tests(self, rt: BaseRuntime) -> None:
         """Retry transient Apptainer/tar setup failures before losing a sample."""
@@ -199,3 +213,18 @@ def _finite_float(value: Any) -> float:
 def _clamp(value: Any) -> float:
     parsed = _finite_float(value)
     return max(0.0, min(1.0, parsed))
+
+
+def _controller_v3_cost(agent_result: Any) -> float:
+    metadata = getattr(agent_result, "metadata", None)
+    if not isinstance(metadata, dict) and isinstance(agent_result, dict):
+        metadata = agent_result.get("metadata")
+    cost_metadata = (
+        metadata.get("controller_v3_cost") if isinstance(metadata, dict) else None
+    )
+    if not isinstance(cost_metadata, dict):
+        raise RuntimeError("Controller V3 GPT cost metadata is missing")
+    cost = _finite_float(cost_metadata.get("cost"))
+    if cost < 0:
+        raise ValueError("Controller V3 GPT cost must be nonnegative")
+    return cost

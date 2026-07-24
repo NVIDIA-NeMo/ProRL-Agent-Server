@@ -220,6 +220,27 @@ case "${TMAX_AGENT_HARNESS}" in
             _mini_swe_vanillux_source _mini_swe_vanillux_installed \
             _mini_swe_vanillux_config_source _mini_swe_vanillux_config_installed
         ;;
+    controller_v3)
+        _controller_v3_python="${MINI_SWE_AGENT_RUNTIME_DIR}/python/bin/python3.10"
+        _controller_v3_manifest="${MINI_SWE_AGENT_RUNTIME_DIR}/.polar-mini-runtime-manifest.json"
+        if [ ! -x "${_controller_v3_python}" ] || \
+           [ ! -f "${_controller_v3_manifest}" ] || \
+           ! "${_controller_v3_python}" -I - "${_controller_v3_manifest}" <<'PY'
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+assert manifest["python_version"] == "3.10.20"
+assert manifest["mini_swe_agent_version"] == "2.4.0"
+import minisweagent
+assert minisweagent.__version__ == "2.4.0"
+PY
+        then
+            echo "ERROR: Controller V3 requires the pinned Python 3.10 / Mini-SWE-Agent 2.4.0 runtime at ${MINI_SWE_AGENT_RUNTIME_DIR}" >&2
+            exit 1
+        fi
+        unset _controller_v3_python _controller_v3_manifest
+        ;;
     codex)
         if [ ! -x "${AGENT_CLI_DIR}/bin/codex" ]; then
             echo "ERROR: shared Codex CLI not found at ${AGENT_CLI_DIR}/bin/codex" >&2

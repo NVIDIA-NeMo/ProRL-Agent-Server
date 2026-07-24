@@ -14,12 +14,22 @@ Adapter contract:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import re
 import statistics
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# A controller turn emits one JSON routing decision. These are the field values
+# a sample-local validity check can confirm without the engine's visible-event
+# set, so the format signal treats any other shape as a malformed turn.
+_CONTROLLER_STRENGTHS = frozenset({"keep", "escalate", "deescalate"})
+_CONTROLLER_CONFIDENCES = frozenset({"unknown", "high", "low"})
+# Realized routing actions a builder stamps onto each controller trace.
+_ACTUAL_ACTIONS = ("keep", "escalate", "deescalate")
 
 
 def post_process_rewards(
@@ -27,6 +37,31 @@ def post_process_rewards(
     samples: list[Any],
 ) -> tuple[list[float], list[float]]:
     """Slime reward-post-process hook. Returns (raw_rewards, rewards)."""
+    raw_rewards, rewards = _reward_advantages(args, samples)
+    _apply_controller_credit_mode(args, samples, rewards)
+    _apply_controller_invalid_turn_penalty(args, samples, rewards)
+    return raw_rewards, rewards
+
+
+def _reward_advantages(
+    args: Any,
+    samples: list[Any],
+) -> tuple[list[float], list[float]]:
+    """Select and run the configured advantage estimator for a sample batch."""
+    gdpo_reward_keys = getattr(args, "gdpo_reward_keys", None)
+    if gdpo_reward_keys is not None:
+        return _post_process_gdpo(
+            samples,
+            tuple(gdpo_reward_keys),
+            cost_gate_all_correct=bool(
+                getattr(args, "polar_gdpo_cost_gate_all_correct", False)
+            ),
+        )
+
+    dvao_reward_keys = getattr(args, "dvao_reward_keys", None)
+    if dvao_reward_keys is not None:
+        return _post_process_dvao(samples, tuple(dvao_reward_keys))
+
     # Enforce the failure policy again at the training boundary so replaying
     # an artifact produced by an older adapter cannot resurrect a positive
     # reward. Fully failed/removed trajectories stay excluded; aligned model
@@ -103,6 +138,282 @@ def post_process_rewards(
                 ) / group_scale
 
     return raw_rewards, normalized_by_sample
+
+
+def _post_process_gdpo(
+    samples: list[Any],
+    reward_keys: tuple[str, ...],
+    *,
+    cost_gate_all_correct: bool = False,
+) -> tuple[list[float], list[float]]:
+    """Compute equal-weight GDPO advantages for named reward components.
+
+    Each component is normalized independently within its prompt rollout
+    group, the normalized components are summed, and the resulting advantages
+    are normalized once more across the training batch. Trajectories, rather
+    than their variable number of Polar trace samples, remain the exchangeable
+    units for both normalization stages.
+
+    ``cost_gate_all_correct`` treats the first reward key as the correctness
+    signal and the remaining key(s) as cost: within a prompt group that is not
+    fully correct the cost component is dropped, so only accuracy is optimized
+    until every trajectory in the group succeeds.
+    """
+
+    if len(reward_keys) != 2 or len(set(reward_keys)) != 2:
+        raise ValueError("GDPO requires exactly two distinct reward keys")
+
+    components_by_sample: list[tuple[float, ...]] = []
+    for sample in samples:
+        if _is_failed_trajectory(sample) or bool(getattr(sample, "remove_sample", False)):
+            components_by_sample.append((0.0, 0.0))
+        elif _is_trainable_negative(sample):
+            # Fail closed on the outcome, but keep the real cost the sample
+            # incurred so a cheap-looking zero never rewards the failure.
+            components_by_sample.append(
+                _trainable_negative_components(sample, reward_keys)
+            )
+        else:
+            components_by_sample.append(
+                tuple(
+                    _finite_named_reward(sample, reward_key, algorithm="GDPO")
+                    for reward_key in reward_keys
+                )
+            )
+
+    raw_rewards = [sum(components) / len(components) for components in components_by_sample]
+
+    traj_sample_indices: dict[tuple[Any, Any], list[int]] = {}
+    traj_component_values: dict[tuple[Any, Any], list[tuple[float, ...]]] = {}
+    traj_failed: dict[tuple[Any, Any], bool] = {}
+    group_keys: dict[Any, list[tuple[Any, Any]]] = {}
+
+    for sample_index, sample in enumerate(samples):
+        group_idx, key = _trajectory_key(sample, sample_index)
+        if key not in traj_sample_indices:
+            traj_sample_indices[key] = []
+            traj_component_values[key] = []
+            traj_failed[key] = False
+            group_keys.setdefault(group_idx, []).append(key)
+        if _is_failed_trajectory(sample):
+            traj_failed[key] = True
+        elif _has_trainable_tokens(sample):
+            traj_sample_indices[key].append(sample_index)
+            traj_component_values[key].append(components_by_sample[sample_index])
+
+    pre_batch_advantages = [0.0] * len(samples)
+    valid_trajectory_keys: list[tuple[Any, Any]] = []
+    epsilon = 1e-4
+
+    for keys in group_keys.values():
+        valid_keys = [key for key in keys if not traj_failed[key] and traj_component_values[key]]
+        if not valid_keys:
+            continue
+        valid_trajectory_keys.extend(valid_keys)
+
+        trajectory_means = {
+            key: tuple(
+                statistics.fmean(values[component_index] for values in traj_component_values[key])
+                for component_index in range(len(reward_keys))
+            )
+            for key in valid_keys
+        }
+        component_means = tuple(
+            statistics.fmean(trajectory_means[key][component_index] for key in valid_keys)
+            for component_index in range(len(reward_keys))
+        )
+        component_stds = tuple(
+            statistics.stdev(
+                trajectory_means[key][component_index] for key in valid_keys
+            )
+            if len(valid_keys) > 1
+            else 0.0
+            for component_index in range(len(reward_keys))
+        )
+
+        # Cost gate: outside a fully correct group keep only the first
+        # (accuracy) component, so cost never trades away correctness. A
+        # trajectory's outcome accuracy is shared by all its traces, so judge it
+        # by the max over traces, not the per-trace mean: a zero-reward
+        # parser-invalid / agent-timeout trace must not drag a solved
+        # trajectory below 1.0 and falsely close the gate on an all-correct
+        # group.
+        drop_cost = cost_gate_all_correct and not all(
+            max(values[0] for values in traj_component_values[key]) >= 1.0
+            for key in valid_keys
+        )
+
+        for key in valid_keys:
+            for sample_index in traj_sample_indices[key]:
+                components = components_by_sample[sample_index]
+                # A component whose trajectory means are all equal has zero
+                # within-group variance, hence no preference signal. Skip it
+                # (contribute zero) rather than dividing a per-trace deviation
+                # by ``epsilon`` and manufacturing a ~1e4 advantage, matching
+                # the degenerate-group handling in DVAO and ``_group_scale``.
+                # A single-trajectory group makes every component degenerate,
+                # so its pre-batch advantage is zero.
+                pre_batch_advantages[sample_index] = sum(
+                    (value - component_means[component_index])
+                    / (component_stds[component_index] + epsilon)
+                    for component_index, value in enumerate(components)
+                    if (component_index == 0 or not drop_cost)
+                    and component_stds[component_index] > 0.0
+                )
+
+    trajectory_advantages = [
+        statistics.fmean(
+            pre_batch_advantages[sample_index]
+            for sample_index in traj_sample_indices[key]
+        )
+        for key in valid_trajectory_keys
+    ]
+    if len(trajectory_advantages) <= 1:
+        return raw_rewards, [0.0] * len(samples)
+
+    batch_mean = statistics.fmean(trajectory_advantages)
+    batch_std = statistics.stdev(trajectory_advantages)
+    if batch_std == 0.0:
+        return raw_rewards, [0.0] * len(samples)
+
+    advantages = [0.0] * len(samples)
+    for key in valid_trajectory_keys:
+        for sample_index in traj_sample_indices[key]:
+            advantages[sample_index] = (
+                pre_batch_advantages[sample_index] - batch_mean
+            ) / (batch_std + epsilon)
+
+    return raw_rewards, advantages
+
+
+def _post_process_dvao(
+    samples: list[Any],
+    reward_keys: tuple[str, ...],
+) -> tuple[list[float], list[float]]:
+    """Compute the paper's equal-prior-weight DVAO advantage.
+
+    DVAO normalizes each named reward within a prompt's rollout group, then
+    combines its per-objective advantages with weights proportional to the
+    corresponding group standard deviations. With equal prior weights this is
+    equivalent to::
+
+        sum_k (reward_k - group_mean_k) / sum_k group_std_k
+
+    A Polar trajectory may fan out into several trace samples. Group statistics
+    use one mean vector per trajectory, preserving trajectories as the
+    exchangeable units. Each trace keeps its own centered reward vector; Slime's
+    existing rollout-id reducer averages the trace losses back to the exact
+    trajectory-level DVAO signal.
+    """
+
+    if len(reward_keys) != 2 or len(set(reward_keys)) != 2:
+        raise ValueError("DVAO requires exactly two distinct reward keys")
+
+    components_by_sample: list[tuple[float, ...]] = []
+    for sample in samples:
+        if _is_failed_trajectory(sample) or bool(getattr(sample, "remove_sample", False)):
+            components_by_sample.append((0.0, 0.0))
+        elif _is_trainable_negative(sample):
+            # Fail closed on the outcome, but keep the real cost the sample
+            # incurred so a cheap-looking zero never rewards the failure.
+            components_by_sample.append(
+                _trainable_negative_components(sample, reward_keys)
+            )
+        else:
+            components_by_sample.append(
+                tuple(
+                    _finite_named_reward(sample, reward_key, algorithm="DVAO")
+                    for reward_key in reward_keys
+                )
+            )
+
+    # Equal-weight scalarization is diagnostic only. The optimizer consumes
+    # ``advantages`` below, not these raw values.
+    raw_rewards = [sum(components) / len(components) for components in components_by_sample]
+
+    traj_sample_indices: dict[tuple[Any, Any], list[int]] = {}
+    traj_component_values: dict[
+        tuple[Any, Any],
+        list[tuple[float, ...]],
+    ] = {}
+    traj_failed: dict[tuple[Any, Any], bool] = {}
+    group_keys: dict[Any, list[tuple[Any, Any]]] = {}
+
+    for sample_index, sample in enumerate(samples):
+        group_idx, key = _trajectory_key(sample, sample_index)
+        if key not in traj_sample_indices:
+            traj_sample_indices[key] = []
+            traj_component_values[key] = []
+            traj_failed[key] = False
+            group_keys.setdefault(group_idx, []).append(key)
+        if _is_failed_trajectory(sample):
+            traj_failed[key] = True
+        elif _has_trainable_tokens(sample):
+            traj_sample_indices[key].append(sample_index)
+            traj_component_values[key].append(components_by_sample[sample_index])
+
+    advantages = [0.0] * len(samples)
+    for keys in group_keys.values():
+        valid_keys = [key for key in keys if not traj_failed[key] and traj_component_values[key]]
+        if not valid_keys:
+            continue
+
+        trajectory_means = {
+            key: tuple(
+                statistics.fmean(values[component_index] for values in traj_component_values[key])
+                for component_index in range(len(reward_keys))
+            )
+            for key in valid_keys
+        }
+        component_means = tuple(
+            statistics.fmean(trajectory_means[key][component_index] for key in valid_keys)
+            for component_index in range(len(reward_keys))
+        )
+        # The paper's derivation uses population group standard deviation
+        # (its derivative carries the 1/G factor), so use pstdev here.
+        component_stds = tuple(
+            statistics.pstdev(trajectory_means[key][component_index] for key in valid_keys)
+            for component_index in range(len(reward_keys))
+        )
+        denominator = sum(component_stds)
+        if denominator == 0.0:
+            continue
+
+        for key in valid_keys:
+            for sample_index in traj_sample_indices[key]:
+                components = components_by_sample[sample_index]
+                advantages[sample_index] = (
+                    sum(
+                        value - component_means[component_index]
+                        for component_index, value in enumerate(components)
+                    )
+                    / denominator
+                )
+
+    return raw_rewards, advantages
+
+
+def _finite_named_reward(
+    sample: Any,
+    reward_key: str,
+    *,
+    algorithm: str,
+) -> float:
+    reward = getattr(sample, "reward", None)
+    if not isinstance(reward, dict) or reward_key not in reward:
+        raise ValueError(
+            f"{algorithm} reward {reward_key!r} is missing from a trainable sample"
+        )
+    value = reward[reward_key]
+    if isinstance(value, bool):
+        raise ValueError(f"{algorithm} reward {reward_key!r} must be numeric")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{algorithm} reward {reward_key!r} must be numeric") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{algorithm} reward {reward_key!r} must be finite")
+    return parsed
 
 
 def _finite_reward_or_zero(sample: Any, args: Any) -> float:
@@ -188,3 +499,254 @@ def _is_trainable_negative(sample: Any) -> bool:
         and training_filter.get("trainable") is True
         and training_filter.get("masked") is not True
     )
+
+
+def _original_reward_components(sample: Any) -> dict[str, Any]:
+    """Real reward components a sample earned before it was zero-rewarded.
+
+    ``zero_reward_parser_invalid_tool_call_trace`` / the aligned agent-timeout
+    filter blank a sample's effective reward but stash the pre-zeroing values
+    under ``training_filter.original_reward_components``. Returns ``{}`` when
+    nothing was preserved.
+    """
+    metadata = getattr(sample, "metadata", None)
+    polar = metadata.get("polar") if isinstance(metadata, dict) else None
+    training_filter = polar.get("training_filter") if isinstance(polar, dict) else None
+    originals = (
+        training_filter.get("original_reward_components")
+        if isinstance(training_filter, dict)
+        else None
+    )
+    return originals if isinstance(originals, dict) else {}
+
+
+def _finite_component_or_zero(value: Any) -> float:
+    if isinstance(value, bool) or value is None:
+        return 0.0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
+
+
+def _trainable_negative_components(
+    sample: Any,
+    reward_keys: tuple[str, ...],
+) -> tuple[float, ...]:
+    """Fail-closed components for an aligned parser-invalid / agent-timeout sample.
+
+    The outcome key (first reward key) is forced to zero so centered group
+    advantages push the malformed/timed-out action's probability down. Every
+    other component keeps the REAL value the sample earned, recovered from
+    ``training_filter.original_reward_components``. Zeroing them too is wrong for
+    a cost objective: ``negative_cost`` of 0 is the cheapest (best) value in the
+    group, so a fail-closed zero rewards the failure for being cheap. Missing
+    originals fall back to zero, which is no worse than the prior behavior.
+    """
+    originals = _original_reward_components(sample)
+    return tuple(
+        0.0 if index == 0 else _finite_component_or_zero(originals.get(reward_key))
+        for index, reward_key in enumerate(reward_keys)
+    )
+
+
+def _apply_controller_credit_mode(
+    args: Any,
+    samples: list[Any],
+    rewards: list[float],
+) -> None:
+    """Rescale advantages according to the configured controller credit mode."""
+    mode = str(getattr(args, "polar_controller_credit_mode", "standard") or "standard")
+    if mode == "standard":
+        return
+    if mode != "actual_action_balanced":
+        raise ValueError(
+            "polar_controller_credit_mode must be standard or actual_action_balanced"
+        )
+    _apply_actual_action_balancing(samples, rewards)
+
+
+def _apply_actual_action_balancing(
+    samples: list[Any],
+    rewards: list[float],
+) -> None:
+    """Make each realized routing action an equal policy-loss stratum.
+
+    Slime reduces all controller traces in one trajectory with a shared
+    token-count denominator, then averages trajectories. Scaling each trace's
+    scalar advantage implements the equivalent hierarchy: turn token mean ->
+    trajectory/action mean -> action mean. When no trace carries a realized
+    action the batch is left unchanged; when some do, eligible turns whose
+    action cannot be recovered contribute no gradient.
+    """
+
+    turns_by_trajectory_action: dict[tuple[Any, Any], dict[str, list[int]]] = {}
+    trajectory_total_tokens: dict[tuple[Any, Any], int] = {}
+    no_action_indices: list[int] = []
+    for index, sample in enumerate(samples):
+        if _is_failed_trajectory(sample) or _trainable_token_count(sample) <= 0:
+            continue
+        _, trajectory_key = _trajectory_key(sample, index)
+        trajectory_total_tokens[trajectory_key] = (
+            trajectory_total_tokens.get(trajectory_key, 0)
+            + _trainable_token_count(sample)
+        )
+        action = _controller_actual_action(sample)
+        if action is None:
+            no_action_indices.append(index)
+            continue
+        turns_by_trajectory_action.setdefault(trajectory_key, {}).setdefault(
+            action, []
+        ).append(index)
+
+    present_actions = [
+        action
+        for action in _ACTUAL_ACTIONS
+        if any(action in turns for turns in turns_by_trajectory_action.values())
+    ]
+    if not present_actions:
+        return
+
+    trajectory_count = len(turns_by_trajectory_action)
+    action_trajectory_counts = {
+        action: sum(action in turns for turns in turns_by_trajectory_action.values())
+        for action in present_actions
+    }
+    action_count = len(present_actions)
+
+    for trajectory_key, action_turns in turns_by_trajectory_action.items():
+        total_tokens = trajectory_total_tokens[trajectory_key]
+        for action, indices in action_turns.items():
+            action_trajectory_count = action_trajectory_counts[action]
+            turn_count = len(indices)
+            for index in indices:
+                token_count = _trainable_token_count(samples[index])
+                scale = (trajectory_count * total_tokens) / (
+                    action_count * action_trajectory_count * turn_count * token_count
+                )
+                rewards[index] *= scale
+
+    for index in no_action_indices:
+        rewards[index] = 0.0
+
+
+def _controller_actual_action(sample: Any) -> str | None:
+    """Read the realized routing action a builder stamped onto the trace."""
+    metadata = getattr(sample, "metadata", None)
+    polar = metadata.get("polar") if isinstance(metadata, dict) else None
+    trace_metadata = polar.get("trace_metadata") if isinstance(polar, dict) else None
+    action = (
+        trace_metadata.get("controller_actual_action")
+        if isinstance(trace_metadata, dict)
+        else None
+    )
+    return action if action in _ACTUAL_ACTIONS else None
+
+
+def _apply_controller_invalid_turn_penalty(
+    args: Any,
+    samples: list[Any],
+    rewards: list[float],
+) -> None:
+    """Add a centered, trajectory- and turn-equal signal for malformed turns.
+
+    Controller turns whose response does not parse into a legal routing
+    decision receive a negative signal and well-formed turns a small positive
+    one, centered on the batch's malformed rate so a batch with no malformed
+    turns is left exactly unchanged. The signal is scaled to be turn-equal
+    rather than token-weighted, and the base advantage is never rescaled.
+    Disabled (no-op) when the weight is not positive.
+    """
+
+    weight = float(getattr(args, "polar_controller_invalid_turn_penalty", 0.0) or 0.0)
+    if weight < 0.0:
+        raise ValueError("polar_controller_invalid_turn_penalty must be non-negative")
+    if weight == 0.0:
+        return
+
+    trajectory_turns: dict[tuple[Any, Any], list[int]] = {}
+    for index, sample in enumerate(samples):
+        if _is_failed_trajectory(sample) or _trainable_token_count(sample) <= 0:
+            continue
+        _, key = _trajectory_key(sample, index)
+        trajectory_turns.setdefault(key, []).append(index)
+    if not trajectory_turns:
+        return
+
+    valid_by_sample: dict[int, bool] = {}
+    invalid_rates: list[float] = []
+    for indices in trajectory_turns.values():
+        invalid = 0
+        for index in indices:
+            is_valid = _controller_turn_is_valid(samples[index])
+            valid_by_sample[index] = is_valid
+            invalid += int(not is_valid)
+        invalid_rates.append(invalid / len(indices))
+    batch_invalid_rate = statistics.fmean(invalid_rates)
+
+    for indices in trajectory_turns.values():
+        token_counts = {index: _trainable_token_count(samples[index]) for index in indices}
+        trajectory_token_count = sum(token_counts.values())
+        turn_count = len(indices)
+        for index in indices:
+            centered_signal = batch_invalid_rate - float(not valid_by_sample[index])
+            turn_equal_scale = trajectory_token_count / (turn_count * token_counts[index])
+            rewards[index] += weight * centered_signal * turn_equal_scale
+
+
+def _coerces_to_int(value: Any) -> bool:
+    """Match the engine's pydantic lax int coercion for an evidence id.
+
+    ``ControllerV3Decision.evidence_event_ids`` is ``list[int]`` parsed by
+    pydantic v2 in lax mode, which accepts an int, an integer-valued float, or a
+    numeric integer string (12, 12.0, "12") and rejects bools. The invalid-turn
+    penalty must not flag a decision the engine validated and executed as
+    malformed, so mirror that acceptance here instead of requiring ``int``.
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value) and value.is_integer()
+    if isinstance(value, str):
+        try:
+            int(value.strip())
+        except ValueError:
+            return False
+        return True
+    return False
+
+
+def _controller_turn_is_valid(sample: Any) -> bool:
+    """True if the controller response parses into a legal routing decision."""
+    text = getattr(sample, "response", None)
+    if not isinstance(text, str):
+        return False
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match is None:
+        return False
+    try:
+        decision = json.loads(match.group(0))
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(decision, dict):
+        return False
+    evidence = decision.get("evidence_event_ids")
+    return (
+        decision.get("required_model_strength") in _CONTROLLER_STRENGTHS
+        and decision.get("state_confidence") in _CONTROLLER_CONFIDENCES
+        and isinstance(evidence, list)
+        and 1 <= len(evidence) <= 2
+        and all(_coerces_to_int(item) for item in evidence)
+    )
+
+
+def _trainable_token_count(sample: Any) -> int:
+    if bool(getattr(sample, "remove_sample", False)):
+        return 0
+    loss_mask = getattr(sample, "loss_mask", None)
+    if loss_mask is None:
+        return int(getattr(sample, "response_length", 0) or 0)
+    return sum(1 for value in loss_mask if int(value) != 0)

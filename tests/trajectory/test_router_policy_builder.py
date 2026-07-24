@@ -1,9 +1,29 @@
 from __future__ import annotations
 
+from collections import UserDict
+
 import pytest
 
 from polar.trajectory.builder.router_policy import RouterPolicyBuilder
 from polar.trajectory.models import CompletionRecord, CompletionSession
+
+
+class _Tokenizer:
+    def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+        assert add_special_tokens is False
+        return [ord(char) for char in text]
+
+    def decode(self, ids: list[int]) -> str:
+        return "".join(chr(token_id) for token_id in ids)
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        **kwargs: object,
+    ) -> UserDict[str, list[int]]:
+        assert kwargs["tokenize"] is True
+        assert kwargs["add_generation_prompt"] is True
+        return UserDict({"input_ids": [1, 2, 3]})
 
 
 def _completion(
@@ -81,6 +101,54 @@ async def test_router_policy_excludes_pool_and_unlabelled_completions() -> None:
 
 
 @pytest.mark.asyncio
+async def test_router_policy_annotates_realized_routing_actions() -> None:
+    def controller_turn(
+        completion_id: str,
+        worker: str,
+        prompt_ids: list[int],
+        response_ids: list[int],
+    ) -> CompletionRecord:
+        record = _completion(
+            completion_id,
+            role="router_policy",
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+        )
+        record.metadata["controller_worker_before"] = worker
+        return record
+
+    # Distinct, non-prefix prompts keep every turn its own trace, in order.
+    session = CompletionSession(
+        session_id="session-actions",
+        completions=[
+            controller_turn("t0", "small", [1, 2], [10]),
+            controller_turn("t1", "large", [3, 4], [11]),
+            controller_turn("t2", "small", [5, 6], [12]),
+            controller_turn("t3", "small", [7, 8], [13]),
+        ],
+    )
+
+    trajectory = await RouterPolicyBuilder().build(session)
+
+    actions = [trace.metadata.get("controller_actual_action") for trace in trajectory.traces]
+    assert actions == ["escalate", "deescalate", "keep", "keep"]
+
+
+@pytest.mark.asyncio
+async def test_router_policy_leaves_actions_unset_without_workers() -> None:
+    session = CompletionSession(
+        session_id="session-no-workers",
+        completions=[
+            _completion("t0", role="router_policy", prompt_ids=[1, 2], response_ids=[10]),
+        ],
+    )
+
+    trajectory = await RouterPolicyBuilder().build(session)
+
+    assert "controller_actual_action" not in trajectory.traces[0].metadata
+
+
+@pytest.mark.asyncio
 async def test_router_policy_fails_closed_without_trusted_completions() -> None:
     session = CompletionSession(
         session_id="session-2",
@@ -125,3 +193,137 @@ async def test_router_policy_allows_explicit_migration_role() -> None:
 def test_router_policy_rejects_empty_role_allowlist() -> None:
     with pytest.raises(ValueError, match="trusted_roles must not be empty"):
         RouterPolicyBuilder(trusted_roles=[])
+
+
+@pytest.mark.asyncio
+async def test_router_policy_reconstructs_missing_sglang_token_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "polar.trajectory.builder.prefix_merging._load_tokenizer",
+        lambda *_args, **_kwargs: _Tokenizer(),
+    )
+    completion = CompletionRecord(
+        completion_id="router",
+        request={
+            "messages": [{"role": "user", "content": "route"}],
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        response={
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "{}"},
+                    "finish_reason": "length",
+                    "logprobs": {
+                        "content": [
+                            {"token": "{", "logprob": -0.1},
+                            {"token": "}", "logprob": -0.2},
+                        ]
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        },
+        metadata={"completion_role": "router_policy"},
+    )
+
+    trajectory = await RouterPolicyBuilder(
+        tokenizer_name_or_path="/model",
+    ).build(CompletionSession(session_id="session-4", completions=[completion]))
+
+    trace = trajectory.traces[0]
+    assert trace.prompt_ids == [1, 2, 3]
+    assert trace.response_ids == [ord("{"), ord("}")]
+    assert trace.response_logprobs == [-0.1, -0.2]
+    assert trace.loss_mask == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_router_policy_reconstruction_fails_closed_on_length_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MismatchedTokenizer(_Tokenizer):
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            return [1]
+
+    monkeypatch.setattr(
+        "polar.trajectory.builder.prefix_merging._load_tokenizer",
+        lambda *_args, **_kwargs: MismatchedTokenizer(),
+    )
+    completion = CompletionRecord(
+        completion_id="router",
+        request={"messages": [{"role": "user", "content": "route"}]},
+        response={
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "{}"},
+                    "finish_reason": "length",
+                    "logprobs": {
+                        "content": [
+                            {"token": "{", "logprob": -0.1},
+                            {"token": "}", "logprob": -0.2},
+                        ]
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        },
+        metadata={"completion_role": "router_policy"},
+    )
+
+    trajectory = await RouterPolicyBuilder(
+        tokenizer_name_or_path="/model",
+    ).build(CompletionSession(session_id="session-5", completions=[completion]))
+
+    assert trajectory.traces[0].response_ids == []
+    assert trajectory.traces[0].loss_mask == []
+
+
+@pytest.mark.asyncio
+async def test_router_policy_reconstruction_fails_closed_on_segmentation_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The sampled split is "12" + "3", but "123" re-encodes to the canonical
+    # "1" + "23": equal token count, ids that were never sampled. Decoding them
+    # back does not reproduce the original token strings, so reconstruction must
+    # be abandoned rather than mis-pair ids with the sampled logprobs.
+    class NonCanonicalTokenizer(_Tokenizer):
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            assert add_special_tokens is False
+            return [1, 23]
+
+        def decode(self, ids: list[int]) -> str:
+            table = {1: "1", 23: "23"}
+            return "".join(table[token_id] for token_id in ids)
+
+    monkeypatch.setattr(
+        "polar.trajectory.builder.prefix_merging._load_tokenizer",
+        lambda *_args, **_kwargs: NonCanonicalTokenizer(),
+    )
+    completion = CompletionRecord(
+        completion_id="router",
+        request={"messages": [{"role": "user", "content": "route"}]},
+        response={
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "123"},
+                    "finish_reason": "length",
+                    "logprobs": {
+                        "content": [
+                            {"token": "12", "logprob": -0.1},
+                            {"token": "3", "logprob": -0.2},
+                        ]
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        },
+        metadata={"completion_role": "router_policy"},
+    )
+
+    trajectory = await RouterPolicyBuilder(
+        tokenizer_name_or_path="/model",
+    ).build(CompletionSession(session_id="session-6", completions=[completion]))
+
+    assert trajectory.traces[0].response_ids == []
+    assert trajectory.traces[0].loss_mask == []

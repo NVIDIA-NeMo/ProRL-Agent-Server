@@ -249,7 +249,11 @@ for _tmax_token_budget_name in ROLLOUT_MAX_PROMPT_LEN ROLLOUT_MAX_RESPONSE_LEN T
     fi
 done
 unset _tmax_token_budget_name _tmax_token_budget_value
-export TMAX_TRAIN_PACK_LENGTH="$((ROLLOUT_MAX_PROMPT_LEN + TMAX_MAX_TOTAL_RESPONSE_LEN))"
+if [ "${TMAX_AGENT_HARNESS:-}" = "controller_v3" ]; then
+    export TMAX_TRAIN_PACK_LENGTH="$((ROLLOUT_MAX_PROMPT_LEN + ROLLOUT_MAX_RESPONSE_LEN))"
+else
+    export TMAX_TRAIN_PACK_LENGTH="$((ROLLOUT_MAX_PROMPT_LEN + TMAX_MAX_TOTAL_RESPONSE_LEN))"
+fi
 export SEQ_LENGTH="${SEQ_LENGTH:-${TMAX_TRAIN_PACK_LENGTH}}"
 # Slime's dynamic scheduler multiplies this cap by CP, not TP. With CP=1 it
 # must therefore admit one complete 67,584-token pack. TP4 sequence
@@ -425,9 +429,9 @@ _tmax_validate_resource_topology() {
         return 1
     fi
 
-    local actor_gpus actor_parallel_size capacity allocated_gpus rollout_product expected_global_batch
+    local actor_gpus actor_parallel_size capacity allocated_gpus rollout_product expected_global_batch expected_train_pack_length
     local required_gpus
-    local global_batch actor_dp train_rollouts_per_dp
+    local global_batch actor_dp train_rollouts_per_dp min_train_rollouts_per_dp
     actor_gpus="$((ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE))"
     capacity="$((NUM_NODES * RAY_NUM_GPUS_PER_NODE))"
     allocated_gpus="$((NUM_NODES * SLURM_GPUS))"
@@ -487,9 +491,14 @@ _tmax_validate_resource_topology() {
         echo "ERROR: per-turn ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN} exceeds cumulative TMAX_MAX_TOTAL_RESPONSE_LEN=${TMAX_MAX_TOTAL_RESPONSE_LEN}" >&2
         return 1
     fi
-    if [ "${TMAX_TRAIN_PACK_LENGTH}" -ne "$((ROLLOUT_MAX_PROMPT_LEN + TMAX_MAX_TOTAL_RESPONSE_LEN))" ] || \
+    if [ "${TMAX_AGENT_HARNESS:-}" = "controller_v3" ]; then
+        expected_train_pack_length="$((ROLLOUT_MAX_PROMPT_LEN + ROLLOUT_MAX_RESPONSE_LEN))"
+    else
+        expected_train_pack_length="$((ROLLOUT_MAX_PROMPT_LEN + TMAX_MAX_TOTAL_RESPONSE_LEN))"
+    fi
+    if [ "${TMAX_TRAIN_PACK_LENGTH}" -ne "${expected_train_pack_length}" ] || \
        [ "${SEQ_LENGTH}" -ne "${TMAX_TRAIN_PACK_LENGTH}" ]; then
-        echo "ERROR: TMax requires SEQ_LENGTH=prompt+total_response=${TMAX_TRAIN_PACK_LENGTH}, got SEQ_LENGTH=${SEQ_LENGTH}" >&2
+        echo "ERROR: TMax requires SEQ_LENGTH=${expected_train_pack_length} for harness ${TMAX_AGENT_HARNESS:-default}, got SEQ_LENGTH=${SEQ_LENGTH}" >&2
         return 1
     fi
     if [ "$((MAX_TOKENS_PER_GPU * CONTEXT_PARALLEL_SIZE))" -lt "${TMAX_TRAIN_PACK_LENGTH}" ] && \
@@ -518,8 +527,9 @@ _tmax_validate_resource_topology() {
         return 1
     fi
     train_rollouts_per_dp="$((global_batch / actor_dp))"
-    if [ "$train_rollouts_per_dp" -lt 8 ]; then
-        echo "ERROR: global batch gives only ${train_rollouts_per_dp} trajectories per actor DP rank; require at least 8 to avoid underfilled trainer GPUs" >&2
+    min_train_rollouts_per_dp="${TMAX_MIN_TRAIN_ROLLOUTS_PER_DP:-8}"
+    if [ "$train_rollouts_per_dp" -lt "$min_train_rollouts_per_dp" ]; then
+        echo "ERROR: global batch gives only ${train_rollouts_per_dp} trajectories per actor DP rank; require at least ${min_train_rollouts_per_dp}" >&2
         return 1
     fi
 }
@@ -705,7 +715,8 @@ unset -f _tmax_validate_async_capacity
 
 export TMAX_AGENT_HARNESS="${TMAX_AGENT_HARNESS:-${POLAR_AGENT_HARNESS:-mini_swe_agent}}"
 export POLAR_AGENT_HARNESS="${TMAX_AGENT_HARNESS}"
-if [ "${TMAX_AGENT_HARNESS}" = "spilot_router" ]; then
+if [ "${TMAX_AGENT_HARNESS}" = "spilot_router" ] || \
+   [ "${TMAX_AGENT_HARNESS}" = "controller_v3" ]; then
     for _tmax_spilot_isolation_name in \
         POLAR_APPTAINER_NO_MOUNT_HOSTFS \
         POLAR_APPTAINER_NO_MOUNT_TMP \
@@ -743,7 +754,7 @@ if ! [[ "${POLAR_AGENT_MAX_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
     return 1 2>/dev/null || exit 1
 fi
 case "${TMAX_AGENT_HARNESS}" in
-    mini_swe_agent|spilot_router|vanillux2)
+    controller_v3|mini_swe_agent|spilot_router|vanillux2)
         export POLAR_AGENT_PATH="${MINI_SWE_AGENT_CONTAINER_DIR}/bin:/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         printf -v POLAR_AGENT_RUNTIME_VOLUME '        - %s:%s:ro' \
             "${MINI_SWE_AGENT_RUNTIME_DIR}" "${MINI_SWE_AGENT_CONTAINER_DIR}"
@@ -1229,10 +1240,10 @@ _polar_load_export_from_zshrc() {
     local name="$1"
     local line value
     if [ -n "${!name:-}" ] || [ ! -f "$HOME/.zshrc" ]; then
-        return
+        return 0
     fi
     line="$(grep -E "^export ${name}=" "$HOME/.zshrc" 2>/dev/null | tail -n 1 || true)"
-    [ -n "$line" ] || return
+    [ -n "$line" ] || return 0
     value="${line#export ${name}=}"
     eval "export ${name}=${value}"
 }

@@ -11,6 +11,7 @@ def _builtin_harness_map() -> dict[str, type[BaseHarness]]:
     """Lazy import to avoid circular imports at module level."""
     from polar.agent.presets.claude_code import ClaudeCodeHarness
     from polar.agent.presets.codex import CodexHarness
+    from polar.agent.presets.controller_v3 import ControllerV3Harness
     from polar.agent.presets.gemini_cli import GeminiCliHarness
     from polar.agent.presets.hermes import HermesHarness
     from polar.agent.presets.mini_swe_agent import MiniSweAgentHarness
@@ -26,6 +27,7 @@ def _builtin_harness_map() -> dict[str, type[BaseHarness]]:
     return {
         "claude_code": ClaudeCodeHarness,
         "codex": CodexHarness,
+        "controller_v3": ControllerV3Harness,
         "gemini_cli": GeminiCliHarness,
         "hermes": HermesHarness,
         "mini_swe_agent": MiniSweAgentHarness,

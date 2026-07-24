@@ -310,6 +310,14 @@ class PolarRolloutSchedulerError(RuntimeError):
     """Raised when the async Polar scheduler cannot safely make progress."""
 
 
+class PolarUntrainableGroupError(PolarRolloutSchedulerError):
+    """Raised when a completed group contains no loss-bearing tokens."""
+
+    def __init__(self, message: str, *, infrastructure_only: bool) -> None:
+        super().__init__(message)
+        self.infrastructure_only = infrastructure_only
+
+
 class PolarLowCompleteAcceptFractionError(PolarRolloutSchedulerError):
     """Raised when a completed task has too few trainable completed sessions."""
 
@@ -943,6 +951,18 @@ def _is_zero_trainable_error(exc: BaseException) -> bool:
     return "zero trainable tokens" in str(exc)
 
 
+def _task_result_is_infrastructure_only(task_result: TaskResult) -> bool:
+    if not task_result.results:
+        return False
+    for result in task_result.results:
+        if _status_value(result.status).upper() != "ERROR":
+            return False
+        trajectory = getattr(result, "trajectory", None)
+        if getattr(trajectory, "traces", None):
+            return False
+    return True
+
+
 def _annotate_accepted_samples(
     samples: list[Any],
     *,
@@ -1030,6 +1050,7 @@ class AsyncPolarRolloutWorker:
         self._fully_async_request_count = 0
         self._fully_async_admission_credit = 0
         self._fatal_error: BaseException | None = None
+        self._consecutive_infrastructure_failures = 0
         self._state_lock = threading.RLock()
         self._metrics: dict[str, float] = {}
         self._last_reported_counters: dict[str, float] = {}
@@ -1461,19 +1482,30 @@ class AsyncPolarRolloutWorker:
         if not self._running:
             return
 
+        fuse_error: PolarRolloutSchedulerError | None = None
         if _is_zero_trainable_error(last_error):
             category_metric = "polar/dropped_zero_trainable_groups"
             reason = "zero trainable tokens"
             permanently_consumed = True
+            if (
+                isinstance(last_error, PolarUntrainableGroupError)
+                and last_error.infrastructure_only
+            ):
+                fuse_error = self._note_infrastructure_failure()
+            else:
+                self._reset_infrastructure_failures()
         elif isinstance(last_error, PolarLowCompleteAcceptFractionError):
+            self._reset_infrastructure_failures()
             category_metric = "polar/dropped_low_complete_fraction_groups"
             reason = "low complete accept fraction"
             permanently_consumed = True
         elif isinstance(last_error, RolloutLogprobError):
+            self._reset_infrastructure_failures()
             category_metric = "polar/dropped_logprob_error_groups"
             reason = "rollout logprob error"
             permanently_consumed = True
         else:
+            self._reset_infrastructure_failures()
             category_metric = "polar/dropped_failed_groups"
             reason = "task failure"
             permanently_consumed = False
@@ -1496,6 +1528,9 @@ class AsyncPolarRolloutWorker:
                 )
             self._consume_reservation(pending.reservation_id, outcome="permanent_drop")
             self._restore_fully_async_admission_credit(1)
+            if fuse_error is not None:
+                self._set_fatal(fuse_error)
+                self._running = False
         else:
             if pending.reservation_id is not None:
                 self._inc_metric("polar/replay_on_resume_groups")
@@ -1574,8 +1609,9 @@ class AsyncPolarRolloutWorker:
         if not _has_trainable_tokens(group_samples):
             self._emit_health_observation(completed)
             self._record_wasted_samples(group_samples)
-            raise PolarRolloutSchedulerError(
-                f"Task {task_result.task_id} produced zero trainable tokens"
+            raise PolarUntrainableGroupError(
+                f"Task {task_result.task_id} produced zero trainable tokens",
+                infrastructure_only=_task_result_is_infrastructure_only(task_result),
             )
         rejection_reason = _low_complete_accept_fraction_rejection_reason(
             self.config, task_result, group_samples
@@ -1596,6 +1632,7 @@ class AsyncPolarRolloutWorker:
             try:
                 completed.output_queue_wait_seconds = time.perf_counter() - wait_started
                 self.output_queue.put_nowait(completed)
+                self._reset_infrastructure_failures()
                 self._inc_metric("polar/completed_groups")
                 return
             except queue.Full:
@@ -1890,6 +1927,27 @@ class AsyncPolarRolloutWorker:
         with self._state_lock:
             if self._fatal_error is None:
                 self._fatal_error = exc
+
+    def _note_infrastructure_failure(self) -> PolarRolloutSchedulerError | None:
+        with self._state_lock:
+            self._consecutive_infrastructure_failures += 1
+            count = self._consecutive_infrastructure_failures
+            self._metrics["polar/consecutive_infrastructure_failures"] = float(count)
+            limit = self.config.max_consecutive_infrastructure_failures
+        if limit > 0 and count >= limit:
+            return PolarRolloutSchedulerError(
+                "Polar rollout stopped after "
+                f"{count} consecutive infrastructure-only untrainable groups "
+                f"(limit={limit})"
+            )
+        return None
+
+    def _reset_infrastructure_failures(self) -> None:
+        with self._state_lock:
+            if self._consecutive_infrastructure_failures == 0:
+                return
+            self._consecutive_infrastructure_failures = 0
+            self._metrics["polar/consecutive_infrastructure_failures"] = 0.0
 
     async def _submit_with_callback(
         self, client: httpx.AsyncClient, payload: dict[str, Any]
@@ -4103,10 +4161,15 @@ def generate_rollout_polar_async(
             completed.reservation_id for completed in accepted_completions
         )
 
+    from slime_bridge.group_selection import select_training_groups
+
+    data, group_selection_metrics = select_training_groups(args, data, rollout_id=rollout_id)
+
     RolloutFnTrainOutput = _load_rollout_train_output_type()
     flat = [s for g in data for s in g]
     rewards = [_extract_sample_reward(s, async_worker.config.reward_key) for s in flat]
     metrics: dict[str, Any] = dict(dynamic_filter_metrics)
+    metrics.update(group_selection_metrics)
     metrics.update(dynamic_filter_reservation_metrics)
     metrics.update(partial_recovery_metrics)
     if candidate_pool_health_report is not None:
@@ -6003,6 +6066,47 @@ def _polar_extra_metrics(
         graded_sessions = len(session_report)
         resolved = sum(1 for r in session_report.values() if r.get("resolved"))
         out["polar/resolved_rate"] = resolved / graded_sessions
+    # Realized keep/escalate/deescalate distribution across controller traces.
+    # Emitted only when a builder stamped actions, so this is inert otherwise.
+    action_counts = {action: 0 for action in ("keep", "escalate", "deescalate")}
+    for sample in flat_samples:
+        polar_meta = sample.metadata.get("polar", {})
+        trace_metadata = polar_meta.get("trace_metadata") if isinstance(polar_meta, dict) else None
+        action = trace_metadata.get("controller_actual_action") if isinstance(trace_metadata, dict) else None
+        if action in action_counts:
+            action_counts[action] += 1
+    action_total = sum(action_counts.values())
+    if action_total:
+        out["polar/routing/actual_action_count/total"] = float(action_total)
+        for action, count in action_counts.items():
+            out[f"polar/routing/actual_action_count/{action}"] = float(count)
+            out[f"polar/routing/actual_action_ratio/{action}"] = count / action_total
+    # Mean GPT cost per trajectory, taken from the evaluation metadata's real
+    # spend (``gpt_cost_usd``). The ``negative_cost`` reward component is zeroed
+    # on every fail-closed path (parser-invalid, timeout, ERROR mask), so a
+    # session that burned real GPT money before failing would otherwise be
+    # recorded as $0 and understate the mean. Aggregate once per non-placeholder
+    # session (the outcome is broadcast to every trace).
+    cost_by_session: dict[str, float] = {}
+    for sample in flat_samples:
+        polar_meta = sample.metadata.get("polar", {})
+        if not isinstance(polar_meta, dict) or polar_meta.get("placeholder"):
+            continue
+        session_id = polar_meta.get("session_id")
+        if not session_id:
+            continue
+        trajectory_metadata = polar_meta.get("trajectory_metadata")
+        evaluation = (
+            trajectory_metadata.get("evaluation")
+            if isinstance(trajectory_metadata, dict)
+            else None
+        )
+        if isinstance(evaluation, dict) and "gpt_cost_usd" in evaluation:
+            cost_by_session[str(session_id)] = _finite_float_or_zero(evaluation["gpt_cost_usd"])
+    if cost_by_session:
+        out["polar/controller/cost_usd_mean"] = sum(cost_by_session.values()) / len(
+            cost_by_session
+        )
     return out
 
 

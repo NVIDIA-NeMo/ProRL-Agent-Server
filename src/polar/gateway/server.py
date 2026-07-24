@@ -756,6 +756,7 @@ def _policy_completion_metadata(
     response: dict[str, Any],
     *,
     completion_role: str,
+    original_request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     metadata = _completion_metadata(session_info, response)
     # Stamp this at the gateway persistence boundary and deliberately overwrite
@@ -764,6 +765,12 @@ def _policy_completion_metadata(
     # requests remain persisted for legacy builders but are excluded by the
     # RouterPolicyBuilder.
     metadata["completion_role"] = completion_role
+    # Record the controller's active worker for this turn so training can
+    # recover the realized routing action per trace. The reserved request field
+    # is stripped from the upstream body but preserved on the original request.
+    worker_before = (original_request or {}).get("_polar_controller_worker_before")
+    if worker_before in ("small", "large"):
+        metadata["controller_worker_before"] = worker_before
     return metadata
 
 
@@ -1339,9 +1346,15 @@ async def proxy_request(request: Request, path: str):
                 code="unsupported_router_api",
             )
     if isinstance(original_model, str) and original_model.startswith("pool/"):
-        if api_type != APIType.OPENAI_CHAT or "/v1/chat/completions" not in full_path:
+        is_chat_request = (
+            api_type == APIType.OPENAI_CHAT and "/v1/chat/completions" in full_path
+        )
+        is_responses_request = (
+            api_type == APIType.OPENAI_RESPONSES and "/v1/responses" in full_path
+        )
+        if not (is_chat_request or is_responses_request):
             return _model_pool_error(
-                "Model-pool aliases support only /v1/chat/completions",
+                "Model-pool aliases support only /v1/chat/completions and /v1/responses",
                 code="unsupported_pool_api",
             )
         pool_route = state.model_pool.get(original_model)
@@ -1412,6 +1425,34 @@ async def proxy_request(request: Request, path: str):
                 return auth_error
             assert session_id is not None
     try:
+        if pool_route is not None and api_type == APIType.OPENAI_RESPONSES:
+            if body.get("stream") is True:
+                return _model_pool_error(
+                    "Native model-pool Responses streaming is not supported",
+                    code="unsupported_pool_streaming",
+                )
+            upstream_request = body.copy()
+            upstream_request["model"] = pool_route.model
+            upstream_request["stream"] = False
+            try:
+                response = await pool_route.inference.responses(upstream_request)
+            except UpstreamError as exc:
+                logger.warning(
+                    "Model-pool Responses upstream error for session %s: %s",
+                    session_id,
+                    _error_type_name(exc),
+                )
+                return _upstream_error_response(
+                    api_type,
+                    exc,
+                    standardize_openai_context_length=True,
+                )
+            response["model"] = original_model
+            return Response(
+                content=orjson.dumps(response),
+                media_type="application/json",
+            )
+
         transformer = state.transform_manager.get(api_type)
         session_info = state.session_registry.get(session_id)
 
@@ -1435,6 +1476,9 @@ async def proxy_request(request: Request, path: str):
             else "policy"
         )
         transformed_body = body.copy()
+        # Reserved controller annotation: recorded on the completion for training,
+        # never forwarded upstream. ``body`` (the original request) keeps it.
+        transformed_body.pop("_polar_controller_worker_before", None)
         transformed_body["_polar_model_served"] = served_model
         openai_request = transformer.transform_request(transformed_body)
         openai_request["model"] = served_model
@@ -1593,6 +1637,7 @@ async def _handle_non_streaming(
                 session_info,
                 response,
                 completion_role=completion_role,
+                original_request=original_request,
             ),
         )
     transformed = transformer.transform_response(response, original_request)
@@ -1652,6 +1697,7 @@ async def _handle_streaming(
                 session_info,
                 response,
                 completion_role=completion_role,
+                original_request=original_request,
             ),
         )
 

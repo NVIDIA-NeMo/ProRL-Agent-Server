@@ -173,6 +173,36 @@ class InferenceClient:
         # section on the gateway's event-loop thread.
         return self.engine.normalize_response(orjson.loads(resp.content))
 
+    async def responses(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Non-streaming OpenAI Responses request for a native upstream."""
+        await self._acquire_generation_slot()
+        try:
+            if self._completion_semaphore is not None:
+                async with self._completion_semaphore:
+                    return await self._responses(request)
+            return await self._responses(request)
+        finally:
+            await self._release_generation_slot()
+
+    async def _responses(self, request: dict[str, Any]) -> dict[str, Any]:
+        client = await self._get_client()
+        from copy import deepcopy
+
+        request_copy = deepcopy(request)
+        request_copy["stream"] = False
+        request_copy = self.engine.prepare_request(request_copy)
+        try:
+            resp = await client.post(
+                self._v1_endpoint("responses"),
+                json=request_copy,
+                headers=self._json_headers(),
+            )
+        except httpx.RequestError as exc:
+            raise self._translate_transport_error(exc) from exc
+
+        await self._raise_for_status(resp)
+        return orjson.loads(resp.content)
+
     async def tokenize(self, request: dict[str, Any]) -> dict[str, Any]:
         """Tokenize a prompt with the inference server's exact chat template.
 

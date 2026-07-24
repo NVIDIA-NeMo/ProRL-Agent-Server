@@ -60,6 +60,7 @@ def test_resolve_polar_slime_config_computes_concurrency_and_normalizes_url() ->
     assert config.max_session_concurrency == 24
     assert config.fully_async is True
     assert config.max_off_policy_steps == 7
+    assert config.max_consecutive_infrastructure_failures == 0
     assert config.request_timeout == 60.0
     assert config.task_timeout_floor is None
     assert config.train_agent_timeout is None
@@ -79,6 +80,27 @@ def test_resolve_polar_slime_config_requires_agent_template() -> None:
 def test_resolve_polar_slime_config_rejects_invalid_fully_async_value() -> None:
     with pytest.raises(ValueError, match="polar_fully_async"):
         resolve_polar_slime_config(_args(polar_fully_async="sometimes"))
+
+
+def test_resolve_polar_slime_config_accepts_infrastructure_failure_fuse() -> None:
+    config = resolve_polar_slime_config(
+        _args(polar_max_consecutive_infrastructure_failures=3)
+    )
+
+    assert config.max_consecutive_infrastructure_failures == 3
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, True, "three"])
+def test_resolve_polar_slime_config_rejects_invalid_infrastructure_failure_fuse(
+    value,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="polar_max_consecutive_infrastructure_failures",
+    ):
+        resolve_polar_slime_config(
+            _args(polar_max_consecutive_infrastructure_failures=value)
+        )
 
 
 def test_resolve_polar_slime_config_accepts_complete_fraction_threshold() -> None:

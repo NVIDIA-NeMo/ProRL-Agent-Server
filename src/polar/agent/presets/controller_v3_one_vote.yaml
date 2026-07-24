@@ -1,0 +1,52 @@
+# Dynamic one-vote Controller V3 override. The immutable runtime supplies prompts.
+model:
+  model_class: litellm_response
+  model_name: openai/pool/gpt-5.6-luna
+  model_kwargs:
+    drop_params: true
+    parallel_tool_calls: true
+    timeout: 600
+    temperature: null
+    top_p: null
+    max_tokens: null
+    max_output_tokens: 65536
+    reasoning:
+      effort: max
+
+agent:
+  agent_class: minisweagent.agents.oracle_controller_v3.OracleControllerV3Agent
+  initial_worker: small
+  window_events: 8
+  switch_confirmations: 1
+  upgrade_confirmations: 1
+  downgrade_confirmations: 1
+  controller_max_input_tokens: 15000
+  controller_retry_input_tokens: 12000
+  shared_log_path: /agent_history
+
+  small_model:
+    model_class: litellm
+    model_name: openai/pool/qwen3.6-35b-a3b
+    model_kwargs:
+      drop_params: true
+      parallel_tool_calls: true
+      timeout: 600
+      temperature: 0.6
+      top_p: 0.95
+      max_tokens: 65536
+      extra_body:
+        top_k: 20
+        chat_template_kwargs:
+          enable_thinking: true
+
+  controller_model:
+    model_class: litellm
+    model_name: openai/router/policy
+    model_kwargs:
+      drop_params: true
+      timeout: 600
+      temperature: 1.0
+      max_tokens: 1024
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false

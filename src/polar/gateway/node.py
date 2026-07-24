@@ -58,6 +58,9 @@ _CALLBACK_REQUEST_TIMEOUT_SECONDS = 5.0
 _CALLBACK_RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _AGENT_RESULT_METADATA_KEY = "agent_result"
 _TRAINABLE_AGENT_TIMEOUT_REASON = "agent_timeout"
+# Grace window to harvest the partial GPT cost an agent-budget timeout already
+# wrote to its trajectory file, after the agent budget itself is exhausted.
+_AGENT_TIMEOUT_COST_HARVEST_SECONDS = 10.0
 
 
 class GatewayExecutionTimeout(TimeoutError):
@@ -269,7 +272,7 @@ class GatewayNodeManager:
             router_capability: str | None = None
             model_pool_capability: str | None = None
             model_pool_admission_capability: str | None = None
-            if request.agent.harness == "spilot_router":
+            if request.agent.harness in {"spilot_router", "controller_v3"}:
                 router_capability = self.session_registry.issue_capability(
                     session_id,
                     scope=ROUTER_CAPABILITY_SCOPE,
@@ -281,10 +284,11 @@ class GatewayNodeManager:
                     session_id,
                     scope=MODEL_POOL_CAPABILITY_SCOPE,
                 )
-                model_pool_admission_capability = self.session_registry.issue_capability(
-                    session_id,
-                    scope=MODEL_POOL_ADMISSION_CAPABILITY_SCOPE,
-                )
+                if request.agent.harness == "spilot_router":
+                    model_pool_admission_capability = self.session_registry.issue_capability(
+                        session_id,
+                        scope=MODEL_POOL_ADMISSION_CAPABILITY_SCOPE,
+                    )
             await self._dispatcher.enqueue(
                 ManagedSession(
                     request=request,
@@ -568,7 +572,7 @@ class GatewayNodeManager:
         except GatewayExecutionTimeout as exc:
             # Don't set final_result — let _handle_postrun build a partial
             # trajectory from the completions captured so far.
-            managed.agent_result = AgentRunResult(
+            timeout_result = AgentRunResult(
                 status="timeout",
                 return_code=-1,
                 error=str(exc),
@@ -577,6 +581,30 @@ class GatewayNodeManager:
                     "timeout_stage": timeout_stage,
                 },
             )
+            managed.agent_result = timeout_result
+            # An agent-budget timeout during exec is an aligned, trainable
+            # negative. The agent saves its trajectory (with running GPT cost)
+            # after every step, so harvest that partial cost here — the normal
+            # post-exec postprocess was skipped when the budget ran out. This
+            # keeps the sample's real spend instead of letting it look free.
+            # Best-effort and time-bounded; a missing/torn file leaves cost
+            # absent (falls back to today's drop) and never sets timeout_stage.
+            if (
+                timeout_stage == "exec"
+                and harness is not None
+                and managed.runtime is not None
+            ):
+                try:
+                    await asyncio.wait_for(
+                        harness.postprocess(managed.runtime, timeout_result),
+                        timeout=_AGENT_TIMEOUT_COST_HARVEST_SECONDS,
+                    )
+                except Exception as harvest_exc:
+                    logger.warning(
+                        "Cost harvest after agent timeout failed for session %s: %s",
+                        request.session_id,
+                        harvest_exc,
+                    )
         except Exception as exc:
             if managed.cancel_requested:
                 logger.info("Agent execution cancelled for session %s", request.session_id)
@@ -977,11 +1005,19 @@ class GatewayNodeManager:
                 }
             )
             training_filter.setdefault("original_reward", trace.reward)
+            if trace.reward_components:
+                training_filter.setdefault(
+                    "original_reward_components",
+                    dict(trace.reward_components),
+                )
             trace_metadata["training_filter"] = training_filter
             filtered_traces.append(
                 trace.model_copy(
                     update={
                         "reward": 0.0,
+                        "reward_components": {
+                            key: 0.0 for key in trace.reward_components
+                        },
                         "loss_mask": [0] * len(trace.response_ids),
                         "metadata": trace_metadata,
                     }
@@ -1208,6 +1244,38 @@ class GatewayNodeManager:
                 trace.model_copy(update={"reward": eval_result.outcome_reward}) for trace in traces
             ]
 
+        if eval_result.trace_reward_components is not None:
+            if len(eval_result.trace_reward_components) != len(traces):
+                return trajectory.model_copy(
+                    update={
+                        "status": "ERROR",
+                        "error": (
+                            f"evaluator returned {len(eval_result.trace_reward_components)} "
+                            f"trace_reward_components but trajectory has {len(traces)} traces"
+                        ),
+                    }
+                )
+            traces = [
+                trace.model_copy(update={"reward_components": components or {}})
+                for trace, components in zip(
+                    traces,
+                    eval_result.trace_reward_components,
+                )
+            ]
+        elif eval_result.outcome_reward_components is not None and traces:
+            # Broadcast trajectory-level reward components independently of
+            # the legacy scalar reward.
+            traces = [
+                trace.model_copy(
+                    update={
+                        "reward_components": dict(
+                            eval_result.outcome_reward_components
+                        )
+                    }
+                )
+                for trace in traces
+            ]
+
         # A successful session can contain abandoned retry chains. Never let a
         # terminal outcome positively reinforce a chain whose attempted tool
         # call could not be parsed. This is still a sampled policy action: if
@@ -1226,6 +1294,8 @@ class GatewayNodeManager:
             "strategy": evaluator_spec.strategy,
             "outcome_reward": eval_result.outcome_reward,
             "trace_rewards": eval_result.trace_rewards,
+            "outcome_reward_components": eval_result.outcome_reward_components,
+            "trace_reward_components": eval_result.trace_reward_components,
             **eval_result.metadata,
         }
         if parser_invalid_traces_zero_rewarded:
@@ -1279,9 +1349,17 @@ class GatewayNodeManager:
                 filter_update["trainable"] = aligned_agent_timeout
             training_filter.update(filter_update)
             training_filter.setdefault("original_reward", trace.reward)
+            if trace.reward_components:
+                training_filter.setdefault(
+                    "original_reward_components",
+                    dict(trace.reward_components),
+                )
             trace_metadata["training_filter"] = training_filter
             updates: dict[str, Any] = {
                 "reward": 0.0,
+                "reward_components": {
+                    key: 0.0 for key in trace.reward_components
+                },
                 "metadata": trace_metadata,
             }
             if not aligned_agent_timeout:
@@ -1294,10 +1372,24 @@ class GatewayNodeManager:
             evaluation = dict(evaluation)
             outcome_reward = evaluation.get("outcome_reward")
             trace_rewards = evaluation.get("trace_rewards")
+            outcome_reward_components = evaluation.get(
+                "outcome_reward_components"
+            )
+            trace_reward_components = evaluation.get("trace_reward_components")
             if outcome_reward is not None:
                 evaluation.setdefault("discarded_outcome_reward", outcome_reward)
             if trace_rewards is not None:
                 evaluation.setdefault("discarded_trace_rewards", trace_rewards)
+            if outcome_reward_components is not None:
+                evaluation.setdefault(
+                    "discarded_outcome_reward_components",
+                    outcome_reward_components,
+                )
+            if trace_reward_components is not None:
+                evaluation.setdefault(
+                    "discarded_trace_reward_components",
+                    trace_reward_components,
+                )
             # ``reward`` and ``resolved`` are common evaluator convenience
             # fields (including Harbor).  Keep verifier_reported_reward intact
             # as the raw diagnostic while making these effective fields agree
@@ -1310,6 +1402,19 @@ class GatewayNodeManager:
             evaluation["outcome_reward"] = 0.0
             if isinstance(trace_rewards, list):
                 evaluation["trace_rewards"] = [0.0] * len(trace_rewards)
+            if isinstance(outcome_reward_components, dict):
+                evaluation["outcome_reward_components"] = {
+                    key: 0.0 for key in outcome_reward_components
+                }
+            if isinstance(trace_reward_components, list):
+                evaluation["trace_reward_components"] = [
+                    (
+                        {key: 0.0 for key in components}
+                        if isinstance(components, dict)
+                        else None
+                    )
+                    for components in trace_reward_components
+                ]
             evaluation["reward_discarded"] = True
             evaluation["reward_discard_reason"] = filter_reason
             metadata["evaluation"] = evaluation

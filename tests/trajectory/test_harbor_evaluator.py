@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -266,3 +267,51 @@ async def test_harbor_raises_after_upload_attempts_exhausted(tmp_path) -> None:
         )
 
     assert runtime.upload_attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_harbor_emits_negative_gpt_cost_component(tmp_path) -> None:
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    artifacts_dir = tmp_path / "session" / "artifacts"
+    runtime = HarborRuntime(tmp_path / "session", artifacts_dir)
+    evaluator = HarborEvaluator(
+        tests_dir=str(tests_dir),
+        emit_cost_reward=True,
+    )
+
+    result = await evaluator.evaluate(
+        Trajectory(status="COMPLETED"),
+        runtime=runtime,
+        artifacts_dir=artifacts_dir,
+        agent_result=SimpleNamespace(
+            metadata={"controller_v3_cost": {"cost": 0.0123}}
+        ),
+    )
+
+    assert result.outcome_reward == 1.0
+    assert result.outcome_reward_components == {
+        "harbor_reward": 1.0,
+        "negative_cost": -0.0123,
+    }
+    assert result.metadata["gpt_cost_usd"] == 0.0123
+
+
+@pytest.mark.asyncio
+async def test_harbor_cost_reward_fails_closed_without_usage(tmp_path) -> None:
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    artifacts_dir = tmp_path / "session" / "artifacts"
+    runtime = HarborRuntime(tmp_path / "session", artifacts_dir)
+    evaluator = HarborEvaluator(
+        tests_dir=str(tests_dir),
+        emit_cost_reward=True,
+    )
+
+    with pytest.raises(RuntimeError, match="cost metadata is missing"):
+        await evaluator.evaluate(
+            Trajectory(status="COMPLETED"),
+            runtime=runtime,
+            artifacts_dir=artifacts_dir,
+            agent_result=SimpleNamespace(metadata={}),
+        )

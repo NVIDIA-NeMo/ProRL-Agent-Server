@@ -82,6 +82,53 @@ class _BlockingEvaluator:
             raise
 
 
+def test_merge_eval_result_broadcasts_named_reward_components() -> None:
+    trajectory = Trajectory(
+        status="COMPLETED",
+        traces=[Trace(), Trace()],
+    )
+    merged = GatewayNodeManager._merge_eval_result(
+        trajectory,
+        EvalResult(
+            outcome_reward=0.75,
+            outcome_reward_components={
+                "reward_1": 1.0,
+                "reward_2": 0.5,
+            },
+        ),
+        EvaluatorSpec(strategy="test"),
+    )
+
+    assert [trace.reward for trace in merged.traces] == [0.75, 0.75]
+    assert [trace.reward_components for trace in merged.traces] == [
+        {"reward_1": 1.0, "reward_2": 0.5},
+        {"reward_1": 1.0, "reward_2": 0.5},
+    ]
+    assert merged.metadata["evaluation"]["outcome_reward_components"] == {
+        "reward_1": 1.0,
+        "reward_2": 0.5,
+    }
+
+
+def test_merge_eval_result_rejects_misaligned_trace_reward_components() -> None:
+    trajectory = Trajectory(
+        status="COMPLETED",
+        traces=[Trace(), Trace()],
+    )
+    merged = GatewayNodeManager._merge_eval_result(
+        trajectory,
+        EvalResult(
+            trace_reward_components=[
+                {"reward_1": 1.0, "reward_2": 0.5},
+            ],
+        ),
+        EvaluatorSpec(strategy="test"),
+    )
+
+    assert merged.status == "ERROR"
+    assert "trace_reward_components" in str(merged.error)
+
+
 @pytest.mark.asyncio
 async def test_node_close_propagates_dispatcher_containment_failure() -> None:
     manager = object.__new__(GatewayNodeManager)
@@ -306,6 +353,52 @@ async def test_spilot_dispatch_issues_and_injects_scoped_capabilities(
         storage.close()
 
 
+@pytest.mark.asyncio
+async def test_controller_v3_dispatch_issues_router_and_pool_capabilities_only(
+    tmp_path: Path,
+) -> None:
+    registry = SessionRegistry()
+    storage = SessionStore()
+    manager = GatewayNodeManager(
+        node_id="node-test",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=storage,
+        session_registry=registry,
+        builders=SimpleNamespace(),  # type: ignore[arg-type]
+        evaluators=SimpleNamespace(),  # type: ignore[arg-type]
+        session_base_dir=str(tmp_path),
+    )
+    enqueue = AsyncMock()
+    manager._dispatcher.enqueue = enqueue
+    request = SessionDispatchRequest(
+        session_id="controller-session-id",
+        task_id="task-id",
+        instruction="Fix it",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(image="task.sif"),
+        agent=AgentSpec(harness="controller_v3"),
+    )
+    try:
+        await manager.dispatch(request)
+        managed = enqueue.await_args.args[0]
+        assert managed.router_capability not in (None, request.session_id)
+        assert managed.model_pool_capability not in (None, request.session_id)
+        assert managed.model_pool_admission_capability is None
+
+        managed.stage = SessionStage.RUNNING
+        registry.set_status(request.session_id, SessionStatus.RUNNING)
+        environment = manager._runtime_env(request, managed, include_agent_env=True)
+        assert environment[ROUTER_CAPABILITY_ENV] == managed.router_capability
+        assert environment[MODEL_POOL_CAPABILITY_ENV] == managed.model_pool_capability
+        assert MODEL_POOL_ADMISSION_CAPABILITY_ENV not in environment
+    finally:
+        await manager._client.aclose()
+        storage.close()
+
+
 def test_runtime_prepare_retries_configured_transient_exec_failure(tmp_path) -> None:
     manager = object.__new__(GatewayNodeManager)
     manager._runtime_env = lambda *_args, **_kwargs: {}  # type: ignore[method-assign]
@@ -348,7 +441,7 @@ def test_runtime_prepare_retries_configured_transient_exec_failure(tmp_path) -> 
 
 
 @pytest.mark.asyncio
-async def test_timeout_before_postprocess_does_not_create_coroutine(tmp_path: Path) -> None:
+async def test_session_timeout_during_exec_harvests_cost_via_postprocess(tmp_path: Path) -> None:
     manager = object.__new__(GatewayNodeManager)
     manager._start_eval_prewarm = lambda _managed: None  # type: ignore[method-assign]
     manager._runtime_env = lambda *_args, **_kwargs: {}  # type: ignore[method-assign]
@@ -356,7 +449,7 @@ async def test_timeout_before_postprocess_does_not_create_coroutine(tmp_path: Pa
     async def setup(_runtime: BaseRuntime) -> None:
         pass
 
-    postprocess = Mock()
+    postprocess = AsyncMock()
     harness = SimpleNamespace(
         setup=setup,
         run_steps=Mock(return_value=[]),
@@ -392,8 +485,10 @@ async def test_timeout_before_postprocess_does_not_create_coroutine(tmp_path: Pa
 
     await manager._handle_run(managed)
 
-    postprocess.assert_not_called()
+    # The exec-stage timeout handler re-runs postprocess (properly awaited, no
+    # stray coroutine) to harvest the partial cost the agent already persisted.
     assert managed.agent_result is not None
+    postprocess.assert_awaited_once_with(managed.runtime, managed.agent_result)
     assert managed.agent_result.status == "timeout"
     assert managed.agent_result.metadata["timeout_source"] == "session"
     assert managed.agent_result.metadata["timeout_stage"] == "exec"
@@ -402,7 +497,7 @@ async def test_timeout_before_postprocess_does_not_create_coroutine(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_agent_budget_exhausted_before_postprocess_remains_exec_timeout(
+async def test_agent_budget_exhausted_harvests_cost_and_remains_exec_timeout(
     tmp_path: Path,
 ) -> None:
     manager = object.__new__(GatewayNodeManager)
@@ -412,7 +507,7 @@ async def test_agent_budget_exhausted_before_postprocess_remains_exec_timeout(
     async def setup(_runtime: BaseRuntime) -> None:
         pass
 
-    postprocess = Mock()
+    postprocess = AsyncMock()
     harness = SimpleNamespace(
         setup=setup,
         run_steps=Mock(return_value=[]),
@@ -449,8 +544,11 @@ async def test_agent_budget_exhausted_before_postprocess_remains_exec_timeout(
 
     await manager._handle_run(managed)
 
-    postprocess.assert_not_called()
+    # The agent-budget timeout is the trainable-negative case: postprocess is
+    # re-run (awaited) to harvest the partial GPT cost, and the result must
+    # still read as an exec-stage agent timeout afterwards.
     assert managed.agent_result is not None
+    postprocess.assert_awaited_once_with(managed.runtime, managed.agent_result)
     assert managed.agent_result.status == "timeout"
     assert managed.agent_result.error == "agent execution timeout"
     assert managed.agent_result.metadata["timeout_source"] == "agent"
