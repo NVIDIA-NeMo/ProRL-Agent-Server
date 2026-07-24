@@ -45,6 +45,8 @@ export SGLANG_ENABLE_FP32_LM_HEAD=0
 
 export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
 export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
+# Save a checkpoint every 5 rollouts (set before env.cwdfw.sh's default of 10).
+export SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
 export DVAO_REWARD_KEY_1="${DVAO_REWARD_KEY_1:-}"
 export DVAO_REWARD_KEY_2="${DVAO_REWARD_KEY_2:-}"
 export GDPO_REWARD_KEY_1="${GDPO_REWARD_KEY_1:-harbor_reward}"
