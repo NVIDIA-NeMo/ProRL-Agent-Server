@@ -143,11 +143,15 @@ def select_training_groups(
         mixed = [i for i in kept if classes[i] == "mixed"]
         all_correct = [i for i in kept if classes[i] == "all_correct"]
         other = [i for i in kept if classes[i] not in ("mixed", "all_correct")]
+        all_correct_reaching_c = len(all_correct)
         if len(all_correct) > len(mixed):
             seed = rollout_id if isinstance(rollout_id, int) else None
             all_correct = random.Random(seed).sample(all_correct, len(mixed))
+        # Count only what C actually downsamples, among the all-correct groups
+        # that reached C (survived D/B). ``classes.count`` would also blame C for
+        # all-correct groups an earlier stage already excluded.
         metrics["polar/group_selection/subsampled_all_correct"] = float(
-            classes.count("all_correct") - len(all_correct)
+            all_correct_reaching_c - len(all_correct)
         )
         kept = mixed + all_correct + other
 
