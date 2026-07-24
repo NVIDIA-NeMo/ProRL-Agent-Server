@@ -189,7 +189,7 @@ printf -v BASH_Q '%q' "$BASH_BIN"
 if [ "${POLAR_APPTAINER_JOB_SESSION_MOUNT:-0}" = "1" ]; then
     APPTAINER_SESSIONDIR="${POLAR_APPTAINER_SESSIONDIR:?set POLAR_APPTAINER_SESSIONDIR}"
     printf -v APPTAINER_SESSIONDIR_Q '%q' "${APPTAINER_SESSIONDIR}"
-    APPTAINER_SESSION_SETUP="APPTAINER_SESSION_HOST=/tmp/polar-apptainer-session-\${SLURM_JOB_ID}-\${UID}; ${SRUN_Q} --overlap --nodes=${NUM_NODES} --ntasks=${NUM_NODES} --ntasks-per-node=1 --cpus-per-task=1 --cpu-bind=none ${BASH_Q} -c 'set -euo pipefail; root=\"\$1\"; if [ -e \"\${root}\" ] || [ -L \"\${root}\" ]; then echo \"ERROR: refusing existing Apptainer session root: \${root}\" >&2; exit 1; fi; install -d -m 700 -- \"\${root}\"' bash \"\${APPTAINER_SESSION_HOST}\"; MNT_Q_WITH_SESSION=${MNT_Q},\${APPTAINER_SESSION_HOST}:${APPTAINER_SESSIONDIR_Q}:rw"
+    APPTAINER_SESSION_SETUP="APPTAINER_SESSION_HOST=/tmp/polar-apptainer-session-\${SLURM_JOB_ID}-\${SLURM_RESTART_COUNT:-0}-\${UID}; ${SRUN_Q} --overlap --nodes=${NUM_NODES} --ntasks=${NUM_NODES} --ntasks-per-node=1 --cpus-per-task=1 --cpu-bind=none ${BASH_Q} -c 'set -euo pipefail; root=\"\$1\"; if [ -e \"\${root}\" ] || [ -L \"\${root}\" ]; then echo \"ERROR: refusing existing Apptainer session root: \${root}\" >&2; exit 1; fi; install -d -m 700 -- \"\${root}\"' bash \"\${APPTAINER_SESSION_HOST}\"; MNT_Q_WITH_SESSION=${MNT_Q},\${APPTAINER_SESSION_HOST}:${APPTAINER_SESSIONDIR_Q}:rw"
     MNT_ARG='${MNT_Q_WITH_SESSION}'
 else
     APPTAINER_SESSION_SETUP=:
