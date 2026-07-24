@@ -305,13 +305,23 @@ def _install_capability_guards(
             except FormatError as exc:
                 # The paid responses() call already happened before the tool
                 # call parse raised; the model stashes the billed response on
-                # the exception. Bill it (best-effort) so a tool-call-less turn
-                # still counts toward cost, then let FormatError propagate.
+                # the exception (InterruptAgentFlow keeps it as a TUPLE). Bill
+                # it (best-effort) so a tool-call-less turn still counts toward
+                # cost, then let FormatError propagate. _account never runs on
+                # this path, so mirror it here to land the dollars in the
+                # usage['large']['cost'] field postprocess harvests.
                 if _price_response:
                     error_messages = getattr(exc, "messages", None)
-                    if isinstance(error_messages, list) and error_messages:
+                    if isinstance(error_messages, (list, tuple)) and error_messages:
                         try:
                             _price_large_worker_response(agent, error_messages[0])
+                            billed = (
+                                error_messages[0].get("extra", {}).get("cost", 0.0)
+                                or 0.0
+                            )
+                            totals = agent.usage["large"]
+                            totals["n_calls"] = int(totals.get("n_calls", 0)) + 1
+                            totals["cost"] = float(totals.get("cost", 0.0)) + billed
                         except Exception:
                             pass
                 raise

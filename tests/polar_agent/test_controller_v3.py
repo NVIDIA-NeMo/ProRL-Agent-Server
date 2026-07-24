@@ -233,6 +233,76 @@ def test_large_worker_prices_cached_uncached_and_output_tokens() -> None:
     assert agent.usage["large"]["cached_input_tokens"] == 250_000
 
 
+def test_format_error_turn_still_bills_large_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+    import types
+
+    exceptions_mod = types.ModuleType("minisweagent.exceptions")
+
+    class FormatError(Exception):
+        def __init__(self, *messages: dict) -> None:
+            # The runtime's InterruptAgentFlow keeps messages as a TUPLE.
+            self.messages = messages
+            super().__init__()
+
+    exceptions_mod.FormatError = FormatError  # type: ignore[attr-defined]
+    package_mod = types.ModuleType("minisweagent")
+    package_mod.exceptions = exceptions_mod  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "minisweagent", package_mod)
+    monkeypatch.setitem(sys.modules, "minisweagent.exceptions", exceptions_mod)
+
+    runner = _load_runner()
+    billed_response = {
+        "usage": {
+            "input_tokens": 1_000_000,
+            "output_tokens": 1_000_000,
+            "input_tokens_details": {"cached_tokens": 250_000},
+        }
+    }
+
+    class Model:
+        def __init__(self, *, raises: bool) -> None:
+            self.config = SimpleNamespace(model_kwargs={})
+            self.raises = raises
+
+        def query(self, _messages):
+            if self.raises:
+                raise FormatError(billed_response)
+            return {"usage": {"input_tokens": 0, "output_tokens": 0}}
+
+    small = Model(raises=False)
+    large = Model(raises=True)
+
+    class Agent:
+        small_model = small
+        large_model = large
+        controller_model = Model(raises=False)
+        usage = {"large": {"n_calls": 0, "cost": 0.0}}
+
+        def _query_controller_model(self, _messages):
+            return {}
+
+    agent = Agent()
+    runner._install_capability_guards(
+        agent,
+        router_capability="router-secret",
+        pool_capability="pool-secret",
+    )
+
+    with pytest.raises(FormatError):
+        large.query([])
+
+    # The tool-call-less turn was billed before the exception propagated:
+    # tokens land in usage['large'] and the dollars in the cost/n_calls
+    # fields postprocess harvests into controller_v3_cost.
+    assert agent.usage["large"]["input_tokens"] == 1_000_000
+    assert agent.usage["large"]["output_tokens"] == 1_000_000
+    assert agent.usage["large"]["cached_input_tokens"] == 250_000
+    assert agent.usage["large"]["n_calls"] == 1
+    assert agent.usage["large"]["cost"] == pytest.approx(6.775)
+    assert billed_response["extra"]["cost"] == pytest.approx(6.775)
+
+
 def test_capability_guards_initialize_zero_gpt_cost_usage() -> None:
     runner = _load_runner()
 
