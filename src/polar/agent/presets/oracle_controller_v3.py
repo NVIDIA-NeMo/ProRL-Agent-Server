@@ -888,22 +888,35 @@ class OracleControllerV3Agent(DefaultAgent):
             self.shared_log_errors.append(f"init: {type(e).__name__}: {e}")
 
     def _sync_shared_log(self) -> None:
-        """Append all not-yet-written events. Called at every switch: the two
+        """Publish all not-yet-written events. Called at every switch: the two
         workers alternate, so a switch-time sync is always complete for the
-        incoming reader."""
+        incoming reader.
+
+        The whole log is written to a temp file and atomically renamed over
+        events.log, rather than appended in place. A chunked append that failed
+        or was killed partway would otherwise leave a truncated block in
+        events.log while ``_shared_log_synced`` stayed put, so the next sync
+        re-sent everything and the reader saw a dangling half-block plus
+        duplicate event ids. A rename either fully lands the new log or leaves
+        the previous complete one untouched.
+        """
         self._ensure_shared_log()
         if not self._shared_log_ready:
             return
-        pending = self.events[self._shared_log_synced :]
-        if not pending:
+        if self._shared_log_synced == len(self.events):
             return
+        block = "".join(self._shared_log_block(event) for event in self.events)
         try:
-            self._shared_log_write(
-                "events.log", "".join(self._shared_log_block(event) for event in pending), append=True
-            )
+            self._shared_log_write("events.log.tmp", block, append=False)
+            self._shared_log_rename("events.log.tmp", "events.log")
             self._shared_log_synced = len(self.events)
         except Exception as e:
-            self.shared_log_errors.append(f"sync at E{pending[-1]['event_id']}: {type(e).__name__}: {e}")
+            last_id = self.events[-1]["event_id"] if self.events else "?"
+            self.shared_log_errors.append(f"sync at E{last_id}: {type(e).__name__}: {e}")
+
+    def _shared_log_rename(self, src: str, dst: str) -> None:
+        base = self.config.shared_log_path
+        self._shared_log_execute(f"mv -f '{base}/{src}' '{base}/{dst}'")
 
     # ---------------- controller ----------------
 
