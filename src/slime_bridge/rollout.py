@@ -6081,17 +6081,28 @@ def _polar_extra_metrics(
         for action, count in action_counts.items():
             out[f"polar/routing/actual_action_count/{action}"] = float(count)
             out[f"polar/routing/actual_action_ratio/{action}"] = count / action_total
-    # Mean GPT cost per trajectory. ``negative_cost`` is a per-episode outcome
-    # broadcast to every trace, so aggregate once per non-placeholder session.
+    # Mean GPT cost per trajectory, taken from the evaluation metadata's real
+    # spend (``gpt_cost_usd``). The ``negative_cost`` reward component is zeroed
+    # on every fail-closed path (parser-invalid, timeout, ERROR mask), so a
+    # session that burned real GPT money before failing would otherwise be
+    # recorded as $0 and understate the mean. Aggregate once per non-placeholder
+    # session (the outcome is broadcast to every trace).
     cost_by_session: dict[str, float] = {}
     for sample in flat_samples:
         polar_meta = sample.metadata.get("polar", {})
         if not isinstance(polar_meta, dict) or polar_meta.get("placeholder"):
             continue
         session_id = polar_meta.get("session_id")
-        reward = getattr(sample, "reward", None)
-        if session_id and isinstance(reward, dict) and "negative_cost" in reward:
-            cost_by_session[str(session_id)] = -_finite_float_or_zero(reward["negative_cost"])
+        if not session_id:
+            continue
+        trajectory_metadata = polar_meta.get("trajectory_metadata")
+        evaluation = (
+            trajectory_metadata.get("evaluation")
+            if isinstance(trajectory_metadata, dict)
+            else None
+        )
+        if isinstance(evaluation, dict) and "gpt_cost_usd" in evaluation:
+            cost_by_session[str(session_id)] = _finite_float_or_zero(evaluation["gpt_cost_usd"])
     if cost_by_session:
         out["polar/controller/cost_usd_mean"] = sum(cost_by_session.values()) / len(
             cost_by_session
