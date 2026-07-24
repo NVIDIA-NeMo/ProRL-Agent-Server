@@ -826,7 +826,8 @@ def test_checkpoint_retention_is_optional_validated_and_forwarded(tmp_path: Path
     assert 'export SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-}"' in env_script
     assert 'SAVE_RETENTION_ARGS+=(--save-retain-interval "${SAVE_RETAIN_INTERVAL}")' in shared_run
     assert '"${SAVE_RETENTION_ARGS[@]}" \\' in shared_run
-    assert "SAVE_INTERVAL|SAVE_RETAIN_INTERVAL|SEQUENCE_PARALLEL" in shared_submit
+    assert "SAVE_INTERVAL|SAVE_RETAIN_INTERVAL|" in shared_submit
+    assert "SAVE_HF_ENABLED|SAVE_MEGATRON|SAVE_HF_TEMPLATE|SEQUENCE_PARALLEL" in shared_submit
     assert "SAVE_INTERVAL SAVE_RETAIN_INTERVAL" in run_state
 
     optional_env = clean_env(tmp_path)
@@ -2220,7 +2221,7 @@ printf '%s\n' \
         "8|1|1|8",
         "32|4|4|32",
         "17700|36600|37200",
-        "backfill|2-00:00:00|2-00:00:00|43200|43200|5",
+        "batch|04:00:00|04:00:00|1800|1800|5",
     ]
 
 
@@ -2290,7 +2291,16 @@ def test_spilot_launcher_rejects_wall_time_shorter_than_request_and_grace(
     tmp_path: Path,
 ) -> None:
     env = clean_env(tmp_path)
-    env.update(WALL_TIME="4:00:00", TMAX_MIN_WALL_TIME="4:00:00")
+    # Durable canonical admission requires the explicit backfill override and
+    # a checkpoint-reserve-sized grace buffer (defaults are batch/4h for the
+    # regular lanes); pin those so the wall-time guard itself is what fires.
+    env.update(
+        WALL_TIME="4:00:00",
+        TMAX_MIN_WALL_TIME="4:00:00",
+        PARTITION="backfill",
+        TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="43200",
+        TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS="43200",
+    )
     result = run_bash(
         f"source {SPILOT / 'experiment_defaults.sh'}; "
         f"source {TMAX / 'env.cwdfw.sh'}",
@@ -2309,9 +2319,12 @@ def test_spilot_launcher_rejects_grace_buffer_without_checkpoint_reserve(
     tmp_path: Path,
 ) -> None:
     env = clean_env(tmp_path)
+    # PARTITION=backfill gets past the durable-admission partition guard so
+    # the checkpoint-reserve arithmetic below is what fires.
     env.update(
         TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="40799",
         TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS="40799",
+        PARTITION="backfill",
     )
     result = run_bash(
         f"source {SPILOT / 'experiment_defaults.sh'}; "
