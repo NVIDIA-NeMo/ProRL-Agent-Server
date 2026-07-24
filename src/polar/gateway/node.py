@@ -58,6 +58,9 @@ _CALLBACK_REQUEST_TIMEOUT_SECONDS = 5.0
 _CALLBACK_RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _AGENT_RESULT_METADATA_KEY = "agent_result"
 _TRAINABLE_AGENT_TIMEOUT_REASON = "agent_timeout"
+# Grace window to harvest the partial GPT cost an agent-budget timeout already
+# wrote to its trajectory file, after the agent budget itself is exhausted.
+_AGENT_TIMEOUT_COST_HARVEST_SECONDS = 10.0
 
 
 class GatewayExecutionTimeout(TimeoutError):
@@ -569,7 +572,7 @@ class GatewayNodeManager:
         except GatewayExecutionTimeout as exc:
             # Don't set final_result — let _handle_postrun build a partial
             # trajectory from the completions captured so far.
-            managed.agent_result = AgentRunResult(
+            timeout_result = AgentRunResult(
                 status="timeout",
                 return_code=-1,
                 error=str(exc),
@@ -578,6 +581,30 @@ class GatewayNodeManager:
                     "timeout_stage": timeout_stage,
                 },
             )
+            managed.agent_result = timeout_result
+            # An agent-budget timeout during exec is an aligned, trainable
+            # negative. The agent saves its trajectory (with running GPT cost)
+            # after every step, so harvest that partial cost here — the normal
+            # post-exec postprocess was skipped when the budget ran out. This
+            # keeps the sample's real spend instead of letting it look free.
+            # Best-effort and time-bounded; a missing/torn file leaves cost
+            # absent (falls back to today's drop) and never sets timeout_stage.
+            if (
+                timeout_stage == "exec"
+                and harness is not None
+                and managed.runtime is not None
+            ):
+                try:
+                    await asyncio.wait_for(
+                        harness.postprocess(managed.runtime, timeout_result),
+                        timeout=_AGENT_TIMEOUT_COST_HARVEST_SECONDS,
+                    )
+                except Exception as harvest_exc:
+                    logger.warning(
+                        "Cost harvest after agent timeout failed for session %s: %s",
+                        request.session_id,
+                        harvest_exc,
+                    )
         except Exception as exc:
             if managed.cancel_requested:
                 logger.info("Agent execution cancelled for session %s", request.session_id)
