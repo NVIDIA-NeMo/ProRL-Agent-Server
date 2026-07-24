@@ -232,9 +232,15 @@ def _post_process_gdpo(
         )
 
         # Cost gate: outside a fully correct group keep only the first
-        # (accuracy) component, so cost never trades away correctness.
+        # (accuracy) component, so cost never trades away correctness. A
+        # trajectory's outcome accuracy is shared by all its traces, so judge it
+        # by the max over traces, not the per-trace mean: a zero-reward
+        # parser-invalid / agent-timeout trace must not drag a solved
+        # trajectory below 1.0 and falsely close the gate on an all-correct
+        # group.
         drop_cost = cost_gate_all_correct and not all(
-            trajectory_means[key][0] >= 1.0 for key in valid_keys
+            max(values[0] for values in traj_component_values[key]) >= 1.0
+            for key in valid_keys
         )
 
         for key in valid_keys:
