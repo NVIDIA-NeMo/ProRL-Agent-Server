@@ -254,6 +254,8 @@ def _install_capability_guards(
     pool_capability: str,
     responses_client: Any | None = None,
 ) -> None:
+    from minisweagent.exceptions import FormatError
+
     large_usage = agent.usage["large"]
     for key in (
         "input_tokens",
@@ -286,14 +288,28 @@ def _install_capability_guards(
             _price_response: bool = price_response,
             **kwargs: Any,
         ) -> dict[str, Any]:
-            message = _with_capability(
-                _config,
-                pool_capability,
-                _query,
-                messages,
-                request_client=_request_client,
-                **kwargs,
-            )
+            try:
+                message = _with_capability(
+                    _config,
+                    pool_capability,
+                    _query,
+                    messages,
+                    request_client=_request_client,
+                    **kwargs,
+                )
+            except FormatError as exc:
+                # The paid responses() call already happened before the tool
+                # call parse raised; the model stashes the billed response on
+                # the exception. Bill it (best-effort) so a tool-call-less turn
+                # still counts toward cost, then let FormatError propagate.
+                if _price_response:
+                    error_messages = getattr(exc, "messages", None)
+                    if isinstance(error_messages, list) and error_messages:
+                        try:
+                            _price_large_worker_response(agent, error_messages[0])
+                        except Exception:
+                            pass
+                raise
             if _price_response:
                 _price_large_worker_response(agent, message)
             return message
