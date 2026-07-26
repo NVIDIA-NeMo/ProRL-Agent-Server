@@ -3,6 +3,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+# shellcheck source=./lifecycle.sh
+source "${SCRIPT_DIR}/lifecycle.sh"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 SPILOT_ROOT="$(cd -- "${PROJECT_ROOT}/../.." && pwd)"
 
@@ -25,7 +27,7 @@ export TMAX_RUN_STATE_FILE="${TMAX_RUN_STATE_FILE:-${POLAR_DATA_ROOT}/runs/tmax_
 # shellcheck source=./run_state.sh
 source "${SCRIPT_DIR}/run_state.sh"
 
-for command in flock squeue sacct python3; do
+for command in flock git squeue sacct python3; do
     command -v "$command" >/dev/null || { echo "ERROR: ${command} is required" >&2; exit 1; }
 done
 mkdir -p "$(dirname "${TMAX_RUN_STATE_FILE}")"
@@ -36,13 +38,16 @@ if ! flock -n 9; then
 fi
 export TMAX_RUN_STATE_LOCK_HELD=1
 
-# An explicit RUN_ID starts or selects that run. Otherwise continue the run
-# recorded by submit_slurm.sh or an earlier watcher invocation.
+# Existing state is authoritative even when RUN_ID is explicit. This prevents
+# a watcher from silently repinning or overwriting the immutable contract of a
+# prior logical run. A new explicit run must use a new state-file path.
 LOADED_RUN_STATE=false
-if [ -z "${RUN_ID:-}" ] && [ -s "${TMAX_RUN_STATE_FILE}" ]; then
-    tmax_load_run_state "${TMAX_RUN_STATE_FILE}"
+_TMAX_REQUESTED_RUN_ID="${RUN_ID:-}"
+if [ -s "${TMAX_RUN_STATE_FILE}" ]; then
+    tmax_load_selected_run_state "${TMAX_RUN_STATE_FILE}" "${_TMAX_REQUESTED_RUN_ID}"
     LOADED_RUN_STATE=true
 fi
+unset _TMAX_REQUESTED_RUN_ID
 # Run-state files written before the fixed-holdout feature must resume with
 # their original prompt/checkpoint semantics. New submissions persist an
 # explicit TMAX_EVAL_ENABLED value, so only legacy state reaches this branch.
@@ -70,6 +75,15 @@ if [ "$LOADED_RUN_STATE" = true ] && \
    ! tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_DYNAMIC_SAMPLING_FILTER_PATH; then
     export TMAX_DYNAMIC_SAMPLING_FILTER_PATH=""
 fi
+# Episode admission changes both provider pressure and timeout semantics. A run
+# state that contains none of the contract fields predates admission and must
+# resume with the old disabled behavior and 3,300/4,500/5,100 envelopes. A
+# partially written contract is ambiguous and therefore rejected.
+if [ "$LOADED_RUN_STATE" = true ] && \
+   [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ]; then
+    tmax_restore_spilot_admission_resume_contract \
+        "${TMAX_RUN_STATE_FILE}" "[tmax watch]"
+fi
 # Model identity is part of checkpoint compatibility. Run states created before
 # it was persisted belong to the historical Qwen3.5-4B launcher; preserve that
 # lineage instead of combining a 4B SAVE_DIR with the new 9B architecture.
@@ -92,13 +106,39 @@ if [ "$LOADED_RUN_STATE" = true ] && \
 fi
 # shellcheck source=./env.cwdfw.sh
 source "${SCRIPT_DIR}/env.cwdfw.sh" >/dev/null
+if tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_PRORL_GIT_COMMIT ||
+   tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_SLIME_GIT_COMMIT ||
+   tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_MEGATRON_GIT_COMMIT; then
+    if ! tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_PRORL_GIT_COMMIT ||
+       ! tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_SLIME_GIT_COMMIT ||
+       ! tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_MEGATRON_GIT_COMMIT; then
+        echo "ERROR: run state has a partial source revision lock; refusing an ambiguous resume" >&2
+        exit 1
+    fi
+    tmax_verify_source_revisions "${PROJECT_ROOT}" "${SLIME_DIR}" "${MEGATRON_DIR}"
+elif [ "$LOADED_RUN_STATE" = true ]; then
+    echo "[tmax watch] legacy run state has no source revision lock" >&2
+fi
 
 export TMAX_WATCH_MAX_QUICK_FAILURES="${TMAX_WATCH_MAX_QUICK_FAILURES:-3}"
 export TMAX_WATCH_QUICK_FAILURE_SECONDS="${TMAX_WATCH_QUICK_FAILURE_SECONDS:-900}"
 export TMAX_WATCH_FAILURE_COUNT="${TMAX_WATCH_FAILURE_COUNT:-0}"
 export TMAX_WATCH_FAILURE_SIGNATURE="${TMAX_WATCH_FAILURE_SIGNATURE:-}"
 export TMAX_WATCH_LAST_ACCOUNTED_JOB_ID="${TMAX_WATCH_LAST_ACCOUNTED_JOB_ID:-}"
+export TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT="${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT:-0}"
 TMAX_SUBMIT_SCRIPT="${TMAX_SUBMIT_SCRIPT:-${SCRIPT_DIR}/submit_slurm.sh}"
+
+# SPilot credentials are deliberately absent from run state, so its watcher
+# must relaunch through the wrapper that regenerates the control token and
+# normalizes the NVIDIA key.  Refuse a silent fallback to this generic TMax
+# submitter: that exact fallback previously produced an all-503 resume job.
+if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ]; then
+    tmax_require_spilot_entrypoints "watcher preflight"
+    if [ -z "${POLAR_NVIDIA_API_KEY:-${NVIDIA_API_KEY:-}}" ]; then
+        echo "ERROR: SPilot Router watcher requires NVIDIA_API_KEY before relaunch" >&2
+        exit 1
+    fi
+fi
 
 if [ -n "${TMAX_TARGET_ITER:-}" ] && ! [[ "${TMAX_TARGET_ITER}" =~ ^[0-9]+$ ]]; then
     echo "ERROR: TMAX_TARGET_ITER must be a non-negative integer" >&2
@@ -122,7 +162,8 @@ if ! [[ "${ROLLOUT_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] || ! [[ "${NUM_EPOCH}" =~ ^[
 fi
 if ! [[ "${TMAX_WATCH_MAX_QUICK_FAILURES}" =~ ^[1-9][0-9]*$ ]] || \
    ! [[ "${TMAX_WATCH_QUICK_FAILURE_SECONDS}" =~ ^[1-9][0-9]*$ ]] || \
-   ! [[ "${TMAX_WATCH_FAILURE_COUNT}" =~ ^[0-9]+$ ]]; then
+   ! [[ "${TMAX_WATCH_FAILURE_COUNT}" =~ ^[0-9]+$ ]] || \
+   ! [[ "${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT}" =~ ^[0-9]+$ ]]; then
     echo "ERROR: invalid watcher failure-policy setting" >&2
     exit 2
 fi
@@ -154,20 +195,9 @@ latest_iter() {
 
 validate_checkpoint_pair() {
     local pointer="${SAVE_DIR}/latest_checkpointed_iteration.txt"
-    local value state_path
-    [ -e "$pointer" ] || return 0
-    if [ ! -s "$pointer" ]; then
-        echo "[tmax watch] ERROR: checkpoint pointer exists but is empty: ${pointer}" >&2
-        return 1
-    fi
-    value="$(tr -d '[:space:]' <"$pointer")"
-    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
-        echo "[tmax watch] ERROR: invalid checkpoint pointer ${pointer}: ${value}" >&2
-        return 1
-    fi
-    state_path="${SAVE_DIR}/rollout/global_dataset_state_dict_${value}.pt"
-    if [ ! -s "$state_path" ]; then
-        echo "[tmax watch] ERROR: model checkpoint ${value} has no matching rollout state: ${state_path}" >&2
+    [ -e "${pointer}" ] || return 0
+    if ! tmax_validate_numbered_checkpoint \
+        "${SAVE_DIR}" "[tmax watch] ERROR" >/dev/null; then
         echo "[tmax watch] refusing to resume from a non-atomic checkpoint" >&2
         return 1
     fi
@@ -303,6 +333,105 @@ slurm_job_record() {
         awk -F '|' -v wanted="$id" '$1 == wanted { print $2 "|" $3 "|" $4; exit }'
 }
 
+spilot_admission_fatal_marker_status() {
+    local id="$1"
+    python3 - "${TMAX_RUN_STATE_FILE}" "${id}" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+state_path = pathlib.Path(sys.argv[1])
+job_id = sys.argv[2]
+prefix = f"{state_path.name}.job-{job_id}.admission-fatal.rank-"
+paths = sorted(state_path.parent.glob(f"{prefix}*.json"))
+if not paths:
+    raise SystemExit(1)
+retained_total = 0
+for path in paths:
+    match = re.fullmatch(re.escape(prefix) + r"([0-9]+)\.json", path.name)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise SystemExit(2)
+    if (
+        match is None
+        or not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("kind") != "model_pool_episode_admission_fatal_retained"
+        or payload.get("job_id") != job_id
+        or type(payload.get("rank")) is not int
+        or payload["rank"] != int(match.group(1))
+        or not isinstance(payload.get("node_id"), str)
+        or not payload["node_id"]
+        or not isinstance(payload.get("observed_at"), str)
+        or not payload["observed_at"]
+        or type(payload.get("retained_count")) is not int
+        or payload["retained_count"] <= 0
+    ):
+        raise SystemExit(2)
+    retained_total += payload["retained_count"]
+print(f"{len(paths)}|{retained_total}")
+PY
+}
+
+spilot_candidate_pool_health_incident_status() {
+    local id="$1"
+    python3 - "${SAVE_DIR}" "${TMAX_RUN_STATE_FILE}" "${id}" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+save_dir = pathlib.Path(sys.argv[1])
+state_file = pathlib.Path(sys.argv[2])
+job_id = sys.argv[3]
+incident_dirs = (
+    save_dir / "rollout" / "candidate_pool_health_incidents",
+    pathlib.Path(f"{state_file}.candidate_pool_health_incidents"),
+)
+paths = sorted(
+    {
+        path
+        for incident_dir in incident_dirs
+        for path in incident_dir.glob("rollout_*.json")
+    }
+)
+matches = []
+for path in paths:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        # A file that cannot identify its producing allocation cannot safely
+        # be attributed to this terminal job. Valid incident files are written
+        # atomically, so leave unrelated/corrupt historical files alone.
+        continue
+    if not isinstance(payload, dict) or payload.get("slurm_job_id") != job_id:
+        continue
+    filename_match = re.fullmatch(r"rollout_([0-9]{7})\.json", path.name)
+    reasons = payload.get("trigger_reasons")
+    rollout_id = payload.get("rollout_id")
+    if (
+        filename_match is None
+        or payload.get("schema_version") != 1
+        or payload.get("triggered") is not True
+        or type(rollout_id) is not int
+        or rollout_id < 0
+        or rollout_id != int(filename_match.group(1))
+        or not isinstance(reasons, list)
+        or not reasons
+        or any(not isinstance(reason, str) or not reason for reason in reasons)
+    ):
+        raise SystemExit(2)
+    matches.append((rollout_id, reasons))
+
+if not matches:
+    raise SystemExit(1)
+latest_rollout_id, latest_reasons = max(matches, key=lambda item: item[0])
+print(f"{len(matches)}|{latest_rollout_id}|{','.join(latest_reasons)}")
+PY
+}
+
 normalize_slurm_state() {
     local state="${1%% *}"
     printf '%s\n' "${state%+}"
@@ -350,10 +479,87 @@ record_failure_signature() {
     export TMAX_WATCH_FAILURE_COUNT="$((TMAX_WATCH_FAILURE_COUNT + 1))"
 }
 
+publish_spilot_static_metrics() {
+    local wandb_label="${1:?missing W&B publisher label}"
+    shift
+    local publish_python publish_script publish_timeout wandb_dir static_metric
+    local -a publish_args
+    [ -n "${WANDB_API_KEY:-}" ] || {
+        echo "[tmax watch] W&B ${wandb_label} metric publish skipped: WANDB_API_KEY is unavailable" >&2
+        return 0
+    }
+    case "${WANDB_MODE:-offline}" in
+        online|shared) ;;
+        *)
+            echo "[tmax watch] W&B ${wandb_label} metric publish skipped: WANDB_MODE=${WANDB_MODE:-offline}" >&2
+            return 0
+            ;;
+    esac
+    command -v timeout >/dev/null || {
+        echo "[tmax watch] WARNING: cannot publish W&B ${wandb_label} metric without timeout(1)" >&2
+        return 0
+    }
+    publish_python="${TMAX_SPILOT_FATAL_WANDB_PYTHON_BIN:-${POLR_TRAIN_VENV}/bin/python3}"
+    publish_script="${PROJECT_ROOT}/scripts/monitor_wandb_gpu.py"
+    publish_timeout="${TMAX_SPILOT_FATAL_WANDB_PUBLISH_TIMEOUT_SECONDS:-45}"
+    if ! [[ "$publish_timeout" =~ ^[1-9][0-9]*$ ]]; then
+        echo "[tmax watch] WARNING: invalid TMAX_SPILOT_FATAL_WANDB_PUBLISH_TIMEOUT_SECONDS=${publish_timeout}" >&2
+        return 0
+    fi
+    if [ ! -x "$publish_python" ] || [ ! -f "$publish_script" ]; then
+        echo "[tmax watch] WARNING: final W&B fatal metric publisher is unavailable" >&2
+        return 0
+    fi
+    wandb_dir="${POLAR_DATA_ROOT}/runs/${RUN_ID}/watcher-wandb"
+    mkdir -p "$wandb_dir"
+    publish_args=(
+        "$publish_python" "$publish_script"
+        --one-shot-static
+        --metric-prefix "${GPU_MONITOR_PREFIX:-polar_tmax_system}"
+        --train-progress-file "${SAVE_DIR}/train_progress.step"
+        --wandb-run-id "${WANDB_RUN_ID:-${RUN_ID}}"
+        --wandb-project "${WANDB_PROJECT:-polar-tmax-grpo}"
+        --wandb-group "${WANDB_GROUP:-spilot-router-qwen35-9b-8n64}"
+        --wandb-dir "$wandb_dir"
+        --wandb-label "${wandb_label}"
+        --wandb-mode shared
+        --wandb-finish-timeout-s 15
+    )
+    for static_metric in "$@"; do
+        publish_args+=(--static-metric "${static_metric}")
+    done
+    if [ -n "${WANDB_ENTITY:-}" ]; then
+        publish_args+=(--wandb-entity "${WANDB_ENTITY}")
+    fi
+    if timeout --signal=TERM --kill-after=5 "$publish_timeout" "${publish_args[@]}"; then
+        if [ "${wandb_label}" = "spilot-fatal-watcher" ]; then
+            echo "[tmax watch] published final SPilot admission fatal count=${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT} to W&B" >&2
+        else
+            echo "[tmax watch] published SPilot ${wandb_label} metric(s) to W&B" >&2
+        fi
+    else
+        echo "[tmax watch] WARNING: bounded W&B ${wandb_label} metric publish failed; run state/incident remains authoritative" >&2
+    fi
+}
+
+publish_spilot_admission_fatal_metric() {
+    publish_spilot_static_metrics \
+        spilot-fatal-watcher \
+        "polar/spilot_router/admission_fatal_job_count_total=${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT}"
+}
+
+publish_spilot_candidate_pool_health_metric() {
+    publish_spilot_static_metrics \
+        spilot-candidate-health-watcher \
+        "polar/candidate_pool_health/gate_triggered=1"
+}
+
 account_terminal_job() {
     local id="$1" state="$2" elapsed="$3" exit_code="$4" iter="$5"
     local submitted_iter="${TMAX_LAST_JOB_CHECKPOINT_ITER:--1}"
     local progressed=false fail_closed_quick=false signature
+    local admission_fatal=false marker_status=0 marker_summary=""
+    local candidate_health_incident=false health_status=0 health_summary=""
 
     if [ "${TMAX_WATCH_LAST_ACCOUNTED_JOB_ID}" = "$id" ]; then
         if is_fail_closed_failure_signature "${TMAX_WATCH_FAILURE_SIGNATURE}"; then
@@ -372,12 +578,59 @@ account_terminal_job() {
         progressed=true
     fi
 
+    # Runtime-containment fatal markers remain authoritative after admission
+    # has been disabled to quiesce a draining or incident-affected allocation.
+    if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ]; then
+        marker_summary="$(spilot_admission_fatal_marker_status "$id")" || marker_status=$?
+        health_summary="$(spilot_candidate_pool_health_incident_status "$id")" || health_status=$?
+    else
+        marker_status=1
+        health_status=1
+    fi
+    if [ "$marker_status" -eq 0 ]; then
+        admission_fatal=true
+        export TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT="$((TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT + 1))"
+        echo "[tmax watch] SPilot admission fatal job metric: count_total=${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT} job=${id} markers_retained=${marker_summary}" >&2
+    elif [ "$marker_status" -eq 2 ]; then
+        echo "[tmax watch] malformed SPilot admission fatal marker for job=${id}; retaining normal fail-closed policy" >&2
+    fi
+    if [ "$health_status" -eq 0 ]; then
+        candidate_health_incident=true
+    elif [ "$health_status" -eq 2 ]; then
+        # The payload explicitly names this allocation, so an invalid schema
+        # must not turn a provider outage into an automatic retry loop.
+        candidate_health_incident=true
+        health_summary="malformed"
+        echo "[tmax watch] malformed candidate-pool health incident for job=${id}; failing closed" >&2
+    fi
+
+    if [ "$candidate_health_incident" = true ]; then
+        signature="quick-fail-closed/candidate-pool-health/job=${id}/incident=${health_summary}/${state}/exit=${exit_code}/checkpoint=${iter}"
+        record_failure_signature "$signature"
+        export TMAX_WATCH_LAST_ACCOUNTED_JOB_ID="$id"
+        tmax_write_run_state "${TMAX_RUN_STATE_FILE}"
+        if [ "$admission_fatal" = true ]; then
+            publish_spilot_admission_fatal_metric
+        fi
+        publish_spilot_candidate_pool_health_metric
+        echo "[tmax watch] candidate-pool health incident: job=${id} incident=${health_summary}; refusing automatic resubmission" >&2
+        if [[ "${health_summary}" == *partial_wal_quarantine_failed* ]]; then
+            echo "[tmax watch] partial WAL quarantine failed; do not reset this SAVE_DIR for ordinary resume" >&2
+        else
+            echo "[tmax watch] verify provider health, then restart with TMAX_WATCH_RESET_FAILURES=1" >&2
+        fi
+        WATCH_ABORT=true
+        return
+    fi
+
     # Completion without either the final marker (handled before this function)
     # or a newer atomic checkpoint is still a failed continuation, regardless
     # of elapsed time or Slurm's terminal-state spelling.
     if [ "$progressed" = false ]; then
         signature="${state}/exit=${exit_code}/checkpoint=${iter}"
-        if [[ "$elapsed" =~ ^[0-9]+$ ]] && \
+        if [ "$admission_fatal" = true ]; then
+            signature="recoverable/model-pool-episode-admission-retained/${signature}"
+        elif [[ "$elapsed" =~ ^[0-9]+$ ]] && \
            [ "$elapsed" -lt "$TMAX_WATCH_QUICK_FAILURE_SECONDS" ] && \
            is_fail_closed_quick_failure_state "$state"; then
             fail_closed_quick=true
@@ -390,6 +643,12 @@ account_terminal_job() {
     fi
     export TMAX_WATCH_LAST_ACCOUNTED_JOB_ID="$id"
     tmax_write_run_state "${TMAX_RUN_STATE_FILE}"
+    if [ "$admission_fatal" = true ]; then
+        # The allocation-side GPU monitor exited before this watcher could
+        # increment the run-level count. Publish this event now so the terminal
+        # third fatal is not lost when no subsequent allocation is launched.
+        publish_spilot_admission_fatal_metric
+    fi
 
     if [ "$fail_closed_quick" = true ]; then
         echo "[tmax watch] fail-closed quick failure: job=${id} state=${state} elapsed=${elapsed}s is below ${TMAX_WATCH_QUICK_FAILURE_SECONDS}s with no checkpoint progress; refusing automatic resubmission" >&2
@@ -415,6 +674,14 @@ record_submission_failure() {
     fi
 }
 
+import_submission_source_lock() {
+    if tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_PRORL_GIT_COMMIT ||
+       tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_SLIME_GIT_COMMIT ||
+       tmax_run_state_has_export "${TMAX_RUN_STATE_FILE}" TMAX_MEGATRON_GIT_COMMIT; then
+        tmax_import_source_revision_lock "${TMAX_RUN_STATE_FILE}"
+    fi
+}
+
 submit_training() {
     local iter="$1" status
     rm -f "${TMAX_SUBMIT_RECEIPT_FILE}"
@@ -423,6 +690,11 @@ submit_training() {
             # The job may exist but its id is unknown. Retrying here could
             # duplicate it, so stop instead of treating this as a normal error.
             echo "[tmax watch] ERROR: submission returned success without a valid fresh receipt; refusing a duplicate submission" >&2
+            WATCH_ABORT=true
+            return
+        fi
+        if ! import_submission_source_lock; then
+            echo "[tmax watch] ERROR: submitted job but could not retain its source revision lock; refusing another submission" >&2
             WATCH_ABORT=true
             return
         fi
@@ -436,11 +708,21 @@ submit_training() {
             # sbatch succeeded and the wrapper failed in later bookkeeping.
             # The receipt proves a live job may exist, so track it and never
             # issue a second submission for this polling cycle.
+            if ! import_submission_source_lock; then
+                echo "[tmax watch] ERROR: submission receipt exists but its source revision lock is invalid; refusing another submission" >&2
+                WATCH_ABORT=true
+                return
+            fi
             export TMAX_PREPARE_DATA=0
             export TMAX_LAST_JOB_CHECKPOINT_ITER="$iter"
             tmax_write_run_state "${TMAX_RUN_STATE_FILE}"
             echo "[tmax watch] submission wrapper exited ${status}, but receipt confirms job=${TMAX_LAST_JOB_ID}; tracking that job" >&2
         else
+            if ! import_submission_source_lock; then
+                echo "[tmax watch] ERROR: submission failed and its source revision lock is invalid; refusing another submission" >&2
+                WATCH_ABORT=true
+                return
+            fi
             record_submission_failure "$status" "$iter"
         fi
     fi

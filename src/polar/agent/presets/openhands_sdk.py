@@ -8,7 +8,6 @@ gateway (LLM_BASE_URL=$OPENAI_BASE_URL). Same idea, different launch shape.
 from __future__ import annotations
 
 import json
-import shlex
 
 from polar.agent.base import BaseHarness
 from polar.agent.models import AgentSpec

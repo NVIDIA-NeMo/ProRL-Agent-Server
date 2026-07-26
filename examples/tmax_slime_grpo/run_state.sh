@@ -29,6 +29,178 @@ tmax_load_run_state() {
     [ -n "${RUN_ID:-}" ] && [ -n "${SAVE_DIR:-}" ]
 }
 
+tmax_load_selected_run_state() {
+    local state_file="$1" requested_run_id="${2:-}"
+    tmax_load_run_state "$state_file" || return 1
+    if [ -n "$requested_run_id" ] && [ "$requested_run_id" != "$RUN_ID" ]; then
+        echo "ERROR: requested RUN_ID ${requested_run_id} does not match locked run state ${RUN_ID}" >&2
+        return 1
+    fi
+}
+
+tmax_restore_spilot_admission_resume_contract() {
+    local state_file="${1:?missing run state file}"
+    local log_prefix="${2:-[tmax resume]}"
+    local name present=0
+    local -a names=(
+        SPILOT_EPISODE_ADMISSION_ENABLED
+        SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS
+        SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT
+        SPILOT_QWEN_MAX_ACTIVE_EPISODES
+        SPILOT_GPT_MAX_ACTIVE_EPISODES
+        SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES
+        SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES
+        SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY
+        SPILOT_GPT_GATEWAY_MAX_CONCURRENCY
+        SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES
+        SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES
+    )
+
+    [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ] || return 0
+    for name in "${names[@]}"; do
+        if tmax_run_state_has_export "$state_file" "$name"; then
+            present="$((present + 1))"
+        fi
+    done
+    if [ "$present" -ne 0 ] && [ "$present" -ne "${#names[@]}" ]; then
+        echo "ERROR: run state has a partial SPilot episode-admission contract" >&2
+        return 1
+    fi
+    if [ "$present" -ne 0 ]; then
+        return 0
+    fi
+
+    # Logical runs that predate episode admission must retain their original
+    # provider pressure and timeout semantics. In particular, do this before
+    # sourcing current defaults: otherwise the new enabled contract would fill
+    # the missing fields and make a legacy resume look like a fresh run.
+    export SPILOT_EPISODE_ADMISSION_ENABLED=false
+    export SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS=0
+    export SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT="${NUM_NODES:-1}"
+    export SPILOT_QWEN_MAX_ACTIVE_EPISODES=0
+    export SPILOT_GPT_MAX_ACTIVE_EPISODES=0
+    export SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES=null
+    export SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES=null
+    export SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY=32
+    export SPILOT_GPT_GATEWAY_MAX_CONCURRENCY=32
+    export SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES=0
+    export SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES=0
+    if ! tmax_run_state_has_export "$state_file" TMAX_TRAIN_AGENT_TIMEOUT_SECONDS; then
+        export TMAX_TRAIN_AGENT_TIMEOUT_SECONDS=3300
+    fi
+    if ! tmax_run_state_has_export "$state_file" POLAR_TASK_TIMEOUT_FLOOR_SECONDS; then
+        export POLAR_TASK_TIMEOUT_FLOOR_SECONDS=4500
+    fi
+    if ! tmax_run_state_has_export "$state_file" POLAR_REQUEST_TIMEOUT; then
+        export POLAR_REQUEST_TIMEOUT=5100
+    fi
+    echo "${log_prefix} legacy SPilot run state: episode admission disabled; preserving old timeout envelopes" >&2
+}
+
+tmax_git_source_revision() {
+    local label="${1:?missing source label}"
+    local source_root="${2:?missing source repository}"
+    local current_revision dirty_state
+
+    if ! command -v git >/dev/null; then
+        echo "ERROR: git is required to pin TMax source revisions" >&2
+        return 1
+    fi
+    if ! current_revision="$(git -C "$source_root" rev-parse --verify HEAD 2>/dev/null)"; then
+        echo "ERROR: ${label} source directory must be a Git worktree: ${source_root}" >&2
+        return 1
+    fi
+    if ! [[ "$current_revision" =~ ^[0-9a-f]{40,64}$ ]]; then
+        echo "ERROR: ${label} returned an invalid Git revision: ${current_revision}" >&2
+        return 1
+    fi
+    if ! dirty_state="$(git -C "$source_root" status --porcelain=v1 --untracked-files=all 2>/dev/null)"; then
+        echo "ERROR: cannot inspect ${label} source worktree: ${source_root}" >&2
+        return 1
+    fi
+    if [ -n "$dirty_state" ]; then
+        echo "ERROR: ${label} source worktree is dirty: ${source_root}" >&2
+        return 1
+    fi
+    printf '%s\n' "$current_revision"
+}
+
+tmax_pin_source_revisions() {
+    local prorl_root="${1:?missing ProRL repository}"
+    local slime_root="${2:?missing Slime repository}"
+    local megatron_root="${3:?missing Megatron repository}"
+    local current_prorl current_slime current_megatron
+
+    current_prorl="$(tmax_git_source_revision ProRL "$prorl_root")" || return 1
+    current_slime="$(tmax_git_source_revision Slime "$slime_root")" || return 1
+    current_megatron="$(tmax_git_source_revision Megatron "$megatron_root")" || return 1
+    if [ -n "${TMAX_PRORL_GIT_COMMIT:-}" ] && [ "$TMAX_PRORL_GIT_COMMIT" != "$current_prorl" ]; then
+        echo "ERROR: ProRL source revision changed: expected ${TMAX_PRORL_GIT_COMMIT}, found ${current_prorl}" >&2
+        return 1
+    fi
+    if [ -n "${TMAX_SLIME_GIT_COMMIT:-}" ] && [ "$TMAX_SLIME_GIT_COMMIT" != "$current_slime" ]; then
+        echo "ERROR: Slime source revision changed: expected ${TMAX_SLIME_GIT_COMMIT}, found ${current_slime}" >&2
+        return 1
+    fi
+    if [ -n "${TMAX_MEGATRON_GIT_COMMIT:-}" ] && [ "$TMAX_MEGATRON_GIT_COMMIT" != "$current_megatron" ]; then
+        echo "ERROR: Megatron source revision changed: expected ${TMAX_MEGATRON_GIT_COMMIT}, found ${current_megatron}" >&2
+        return 1
+    fi
+    export MEGATRON_DIR="$megatron_root"
+    export TMAX_PRORL_GIT_COMMIT="$current_prorl"
+    export TMAX_SLIME_GIT_COMMIT="$current_slime"
+    export TMAX_MEGATRON_GIT_COMMIT="$current_megatron"
+}
+
+tmax_import_source_revision_lock() {
+    local state_file="${1:?missing run state file}"
+    local serialized revision
+    local -a revisions=()
+
+    if [ ! -s "$state_file" ]; then
+        echo "ERROR: cannot import source revision lock from missing run state: ${state_file}" >&2
+        return 1
+    fi
+    serialized="$(
+        unset TMAX_PRORL_GIT_COMMIT TMAX_SLIME_GIT_COMMIT TMAX_MEGATRON_GIT_COMMIT
+        # The state file is generated by tmax_write_run_state with shell-escaped values.
+        # shellcheck source=/dev/null
+        source "$state_file" || exit 1
+        printf '%s\n' \
+            "${TMAX_PRORL_GIT_COMMIT:-}" \
+            "${TMAX_SLIME_GIT_COMMIT:-}" \
+            "${TMAX_MEGATRON_GIT_COMMIT:-}"
+    )" || {
+        echo "ERROR: cannot read source revision lock from run state: ${state_file}" >&2
+        return 1
+    }
+    mapfile -t revisions <<<"$serialized"
+    if [ "${#revisions[@]}" -ne 3 ]; then
+        echo "ERROR: run state has a malformed source revision lock: ${state_file}" >&2
+        return 1
+    fi
+    for revision in "${revisions[@]}"; do
+        if ! [[ "$revision" =~ ^[0-9a-f]{40,64}$ ]]; then
+            echo "ERROR: run state has an invalid source revision lock: ${state_file}" >&2
+            return 1
+        fi
+    done
+    export TMAX_PRORL_GIT_COMMIT="${revisions[0]}"
+    export TMAX_SLIME_GIT_COMMIT="${revisions[1]}"
+    export TMAX_MEGATRON_GIT_COMMIT="${revisions[2]}"
+}
+
+tmax_verify_source_revisions() {
+    local name
+    for name in TMAX_PRORL_GIT_COMMIT TMAX_SLIME_GIT_COMMIT TMAX_MEGATRON_GIT_COMMIT; do
+        if [ -z "${!name:-}" ]; then
+            echo "ERROR: source revision lock is incomplete; missing ${name}" >&2
+            return 1
+        fi
+    done
+    tmax_pin_source_revisions "$@"
+}
+
 tmax_write_run_state() {
     local state_file="$1"
     local tmp_file="${state_file}.tmp.$$"
@@ -41,7 +213,7 @@ tmax_write_run_state() {
         TMAX_EVAL_ENABLED TMAX_TRAINING_EVAL_ENABLED
         TMAX_EVAL_SOURCE TMAX_EVAL_DATA TMAX_EVAL_START_INDEX
         TMAX_EVAL_MAX_TASKS TMAX_EVAL_DATASET_NAME TMAX_EVAL_INTERVAL
-        TMAX_CONCURRENT_PRETRAIN_EVAL TMAX_SKIP_EVAL_BEFORE_TRAIN
+        TMAX_CONCURRENT_PRETRAIN_EVAL
         TMAX_EVAL_RESUMED_CHECKPOINT_BEFORE_TRAIN
         TMAX_EVAL_SAMPLES_PER_PROMPT TMAX_EVAL_MIN_VALID_SAMPLES
         TMAX_EVAL_TEMPERATURE TMAX_EVAL_TOP_P TMAX_EVAL_MAX_RESPONSE_LEN
@@ -51,7 +223,7 @@ tmax_write_run_state() {
         TMAX_EXTERNAL_EVAL_MIN_VALID_SAMPLES
         TMAX_EXTERNAL_EVAL_TEMPERATURE TMAX_EXTERNAL_EVAL_TOP_P
         TMAX_EXTERNAL_EVAL_MAX_RESPONSE_LEN TMAX_EXTERNAL_EVAL_AGENT_STEP_LIMIT
-        TMAX_EVAL_WEIGHT TMAX_EXTERNAL_EVAL_WEIGHT TMAX_EVAL_CONFIG_PATH
+        TMAX_EVAL_CONFIG_PATH
         TMAX_HARBOR_EVAL_TASKS_DIR TMAX_HARBOR_EVAL_IMAGE_DIR
         TMAX_HARBOR_EVAL_REVISION
         TMAX_HARBOR_EVAL_AGENT_TIMEOUT_CAP
@@ -60,23 +232,40 @@ tmax_write_run_state() {
         TMAX_PREPARE_EVAL_DATA TMAX_DATA_INTEGRITY_MANIFEST
         TMAX_TRAIN_DATA_SHA256 TMAX_EVAL_DATA_SHA256
         TMAX_EXTERNAL_EVAL_DATA_SHA256 TMAX_EVAL_BUNDLE_SHA256
-        ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT NUM_EPOCH SAVE_INTERVAL
-        TMAX_NUM_ROLLOUT TMAX_TARGET_ITER TMAX_EVAL_ONLY WALL_TIME TMAX_MIN_WALL_TIME TMAX_ENABLE_GRACEFUL_EXIT
+        ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT NUM_EPOCH SAVE_INTERVAL SAVE_RETAIN_INTERVAL
+        SAVE_HF_ENABLED SAVE_MEGATRON SAVE_HF_TEMPLATE
+        SPILOT_QWEN_COST_WEIGHT SPILOT_GPT_COST_WEIGHT
+        SPILOT_COST_PENALTY_LAMBDA SPILOT_COST_NORMALIZER
+        SPILOT_COST_PENALTY_MODE SPILOT_DIFFICULTY_LEDGER_PATH
+        SPILOT_DIFFICULTY_EASY_MULT SPILOT_DIFFICULTY_HARD_MULT
+        SPILOT_LATENCY_PENALTY_LAMBDA SPILOT_LATENCY_NORMALIZER
+        SPILOT_ROUTING_MODE SPILOT_CONTEXT_HANDOFF SPILOT_SLOT_LABEL_MODE
+        SPILOT_ROUTER_MEMORY
+        SPILOT_MAX_POOL_CALLS SPILOT_ROUTER_OBS_MAX_CHARS
+        POLAR_CONTROLLER_INVALID_TURN_PENALTY POLAR_CONTROLLER_CREDIT_MODE
+        POLAR_GDPO_COST_GATE_ALL_CORRECT
+        POLAR_DROP_ALL_WRONG_GROUPS POLAR_DROP_ALL_KEEP_GROUPS
+        POLAR_BALANCE_ALL_CORRECT_GROUPS
+        WANDB_ENTITY WANDB_MODE
+        TMAX_NUM_ROLLOUT TMAX_TARGET_ITER WALL_TIME TMAX_MIN_WALL_TIME TMAX_ENABLE_GRACEFUL_EXIT
+        TMAX_TRAIN_MODE TMAX_PROFILE_DISABLE_CHECKPOINT
+        TMAX_PROFILE_ARM TMAX_PROFILE_BATCH_ID
         TMAX_GRACEFUL_EXIT_BUFFER_SECONDS TMAX_MIN_GRACEFUL_EXIT_BUFFER_SECONDS
         EXPERIMENT_NAME
-        POLAR_DATA_ROOT APPTAINER_IMAGE_DIR
-        MINI_SWE_AGENT_RUNTIME_DIR MINI_SWE_AGENT_BIN
-        POLR_TRAIN_VENV POLR_TRAIN_PYTHON_OVERLAY SLIME_DIR
+        MEGATRON_DIR
+        TMAX_PRORL_GIT_COMMIT TMAX_SLIME_GIT_COMMIT TMAX_MEGATRON_GIT_COMMIT
         HF_CHECKPOINT REF_LOAD TORCH_DIST_DIR MODEL_ARGS_FILE
         ACCOUNT PARTITION SLURM_CONSTRAINT SLURM_EXCLUDE NUM_NODES SLURM_GPUS
-        CPUS_PER_TASK SLURM_STEP_CPUS_PER_TASK
+        CPUS_PER_TASK SLURM_STEP_CPUS_PER_TASK POLAR_SLURM_MEM_PER_NODE
         ACTOR_NUM_NODES ACTOR_NUM_GPUS_PER_NODE
         ACTOR_TENSOR_MODEL_PARALLEL_SIZE ACTOR_PIPELINE_MODEL_PARALLEL_SIZE
         CONTEXT_PARALLEL_SIZE
         ROLLOUT_NUM_GPUS ROLLOUT_NUM_GPUS_PER_ENGINE RAY_NUM_GPUS_PER_NODE
-        TMAX_REQUIRE_FULL_GPU_ALLOCATION
+        TMAX_REQUIRE_FULL_GPU_ALLOCATION TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL
+        TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP
         NUM_STEPS_PER_ROLLOUT GLOBAL_BATCH_SIZE EVAL_GLOBAL_BATCH_SIZE
         TRAIN_LR TMAX_OVERRIDE_OPT_PARAM_SCHEDULER KL_LOSS_COEF POLICY_LOSS_TYPE USE_TIS GRPO_STD_NORMALIZATION
+        TMAX_OPTIMIZER_CPU_OFFLOAD
         TMAX_ENABLE_FP32_LM_HEAD CALCULATE_PER_TOKEN_LOSS
         DPPO_DIVERGENCE_TYPE DPPO_DIVERGENCE_THRESHOLD
         MAX_TRAIN_ROLLOUT_LOGPROB_ABS_DIFF
@@ -89,9 +278,11 @@ tmax_write_run_state() {
         SGLANG_ROUTER_PORT
         SEQUENCE_PARALLEL DIST_CKPT_STRICTNESS ATTENTION_BACKEND
         TMAX_AGENT_HARNESS POLAR_AGENT_HARNESS POLAR_AGENT_MODEL_NAME
+        MINI_SWE_AGENT_RUNTIME_DIR MINI_SWE_AGENT_BIN MINI_SWE_AGENT_SPEC
         POLAR_AGENT_STEP_LIMIT POLAR_AGENT_COST_LIMIT POLAR_AGENT_TEMPERATURE
         POLAR_AGENT_TOP_P POLAR_AGENT_MAX_TOKENS POLAR_AGENT_ENABLE_THINKING
-        POLAR_FULLY_ASYNC POLAR_MULTI_GATEWAY
+        POLAR_FULLY_ASYNC POLAR_MULTI_GATEWAY POLAR_GATEWAY_COUNT_OVERRIDE
+        SGLANG_ENABLE_DETERMINISTIC_INFERENCE SGLANG_ATTENTION_BACKEND
         POLAR_ROLLOUT_EXAMPLES_DIR POLAR_ROLLOUT_EXAMPLE_INTERVAL
         POLAR_ROLLOUT_EXAMPLE_COUNT POLAR_ROLLOUT_EXAMPLES_WANDB
         CUSTOM_ROLLOUT_LOG_FUNCTION_PATH
@@ -99,8 +290,23 @@ tmax_write_run_state() {
         TMAX_TRAIN_AGENT_TIMEOUT_SECONDS TMAX_TRAIN_TASK_TIMEOUT_RESERVE_SECONDS
         POLAR_REQUEST_TIMEOUT
         POLAR_TASK_TIMEOUT_SECONDS POLAR_TASK_TIMEOUT_FLOOR_SECONDS
+        SPILOT_EPISODE_ADMISSION_ENABLED
+        SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS
+        SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT
+        SPILOT_QWEN_MAX_ACTIVE_EPISODES SPILOT_GPT_MAX_ACTIVE_EPISODES
+        SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES
+        SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES
+        SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY
+        SPILOT_GPT_GATEWAY_MAX_CONCURRENCY
+        SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES
+        SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES
+        TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT
         POLAR_MIN_COMPLETE_ACCEPT_FRACTION
-        POLAR_EARLY_STOP_GRACE_SESSIONS TMAX_DYNAMIC_SAMPLING_FILTER_PATH
+        POLAR_EARLY_STOP_GRACE_SESSIONS
+        POLAR_CANDIDATE_POOL_HEALTH_GATE_ENABLED
+        POLAR_CANDIDATE_POOL_HEALTH_MIN_OBSERVED_SESSIONS
+        POLAR_CANDIDATE_POOL_HEALTH_MIN_COMPLETION_FRACTION
+        TMAX_DYNAMIC_SAMPLING_FILTER_PATH
         TMAX_MIN_ACTIVE_SESSIONS_PER_ROLLOUT_GPU
         TMAX_MIN_RUN_WORKERS_PER_ROLLOUT_GPU
         TMAX_MIN_POSTRUN_WORKERS_PER_ROLLOUT_GPU
@@ -123,8 +329,10 @@ tmax_write_run_state() {
         POLAR_APPTAINER_NO_MOUNT_HOSTFS POLAR_APPTAINER_NO_MOUNT_TMP
         POLAR_APPTAINER_ISOLATE_PID POLAR_APPTAINER_ISOLATE_IPC
         POLAR_APPTAINER_CLEANENV POLAR_SANDBOX_NETWORK
-        WANDB_PROJECT WANDB_GROUP WANDB_RESUME WANDB_ALWAYS_USE_TRAIN_STEP
+        WANDB_PROJECT WANDB_GROUP WANDB_RUN_ID WANDB_RESUME WANDB_ALWAYS_USE_TRAIN_STEP
         TMAX_REQUIRE_WANDB TMAX_TRAIN_ABI_PREFLIGHT
+        TMAX_SUBMIT_SCRIPT POLAR_TRAIN_RUN_SCRIPT
+        POLAR_CONFIG_TEMPLATE TOPOLOGY_TEMPLATE
         JOB_NAME TMAX_SUBMIT_RECEIPT_FILE TMAX_LAST_JOB_ID
         TMAX_LAST_JOB_SUBMITTED_AT TMAX_LAST_JOB_CHECKPOINT_ITER
         TMAX_WATCH_LAST_ACCOUNTED_JOB_ID TMAX_WATCH_FAILURE_SIGNATURE

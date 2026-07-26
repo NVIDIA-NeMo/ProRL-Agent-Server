@@ -96,6 +96,7 @@ ipython_config.py
 *.out
 *.pkl
 batches/
+*.err
 wandb/
 checkpoints/
 models/

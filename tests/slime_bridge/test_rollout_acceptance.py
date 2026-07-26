@@ -124,6 +124,48 @@ def test_async_worker_only_admits_requested_groups() -> None:
     assert worker._can_admit_group({}, 0) is False
 
 
+def test_infrastructure_only_result_requires_all_error_sessions_without_traces() -> None:
+    infrastructure_only = SimpleNamespace(
+        results=[
+            SimpleNamespace(
+                status="ERROR",
+                trajectory=SimpleNamespace(traces=[]),
+            )
+            for _ in range(2)
+        ]
+    )
+    mixed = SimpleNamespace(
+        results=[
+            SimpleNamespace(
+                status="ERROR",
+                trajectory=SimpleNamespace(traces=[]),
+            ),
+            SimpleNamespace(
+                status="COMPLETED",
+                trajectory=SimpleNamespace(traces=[]),
+            ),
+        ]
+    )
+
+    assert rollout_module._task_result_is_infrastructure_only(infrastructure_only) is True
+    assert rollout_module._task_result_is_infrastructure_only(mixed) is False
+
+
+def test_infrastructure_failure_fuse_trips_and_resets() -> None:
+    args = _worker_args()
+    args.polar_max_consecutive_infrastructure_failures = 3
+    worker = AsyncPolarRolloutWorker(args, data_source=SimpleNamespace())
+
+    assert worker._note_infrastructure_failure() is None
+    assert worker._note_infrastructure_failure() is None
+    error = worker._note_infrastructure_failure()
+    assert error is not None
+    assert "3 consecutive infrastructure-only" in str(error)
+
+    worker._reset_infrastructure_failures()
+    assert worker._note_infrastructure_failure() is None
+
+
 def test_fully_async_worker_prefetches_only_for_outstanding_request() -> None:
     args = _worker_args()
     args.polar_fully_async = True
@@ -278,6 +320,30 @@ def test_explicit_trajectory_cap_fails_above_model_sequence_length() -> None:
     )
 
     with pytest.raises(ValueError, match="exceeds model sequence length"):
+        _resolve_max_tokens(args)
+
+
+def test_explicit_trajectory_cap_can_exceed_aggregate_microbatch_cap() -> None:
+    args = SimpleNamespace(
+        max_tokens_per_gpu=24_576,
+        context_parallel_size=1,
+        seq_length=67_584,
+        polar_max_trajectory_tokens=67_584,
+        polar_allow_single_sample_over_token_cap=True,
+    )
+
+    assert _resolve_max_tokens(args) == 67_584
+
+
+def test_aggregate_microbatch_cap_opt_in_requires_boolean() -> None:
+    args = SimpleNamespace(
+        max_tokens_per_gpu=24_576,
+        context_parallel_size=1,
+        seq_length=67_584,
+        polar_allow_single_sample_over_token_cap="sometimes",
+    )
+
+    with pytest.raises(ValueError, match="must be a boolean"):
         _resolve_max_tokens(args)
 
 

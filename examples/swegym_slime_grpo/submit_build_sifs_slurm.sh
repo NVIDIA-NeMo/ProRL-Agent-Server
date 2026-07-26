@@ -8,6 +8,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+# shellcheck source=../path_safety.sh
+source "${SCRIPT_DIR}/../path_safety.sh"
 
 ACCOUNT="${ACCOUNT:-nvr_lpr_llm}"
 PARTITION="${SIF_BUILD_PARTITION:-cpu_short}"
@@ -20,7 +22,8 @@ BUILD_CONTAINER_MOUNTS="${SIF_BUILD_CONTAINER_MOUNTS:-${TRAIN_CONTAINER_MOUNTS:-
 
 APPTAINER_IMAGE_DIR="${APPTAINER_IMAGE_DIR:?set APPTAINER_IMAGE_DIR}"
 POLAR_DATA_ROOT="${POLAR_DATA_ROOT:-${PROJECT_ROOT}/tmp}"
-LOG_DIR="${PROJECT_ROOT}/logs/slurm"
+LOG_DIR="${SIF_BUILD_LOG_DIR:-${POLAR_DATA_ROOT}/logs/slurm}"
+polar_require_absolute_path SIF_BUILD_LOG_DIR "${LOG_DIR}"
 mkdir -p "${LOG_DIR}" "${POLAR_DATA_ROOT}/runs"
 
 SHARDS="${SIF_BUILD_SHARDS:-64}"

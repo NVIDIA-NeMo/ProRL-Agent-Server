@@ -27,13 +27,18 @@ class PolarSlimeConfig:
     max_async_level: int
     fully_async: bool
     max_off_policy_steps: int
+    max_consecutive_infrastructure_failures: int
     request_timeout: float | None
     task_timeout_floor: float | None
     train_agent_timeout: float | None
+    eval_agent_timeout: float | None
     callback_host: str
     scoring_mode: str
     min_complete_accept_fraction: float
     early_stop_grace_sessions: int
+    candidate_pool_health_gate_enabled: bool
+    candidate_pool_health_min_observed_sessions: int
+    candidate_pool_health_min_completion_fraction: float
     tokenizer_name_or_path: str | None
     add_generation_prompt: bool
     eval_dataset_name: str
@@ -85,6 +90,28 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
     max_session_concurrency = max_concurrency * group_size
     max_off_policy_steps = max_async_level + update_weights_interval
 
+    raw_failure_limit = getattr(
+        args, "polar_max_consecutive_infrastructure_failures", 0
+    )
+    if isinstance(raw_failure_limit, bool):
+        raise ValueError(
+            "polar_max_consecutive_infrastructure_failures must be a non-negative integer"
+        )
+    try:
+        max_consecutive_infrastructure_failures = int(raw_failure_limit)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "polar_max_consecutive_infrastructure_failures must be a non-negative integer"
+        ) from exc
+    if (
+        max_consecutive_infrastructure_failures < 0
+        or isinstance(raw_failure_limit, float)
+        and not raw_failure_limit.is_integer()
+    ):
+        raise ValueError(
+            "polar_max_consecutive_infrastructure_failures must be a non-negative integer"
+        )
+
     request_timeout = getattr(args, "polar_request_timeout", None)
     if request_timeout is not None:
         request_timeout = float(request_timeout)
@@ -102,6 +129,13 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
         train_agent_timeout = _positive_finite_number(
             train_agent_timeout,
             field="polar_train_agent_timeout",
+        )
+
+    eval_agent_timeout = getattr(args, "polar_eval_agent_timeout", None)
+    if eval_agent_timeout is not None:
+        eval_agent_timeout = _positive_finite_number(
+            eval_agent_timeout,
+            field="polar_eval_agent_timeout",
         )
 
     callback_host = str(getattr(args, "polar_callback_host", "127.0.0.1")).strip()
@@ -125,6 +159,68 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
     if early_stop_grace_sessions < 0:
         raise ValueError("polar_early_stop_grace_sessions must be non-negative")
 
+    candidate_pool_health_gate_value = getattr(
+        args,
+        "polar_candidate_pool_health_gate_enabled",
+        False,
+    )
+    if isinstance(candidate_pool_health_gate_value, str):
+        normalized = candidate_pool_health_gate_value.strip().lower()
+        if normalized not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
+            raise ValueError("polar_candidate_pool_health_gate_enabled must be a boolean")
+        candidate_pool_health_gate_enabled = normalized in {"1", "true", "yes", "on"}
+    elif isinstance(candidate_pool_health_gate_value, bool):
+        candidate_pool_health_gate_enabled = candidate_pool_health_gate_value
+    else:
+        raise ValueError("polar_candidate_pool_health_gate_enabled must be a boolean")
+
+    raw_min_observed_sessions = getattr(
+        args,
+        "polar_candidate_pool_health_min_observed_sessions",
+        16,
+    )
+    if isinstance(raw_min_observed_sessions, bool):
+        raise ValueError(
+            "polar_candidate_pool_health_min_observed_sessions must be a positive integer"
+        )
+    try:
+        candidate_pool_health_min_observed_sessions = int(raw_min_observed_sessions)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "polar_candidate_pool_health_min_observed_sessions must be a positive integer"
+        ) from exc
+    if (
+        candidate_pool_health_min_observed_sessions <= 0
+        or str(raw_min_observed_sessions).strip()
+        != str(candidate_pool_health_min_observed_sessions)
+    ):
+        raise ValueError(
+            "polar_candidate_pool_health_min_observed_sessions must be a positive integer"
+        )
+
+    raw_min_completion_fraction = getattr(
+        args,
+        "polar_candidate_pool_health_min_completion_fraction",
+        0.1,
+    )
+    if isinstance(raw_min_completion_fraction, bool):
+        raise ValueError(
+            "polar_candidate_pool_health_min_completion_fraction must be between 0 and 1"
+        )
+    try:
+        candidate_pool_health_min_completion_fraction = float(raw_min_completion_fraction)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "polar_candidate_pool_health_min_completion_fraction must be between 0 and 1"
+        ) from exc
+    if not (
+        math.isfinite(candidate_pool_health_min_completion_fraction)
+        and 0.0 <= candidate_pool_health_min_completion_fraction <= 1.0
+    ):
+        raise ValueError(
+            "polar_candidate_pool_health_min_completion_fraction must be between 0 and 1"
+        )
+
     return PolarSlimeConfig(
         rollout_server_url=str(rollout_server_url).rstrip("/"),
         task_template=task_template,
@@ -142,13 +238,24 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
         max_async_level=max_async_level,
         fully_async=fully_async,
         max_off_policy_steps=max_off_policy_steps,
+        max_consecutive_infrastructure_failures=(
+            max_consecutive_infrastructure_failures
+        ),
         request_timeout=request_timeout,
         task_timeout_floor=task_timeout_floor,
         train_agent_timeout=train_agent_timeout,
+        eval_agent_timeout=eval_agent_timeout,
         callback_host=callback_host,
         scoring_mode=scoring_mode,
         min_complete_accept_fraction=min_complete_accept_fraction,
         early_stop_grace_sessions=early_stop_grace_sessions,
+        candidate_pool_health_gate_enabled=candidate_pool_health_gate_enabled,
+        candidate_pool_health_min_observed_sessions=(
+            candidate_pool_health_min_observed_sessions
+        ),
+        candidate_pool_health_min_completion_fraction=(
+            candidate_pool_health_min_completion_fraction
+        ),
         tokenizer_name_or_path=getattr(args, "hf_checkpoint", None),
         add_generation_prompt=bool(getattr(args, "polar_add_generation_prompt", True)),
         eval_dataset_name=str(getattr(args, "polar_eval_dataset_name", "polar_eval")),
@@ -199,6 +306,11 @@ def render_task_payload(
         if not isinstance(task_metadata, dict):
             raise ValueError("rendered task payload metadata must be a mapping")
         task_metadata["agent_timeout"] = config.train_agent_timeout
+    if config.eval_agent_timeout is not None and is_eval:
+        task_metadata = payload.setdefault("metadata", {})
+        if not isinstance(task_metadata, dict):
+            raise ValueError("rendered task payload metadata must be a mapping")
+        task_metadata["agent_timeout"] = config.eval_agent_timeout
     if isinstance(metadata, dict) and metadata.get("agent_step_limit") is not None:
         try:
             step_limit = int(metadata["agent_step_limit"])
@@ -390,6 +502,10 @@ def render_topology_template(topology_path: str | Path, args: Any) -> dict[str, 
                         "engine": "sglang",
                         "base_url": router_url,
                     },
+                    "model_pool": [
+                        candidate.model_dump(mode="python")
+                        for candidate in node.model_pool
+                    ],
                     "max_init_workers": node.max_init_workers,
                     "max_run_workers": node.max_run_workers,
                     "max_postrun_workers": node.max_postrun_workers,

@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--exclude-data",
         action="append",
-        default=[default_exclude_data] if default_exclude_data else [],
+        default=[],
         help=(
             "Exclude every metadata.task_name from this JSONL. This is a "
             "fail-closed full-dataset complement mode and therefore requires "
@@ -84,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--only-ready",
         action="store_true",
-        default=os.environ.get("TMAX_ONLY_READY", "0") == "1",
+        default=False,
         help=(
             "Explicit partial-data smoke mode: drop missing images from the "
             "selected prefix instead of failing; later tasks never backfill it."
@@ -112,19 +112,13 @@ def load_excluded_task_names(paths: list[str]) -> set[str]:
                     row = json.loads(line)
                     task_name = row["metadata"]["task_name"]
                     if not isinstance(task_name, str) or not task_name:
-                        raise TypeError(
-                            "metadata.task_name must be a non-empty string"
-                        )
+                        raise TypeError("metadata.task_name must be a non-empty string")
                 except (json.JSONDecodeError, KeyError, TypeError) as exc:
                     raise SystemExit(
-                        f"Invalid TMax exclusion row in {path} at line "
-                        f"{line_number}: {exc}"
+                        f"Invalid TMax exclusion row in {path} at line {line_number}: {exc}"
                     ) from exc
                 if task_name in excluded:
-                    raise SystemExit(
-                        f"Duplicate excluded TMax task_name {task_name!r} "
-                        f"in {path}"
-                    )
+                    raise SystemExit(f"Duplicate excluded TMax task_name {task_name!r} in {path}")
                 excluded.add(task_name)
     if paths and not excluded:
         raise SystemExit("TMax exclusion JSONL(s) contain no task rows")
@@ -175,18 +169,14 @@ def load_task_prefix(args: argparse.Namespace) -> list[TmaxTask]:
     if args.task and start_index:
         raise SystemExit("--start-index cannot be combined with explicit --task values")
     exclude_paths = list(getattr(args, "exclude_data", []) or [])
-    if exclude_paths and (
-        args.task or start_index != 0 or int(args.max_tasks) != -1
-    ):
+    if exclude_paths and (args.task or start_index != 0 or int(args.max_tasks) != -1):
         raise SystemExit(
             "--exclude-data requires the complete deterministic source "
             "population: --start-index 0, --max-tasks -1, and no --task"
         )
     expected_total = int(getattr(args, "expected_total_tasks", 0))
     if expected_total < 0:
-        raise SystemExit(
-            f"--expected-total-tasks must be non-negative, got {expected_total}"
-        )
+        raise SystemExit(f"--expected-total-tasks must be non-negative, got {expected_total}")
     load_limit = (
         -1
         if expected_total

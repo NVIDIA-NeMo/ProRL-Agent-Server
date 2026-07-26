@@ -94,6 +94,12 @@ uv pip install -e slime
 uv pip install -e Megatron-LM
 ```
 
+The patch command above is only for the legacy SWE-Gym bootstrap flow. A
+source-locked launcher such as TMax must instead pin a Slime commit that
+already contains the adapter support. Do not apply the patch in place to a
+source-locked checkout: the training watcher intentionally rejects dirty or
+revision-drifted sources before it submits a replacement job.
+
 Use `SLIME_DIR=/path/to/slime` and `MEGATRON_DIR=/path/to/Megatron-LM` for
 checkouts outside the repository root. Run the patch command with the same
 `SLIME_DIR` value before installing Slime. The patch preserves exact

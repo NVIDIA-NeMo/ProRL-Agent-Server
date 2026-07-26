@@ -289,6 +289,10 @@ class SessionContext:
     # This keeps early-stop cancellation distinct from caller/task cancellation.
     early_stop_requested: bool = field(default=False, repr=False)
     early_stop_usable_sessions: int = field(default=0, repr=False)
+    # Set by the duplicate-dispatch confirmation when the gateway answered an
+    # authoritative 404 for this session id: the failed POST never landed, so
+    # the dispatch loop may safely retry instead of failing closed.
+    dispatch_confirmed_not_landed: bool = field(default=False, repr=False)
     completion_future: asyncio.Future[SessionResult] | None = field(
         default=None,
         repr=False,

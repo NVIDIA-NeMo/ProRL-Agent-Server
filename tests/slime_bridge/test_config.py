@@ -34,9 +34,13 @@ def _args(**overrides):
         "polar_request_timeout": 60,
         "polar_task_timeout_floor": None,
         "polar_train_agent_timeout": None,
+        "polar_eval_agent_timeout": None,
         "polar_callback_host": "127.0.0.1",
         "polar_scoring_mode": "group",
         "polar_min_complete_accept_fraction": 0.0,
+        "polar_candidate_pool_health_gate_enabled": False,
+        "polar_candidate_pool_health_min_observed_sessions": 16,
+        "polar_candidate_pool_health_min_completion_fraction": 0.1,
         "hf_checkpoint": "tokenizer-name",
         "polar_add_generation_prompt": True,
         "polar_eval_dataset_name": "eval",
@@ -56,11 +60,16 @@ def test_resolve_polar_slime_config_computes_concurrency_and_normalizes_url() ->
     assert config.max_session_concurrency == 24
     assert config.fully_async is True
     assert config.max_off_policy_steps == 7
+    assert config.max_consecutive_infrastructure_failures == 0
     assert config.request_timeout == 60.0
     assert config.task_timeout_floor is None
     assert config.train_agent_timeout is None
+    assert config.eval_agent_timeout is None
     assert config.min_complete_accept_fraction == 0.0
     assert config.early_stop_grace_sessions == 2
+    assert config.candidate_pool_health_gate_enabled is False
+    assert config.candidate_pool_health_min_observed_sessions == 16
+    assert config.candidate_pool_health_min_completion_fraction == 0.1
 
 
 def test_resolve_polar_slime_config_requires_agent_template() -> None:
@@ -71,6 +80,27 @@ def test_resolve_polar_slime_config_requires_agent_template() -> None:
 def test_resolve_polar_slime_config_rejects_invalid_fully_async_value() -> None:
     with pytest.raises(ValueError, match="polar_fully_async"):
         resolve_polar_slime_config(_args(polar_fully_async="sometimes"))
+
+
+def test_resolve_polar_slime_config_accepts_infrastructure_failure_fuse() -> None:
+    config = resolve_polar_slime_config(
+        _args(polar_max_consecutive_infrastructure_failures=3)
+    )
+
+    assert config.max_consecutive_infrastructure_failures == 3
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, True, "three"])
+def test_resolve_polar_slime_config_rejects_invalid_infrastructure_failure_fuse(
+    value,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="polar_max_consecutive_infrastructure_failures",
+    ):
+        resolve_polar_slime_config(
+            _args(polar_max_consecutive_infrastructure_failures=value)
+        )
 
 
 def test_resolve_polar_slime_config_accepts_complete_fraction_threshold() -> None:
@@ -84,6 +114,38 @@ def test_resolve_polar_slime_config_rejects_negative_early_stop_grace() -> None:
         resolve_polar_slime_config(_args(polar_early_stop_grace_sessions=-1))
 
 
+@pytest.mark.parametrize("value", ["sometimes", 1, None])
+def test_resolve_polar_slime_config_rejects_invalid_candidate_health_enabled(value) -> None:
+    with pytest.raises(ValueError, match="polar_candidate_pool_health_gate_enabled"):
+        resolve_polar_slime_config(
+            _args(polar_candidate_pool_health_gate_enabled=value)
+        )
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, True, "sixteen"])
+def test_resolve_polar_slime_config_rejects_invalid_candidate_health_min_sessions(
+    value,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="polar_candidate_pool_health_min_observed_sessions",
+    ):
+        resolve_polar_slime_config(
+            _args(polar_candidate_pool_health_min_observed_sessions=value)
+        )
+
+
+@pytest.mark.parametrize("value", [-0.1, 1.1, float("inf"), float("nan"), True])
+def test_resolve_polar_slime_config_rejects_invalid_candidate_health_fraction(value) -> None:
+    with pytest.raises(
+        ValueError,
+        match="polar_candidate_pool_health_min_completion_fraction",
+    ):
+        resolve_polar_slime_config(
+            _args(polar_candidate_pool_health_min_completion_fraction=value)
+        )
+
+
 @pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
 def test_resolve_polar_slime_config_rejects_invalid_task_timeout_floor(value) -> None:
     with pytest.raises(ValueError, match="polar_task_timeout_floor"):
@@ -94,6 +156,12 @@ def test_resolve_polar_slime_config_rejects_invalid_task_timeout_floor(value) ->
 def test_resolve_polar_slime_config_rejects_invalid_train_agent_timeout(value) -> None:
     with pytest.raises(ValueError, match="polar_train_agent_timeout"):
         resolve_polar_slime_config(_args(polar_train_agent_timeout=value))
+
+
+@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan"), True, "slow"])
+def test_resolve_polar_slime_config_rejects_invalid_eval_agent_timeout(value) -> None:
+    with pytest.raises(ValueError, match="polar_eval_agent_timeout"):
+        resolve_polar_slime_config(_args(polar_eval_agent_timeout=value))
 
 
 @pytest.mark.parametrize("value", [-0.1, 1.1])
@@ -245,6 +313,46 @@ def test_render_task_payload_applies_agent_timeout_override_only_to_training() -
 
     assert training_payload["metadata"]["agent_timeout"] == 1200.0
     assert eval_payload["metadata"]["agent_timeout"] == 600.0
+
+
+def test_render_task_payload_can_override_eval_agent_timeout_independently() -> None:
+    args = _args(
+        polar_train_agent_timeout=1200,
+        polar_eval_agent_timeout=3300,
+        polar_task_template={
+            "timeout_seconds": "{sample.metadata.timeout_seconds}",
+            "agent": {"harness": "spilot_router", "model_name": "model"},
+        },
+    )
+    config = resolve_polar_slime_config(args)
+    sample = SimpleNamespace(
+        prompt="prompt",
+        metadata={"timeout_seconds": 4500.0, "agent_timeout": 600.0},
+        group_index=0,
+    )
+
+    training_payload = render_task_payload(
+        args=args,
+        config=config,
+        sample=sample,
+        instruction="task",
+        rollout_id=1,
+        task_position=0,
+        num_rollouts=1,
+    )
+    eval_payload = render_task_payload(
+        args=args,
+        config=config,
+        sample=sample,
+        instruction="task",
+        rollout_id=1,
+        task_position=0,
+        num_rollouts=1,
+        is_eval=True,
+    )
+
+    assert training_payload["metadata"]["agent_timeout"] == 1200.0
+    assert eval_payload["metadata"]["agent_timeout"] == 3300.0
 
 
 @pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan"), True, "slow"])
@@ -519,9 +627,25 @@ gateway:
       public_url: http://127.0.0.1:8100
       model_served: Qwen/Qwen3.5-4B
       inference: {engine: sglang, base_url: http://127.0.0.1:8000}
+      model_pool:
+        - alias: pool/qwen3.6-27b
+          model: nvidia/qwen/qwen3.6-27b
+          base_url: https://integrate.api.nvidia.com/v1
+          api_key_env: POLAR_NVIDIA_API_KEY
+        - alias: pool/gpt-5.5
+          model: openai/openai/gpt-5.5
+          base_url: https://integrate.api.nvidia.com/v1
+          api_key_env: POLAR_NVIDIA_API_KEY
 """.strip()
     )
     rendered = render_topology_template(str(topology_path), _args())
     node = rendered["gateway"]["nodes"][0]
     assert node["inference"] == {"engine": "sglang", "base_url": "http://127.0.0.1:30000"}
+    assert [(item["alias"], item["model"]) for item in node["model_pool"]] == [
+        ("pool/qwen3.6-27b", "nvidia/qwen/qwen3.6-27b"),
+        ("pool/gpt-5.5", "openai/openai/gpt-5.5"),
+    ]
+    assert {item["api_key_env"] for item in node["model_pool"]} == {
+        "POLAR_NVIDIA_API_KEY"
+    }
     assert "sglang" not in node

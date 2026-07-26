@@ -8,6 +8,8 @@ cd "${PROJECT_ROOT}"
 
 # shellcheck source=./env.cwdfw.sh
 source "${SCRIPT_DIR}/env.cwdfw.sh"
+# shellcheck source=../path_safety.sh
+source "${SCRIPT_DIR}/../path_safety.sh"
 
 PYTHON_BIN="${PYTHON_BIN:-${POLR_TRAIN_VENV}/bin/python3}"
 if [ ! -x "${PYTHON_BIN}" ]; then
@@ -23,7 +25,7 @@ SIF_SHARD_INDEX="${SIF_SHARD_INDEX:-0}"
 SIF_BUILD_JOBS="${SIF_BUILD_JOBS:-8}"
 
 export POLAR_JOB_CACHE_ROOT="${POLAR_JOB_CACHE_ROOT:-/tmp/polar-sifbuild-${SLURM_JOB_ID:-manual}-${SIF_SHARD_INDEX}}"
-rm -rf "${POLAR_JOB_CACHE_ROOT}"
+polar_safe_remove_tree POLAR_JOB_CACHE_ROOT "${POLAR_JOB_CACHE_ROOT}" /tmp polar-
 mkdir -p \
     "${POLAR_JOB_CACHE_ROOT}/home" \
     "${POLAR_JOB_CACHE_ROOT}/apptainer-cache" \

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from pathlib import Path
 import shlex
@@ -25,11 +26,14 @@ def test_mini_swe_agent_uses_gateway_and_bounded_steps() -> None:
         )
     )
 
-    step = harness.run_steps("Fix the quoted 'bug'")[0]
+    instruction = "Fix the quoted 'bug' with pkill -f polar-danger-marker-a91c 雪"
+    step = harness.run_steps(instruction)[0]
 
     assert 'OPENAI_API_BASE="$OPENAI_BASE_URL"' in step.command
     assert "--model=openai/Qwen3.5-4B" in step.command
     assert "--cost-limit 0" in step.command
+    assert "--task" not in step.command
+    assert "polar-danger-marker-a91c" not in step.command
     assert "-c mini -c agent.step_limit=30" in step.command
     assert "-c environment.env.PYTHONPATH=" in step.command
     assert step.command.startswith("set -o pipefail; ")
@@ -39,6 +43,10 @@ def test_mini_swe_agent_uses_gateway_and_bounded_steps() -> None:
     assert step.env["MSWEA_COST_TRACKING"] == "ignore_errors"
     assert step.env["MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT"] == "3"
     assert step.env["LITELLM_LOCAL_MODEL_COST_MAP"] == "True"
+    assert (
+        base64.b64decode(step.env["POLAR_MINI_SWE_TASK_B64"], validate=True).decode("utf-8")
+        == instruction
+    )
 
 
 def test_mini_swe_agent_model_retry_attempts_are_configurable() -> None:
@@ -108,7 +116,8 @@ def test_vanillux2_uses_paper_protocol_defaults() -> None:
     )
 
     assert isinstance(harness, Vanillux2Harness)
-    step = harness.run_steps("Repair the environment")[0]
+    instruction = "Repair the environment with pkill -f polar-danger-marker-f41d"
+    step = harness.run_steps(instruction)[0]
     config_arg = next(
         token.removeprefix("model.model_kwargs=")
         for token in shlex.split(step.command)
@@ -133,6 +142,12 @@ def test_vanillux2_uses_paper_protocol_defaults() -> None:
         "top_p": 0.95,
     }
     assert step.env["MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT"] == "5"
+    assert "--task" not in step.command
+    assert "polar-danger-marker-f41d" not in step.command
+    assert (
+        base64.b64decode(step.env["POLAR_MINI_SWE_TASK_B64"], validate=True).decode("utf-8")
+        == instruction
+    )
 
 
 def test_vanillux2_protocol_limits_remain_configurable() -> None:
@@ -209,10 +224,125 @@ def test_tmax_launch_contract_accepts_vanillux2() -> None:
         ROOT / "examples" / "tmax_slime_grpo" / "submit_slurm.sh"
     ).read_text()
 
-    assert "mini_swe_agent|vanillux2)" in env_script
-    assert "mini_swe_agent|vanillux2)" in submit_script
+    assert "mini_swe_agent|spilot_router|vanillux2)" in env_script
+    assert "mini_swe_agent|spilot_router|vanillux2)" in submit_script
     assert "polar_mini_swe_vanillux" in submit_script
     assert "config/vanillux2.yaml" in submit_script
+
+
+def _run_preflight(
+    tmp_path: Path,
+    *,
+    layout: str,
+    routes_through_runner: bool = True,
+    injects_task: bool = True,
+) -> "subprocess.CompletedProcess[str]":
+    """Drive the harness command's task-protocol preflight against a fake install.
+
+    layout="portable": bundled ``<root>/bin/mini-swe-agent`` bash wrapper beside
+    ``<root>/venv/bin/python`` (production). layout="uv_tool": a console-script
+    entry point whose python shebang points at a standalone interpreter with no
+    venv sibling. ``routes_through_runner`` controls whether the ENTRY POINT
+    dispatches through polar_mini_swe_runner (upstream mini-swe-agent does not,
+    even if the module is importable). ``injects_task`` controls whether the
+    resolved interpreter's ``polar_mini_swe_runner`` exposes
+    ``_inject_task_from_env``.
+    """
+
+    import subprocess
+
+    root = tmp_path / layout
+    bindir = root / "bin"
+    bindir.mkdir(parents=True)
+
+    # The module is ALWAYS importable (proving availability is not enough);
+    # injection depends on routing + version.
+    modroot = root / "pylib"
+    modroot.mkdir()
+    (modroot / "polar_mini_swe_runner.py").write_text(
+        "def _inject_task_from_env():\n    pass\n" if injects_task else "pass\n"
+    )
+    interpreter = root / "python"
+    interpreter.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"sys.path.insert(0, {str(modroot)!r})\n"
+        "if len(sys.argv) >= 3 and sys.argv[1] == '-c':\n"
+        "    exec(compile(sys.argv[2], '<probe>', 'exec'))\n"
+        "    sys.exit(0)\n"
+        "print('AGENT-RAN')\n"
+    )
+    interpreter.chmod(0o755)
+
+    agent = bindir / "mini-swe-agent"
+    if layout == "portable":
+        (root / "venv" / "bin").mkdir(parents=True)
+        (root / "venv" / "bin" / "python").symlink_to(interpreter)
+        venv_python = root / "venv" / "bin" / "python"
+        dispatch = (
+            f'exec "{venv_python}" -m polar_mini_swe_runner "$@"'
+            if routes_through_runner
+            else f'exec "{venv_python}" -m minisweagent.run.mini "$@"'
+        )
+        agent.write_text(f"#!/usr/bin/env bash\n{dispatch}\n")
+    else:  # uv_tool console script, no venv sibling; python-path shebang
+        entry = (
+            "from polar_mini_swe_runner import main"
+            if routes_through_runner
+            else "from minisweagent.run.mini import app"
+        )
+        agent.write_text(f"#!{interpreter}\n{entry}\nprint('AGENT-RAN')\n")
+    agent.chmod(0o755)
+
+    harness = MiniSweAgentHarness(
+        AgentSpec(harness="mini_swe_agent", model_name="m", settings={})
+    )
+    command = harness.run_steps("do the task")[0].command
+    command = command.replace('export OPENAI_API_BASE="$OPENAI_BASE_URL" && ', "")
+    command = command.replace('export PATH="$HOME/.local/bin:$PATH" && ', "")
+    command = command.split("2>&1 | tee", 1)[0]
+    return subprocess.run(
+        ["bash", "-c", command],
+        env={"PATH": f"{bindir}:/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_preflight_blocks_stale_portable_runtime(tmp_path: Path) -> None:
+    result = _run_preflight(tmp_path, layout="portable", injects_task=False)
+    assert result.returncode == 64
+    assert "predates" in result.stderr
+    assert "AGENT-RAN" not in result.stdout
+
+
+def test_preflight_passes_current_portable_runtime(tmp_path: Path) -> None:
+    result = _run_preflight(tmp_path, layout="portable")
+    assert result.returncode == 0
+    assert "AGENT-RAN" in result.stdout
+
+
+def test_preflight_passes_uv_tool_install_that_routes_through_runner(tmp_path: Path) -> None:
+    # A uv-tool install (no venv sibling) whose entry point dispatches through
+    # the polar runner is supported and must run.
+    result = _run_preflight(tmp_path, layout="uv_tool")
+    assert result.returncode == 0
+    assert "AGENT-RAN" in result.stdout
+
+
+def test_preflight_blocks_entry_point_that_does_not_route_through_runner(
+    tmp_path: Path,
+) -> None:
+    # The runner module is importable, but the entry point dispatches through
+    # upstream mini-swe-agent and never injects the task — a TASKLESS rollout.
+    # Availability of the module must NOT be mistaken for injection.
+    for layout in ("portable", "uv_tool"):
+        result = _run_preflight(
+            tmp_path / layout, layout=layout, routes_through_runner=False
+        )
+        assert result.returncode == 64, layout
+        assert "does not dispatch through" in result.stderr
+        assert "AGENT-RAN" not in result.stdout
 
 
 def test_mini_swe_postprocess_aggregates_fixed_categories(tmp_path: Path) -> None:

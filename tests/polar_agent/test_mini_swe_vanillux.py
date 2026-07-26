@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -27,13 +28,16 @@ class _FakeLimitsExceeded(Exception):
 
 class _FakeLitellmModel:
     def __init__(self, **kwargs) -> None:
-        self.config = SimpleNamespace(
-            model_name="openai/Qwen3.5-9B",
-            model_kwargs={
+        model_kwargs = kwargs.get("model_kwargs")
+        if model_kwargs is None:
+            model_kwargs = {
                 "temperature": 0.7,
                 "max_tokens": 100,
                 "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
-            },
+            }
+        self.config = SimpleNamespace(
+            model_name=kwargs.get("model_name", "openai/Qwen3.5-9B"),
+            model_kwargs=dict(model_kwargs),
             format_error_template="{{ error }} (finish={{ finish_reason }})",
         )
 
@@ -48,6 +52,23 @@ class _FakeLitellmModel:
 
 
 def _load_vanillux_module(monkeypatch):
+    litellm = ModuleType("litellm")
+    litellm.completion = lambda **_kwargs: None
+    litellm.exceptions = SimpleNamespace(AuthenticationError=RuntimeError)
+    jinja2 = ModuleType("jinja2")
+
+    class Template:
+        def __init__(self, source, **_kwargs) -> None:
+            self.source = source
+
+        def render(self, **values) -> str:
+            result = self.source
+            for key, value in values.items():
+                result = result.replace("{{ " + key + " }}", str(value))
+            return result
+
+    jinja2.StrictUndefined = object()
+    jinja2.Template = Template
     package = ModuleType("minisweagent")
     exceptions = ModuleType("minisweagent.exceptions")
     models = ModuleType("minisweagent.models")
@@ -55,6 +76,8 @@ def _load_vanillux_module(monkeypatch):
     exceptions.FormatError = _FakeFormatError
     exceptions.LimitsExceeded = _FakeLimitsExceeded
     litellm_model.LitellmModel = _FakeLitellmModel
+    monkeypatch.setitem(sys.modules, "litellm", litellm)
+    monkeypatch.setitem(sys.modules, "jinja2", jinja2)
     monkeypatch.setitem(sys.modules, "minisweagent", package)
     monkeypatch.setitem(sys.modules, "minisweagent.exceptions", exceptions)
     monkeypatch.setitem(sys.modules, "minisweagent.models", models)
@@ -84,6 +107,48 @@ def test_vanillux_model_exposes_one_persistent_bash_tool(monkeypatch) -> None:
     assert captured["tools"] == [module.VANILLUX2_BASH_TOOL]
     assert captured["tools"][0]["function"]["name"] == "bash"
     assert "persistent shell" in captured["tools"][0]["function"]["description"]
+
+
+def test_lease_capability_is_delivered_after_hardening_and_scoped_to_model_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_vanillux_module(monkeypatch)
+    secret_read, secret_write = os.pipe()
+    ready_read, ready_write = os.pipe()
+    capability = "lease-call-capability"
+    os.write(secret_write, (capability + "\n").encode())
+    os.close(secret_write)
+    monkeypatch.setenv("POLAR_POOL_CALL_CAPABILITY_FD", str(secret_read))
+    monkeypatch.setenv("POLAR_POOL_CALL_READY_FD", str(ready_write))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    prctl_operations: list[int] = []
+
+    class Libc:
+        def prctl(self, operation, *_args) -> int:
+            prctl_operations.append(operation)
+            return 0
+
+    monkeypatch.setattr(module.ctypes, "CDLL", lambda *_args, **_kwargs: Libc())
+    observed_api_keys: list[str | None] = []
+
+    def fake_completion(**_kwargs):
+        observed_api_keys.append(os.environ.get("OPENAI_API_KEY"))
+        return "response"
+
+    monkeypatch.setattr(module.litellm, "completion", fake_completion)
+    model = module.Vanillux2LitellmModel()
+
+    assert os.read(ready_read, 1) == b"1"
+    os.close(ready_read)
+    assert prctl_operations == [module._PR_SET_DUMPABLE, module._PR_GET_DUMPABLE]
+    assert "POLAR_POOL_CALL_CAPABILITY_FD" not in os.environ
+    assert "POLAR_POOL_CALL_READY_FD" not in os.environ
+    assert "OPENAI_API_KEY" not in os.environ
+
+    assert model.query([{"role": "user", "content": "task"}]) == "response"
+    assert observed_api_keys == [capability]
+    assert "OPENAI_API_KEY" not in os.environ
 
 
 def test_vanillux_cumulative_budget_uses_exact_prompt_growth_and_clamps_turn(
@@ -151,6 +216,57 @@ def test_vanillux_cumulative_budget_uses_exact_prompt_growth_and_clamps_turn(
     assert payload["chat_template_kwargs"] == {"enable_thinking": True}
     assert headers["Authorization"] == "Bearer session-1"
     assert tokenize_requests[1][1]["messages"] == second_messages
+
+
+def test_vanillux_budget_uses_only_max_completion_tokens_when_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_vanillux_module(monkeypatch)
+    tokenize_counts = iter((100, 150))
+    tokenize_payloads: list[dict] = []
+    completion_requests: list[dict] = []
+
+    class TokenizeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"count": next(tokenize_counts)}
+
+    class TokenizeClient:
+        def post(self, _url, *, json, **_kwargs):
+            tokenize_payloads.append(json)
+            return TokenizeResponse()
+
+    def fake_completion(**kwargs):
+        completion_requests.append(kwargs)
+        return "response"
+
+    monkeypatch.setattr(module.litellm, "client_session", TokenizeClient(), raising=False)
+    monkeypatch.setattr(module.litellm, "completion", fake_completion)
+    monkeypatch.setenv("OPENAI_API_BASE", "http://polar.invalid/v1")
+    model = module.Vanillux2LitellmModel(
+        response_token_budget=64,
+        model_name="openai/pool/gpt-5.5",
+        # Recursive mini-SWE config merging supplies both fields.  The modern
+        # field must win and remain the field clamped on every turn.
+        model_kwargs={
+            "max_tokens": 16_384,
+            "max_completion_tokens": 40,
+            "temperature": 0.7,
+        },
+    )
+
+    assert model.query([{"role": "user", "content": "task"}]) == "response"
+    assert model.query([{"role": "user", "content": "larger task"}]) == "response"
+
+    assert "max_tokens" not in model.config.model_kwargs
+    assert [request["max_completion_tokens"] for request in completion_requests] == [40, 14]
+    assert all("max_tokens" not in request for request in completion_requests)
+    assert [payload["model"] for payload in tokenize_payloads] == [
+        "pool/gpt-5.5",
+        "pool/gpt-5.5",
+    ]
 
 
 def test_vanillux_budget_fails_closed_when_gateway_count_is_invalid(

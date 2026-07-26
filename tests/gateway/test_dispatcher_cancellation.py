@@ -8,12 +8,88 @@ from unittest.mock import AsyncMock
 import pytest
 
 from polar.agent.models import AgentSpec
+from polar.gateway import dispatcher as dispatcher_module
 from polar.gateway.dispatcher import ManagedSession, SessionDispatcher, SessionStage
 from polar.gateway.node import GatewayNodeManager
 from polar.gateway.session import SessionRegistry
 from polar.gateway.storage import SessionStore
 from polar.rollout.models import SessionDispatchRequest, SessionStatus
 from polar.rollout.timer import StageTimer
+from polar.runtime.base import BaseRuntime, RuntimeContainmentError
+from polar.runtime.models import ExecResult, RuntimeSpec
+
+
+class _FailingTeardownRuntime(BaseRuntime):
+    def __init__(self, session_dir: Path) -> None:
+        super().__init__(RuntimeSpec(image="task.sif"), "failing-runtime", session_dir)
+        self.cancel_calls = 0
+        self.stop_calls = 0
+
+    @property
+    def runtime_id(self) -> str:
+        return "failing-runtime"
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+        raise RuntimeContainmentError("synthetic stop containment failure")
+
+    async def cancel(self) -> None:
+        self.cancel_calls += 1
+        raise RuntimeContainmentError("synthetic cancel containment failure")
+
+    async def exec(self, *_args, **_kwargs) -> ExecResult:
+        return ExecResult(return_code=0)
+
+    async def upload_file(self, *_args, **_kwargs) -> None:
+        return None
+
+    async def upload_dir(self, *_args, **_kwargs) -> None:
+        return None
+
+    async def download_file(self, *_args, **_kwargs) -> None:
+        return None
+
+    async def download_dir(self, *_args, **_kwargs) -> None:
+        return None
+
+
+class _BlockingTeardownRuntime(_FailingTeardownRuntime):
+    async def stop(self) -> None:
+        self.stop_calls += 1
+        await asyncio.Event().wait()
+
+    async def cancel(self) -> None:
+        self.cancel_calls += 1
+        await asyncio.Event().wait()
+
+
+def test_dispatcher_shutdown_timeout_is_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS", "300")
+    dispatcher = SessionDispatcher(
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+    )
+    assert dispatcher._shutdown_runtime_timeout_seconds == 300.0
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "invalid"])
+def test_dispatcher_shutdown_timeout_rejects_unsafe_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS", value)
+    with pytest.raises(ValueError, match="positive finite number"):
+        SessionDispatcher(
+            max_init_workers=1,
+            max_run_workers=1,
+            max_postrun_workers=1,
+        )
 
 
 def _managed(index: int, runtime, tmp_path: Path) -> ManagedSession:
@@ -85,6 +161,60 @@ async def test_mass_cancel_ack_is_fast_and_shutdown_drains_runtime_kills(tmp_pat
 
     assert dispatcher._runtime_cancel_tasks == set()
     assert all(managed.done_event.is_set() for managed in sessions)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_propagates_unproven_runtime_destruction(tmp_path: Path) -> None:
+    dispatcher = SessionDispatcher(
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+    )
+    await dispatcher.start()
+    runtime = _FailingTeardownRuntime(tmp_path)
+    managed = _managed(0, runtime, tmp_path)
+    async with dispatcher._lock:
+        dispatcher._sessions[managed.session_id] = managed
+
+    with pytest.raises(RuntimeContainmentError, match="could not prove"):
+        await dispatcher.stop()
+
+    assert runtime.cancel_calls == 1
+    assert runtime.stop_calls == 1
+    assert runtime.destroyed is False
+    assert managed.done_event.is_set()
+    assert dispatcher._started is False
+
+
+@pytest.mark.asyncio
+async def test_shutdown_bounds_multiple_blocked_runtime_proofs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_SHUTDOWN_RUNTIME_TIMEOUT_SECONDS",
+        0.05,
+    )
+    dispatcher = SessionDispatcher(
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+    )
+    await dispatcher.start()
+    runtimes = [_BlockingTeardownRuntime(tmp_path / str(index)) for index in range(3)]
+    sessions = [_managed(index, runtime, tmp_path) for index, runtime in enumerate(runtimes)]
+    async with dispatcher._lock:
+        dispatcher._sessions.update(
+            {managed.session_id: managed for managed in sessions}
+        )
+
+    with pytest.raises(RuntimeContainmentError, match="could not prove"):
+        async with asyncio.timeout(1):
+            await dispatcher.stop()
+
+    assert all(runtime.cancel_calls == 1 for runtime in runtimes)
+    assert all(runtime.destroyed is False for runtime in runtimes)
 
 
 @pytest.mark.asyncio

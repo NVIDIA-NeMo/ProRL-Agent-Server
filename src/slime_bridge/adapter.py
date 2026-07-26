@@ -177,6 +177,9 @@ def _build_sample(
         if parser_invalid_reason is not None or trainable_agent_timeout or invalid_execution
         else _reward_value(trace)
     )
+    reward_components = _reward_components(trace)
+    if parser_invalid_reason is not None or trainable_agent_timeout or invalid_execution:
+        reward_components = {key: 0.0 for key in reward_components}
 
     trainable = not invalid_execution
     loss_mask = _loss_mask_from_trace(
@@ -276,9 +279,16 @@ def _build_sample(
                 }
             )
         training_filter.setdefault("original_reward", trace.reward)
+        if trace.reward_components:
+            training_filter.setdefault(
+                "original_reward_components",
+                dict(trace.reward_components),
+            )
         polar_metadata["training_filter"] = training_filter
     polar_metadata.update(_scheduler_metadata(result, trace))
 
+    reward_payload = {reward_key: reward_value}
+    reward_payload.update(reward_components)
     return Sample(
         group_index=group_index,
         index=index,
@@ -287,7 +297,7 @@ def _build_sample(
         response=response_text,
         response_length=len(response_ids),
         rollout_id=index,
-        reward={reward_key: reward_value},
+        reward=reward_payload,
         loss_mask=loss_mask,
         rollout_log_probs=response_log_probs,
         status=status,
@@ -418,7 +428,34 @@ def _reward_value(trace: "Trace") -> float:
     Reward assignment is the evaluator's job (including any broadcasting
     from session-level outcomes). slime_bridge just consumes what's there.
     """
-    return float(trace.reward) if trace.reward is not None else 0.0
+    value = trace.reward
+    if value is None or isinstance(value, bool):
+        return 0.0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
+
+
+def _reward_components(trace: "Trace") -> dict[str, float]:
+    """Copy validated named rewards into the Slime sample payload."""
+
+    components = getattr(trace, "reward_components", None)
+    if not isinstance(components, dict):
+        return {}
+
+    normalized: dict[str, float] = {}
+    for key, value in components.items():
+        if not isinstance(key, str) or not key or isinstance(value, bool):
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(parsed):
+            normalized[key] = parsed
+    return normalized
 
 
 def _scheduler_metadata(result: "SessionResult", trace: "Trace | None") -> dict[str, Any]:

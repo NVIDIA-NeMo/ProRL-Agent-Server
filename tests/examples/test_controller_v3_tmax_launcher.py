@@ -1,0 +1,173 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import subprocess
+
+
+ROOT = Path(__file__).parents[2]
+EXAMPLE = ROOT / "examples/controller_v3_tmax_slime_grpo"
+
+
+def test_controller_v3_polar_contract() -> None:
+    text = (EXAMPLE / "polar_config.yaml").read_text()
+    assert 'harness: "controller_v3"' in text
+    assert 'strategy: "router_policy"' in text
+    assert 'tokenizer_name_or_path: "${HF_CHECKPOINT}"' in text
+    assert 'strategy: "harbor"' in text
+    assert "polar_max_consecutive_infrastructure_failures:" in text
+    assert "cost_penalty" not in text
+    assert "latency_penalty" not in text
+
+
+def test_controller_v3_topology_routes_local_qwen_and_nvidia_luna() -> None:
+    text = (EXAMPLE / "topology.yaml").read_text()
+    assert "pool/qwen3.6-35b-a3b" in text
+    assert "nvidia/qwen/qwen3.6-35b-a3b" in text
+    assert "${CONTROLLER_V3_SMALL_ROUTER_BASE_URL}" in text
+    assert "pool/gpt-5.6-luna" in text
+    assert "openai/openai/gpt-5.6-luna" in text
+    assert "${POLAR_MODEL_POOL_BASE_URL}" in text
+    assert "${CONTROLLER_V3_QWEN_GATEWAY_MAX_CONCURRENCY}" in text
+    assert "${CONTROLLER_V3_GPT_GATEWAY_MAX_CONCURRENCY}" in text
+
+
+def test_split_wrapper_reserves_exact_gpu_layout() -> None:
+    text = (EXAMPLE / "run.sh").read_text()
+    assert 'export RAY_LAST_NODE_NUM_GPUS="${RAY_LAST_NODE_NUM_GPUS:-2}"' in text
+    assert "export RAY_NUM_GPUS_PER_NODE=8" in text
+    assert 'CUDA_VISIBLE_DEVICES="${first_gpu},${second_gpu}"' in text
+    assert "for replica in 0 1 2" in text
+    assert "--tp-size 2" in text
+    assert "--ep-size 2" in text
+    assert "sglang_router.launch_router" in text
+
+
+def test_slurm_submit_preserves_last_node_ray_gpu_limit() -> None:
+    text = (ROOT / "examples/swegym_slime_grpo/submit_slurm.sh").read_text()
+    assert "RAY_NUM_*|RAY_LAST_NODE_NUM_GPUS|" in text
+
+
+def test_slurm_submit_preserves_controller_topology_template() -> None:
+    submit = (ROOT / "examples/swegym_slime_grpo/submit_slurm.sh").read_text()
+    run = (ROOT / "examples/swegym_slime_grpo/run.sh").read_text()
+    assert "TRAIN_CONTAINER_MOUNTS|TOPOLOGY_TEMPLATE|" in submit
+    assert "TOPOLOGY_TEMPLATE|CONTROLLER_V3_*|" in submit
+    assert '"CONTROLLER_V3_SMALL_ROUTER_BASE_URL",' in run
+    assert '"CONTROLLER_V3_QWEN_GATEWAY_MAX_CONCURRENCY",' in run
+    assert '"CONTROLLER_V3_GPT_GATEWAY_MAX_CONCURRENCY",' in run
+    assert '"HF_CHECKPOINT",' in run
+
+
+def test_controller_v3_requires_persistent_apptainer_broker() -> None:
+    profile = (EXAMPLE / "profile.sh").read_text()
+    submit = (EXAMPLE / "submit_slurm.sh").read_text()
+    assert "POLAR_APPTAINER_PERSISTENT_BROKER:-1" in profile
+    assert 'if [ "${POLAR_APPTAINER_PERSISTENT_BROKER:-}" != "1" ]; then' in submit
+    result = subprocess.run(
+        ["bash", str(EXAMPLE / "submit_slurm.sh"), "--dry-run"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "DRY_RUN": "1",
+            "POLAR_APPTAINER_PERSISTENT_BROKER": "0",
+        },
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "protected execution requires" in result.stderr
+
+
+def test_actor_expert_parallelism_reaches_megatron() -> None:
+    profile = (EXAMPLE / "profile.sh").read_text()
+    shared_run = (ROOT / "examples/swegym_slime_grpo/run.sh").read_text()
+    submit = (ROOT / "examples/swegym_slime_grpo/submit_slurm.sh").read_text()
+    assert "ACTOR_TENSOR_MODEL_PARALLEL_SIZE:-2" in profile
+    assert "export EXPERT_MODEL_PARALLEL_SIZE=8" in profile
+    assert '--expert-model-parallel-size "${EXPERT_MODEL_PARALLEL_SIZE:-1}"' in shared_run
+    assert "ACTOR_*|EXPERT_*|ROLLOUT_*" in submit
+
+
+def test_controller_profile_enables_harbor_cost_gdpo() -> None:
+    profile = (EXAMPLE / "profile.sh").read_text()
+    polar_config = (EXAMPLE / "polar_config.yaml").read_text()
+    shared_run = (ROOT / "examples/swegym_slime_grpo/run.sh").read_text()
+    shared_submit = (ROOT / "examples/swegym_slime_grpo/submit_slurm.sh").read_text()
+
+    assert 'GDPO_REWARD_KEY_1="${GDPO_REWARD_KEY_1:-harbor_reward}"' in profile
+    assert 'GDPO_REWARD_KEY_2="${GDPO_REWARD_KEY_2:-negative_cost}"' in profile
+    assert "emit_cost_reward: true" in polar_config
+    assert "--gdpo-reward-keys" in shared_run
+    assert "GDPO_*|" in shared_submit
+    assert "GDPO_REWARD_KEY_1 and GDPO_REWARD_KEY_2 must be set together" in shared_run
+
+
+def test_slurm_dry_run_is_side_effect_free_and_reports_full_topology() -> None:
+    result = subprocess.run(
+        ["bash", str(EXAMPLE / "submit_slurm.sh"), "--dry-run"],
+        cwd=ROOT,
+        env={**os.environ, "DRY_RUN": "1"},
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    output = result.stdout
+    assert "no command executed" in output
+    assert "nodes=3 gpus_per_node=8 total_gpus=24" in output
+    assert "actor=2x8 controller_rollout=1x2 frozen_qwen=3x2" in output
+    assert "gateways=3" in output
+    assert "api=responses reasoning=max" in output
+    assert "request_caps_per_gateway=qwen:1,gpt:4" in output
+    assert "apptainer_persistent_broker=1" in output
+    assert "TMax ready rows=1007 images=1000" in output
+    assert "/data/training_data/tmax/tmax-15k" in output
+    assert "/tmax-15k-open-instruct/enroot-images" in output
+    assert "sbatch --nodes=3" in output
+
+
+def test_two_node_smoke_dry_run_uses_one_prompt_and_eight_trajectories() -> None:
+    script = (EXAMPLE / "smoke_2n.sh").read_text()
+    assert "export ACTOR_TENSOR_MODEL_PARALLEL_SIZE=4" in script
+    assert "export EXPERT_MODEL_PARALLEL_SIZE=8" in script
+    assert "export N_SAMPLES_PER_PROMPT=8" in script
+    assert "export GLOBAL_BATCH_SIZE=8" in script
+    result = subprocess.run(
+        ["bash", str(EXAMPLE / "smoke_2n.sh"), "--dry-run"],
+        cwd=ROOT,
+        env={**os.environ, "DRY_RUN": "1"},
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    output = result.stdout
+    assert "no command executed" in output
+    assert "TMax ready rows=1 images=1" in output
+    assert "nodes=2 gpus_per_node=8 total_gpus=16 partition=interactive" in output
+    assert "actor=1x8 controller_rollout=1x2 frozen_qwen=3x2" in output
+    assert "gateways=2" in output
+    assert "request_caps_per_gateway=qwen:1,gpt:4" in output
+    assert "apptainer_persistent_broker=1" in output
+    assert "sbatch --nodes=2" in output
+
+
+def test_three_node_smoke_dry_run_uses_split_actor_topology() -> None:
+    script = (EXAMPLE / "smoke_3n.sh").read_text()
+    assert "export N_SAMPLES_PER_PROMPT=8" in script
+    assert "export GLOBAL_BATCH_SIZE=8" in script
+    result = subprocess.run(
+        ["bash", str(EXAMPLE / "smoke_3n.sh"), "--dry-run"],
+        cwd=ROOT,
+        env={**os.environ, "DRY_RUN": "1"},
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    output = result.stdout
+    assert "no command executed" in output
+    assert "TMax ready rows=1 images=1" in output
+    assert "nodes=3 gpus_per_node=8 total_gpus=24 partition=batch" in output
+    assert "actor=2x8 controller_rollout=1x2 frozen_qwen=3x2" in output
+    assert "gateways=3" in output
+    assert "sbatch --nodes=3" in output

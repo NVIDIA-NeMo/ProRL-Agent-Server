@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -115,11 +116,20 @@ class Pipeline:
         async with self._lifecycle_lock:
             if self._started:
                 return
+            control_token = os.environ.get("POLAR_CONTROL_PLANE_TOKEN", "").strip()
+            control_headers = (
+                {"X-Polar-Control-Token": control_token} if control_token else None
+            )
             self._client = httpx.AsyncClient(
                 timeout=30.0,
+                headers=control_headers,
                 limits=httpx.Limits(
                     max_connections=self.http_max_connections,
                     max_keepalive_connections=self.http_max_keepalive_connections,
+                    # Must stay strictly below the gateway's uvicorn
+                    # timeout_keep_alive, or bursty dispatch reuses sockets the
+                    # server is closing and fails with spurious ReadErrors.
+                    keepalive_expiry=2.0,
                 ),
             )
             # Keep terminal DELETEs isolated from dispatch/poll traffic.  A
@@ -127,6 +137,7 @@ class Pipeline:
             # releasing gateway runtimes and worker slots.
             self._cleanup_client = httpx.AsyncClient(
                 timeout=10.0,
+                headers=control_headers,
                 limits=httpx.Limits(
                     max_connections=self.cleanup_max_concurrency,
                     max_keepalive_connections=min(64, self.cleanup_max_concurrency),
@@ -378,11 +389,17 @@ class Pipeline:
                 response.raise_for_status()
                 return dispatch_request
             except Exception as exc:
+                session.dispatch_confirmed_not_landed = False
                 if await self._accepted_duplicate_dispatch(
                     exc, node.gateway_url, session, dispatch_request
                 ):
                     return dispatch_request
-                if not isinstance(exc, _DEFINITELY_NOT_CONNECTED_ERRORS):
+                if session.dispatch_confirmed_not_landed:
+                    # The gateway authoritatively reported 404 for this session
+                    # id, so the failed POST never landed. The id is unused and
+                    # the dispatch is safe to retry like a connect failure.
+                    session.dispatch_confirmed_not_landed = False
+                elif not isinstance(exc, _DEFINITELY_NOT_CONNECTED_ERRORS):
                     # A read/write timeout, connection reset, or HTTP failure
                     # can happen after the gateway accepted the request. Session
                     # ids are single-use only within one gateway process, so
@@ -437,7 +454,26 @@ class Pipeline:
                 response.raise_for_status()
                 break
             except Exception as get_exc:
+                # A failed attempt must not leak its response object into the
+                # confirmation path below: a 404/5xx body has no task_id and
+                # would be misread as a duplicate session owned by "task None".
+                response = None
                 confirmation_error = get_exc
+                if (
+                    isinstance(get_exc, httpx.HTTPStatusError)
+                    and get_exc.response.status_code == 404
+                ):
+                    # Authoritative answer: the session does not exist on this
+                    # gateway, so the failed POST never landed and the id is
+                    # still unused there.
+                    logger.info(
+                        "Gateway %s has no session %s after dispatch error; "
+                        "the dispatch never landed and will be retried",
+                        gateway_url,
+                        session.session_id,
+                    )
+                    session.dispatch_confirmed_not_landed = True
+                    return False
                 if attempt == _DISPATCH_CONFIRM_ATTEMPTS:
                     break
                 # The same overloaded gateway may have accepted the POST but

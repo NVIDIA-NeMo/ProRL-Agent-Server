@@ -20,6 +20,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+# shellcheck source=../path_safety.sh
+source "${SCRIPT_DIR}/../path_safety.sh"
 
 TMAX_DATA_ROOT="${TMAX_DATA_ROOT:-/lustre/fsw/portfolios/nvr/projects/nvr_lpr_llm/users/jiaruiy/spilot/data}"
 TMAX_DATASET_DIR="${TMAX_DATASET_DIR:-${TMAX_DATA_ROOT}/tmax-15k}"
@@ -38,7 +40,8 @@ CONSTRAINT="${TMAX_SIF_BUILD_CONSTRAINT:-}"
 LAUNCHER="${TMAX_SIF_BUILD_LAUNCHER:-sbatch-container}"
 BUILD_CONTAINER_IMAGE="${TMAX_SIF_BUILD_CONTAINER_IMAGE:-flappydora/ubuntu22.04-cuda13.3:latest}"
 BUILD_CONTAINER_MOUNTS="${TMAX_SIF_BUILD_CONTAINER_MOUNTS:-/lustre/fsw:/lustre/fsw}"
-LOG_DIR="${TMAX_SIF_BUILD_LOG_DIR:-${PROJECT_ROOT}/logs/slurm}"
+LOG_DIR="${TMAX_SIF_BUILD_LOG_DIR:-${TMAX_DATA_ROOT}/logs/slurm}"
+polar_require_absolute_path TMAX_SIF_BUILD_LOG_DIR "${LOG_DIR}"
 PYTHON_BIN="${TMAX_SIF_PYTHON_BIN:-${PYTHON_BIN:-/lustre/fsw/portfolios/nvr/projects/nvr_lpr_llm/users/jiaruiy/.python/polar/bin/python}}"
 
 SHARDS="${TMAX_SIF_BUILD_SHARDS:-1000}"

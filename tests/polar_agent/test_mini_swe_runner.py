@@ -1,13 +1,143 @@
 from __future__ import annotations
 
+import base64
 import os
 from pathlib import Path
 import socket
+import sys
 import threading
 
 import pytest
 
 from polar.agent.presets import mini_swe_runner
+
+
+def test_private_task_moves_to_python_argv_but_not_proc_cmdline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = "Use pkill -f polar-danger-marker-e81a safely\n雪 'quoted'"
+    monkeypatch.setattr(sys, "argv", ["polar_mini_swe_runner", "--yolo"])
+    monkeypatch.setenv(
+        "POLAR_MINI_SWE_TASK_B64",
+        base64.b64encode(task.encode("utf-8")).decode("ascii"),
+    )
+    before = Path("/proc/self/cmdline").read_bytes()
+
+    mini_swe_runner._inject_task_from_env()
+
+    assert sys.argv == ["polar_mini_swe_runner", f"--task={task}", "--yolo"]
+    assert "POLAR_MINI_SWE_TASK_B64" not in os.environ
+    assert Path("/proc/self/cmdline").read_bytes() == before
+    assert b"polar-danger-marker-e81a" not in before
+
+
+@pytest.mark.parametrize(
+    ("encoded", "message"),
+    [
+        ("not%base64", "strict base64"),
+        (base64.b64encode(b"\xff").decode("ascii"), "UTF-8"),
+    ],
+)
+def test_private_task_rejects_invalid_payload_and_pops_secret_env(
+    monkeypatch: pytest.MonkeyPatch,
+    encoded: str,
+    message: str,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["polar_mini_swe_runner", "--yolo"])
+    monkeypatch.setenv("POLAR_MINI_SWE_TASK_B64", encoded)
+
+    with pytest.raises(ValueError, match=message):
+        mini_swe_runner._inject_task_from_env()
+
+    assert sys.argv == ["polar_mini_swe_runner", "--yolo"]
+    assert "POLAR_MINI_SWE_TASK_B64" not in os.environ
+
+
+@pytest.mark.parametrize(
+    "task_args",
+    [
+        ("--task=argv-task",),
+        ("--task", "argv-task"),
+        ("-t", "argv-task"),
+        ("-targv-task",),
+        ("-t=argv-task",),
+        ("-yt", "argv-task"),
+        ("-ytargv-task",),
+        ("-yt=argv-task",),
+        ("-yytargv-task",),
+    ],
+)
+def test_private_task_rejects_ambiguous_env_and_argv(
+    monkeypatch: pytest.MonkeyPatch,
+    task_args: tuple[str, ...],
+) -> None:
+    original_argv = ["polar_mini_swe_runner", *task_args]
+    monkeypatch.setattr(sys, "argv", original_argv.copy())
+    monkeypatch.setenv(
+        "POLAR_MINI_SWE_TASK_B64",
+        base64.b64encode(b"env-task").decode("ascii"),
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        mini_swe_runner._inject_task_from_env()
+
+    assert sys.argv == original_argv
+    assert "POLAR_MINI_SWE_TASK_B64" not in os.environ
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        [],
+        ["--task-timeout", "5"],
+        ["--model=contains--task"],
+        ["--model", "--task"],
+        ["-m", "-t"],
+        ["-mytask"],
+        ["-ymtask"],
+        ["-ctask"],
+        ["-otask"],
+        ["-ltask"],
+        ["-xtargv-task"],
+        ["-y=targv-task"],
+        ["--", "--task", "positional-text"],
+        ["ordinary-task-text"],
+    ],
+)
+def test_task_argv_checker_does_not_misclassify_other_click_arguments(
+    args: list[str],
+) -> None:
+    assert mini_swe_runner._argv_has_task_option(args) is False
+
+
+@pytest.mark.parametrize(
+    "existing_args",
+    [
+        ["--yolo"],
+        ["--model", "model-id"],
+        ["-mmodel-id"],
+        ["--model"],
+        ["-m"],
+        ["--"],
+    ],
+)
+def test_private_task_is_inserted_before_unrelated_cli_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    existing_args: list[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["polar_mini_swe_runner", *existing_args])
+    monkeypatch.setenv(
+        "POLAR_MINI_SWE_TASK_B64",
+        base64.b64encode(b"env-task").decode("ascii"),
+    )
+
+    mini_swe_runner._inject_task_from_env()
+
+    assert sys.argv == [
+        "polar_mini_swe_runner",
+        "--task=env-task",
+        *existing_args,
+    ]
 
 
 def _serve_unix_echo(path: Path) -> tuple[socket.socket, threading.Thread]:
@@ -32,8 +162,7 @@ def test_loopback_proxy_relays_to_unix_socket(tmp_path: Path) -> None:
     try:
         with mini_swe_runner.LoopbackProxy(str(socket_path), 0) as proxy:
             # Port zero asks the kernel for a collision-free test port.
-            port = proxy._server.server_address[1]  # noqa: SLF001
-            with socket.create_connection(("127.0.0.1", port), timeout=2.0) as client:
+            with socket.create_connection(("127.0.0.1", proxy.port), timeout=2.0) as client:
                 client.sendall(b"request")
                 assert client.recv(4096) == b"echo:request"
     finally:
@@ -93,15 +222,17 @@ def test_proxy_configuration_rewrites_all_proxy_variables(
     upstream.bind(str(socket_path))
     upstream.listen()
     monkeypatch.setenv("POLAR_HTTP_PROXY_UDS", str(socket_path))
-    monkeypatch.setenv("POLAR_HTTP_PROXY_PORT", "28099")
+    monkeypatch.setenv("POLAR_HTTP_PROXY_PORT", "0")
     monkeypatch.setenv("no_proxy", "metadata.internal,localhost")
     monkeypatch.setenv("NO_PROXY", "registry.internal")
 
     proxy = mini_swe_runner._configure_http_proxy()
     try:
         assert proxy is not None
+        assert proxy.port > 0
+        expected_proxy_url = f"http://127.0.0.1:{proxy.port}"
         for name in mini_swe_runner._PROXY_ENV_NAMES:
-            assert os.environ[name] == "http://127.0.0.1:28099"
+            assert os.environ[name] == expected_proxy_url
         assert os.environ["no_proxy"] == (
             "metadata.internal,localhost,registry.internal,127.0.0.1,::1"
         )
@@ -204,7 +335,15 @@ def test_apt_source_upgrade_requires_https_method(
     assert "http://example.invalid" in source.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("value", ["bad", "0", "65536"])
+def test_zero_proxy_port_requests_an_available_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POLAR_HTTP_PROXY_PORT", "0")
+
+    assert mini_swe_runner._proxy_port_from_env() == 0
+
+
+@pytest.mark.parametrize("value", ["bad", "-1", "65536"])
 def test_invalid_proxy_port_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
     value: str,

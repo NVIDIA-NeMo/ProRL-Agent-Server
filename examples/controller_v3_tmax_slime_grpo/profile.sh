@@ -1,0 +1,156 @@
+# Controller V3: 16-GPU actor + 2-GPU policy rollout + 3x2-GPU frozen worker.
+_CONTROLLER_V3_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+_CONTROLLER_V3_ROOT="$(cd -- "${_CONTROLLER_V3_DIR}/../.." && pwd -P)"
+_CONTROLLER_V3_USER_ROOT="$(cd -- "${_CONTROLLER_V3_ROOT}/../../../.." && pwd -P)"
+
+export NUM_NODES="${NUM_NODES:-3}"
+export SLURM_GPUS="${SLURM_GPUS:-8}"
+export PARTITION="${PARTITION:-batch}"
+export WALL_TIME="${WALL_TIME:-04:00:00}"
+export TMAX_MIN_WALL_TIME="${TMAX_MIN_WALL_TIME:-04:00:00}"
+
+export TMAX_AGENT_HARNESS=controller_v3
+export POLAR_AGENT_HARNESS=controller_v3
+export POLAR_AGENT_MODEL_NAME="${POLAR_AGENT_MODEL_NAME:-Qwen3.6-35B-A3B}"
+export POLAR_AGENT_STEP_LIMIT="${POLAR_AGENT_STEP_LIMIT:-64}"
+export POLAR_AGENT_COST_LIMIT="${POLAR_AGENT_COST_LIMIT:-0}"
+export POLAR_FULLY_ASYNC=true
+export TMAX_MIN_ASYNC_LEVEL="${TMAX_MIN_ASYNC_LEVEL:-4}"
+export POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-${TMAX_MIN_ASYNC_LEVEL}}"
+export POLAR_MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES="${POLAR_MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES:-3}"
+export POLAR_MULTI_GATEWAY=1
+export POLAR_GATEWAY_COUNT_OVERRIDE="${POLAR_GATEWAY_COUNT_OVERRIDE:-${NUM_NODES}}"
+export SPILOT_EPISODE_ADMISSION_ENABLED=false
+export POLAR_APPTAINER_PERSISTENT_BROKER="${POLAR_APPTAINER_PERSISTENT_BROKER:-1}"
+
+export ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-2}"
+export ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
+export ACTOR_TENSOR_MODEL_PARALLEL_SIZE="${ACTOR_TENSOR_MODEL_PARALLEL_SIZE:-2}"
+export CONTEXT_PARALLEL_SIZE=1
+export EXPERT_MODEL_PARALLEL_SIZE=8
+export EXPERT_TENSOR_PARALLEL_SIZE=1
+export ROLLOUT_NUM_GPUS=2
+export ROLLOUT_NUM_GPUS_PER_ENGINE=2
+export RAY_NUM_GPUS_PER_NODE=8
+export RAY_LAST_NODE_NUM_GPUS=2
+export TMAX_REQUIRE_FULL_GPU_ALLOCATION=0
+export SGLANG_EP_SIZE=2
+export SGLANG_DP_SIZE=1
+export SGLANG_MEM_FRACTION_STATIC=0.70
+export SGLANG_DISABLE_CUSTOM_ALL_REDUCE=1
+# Keep projection weights in model precision; Slime casts bounded response
+# logits to FP32 for log-prob and entropy calculations.
+export TMAX_ENABLE_FP32_LM_HEAD=0
+export SGLANG_ENABLE_FP32_LM_HEAD=0
+
+export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
+export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
+# Save a checkpoint every 5 rollouts (set before env.cwdfw.sh's default of 10).
+export SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
+export DVAO_REWARD_KEY_1="${DVAO_REWARD_KEY_1:-}"
+export DVAO_REWARD_KEY_2="${DVAO_REWARD_KEY_2:-}"
+export GDPO_REWARD_KEY_1="${GDPO_REWARD_KEY_1:-harbor_reward}"
+export GDPO_REWARD_KEY_2="${GDPO_REWARD_KEY_2:-negative_cost}"
+
+# ==========================================================================
+# Controller reward-shaping knobs. The defaults below run plain GDPO over every
+# task: accuracy + cost on every prompt group, no group filtering, no group
+# dropping. Every knob is independent and OFF by default; enable one by
+# exporting the value shown in its comment (e.g. before calling submit).
+# ==========================================================================
+
+# No dynamic sampling filter by default -> train on every rollout group. The
+# stock default (env.cwdfw.sh) is check_reward_nonzero_std, which drops
+# zero-variance groups (all-correct AND all-wrong); plain GDPO instead keeps the
+# fully-correct groups for the cost signal. Set before env.cwdfw.sh so its ``-``
+# fallback cannot re-enable it. To restore it: export the filter path.
+export TMAX_DYNAMIC_SAMPLING_FILTER_PATH="${TMAX_DYNAMIC_SAMPLING_FILTER_PATH-}"
+
+# Penalty weight for controller turns whose response is not a parseable routing
+# decision (centered, turn-equal format signal). Empty = off; e.g. set 0.1.
+export POLAR_CONTROLLER_INVALID_TURN_PENALTY="${POLAR_CONTROLLER_INVALID_TURN_PENALTY:-}"
+
+# Credit assignment across realized keep/escalate/deescalate actions. Empty =
+# off (standard); set to actual_action_balanced to make each realized action an
+# equal policy-loss stratum.
+export POLAR_CONTROLLER_CREDIT_MODE="${POLAR_CONTROLLER_CREDIT_MODE:-}"
+
+# GDPO cost gate. 0 = off: cost applies to every group (plain GDPO). Set to 1 to
+# apply the cost component only within fully-correct groups.
+export POLAR_GDPO_COST_GATE_ALL_CORRECT="${POLAR_GDPO_COST_GATE_ALL_CORRECT:-0}"
+
+# Post-rollout group selection: drop/subsample groups before training. Each only
+# shrinks the batch (no backfill); an emptied batch keeps the original for that
+# step. 0 = off.
+#   D: drop groups whose trajectories are all wrong.
+export POLAR_DROP_ALL_WRONG_GROUPS="${POLAR_DROP_ALL_WRONG_GROUPS:-0}"
+#   B: drop groups that never realized an escalate/deescalate (needs routing
+#      actions stamped, i.e. the controller_v3 harness).
+export POLAR_DROP_ALL_KEEP_GROUPS="${POLAR_DROP_ALL_KEEP_GROUPS:-0}"
+#   C: downsample fully-correct groups to the mixed-group count so the cost
+#      signal does not dominate accuracy.
+export POLAR_BALANCE_ALL_CORRECT_GROUPS="${POLAR_BALANCE_ALL_CORRECT_GROUPS:-0}"
+export POLAR_MAX_INIT_WORKERS="${POLAR_MAX_INIT_WORKERS:-96}"
+export POLAR_MAX_RUN_WORKERS="${POLAR_MAX_RUN_WORKERS:-258}"
+export POLAR_MAX_POSTRUN_WORKERS="${POLAR_MAX_POSTRUN_WORKERS:-96}"
+export CONTROLLER_V3_QWEN_GATEWAY_MAX_CONCURRENCY="${CONTROLLER_V3_QWEN_GATEWAY_MAX_CONCURRENCY:-1}"
+export CONTROLLER_V3_GPT_GATEWAY_MAX_CONCURRENCY="${CONTROLLER_V3_GPT_GATEWAY_MAX_CONCURRENCY:-4}"
+export POLAR_LOCAL_MODEL_API_KEY="${POLAR_LOCAL_MODEL_API_KEY:-local-no-auth}"
+export POLAR_MODEL_POOL_BASE_URL="${POLAR_MODEL_POOL_BASE_URL:-https://inference-api.nvidia.com/v1}"
+export CONTROLLER_V3_NVIDIA_CREDENTIALS_FILE="${CONTROLLER_V3_NVIDIA_CREDENTIALS_FILE:-/home/junlongl/.config/spilot-controller/nvidia.env}"
+export CONTROLLER_V3_WANDB_NETRC="${CONTROLLER_V3_WANDB_NETRC:-/home/junlongl/.netrc}"
+
+export HF_CHECKPOINT="${HF_CHECKPOINT:-${_CONTROLLER_V3_USER_ROOT}/models/Qwen3.6-35B-A3B}"
+export REF_LOAD="${REF_LOAD:-${_CONTROLLER_V3_USER_ROOT}/models/Qwen3.6-35B-A3B_torch_dist}"
+export TORCH_DIST_DIR="${TORCH_DIST_DIR:-${REF_LOAD}}"
+export MODEL_ARGS_FILE="${MODEL_ARGS_FILE:-${_CONTROLLER_V3_DIR}/model_args_qwen36_35b_a3b.sh}"
+export MINI_SWE_AGENT_RUNTIME_DIR="${MINI_SWE_AGENT_RUNTIME_DIR:-${_CONTROLLER_V3_USER_ROOT}/projects/ProRL-Agent-Server/tmp/mini-swe-agent-runtime-controller-v3-b1.4.1-one-vote-nonthinking}"
+export MINI_SWE_AGENT_BIN="${MINI_SWE_AGENT_BIN:-${MINI_SWE_AGENT_RUNTIME_DIR}/bin/mini}"
+export MINI_SWE_AGENT_SPEC="mini-swe-agent==2.4.0"
+export POLR_TRAIN_VENV="${POLR_TRAIN_VENV:-${_CONTROLLER_V3_USER_ROOT}/projects/slime/.venv-cu13}"
+export SLIME_DIR="${SLIME_DIR:-${_CONTROLLER_V3_ROOT}/../slime}"
+export POLR_TRAIN_SQSH="${POLR_TRAIN_SQSH:-/lustre/fsw/portfolios/nvr/projects/nvr_lpr_llm/users/gheinrich/container-images/pytorch-25.10-py3.sqsh}"
+export MEGATRON_DIR="${MEGATRON_DIR:-${_CONTROLLER_V3_USER_ROOT}/scratch/Megatron-LM}"
+export SGLANG_DIR="${SGLANG_DIR:-${_CONTROLLER_V3_USER_ROOT}/scratch/sglang}"
+export APPTAINER_ENV="${APPTAINER_ENV:-${_CONTROLLER_V3_USER_ROOT}/projects/ProRL-Agent-Server/tmp/apptainer-conda}"
+export POLAR_APPTAINER_BIN="${POLAR_APPTAINER_BIN:-${APPTAINER_ENV}/bin/apptainer}"
+export POLAR_APPTAINER_SESSIONDIR="${POLAR_APPTAINER_SESSIONDIR:-${APPTAINER_ENV}/var/apptainer/mnt/session}"
+export POLAR_APPTAINER_JOB_SESSION_MOUNT=1
+export POLAR_APPTAINER_DIRECT_EXEC=1
+export POLAR_APPTAINER_NO_INSTANCE=1
+_CONTROLLER_V3_PYTHON_LINK="$(readlink -- "${POLR_TRAIN_VENV}/bin/python")"
+_CONTROLLER_V3_PYTHON_TARGET_ROOT="$(dirname -- "$(dirname -- "${_CONTROLLER_V3_PYTHON_LINK}")")"
+_CONTROLLER_V3_PYTHON_SOURCE_ROOT="$(realpath -e -- "${_CONTROLLER_V3_PYTHON_TARGET_ROOT}")"
+export TRAIN_CONTAINER_MOUNTS="${TRAIN_CONTAINER_MOUNTS:-/lustre/fsw:/lustre/fsw,${_CONTROLLER_V3_PYTHON_SOURCE_ROOT}:${_CONTROLLER_V3_PYTHON_TARGET_ROOT}:ro}"
+unset _CONTROLLER_V3_PYTHON_LINK _CONTROLLER_V3_PYTHON_TARGET_ROOT
+unset _CONTROLLER_V3_PYTHON_SOURCE_ROOT
+
+export TMAX_DATASET_DIR="${TMAX_DATASET_DIR:-${_CONTROLLER_V3_USER_ROOT}/data/training_data/tmax/tmax-15k}"
+export TMAX_OPEN_INSTRUCT_DIR="${TMAX_OPEN_INSTRUCT_DIR:-${_CONTROLLER_V3_USER_ROOT}/data/training_data/tmax/tmax-15k-open-instruct}"
+export APPTAINER_IMAGE_DIR="${APPTAINER_IMAGE_DIR:-${TMAX_OPEN_INSTRUCT_DIR}/enroot-images}"
+export TMAX_OPEN_INSTRUCT_TASKS_DIR="${TMAX_OPEN_INSTRUCT_TASKS_DIR:-${TMAX_OPEN_INSTRUCT_DIR}/polar-tasks}"
+export TMAX_TRAIN_DATA="${TMAX_TRAIN_DATA:-${TMAX_OPEN_INSTRUCT_DIR}/polar-controller-v3-ready.jsonl}"
+export TMAX_SIF_PYTHON_BIN="${TMAX_SIF_PYTHON_BIN:-${POLR_TRAIN_VENV}/bin/python}"
+# The wrapper prepares Open-Instruct assets before entering the shared launcher.
+export TMAX_PREPARE_DATA=0
+export TMAX_VALIDATE_EXISTING_ASSETS=0
+
+export TMAX_OPTIMIZER_CPU_OFFLOAD=1
+export USE_DISTRIBUTED_OPTIMIZER=1
+export USE_PRECISION_AWARE_OPTIMIZER=1
+export MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-24576}"
+export TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP=1
+export ROLLOUT_MAX_PROMPT_LEN="${ROLLOUT_MAX_PROMPT_LEN:-15360}"
+export ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-1024}"
+export TMAX_MAX_TOTAL_RESPONSE_LEN="${TMAX_MAX_TOTAL_RESPONSE_LEN:-65536}"
+export SEQ_LENGTH="${SEQ_LENGTH:-16384}"
+export MAX_POSITION_EMBEDDINGS="${MAX_POSITION_EMBEDDINGS:-262144}"
+
+export POLAR_CONFIG_TEMPLATE="${_CONTROLLER_V3_DIR}/polar_config.yaml"
+export TOPOLOGY_TEMPLATE="${_CONTROLLER_V3_DIR}/topology.yaml"
+export POLAR_TRAIN_RUN_SCRIPT="${_CONTROLLER_V3_DIR}/run.sh"
+export TMAX_SUBMIT_SCRIPT="${_CONTROLLER_V3_DIR}/submit_slurm.sh"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-controller-v3-qwen36-3n24}"
+export WANDB_GROUP="${WANDB_GROUP:-controller-v3-qwen36-3n24}"
+
+unset _CONTROLLER_V3_DIR _CONTROLLER_V3_ROOT _CONTROLLER_V3_USER_ROOT

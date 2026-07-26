@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import shutil
-from contextlib import suppress
 from pathlib import Path
 from tempfile import mkdtemp
 from typing import Any
@@ -19,7 +19,16 @@ from polar.gateway.dispatcher import (
     SessionDispatcher,
     SessionStage,
 )
-from polar.gateway.session import SessionRegistry
+from polar.gateway.session import (
+    MODEL_POOL_ADMISSION_CAPABILITY_ENV,
+    MODEL_POOL_ADMISSION_CAPABILITY_SCOPE,
+    MODEL_POOL_CAPABILITY_ENV,
+    MODEL_POOL_CAPABILITY_SCOPE,
+    ROUTER_CAPABILITY_ENV,
+    ROUTER_CAPABILITY_SCOPE,
+    SessionRegistry,
+)
+from polar.gateway.episode_admission import ModelPoolEpisodeAdmission
 from polar.gateway.storage import SessionStore
 from polar.agent.base import BaseHarness
 from polar.agent.factory import create_harness
@@ -34,7 +43,7 @@ from polar.rollout.models import (
     SessionStatus,
 )
 from polar.rollout.timer import StageTimer
-from polar.runtime.base import BaseRuntime
+from polar.runtime.base import BaseRuntime, RuntimeContainmentError
 from polar.runtime.factory import create_runtime
 from polar.runtime.models import ExecInput, RuntimeSpec
 from polar.trajectory.models import EvalResult, EvaluatorSpec, StrategySpec, Trace, Trajectory
@@ -49,6 +58,9 @@ _CALLBACK_REQUEST_TIMEOUT_SECONDS = 5.0
 _CALLBACK_RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _AGENT_RESULT_METADATA_KEY = "agent_result"
 _TRAINABLE_AGENT_TIMEOUT_REASON = "agent_timeout"
+# Grace window to harvest the partial GPT cost an agent-budget timeout already
+# wrote to its trajectory file, after the agent budget itself is exhausted.
+_AGENT_TIMEOUT_COST_HARVEST_SECONDS = 10.0
 
 
 class GatewayExecutionTimeout(TimeoutError):
@@ -57,6 +69,10 @@ class GatewayExecutionTimeout(TimeoutError):
 
 class GatewayExecutionCancelled(RuntimeError):
     """Raised when cancellation wins a race with post-run evaluation."""
+
+
+class GatewayNodeUnhealthyError(RuntimeError):
+    """The node retained an unsafe episode lease and cannot accept work."""
 
 
 class GatewayNodeManager:
@@ -78,6 +94,7 @@ class GatewayNodeManager:
         session_base_dir: str | None = None,
         rollout_server_url: str | None = None,
         heartbeat_interval_seconds: int = 30,
+        episode_admission: ModelPoolEpisodeAdmission | None = None,
     ) -> None:
         self.node_id = node_id
         self.gateway_url = gateway_url.rstrip("/")
@@ -89,8 +106,15 @@ class GatewayNodeManager:
         self.builders = builders
         self.evaluators = evaluators
         self.default_runtime = default_runtime
+        self.episode_admission = episode_admission or ModelPoolEpisodeAdmission({})
+        self._fatal_retained_episode_sessions: set[str] = set()
         self._session_base_dir = session_base_dir
-        self._client = httpx.AsyncClient(timeout=30.0)
+        control_token = os.environ.get("POLAR_CONTROL_PLANE_TOKEN", "").strip()
+        control_headers = (
+            {"X-Polar-Control-Token": control_token} if control_token else None
+        )
+        self._control_headers = control_headers
+        self._client = httpx.AsyncClient(timeout=30.0, headers=control_headers)
         self._dispatcher = SessionDispatcher(
             max_init_workers=max_init_workers,
             max_run_workers=max_run_workers,
@@ -112,12 +136,15 @@ class GatewayNodeManager:
         await self._dispatcher.start()
         if self._rollout_server_url is not None:
             self._control_client = httpx.AsyncClient(
-                base_url=self._rollout_server_url, timeout=15.0
+                base_url=self._rollout_server_url,
+                timeout=15.0,
+                headers=self._control_headers,
             )
             await self._register_with_rollout_server()
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def close(self) -> None:
+        await self.episode_admission.poison("gateway node is shutting down")
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             await asyncio.gather(self._heartbeat_task, return_exceptions=True)
@@ -125,13 +152,26 @@ class GatewayNodeManager:
         if self._control_client is not None:
             await self._control_client.aclose()
             self._control_client = None
-        await self._dispatcher.stop()
+        close_errors: list[BaseException] = []
+        try:
+            await self._dispatcher.stop()
+        except BaseException as exc:
+            close_errors.append(exc)
+        try:
+            await self.episode_admission.close()
+        except BaseException as exc:
+            close_errors.append(exc)
         if self._cancel_finalizers:
             await asyncio.gather(
                 *tuple(self._cancel_finalizers.values()),
                 return_exceptions=True,
             )
-        await self._client.aclose()
+        try:
+            await self._client.aclose()
+        except BaseException as exc:
+            close_errors.append(exc)
+        if close_errors:
+            raise close_errors[0]
 
     async def _register_with_rollout_server(self) -> None:
         if self._control_client is None:
@@ -156,22 +196,43 @@ class GatewayNodeManager:
         assert self._control_client is not None
         while True:
             await asyncio.sleep(self._heartbeat_interval_seconds)
-            try:
-                metrics = await self.stage_metrics()
-                response = await self._control_client.post(
-                    f"/nodes/{self.node_id}/heartbeat",
-                    json=NodeHeartbeatRequest(metrics=metrics).model_dump(mode="json"),
-                )
-                if response.status_code == 404:
-                    await self._register_with_rollout_server()
-                    continue
-                response.raise_for_status()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning("Node heartbeat failed", exc_info=True)
+            await self._send_heartbeat_once()
+
+    async def _send_heartbeat_once(self) -> bool:
+        """Send one heartbeat, or return false for a retained-lease fatal node."""
+
+        assert self._control_client is not None
+        # A retained active episode lease means the candidate runner could not
+        # prove its subreaper-owned candidate process scope disappeared. Stop
+        # advertising this
+        # node as schedulable; the launcher observes the structured local 503
+        # and fails the allocation while rollout-side staleness remains a
+        # second line of defense.
+        if self._fatal_retained_episode_sessions:
+            return False
+        try:
+            metrics = await self.stage_metrics()
+            response = await self._control_client.post(
+                f"/nodes/{self.node_id}/heartbeat",
+                json=NodeHeartbeatRequest(metrics=metrics).model_dump(mode="json"),
+            )
+            if response.status_code == 404:
+                await self._register_with_rollout_server()
+                return True
+            response.raise_for_status()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Node heartbeat failed", exc_info=True)
+        return True
 
     async def dispatch(self, request: SessionDispatchRequest) -> None:
+        if self._fatal_retained_episode_sessions:
+            retained = ", ".join(sorted(self._fatal_retained_episode_sessions))
+            raise GatewayNodeUnhealthyError(
+                "gateway node is unhealthy after a fatal runtime-containment "
+                f"failure for session(s): {retained}"
+            )
         session_id = request.session_id
         if self.session_registry.get(session_id) is not None:
             raise ValueError(
@@ -185,7 +246,10 @@ class GatewayNodeManager:
                 task_id=request.task_id,
                 registered=True,
                 status=SessionStatus.REGISTERED,
-                metadata=dict(request.metadata),
+                metadata={
+                    **dict(request.metadata),
+                    "_polar_agent_harness": request.agent.harness,
+                },
             )
             self.storage.ensure_session(
                 info.session_id,
@@ -205,15 +269,43 @@ class GatewayNodeManager:
             artifacts_dir = session_dir / "artifacts"
             artifacts_dir.mkdir()
             (session_dir / "logs" / "agent").mkdir(parents=True, exist_ok=True)
+            router_capability: str | None = None
+            model_pool_capability: str | None = None
+            model_pool_admission_capability: str | None = None
+            if request.agent.harness in {"spilot_router", "controller_v3"}:
+                router_capability = self.session_registry.issue_capability(
+                    session_id,
+                    scope=ROUTER_CAPABILITY_SCOPE,
+                )
+                # Uncapped model-pool routes use a session-scoped capability.
+                # Capped routes ignore it and require the per-episode call
+                # capability minted by admission instead.
+                model_pool_capability = self.session_registry.issue_capability(
+                    session_id,
+                    scope=MODEL_POOL_CAPABILITY_SCOPE,
+                )
+                if request.agent.harness == "spilot_router":
+                    model_pool_admission_capability = self.session_registry.issue_capability(
+                        session_id,
+                        scope=MODEL_POOL_ADMISSION_CAPABILITY_SCOPE,
+                    )
             await self._dispatcher.enqueue(
                 ManagedSession(
                     request=request,
                     timer=timer,
                     session_dir=session_dir,
                     artifacts_dir=artifacts_dir,
+                    router_capability=router_capability,
+                    model_pool_capability=model_pool_capability,
+                    model_pool_admission_capability=model_pool_admission_capability,
                 )
             )
         except Exception:
+            active_retained = await self.episode_admission.cleanup_session_records(
+                session_id
+            )
+            if active_retained:
+                await self._mark_fatal_retained_episode(session_id)
             self.storage.delete_session(session_id)
             self.session_registry.remove(session_id)
             if session_dir is not None:
@@ -222,6 +314,9 @@ class GatewayNodeManager:
 
     async def cancel(self, session_id: str) -> bool:
         """Accept cancellation quickly and finalize registry cleanup in background."""
+        episode_admission = getattr(self, "episode_admission", None)
+        if episode_admission is not None:
+            await episode_admission.cancel_waiters(session_id)
         async with self._cancel_lock:
             existing = self._cancel_finalizers.get(session_id)
             if existing is not None:
@@ -262,6 +357,32 @@ class GatewayNodeManager:
     async def stage_metrics(self) -> NodeStageMetrics:
         snapshot = await self._dispatcher.snapshot()
         return self._snapshot_to_metrics(snapshot)
+
+    def episode_admission_health(self) -> dict[str, object]:
+        retained = sorted(self._fatal_retained_episode_sessions)
+        return {
+            "healthy": not retained,
+            "fatal_retained": bool(retained),
+            "retained_session_ids": retained,
+        }
+
+    async def _mark_fatal_retained_episode(
+        self,
+        session_id: str,
+        *,
+        reason: str = "active model-pool episode lease was retained",
+    ) -> None:
+        self._fatal_retained_episode_sessions.add(session_id)
+        await self.episode_admission.poison(
+            f"fatal runtime containment failure for session {session_id}: {reason}"
+        )
+        logger.critical(
+            "Gateway node %s is unhealthy after an unproven runtime teardown "
+            "for session %s (%s)",
+            self.node_id,
+            session_id,
+            reason,
+        )
 
     def _handle_dispatcher_stage_change(self, managed: ManagedSession) -> None:
         status = {
@@ -426,9 +547,9 @@ class GatewayNodeManager:
             if managed.cancel_requested:
                 return
 
-            # Postprocess always runs so harnesses can collect artifacts from
-            # failed or timed-out agent runs before post-run evaluation.
-            managed.timer.mark("agent_postprocess", "started")
+            # Attempt postprocess while budget remains so harnesses can collect
+            # artifacts from failed agent runs before post-run evaluation.
+            postprocess_started = False
 
             def start_postprocess():
                 # `_await_with_agent_budget` validates the remaining budget
@@ -437,18 +558,21 @@ class GatewayNodeManager:
                 # start; that is an aligned policy timeout, not a postprocess
                 # failure. Once invoked, a later timeout is a genuine
                 # postprocess timeout and remains fail-closed.
-                nonlocal timeout_stage
+                nonlocal postprocess_started, timeout_stage
                 timeout_stage = "postprocess"
+                postprocess_started = True
+                managed.timer.mark("agent_postprocess", "started")
                 return harness.postprocess(runtime, agent_result)
 
             try:
                 await self._await_with_agent_budget(start_postprocess, managed)
             finally:
-                managed.timer.mark("agent_postprocess", "finished")
+                if postprocess_started:
+                    managed.timer.mark("agent_postprocess", "finished")
         except GatewayExecutionTimeout as exc:
             # Don't set final_result — let _handle_postrun build a partial
             # trajectory from the completions captured so far.
-            managed.agent_result = AgentRunResult(
+            timeout_result = AgentRunResult(
                 status="timeout",
                 return_code=-1,
                 error=str(exc),
@@ -457,6 +581,30 @@ class GatewayNodeManager:
                     "timeout_stage": timeout_stage,
                 },
             )
+            managed.agent_result = timeout_result
+            # An agent-budget timeout during exec is an aligned, trainable
+            # negative. The agent saves its trajectory (with running GPT cost)
+            # after every step, so harvest that partial cost here — the normal
+            # post-exec postprocess was skipped when the budget ran out. This
+            # keeps the sample's real spend instead of letting it look free.
+            # Best-effort and time-bounded; a missing/torn file leaves cost
+            # absent (falls back to today's drop) and never sets timeout_stage.
+            if (
+                timeout_stage == "exec"
+                and harness is not None
+                and managed.runtime is not None
+            ):
+                try:
+                    await asyncio.wait_for(
+                        harness.postprocess(managed.runtime, timeout_result),
+                        timeout=_AGENT_TIMEOUT_COST_HARVEST_SECONDS,
+                    )
+                except Exception as harvest_exc:
+                    logger.warning(
+                        "Cost harvest after agent timeout failed for session %s: %s",
+                        request.session_id,
+                        harvest_exc,
+                    )
         except Exception as exc:
             if managed.cancel_requested:
                 logger.info("Agent execution cancelled for session %s", request.session_id)
@@ -490,12 +638,40 @@ class GatewayNodeManager:
             if managed.cancel_requested:
                 return AgentRunResult(status="failed", return_code=-1, error="cancelled")
             merged_env = {**env, **(step.env or {})}
-            result = await runtime.exec(
-                step.command,
-                cwd=step.cwd,
-                env=merged_env,
-                timeout_sec=self._remaining_agent_budget(managed),
-            )
+            if step.protected_argv is not None:
+                protected_env: dict[str, str] = {}
+                for key in step.protected_env_keys:
+                    value = merged_env.get(key, "")
+                    if not value:
+                        raise RuntimeError(
+                            f"protected runtime credential {key} is unavailable"
+                        )
+                    protected_env[key] = value
+                # Never let a privileged SPilot capability fall back into the
+                # ordinary child environment.  The per-lease pool-call token
+                # is created later by admission and is not session-scoped.
+                for key in (
+                    ROUTER_CAPABILITY_ENV,
+                    MODEL_POOL_CAPABILITY_ENV,
+                    MODEL_POOL_ADMISSION_CAPABILITY_ENV,
+                ):
+                    merged_env.pop(key, None)
+                result = await runtime.exec_protected(
+                    step.protected_argv,
+                    cwd=step.cwd,
+                    env=merged_env,
+                    protected_env=protected_env,
+                    protected_file_digests=step.protected_file_digests,
+                    timeout_sec=self._remaining_agent_budget(managed),
+                )
+            else:
+                assert step.command is not None
+                result = await runtime.exec(
+                    step.command,
+                    cwd=step.cwd,
+                    env=merged_env,
+                    timeout_sec=self._remaining_agent_budget(managed),
+                )
             self._write_exec_log(log_dir, f"step.{i:02d}", result.stdout, result.stderr)
             if result.return_code == -1:
                 metadata = self._step_metadata(log_dir, i, managed)
@@ -543,6 +719,10 @@ class GatewayNodeManager:
         eval_artifacts_dir.mkdir(parents=True, exist_ok=True)
 
         eval_runtime = create_runtime(runtime_spec, f"{request.session_id}-eval", eval_session_dir)
+        # Publish ownership before the first await. Dispatcher shutdown can
+        # now always discover and retry teardown, including when prewarm is
+        # cancelled during start() or completes before RUN consumes its task.
+        managed.eval_runtime = eval_runtime
         try:
             managed.timer.mark("eval_runtime_validation", "started")
             try:
@@ -568,8 +748,14 @@ class GatewayNodeManager:
                 managed.timer.mark("eval_prepare", "finished")
             return eval_runtime
         except asyncio.CancelledError:
-            with suppress(Exception):
-                await eval_runtime.stop()
+            try:
+                await asyncio.shield(eval_runtime.stop())
+                if not eval_runtime.destroyed:
+                    raise RuntimeContainmentError(
+                        "eval runtime stop returned without destruction proof"
+                    )
+            except BaseException as stop_exc:
+                managed.runtime_cancel_error = stop_exc
             managed.timer.add_runtime_exec_summary(eval_runtime.exec_timing_summary())
             raise
         except Exception as exc:
@@ -578,8 +764,14 @@ class GatewayNodeManager:
                 request.session_id,
                 exc,
             )
-            with suppress(Exception):
-                await eval_runtime.stop()
+            try:
+                await asyncio.shield(eval_runtime.stop())
+                if not eval_runtime.destroyed:
+                    raise RuntimeContainmentError(
+                        "eval runtime stop returned without destruction proof"
+                    )
+            except BaseException as stop_exc:
+                managed.runtime_cancel_error = stop_exc
             managed.timer.add_runtime_exec_summary(eval_runtime.exec_timing_summary())
             return None
 
@@ -616,6 +808,7 @@ class GatewayNodeManager:
     async def _handle_postrun(self, managed: ManagedSession) -> None:
         request = managed.request
         result: SessionResult | None = managed.final_result
+        fatal_retained_episode = False
         managed.timer.mark("postrun", "started")
         try:
             if result is None:
@@ -648,10 +841,17 @@ class GatewayNodeManager:
                 managed.timer.mark("postrun_exec", "finished")
 
             runtimes: list[BaseRuntime] = []
+            agent_runtime_destroyed = managed.runtime is None
+            all_runtimes_destroyed = True
             managed.timer.mark("runtime_stop", "started")
             try:
                 stop_tasks = []
                 eval_runtime = await self._drain_eval_prewarm_task(managed)
+                if eval_runtime is None:
+                    # A cancelled/failed prewarm may have retained a runtime
+                    # whose first cleanup attempt failed. Its published owner
+                    # remains authoritative for this final retry.
+                    eval_runtime = managed.eval_runtime
                 if eval_runtime is not None:
                     runtimes.append(eval_runtime)
                     stop_tasks.append(
@@ -667,11 +867,66 @@ class GatewayNodeManager:
                         )
                     )
                 if stop_tasks:
-                    await asyncio.gather(*stop_tasks, return_exceptions=True)
+                    stop_results = await asyncio.gather(
+                        *stop_tasks, return_exceptions=True
+                    )
+                    if not all(result is True for result in stop_results):
+                        all_runtimes_destroyed = False
+                        logger.error(
+                            "One or more runtimes did not report a clean stop for "
+                            "session %s",
+                            request.session_id,
+                        )
+                    if managed.runtime is not None:
+                        agent_runtime_destroyed = stop_results[-1] is True
             finally:
                 managed.timer.mark("runtime_stop", "finished")
                 for runtime in runtimes:
                     managed.timer.add_runtime_exec_summary(runtime.exec_timing_summary())
+                # Runtime.stop() only tears down the outer sandbox.  It is not
+                # proof that every descendant in the candidate process scope
+                # disappeared, so postrun must never reclaim an active lease.
+                # A normal runner explicitly releases only after its Linux
+                # child-subreaper/procfs proof shows the scope is empty.
+                # Anything still active here is a
+                # fatal retained lease and makes this node unschedulable until
+                # gateway shutdown.
+                episode_admission = getattr(self, "episode_admission", None)
+                if episode_admission is not None:
+                    if (
+                        request.agent.harness == "spilot_router"
+                        and not all_runtimes_destroyed
+                    ):
+                        await self._mark_fatal_retained_episode(
+                            request.session_id,
+                            reason="runtime destruction could not be proven",
+                        )
+                        fatal_retained_episode = True
+                    active_retained = await episode_admission.cleanup_session_records(
+                        request.session_id
+                    )
+                    if active_retained and agent_runtime_destroyed:
+                        try:
+                            await asyncio.wait_for(
+                                episode_admission.release_after_runtime_destroyed(
+                                    request.session_id,
+                                    runtime_destroyed=True,
+                                ),
+                                timeout=30.0,
+                            )
+                            await episode_admission.cleanup_session_records(
+                                request.session_id
+                            )
+                            active_retained = False
+                        except Exception:
+                            logger.exception(
+                                "Failed to drain retained episode lease after proven "
+                                "runtime destruction for session %s",
+                                request.session_id,
+                            )
+                    if active_retained:
+                        await self._mark_fatal_retained_episode(request.session_id)
+                        fatal_retained_episode = True
             managed.timer.mark("teardown", "finished")
             managed.timer.mark("return", "finished")
 
@@ -686,6 +941,8 @@ class GatewayNodeManager:
                 managed.timer,
                 "post-run finished without producing a session result",
             )
+        if fatal_retained_episode:
+            result = self._attach_fatal_retained_episode_metadata(result)
         try:
             normalized = result.model_copy(
                 update={
@@ -701,7 +958,90 @@ class GatewayNodeManager:
                 # status/task_id visible for debugging via the polling endpoint.
                 self.session_registry.clear_result_payload(request.session_id)
         finally:
-            await self._remove_session_dir_best_effort(managed.session_dir, request.session_id)
+            if fatal_retained_episode:
+                logger.critical(
+                    "Preserving session directory after fatal containment failure: %s",
+                    managed.session_dir,
+                )
+            else:
+                await self._remove_session_dir_best_effort(
+                    managed.session_dir, request.session_id
+                )
+
+    @staticmethod
+    def _attach_fatal_retained_episode_metadata(result: SessionResult) -> SessionResult:
+        """Expose fatal telemetry and make the result impossible to train."""
+
+        trajectory_metadata = dict(result.trajectory.metadata)
+        evaluation = trajectory_metadata.get("evaluation")
+        evaluation = dict(evaluation) if isinstance(evaluation, dict) else {}
+        router_metadata = evaluation.get("spilot_router")
+        router_metadata = (
+            dict(router_metadata) if isinstance(router_metadata, dict) else {}
+        )
+        router_metadata.update(
+            {
+                "admission_enabled": True,
+                "admission_fatal_retained": True,
+                "admission_node_healthy": False,
+                "runtime_containment_proven": False,
+            }
+        )
+        evaluation["spilot_router"] = router_metadata
+        trajectory_metadata["evaluation"] = evaluation
+        filtered_traces: list[Trace] = []
+        for trace in result.trajectory.traces:
+            trace_metadata = dict(trace.metadata)
+            current_filter = trace_metadata.get("training_filter")
+            training_filter = (
+                dict(current_filter) if isinstance(current_filter, dict) else {}
+            )
+            training_filter.update(
+                {
+                    "masked": True,
+                    "trainable": False,
+                    "reason": "runtime_containment_unproven",
+                    "detail": "runtime destruction could not be proven",
+                }
+            )
+            training_filter.setdefault("original_reward", trace.reward)
+            if trace.reward_components:
+                training_filter.setdefault(
+                    "original_reward_components",
+                    dict(trace.reward_components),
+                )
+            trace_metadata["training_filter"] = training_filter
+            filtered_traces.append(
+                trace.model_copy(
+                    update={
+                        "reward": 0.0,
+                        "reward_components": {
+                            key: 0.0 for key in trace.reward_components
+                        },
+                        "loss_mask": [0] * len(trace.response_ids),
+                        "metadata": trace_metadata,
+                    }
+                )
+            )
+        trajectory = result.trajectory.model_copy(
+            update={
+                "status": "ERROR",
+                "error": "runtime containment could not be proven",
+                "traces": filtered_traces,
+                "metadata": trajectory_metadata,
+            }
+        )
+        result_metadata = dict(result.metadata)
+        result_metadata["model_pool_episode_admission_fatal_retained"] = True
+        result_metadata["runtime_containment_proven"] = False
+        return result.model_copy(
+            update={
+                "status": "ERROR",
+                "error": "runtime containment could not be proven",
+                "trajectory": trajectory,
+                "metadata": result_metadata,
+            }
+        )
 
     async def _build_session_result(self, managed: ManagedSession) -> SessionResult:
         request = managed.request
@@ -904,6 +1244,38 @@ class GatewayNodeManager:
                 trace.model_copy(update={"reward": eval_result.outcome_reward}) for trace in traces
             ]
 
+        if eval_result.trace_reward_components is not None:
+            if len(eval_result.trace_reward_components) != len(traces):
+                return trajectory.model_copy(
+                    update={
+                        "status": "ERROR",
+                        "error": (
+                            f"evaluator returned {len(eval_result.trace_reward_components)} "
+                            f"trace_reward_components but trajectory has {len(traces)} traces"
+                        ),
+                    }
+                )
+            traces = [
+                trace.model_copy(update={"reward_components": components or {}})
+                for trace, components in zip(
+                    traces,
+                    eval_result.trace_reward_components,
+                )
+            ]
+        elif eval_result.outcome_reward_components is not None and traces:
+            # Broadcast trajectory-level reward components independently of
+            # the legacy scalar reward.
+            traces = [
+                trace.model_copy(
+                    update={
+                        "reward_components": dict(
+                            eval_result.outcome_reward_components
+                        )
+                    }
+                )
+                for trace in traces
+            ]
+
         # A successful session can contain abandoned retry chains. Never let a
         # terminal outcome positively reinforce a chain whose attempted tool
         # call could not be parsed. This is still a sampled policy action: if
@@ -922,6 +1294,8 @@ class GatewayNodeManager:
             "strategy": evaluator_spec.strategy,
             "outcome_reward": eval_result.outcome_reward,
             "trace_rewards": eval_result.trace_rewards,
+            "outcome_reward_components": eval_result.outcome_reward_components,
+            "trace_reward_components": eval_result.trace_reward_components,
             **eval_result.metadata,
         }
         if parser_invalid_traces_zero_rewarded:
@@ -975,9 +1349,17 @@ class GatewayNodeManager:
                 filter_update["trainable"] = aligned_agent_timeout
             training_filter.update(filter_update)
             training_filter.setdefault("original_reward", trace.reward)
+            if trace.reward_components:
+                training_filter.setdefault(
+                    "original_reward_components",
+                    dict(trace.reward_components),
+                )
             trace_metadata["training_filter"] = training_filter
             updates: dict[str, Any] = {
                 "reward": 0.0,
+                "reward_components": {
+                    key: 0.0 for key in trace.reward_components
+                },
                 "metadata": trace_metadata,
             }
             if not aligned_agent_timeout:
@@ -990,10 +1372,24 @@ class GatewayNodeManager:
             evaluation = dict(evaluation)
             outcome_reward = evaluation.get("outcome_reward")
             trace_rewards = evaluation.get("trace_rewards")
+            outcome_reward_components = evaluation.get(
+                "outcome_reward_components"
+            )
+            trace_reward_components = evaluation.get("trace_reward_components")
             if outcome_reward is not None:
                 evaluation.setdefault("discarded_outcome_reward", outcome_reward)
             if trace_rewards is not None:
                 evaluation.setdefault("discarded_trace_rewards", trace_rewards)
+            if outcome_reward_components is not None:
+                evaluation.setdefault(
+                    "discarded_outcome_reward_components",
+                    outcome_reward_components,
+                )
+            if trace_reward_components is not None:
+                evaluation.setdefault(
+                    "discarded_trace_reward_components",
+                    trace_reward_components,
+                )
             # ``reward`` and ``resolved`` are common evaluator convenience
             # fields (including Harbor).  Keep verifier_reported_reward intact
             # as the raw diagnostic while making these effective fields agree
@@ -1006,6 +1402,19 @@ class GatewayNodeManager:
             evaluation["outcome_reward"] = 0.0
             if isinstance(trace_rewards, list):
                 evaluation["trace_rewards"] = [0.0] * len(trace_rewards)
+            if isinstance(outcome_reward_components, dict):
+                evaluation["outcome_reward_components"] = {
+                    key: 0.0 for key in outcome_reward_components
+                }
+            if isinstance(trace_reward_components, list):
+                evaluation["trace_reward_components"] = [
+                    (
+                        {key: 0.0 for key in components}
+                        if isinstance(components, dict)
+                        else None
+                    )
+                    for components in trace_reward_components
+                ]
             evaluation["reward_discarded"] = True
             evaluation["reward_discard_reason"] = filter_reason
             metadata["evaluation"] = evaluation
@@ -1118,6 +1527,23 @@ class GatewayNodeManager:
             **{key: str(value) for key, value in runtime_env.items()},
             **{key: str(value) for key, value in agent_env.items()},
         }
+        # These host-generated capabilities are deliberately added after
+        # caller-controlled runtime/agent env.  They exist only for the SPilot
+        # harness and never reuse the externally visible session id.
+        router_capability = getattr(managed, "router_capability", None)
+        model_pool_capability = getattr(managed, "model_pool_capability", None)
+        model_pool_admission_capability = getattr(
+            managed, "model_pool_admission_capability", None
+        )
+        if getattr(managed, "stage", None) == SessionStage.RUNNING:
+            if router_capability:
+                environment[ROUTER_CAPABILITY_ENV] = router_capability
+            if model_pool_capability:
+                environment[MODEL_POOL_CAPABILITY_ENV] = model_pool_capability
+            if model_pool_admission_capability:
+                environment[MODEL_POOL_ADMISSION_CAPABILITY_ENV] = (
+                    model_pool_admission_capability
+                )
         if runtime is not None:
             # Keep RuntimeSpec.env strictly string-valued while still exposing
             # the authoritative policy to an injected network helper. Put this
@@ -1415,16 +1841,41 @@ class GatewayNodeManager:
         runtime: BaseRuntime,
         session_id: str,
         label: str,
-    ) -> None:
-        try:
-            await runtime.stop()
-        except Exception:
-            logger.warning(
-                "Failed to stop %s for session %s",
-                label,
-                session_id,
-                exc_info=True,
-            )
+    ) -> bool:
+        for attempt in range(2):
+            try:
+                await runtime.stop()
+                if not runtime.destroyed:
+                    raise RuntimeContainmentError(
+                        f"{label} stop returned without destruction proof"
+                    )
+                return True
+            except RuntimeContainmentError as exc:
+                if attempt == 0:
+                    logger.warning(
+                        "Containment proof failed while stopping %s for session %s; "
+                        "retrying once: %s",
+                        label,
+                        session_id,
+                        exc,
+                    )
+                    continue
+                logger.warning(
+                    "Failed to stop %s for session %s after one containment retry",
+                    label,
+                    session_id,
+                    exc_info=True,
+                )
+                return False
+            except Exception:
+                logger.warning(
+                    "Failed to stop %s for session %s",
+                    label,
+                    session_id,
+                    exc_info=True,
+                )
+                return False
+        return False
 
     async def _remove_session_dir_best_effort(
         self,

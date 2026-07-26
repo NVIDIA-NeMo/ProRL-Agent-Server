@@ -43,6 +43,10 @@ class RuntimeDestroyedError(RuntimeError):
     """Raised when work is submitted after a runtime has been torn down."""
 
 
+class RuntimeContainmentError(RuntimeError):
+    """Runtime teardown could not positively prove process/namespace removal."""
+
+
 def _local_subprocess_spawn_concurrency() -> int:
     raw_value = os.environ.get(_LOCAL_SUBPROCESS_SPAWN_CONCURRENCY_ENV)
     if raw_value is None:
@@ -178,6 +182,29 @@ class BaseRuntime(ABC):
         timeout_sec: float | None = None,
     ) -> ExecResult:
         """Execute one command inside the runtime and return captured output."""
+
+    async def exec_protected(
+        self,
+        argv: list[str],
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        protected_env: dict[str, str] | None = None,
+        protected_file_digests: dict[str, str] | None = None,
+        timeout_sec: float | None = None,
+    ) -> ExecResult:
+        """Execute a trusted argv with post-hardening secret delivery.
+
+        Generic Docker, instance, and fresh-exec backends cannot guarantee
+        that neither a shell nor an ancestor exposes the secret request
+        environment.  They deliberately fail closed; only the persistent
+        Apptainer broker overrides this method.
+        """
+
+        del argv, cwd, env, protected_env, protected_file_digests, timeout_sec
+        raise RuntimeError(
+            f"runtime backend {type(self).__name__} does not support protected exec"
+        )
 
     @abstractmethod
     async def upload_file(self, local_path: str, remote_path: str) -> None:

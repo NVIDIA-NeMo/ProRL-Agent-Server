@@ -6,7 +6,11 @@ import pytest
 
 from polar.trajectory.builder.base import BaseTrajectoryBuilder
 from polar.trajectory.models import CompletionSession, StrategySpec, Trajectory
-from polar.trajectory.registry import StrategyRegistry, default_builder_registry
+from polar.trajectory.registry import (
+    StrategyRegistry,
+    default_builder_registry,
+    default_evaluator_registry,
+)
 
 
 class DummyBuilder(BaseTrajectoryBuilder):
@@ -42,8 +46,12 @@ def test_strategy_registry_rejects_non_subclasses() -> None:
 def test_default_builder_registry_exposes_built_in_builders() -> None:
     registry = default_builder_registry()
 
-    assert registry.list_strategies() == ["per_request", "prefix_merging"]
+    assert registry.list_strategies() == ["per_request", "prefix_merging", "router_policy"]
     assert registry.create(StrategySpec(strategy="per_request")).__class__.__name__ == "PerRequestBuilder"
+
+
+def test_default_evaluator_registry_exposes_spilot_harbor() -> None:
+    assert "spilot_harbor" in default_evaluator_registry().list_strategies()
 
 
 def test_unknown_strategy_raises_clear_error() -> None:

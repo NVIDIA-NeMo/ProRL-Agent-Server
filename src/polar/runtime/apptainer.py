@@ -28,6 +28,7 @@ import os
 import signal
 import shlex
 import shutil
+import socket
 import tarfile
 import tempfile
 import time
@@ -35,7 +36,11 @@ from pathlib import Path
 from typing import Any
 import uuid
 
-from polar.runtime.base import BaseRuntime, RuntimeDestroyedError
+from polar.runtime.base import (
+    BaseRuntime,
+    RuntimeContainmentError,
+    RuntimeDestroyedError,
+)
 from polar.runtime.models import ExecResult, RuntimeSpec
 
 logger = logging.getLogger(__name__)
@@ -46,6 +51,7 @@ _BROKER_SOCKET_NAME = "control.sock"
 _BROKER_RESULTS_DIR_NAME = "results"
 _BROKER_TRANSFERS_DIR_NAME = "transfers"
 _BROKER_LOG_NAME = "broker.log"
+_BROKER_SCRIPT_NAME = "apptainer_broker.py"
 _BROKER_SUPERVISOR_NAME = "apptainer_broker_supervisor.sh"
 _BROKER_INTERPRETER_NAME = "interpreter.path"
 _BROKER_GENERATION_NAME = "broker.generation"
@@ -54,6 +60,13 @@ _BROKER_RUNTIME_DIR = f"/polar/session/{_BROKER_DIR_NAME}"
 _BROKER_RUNTIME_SOCKET = f"{_BROKER_RUNTIME_DIR}/{_BROKER_SOCKET_NAME}"
 _BROKER_RUNTIME_RESULTS_DIR = f"{_BROKER_RUNTIME_DIR}/{_BROKER_RESULTS_DIR_NAME}"
 _BROKER_RUNTIME_TRANSFERS_DIR = f"{_BROKER_RUNTIME_DIR}/{_BROKER_TRANSFERS_DIR_NAME}"
+_BROKER_TRUSTED_RUNTIME_DIR = "/polar/runtime-control"
+_BROKER_TRUSTED_RUNTIME_SCRIPT = (
+    f"{_BROKER_TRUSTED_RUNTIME_DIR}/{_BROKER_SCRIPT_NAME}"
+)
+_BROKER_TRUSTED_RUNTIME_SUPERVISOR = (
+    f"{_BROKER_TRUSTED_RUNTIME_DIR}/{_BROKER_SUPERVISOR_NAME}"
+)
 _BROKER_START_CONCURRENCY_ENV = "POLAR_APPTAINER_BROKER_START_CONCURRENCY"
 _PERSISTENT_BROKER_ENV = "POLAR_APPTAINER_PERSISTENT_BROKER"
 _DEFAULT_BROKER_START_CONCURRENCY = 2
@@ -76,7 +89,12 @@ _BROKER_READ_CHUNK_BYTES = 64 * 1024
 _PROC_ROOT = Path("/proc")
 _DIRECT_BROKER_TERM_GRACE_SEC = 0.25
 _DIRECT_BROKER_KILL_TIMEOUT_SEC = 2.0
+_DIRECT_BROKER_CLEANUP_TIMEOUT_ENV = "POLAR_APPTAINER_BROKER_CLEANUP_TIMEOUT_SEC"
+_DEFAULT_DIRECT_BROKER_CLEANUP_TIMEOUT_SEC = 15.0
+_MIN_DIRECT_BROKER_CLEANUP_TIMEOUT_SEC = 1.0
+_MAX_DIRECT_BROKER_CLEANUP_TIMEOUT_SEC = 60.0
 _DIRECT_BROKER_CLEANUP_POLL_SEC = 0.05
+_DIRECT_BROKER_STABLE_EMPTY_PROBES = 2
 
 
 class _BrokerDisconnectedError(RuntimeError):
@@ -164,6 +182,17 @@ def _bounded_env_float(
     return parsed
 
 
+def _direct_broker_cleanup_timeout_seconds() -> float:
+    """Return the bounded final containment-proof window."""
+
+    return _bounded_env_float(
+        _DIRECT_BROKER_CLEANUP_TIMEOUT_ENV,
+        _DEFAULT_DIRECT_BROKER_CLEANUP_TIMEOUT_SEC,
+        minimum=_MIN_DIRECT_BROKER_CLEANUP_TIMEOUT_SEC,
+        maximum=_MAX_DIRECT_BROKER_CLEANUP_TIMEOUT_SEC,
+    )
+
+
 def _broker_start_gate() -> asyncio.Semaphore:
     """Return the event-loop-wide gate for complete broker startup attempts.
 
@@ -242,8 +271,8 @@ def _read_proc_table(proc_root: Path) -> dict[int, tuple[int, int, int]]:
     processes: dict[int, tuple[int, int, int]] = {}
     try:
         entries = tuple(proc_root.iterdir())
-    except OSError:
-        return processes
+    except OSError as exc:
+        raise RuntimeContainmentError("could not read procfs for containment proof") from exc
     for entry in entries:
         if not entry.name.isdigit():
             continue
@@ -254,9 +283,13 @@ def _read_proc_table(proc_root: Path) -> dict[int, tuple[int, int, int]]:
             # fields 4/6/22 respectively.
             remainder = (entry / "stat").read_text().rsplit(")", 1)[1].split()
             processes[pid] = (int(remainder[1]), int(remainder[3]), int(remainder[19]))
-        except (IndexError, OSError, ValueError):
+        except (FileNotFoundError, ProcessLookupError):
             # Processes can disappear at every point in a procfs walk.
             continue
+        except (IndexError, OSError, ValueError) as exc:
+            raise RuntimeContainmentError(
+                f"could not read process identity for containment proof: {entry.name}"
+            ) from exc
     return processes
 
 
@@ -270,8 +303,12 @@ def _engine_config_references_session(
 
     try:
         entries = (proc_root / str(pid) / "environ").read_bytes().split(b"\0")
-    except OSError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
+    except OSError as exc:
+        raise RuntimeContainmentError(
+            f"could not read process environment for containment proof: {pid}"
+        ) from exc
     chunks: list[tuple[int, bytes]] = []
     for entry in entries:
         key, separator, value = entry.partition(b"=")
@@ -313,13 +350,23 @@ def _direct_broker_process_snapshot(
     # ENGINE_CONFIG can be large. Discover ownership once, then subsequent
     # TERM/KILL polling can identify survivors solely by the stable SID.
     if not runtime_sessions:
-        for pid, (_, session_id, _) in table.items():
+        for pid, (_, session_id, _) in sorted(table.items()):
+            try:
+                if (proc_root / str(pid)).stat().st_uid != os.getuid():
+                    continue
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except OSError as exc:
+                raise RuntimeContainmentError(
+                    f"could not identify process owner for containment proof: {pid}"
+                ) from exc
             if _engine_config_references_session(
                 pid,
                 session_dir,
                 proc_root=proc_root,
             ):
                 runtime_sessions.add(session_id)
+                break
 
     targets = {pid for pid, (_, session_id, _) in table.items() if session_id in runtime_sessions}
     # Catch commands that called setsid after entering the runtime namespace.
@@ -402,6 +449,14 @@ class ApptainerRuntime(BaseRuntime):
         self._overlay_dir: Path | None = None
         self._broker_dir = self.session_dir / _BROKER_DIR_NAME
         self._broker_socket = self._broker_dir / _BROKER_SOCKET_NAME
+        # Keep enough randomness to avoid collisions without pushing local
+        # test/session roots over Linux's 108-byte AF_UNIX pathname limit.
+        self._protected_broker_socket_name = f"p-{uuid.uuid4().hex[:8]}.sock"
+        self._protected_broker_socket = (
+            self._broker_dir / self._protected_broker_socket_name
+        )
+        self._protected_broker_identity: tuple[int, int] | None = None
+        self._known_runtime_sessions: set[int] = set()
         self._broker_log = self._broker_dir / _BROKER_LOG_NAME
         self._broker_interpreter_file = self._broker_dir / _BROKER_INTERPRETER_NAME
         self._broker_generation_file = self._broker_dir / _BROKER_GENERATION_NAME
@@ -409,7 +464,10 @@ class ApptainerRuntime(BaseRuntime):
         self._broker_results_dir = self._broker_dir / _BROKER_RESULTS_DIR_NAME
         self._broker_transfers_dir = self._broker_dir / _BROKER_TRANSFERS_DIR_NAME
         self._broker_task: asyncio.Task[tuple[int, str | None, str | None]] | None = None
+        self._broker_was_started = False
         self._broker_recovery_lock = asyncio.Lock()
+        self._teardown_lock = asyncio.Lock()
+        self._teardown_started = False
         self._broker_observed_generation = 0
         self._broker_recovery_count = 0
         self._broker_recovery_failure_count = 0
@@ -476,6 +534,25 @@ class ApptainerRuntime(BaseRuntime):
         if network_name and network_name != "host":
             options.extend(["--net", "--network", network_name])
         options.extend(["--bind", f"{self.session_dir}:{self.runtime_session_dir}"])
+        if not self._use_instance and self._use_persistent_broker:
+            # The session bind is intentionally writable so task commands can
+            # exchange files and the broker can publish sockets/results.  The
+            # broker implementation and its supervisor are part of the trusted
+            # control plane, however, and must never be copied into that bind:
+            # an already-running untrusted task could replace either file
+            # before a supervisor restart.  Mount the installed runtime source
+            # directory at a separate read-only path instead.
+            trusted_source_dir = Path(__file__).resolve().parent
+            broker_source = trusted_source_dir / _BROKER_SCRIPT_NAME
+            supervisor_source = trusted_source_dir / _BROKER_SUPERVISOR_NAME
+            if not broker_source.is_file() or not supervisor_source.is_file():
+                raise RuntimeError("trusted Apptainer broker sources are unavailable")
+            options.extend(
+                [
+                    "--bind",
+                    f"{trusted_source_dir}:{_BROKER_TRUSTED_RUNTIME_DIR}:ro",
+                ]
+            )
         # Match DockerRuntime's kwargs.volumes contract (src[:dst[:opts]]).
         for volume in self.spec.kwargs.get("volumes", []):
             options.extend(["--bind", str(volume)])
@@ -496,7 +573,10 @@ class ApptainerRuntime(BaseRuntime):
     def _shell_join(args: list[str]) -> str:
         return " ".join(shlex.quote(a) for a in args)
 
-    def _broker_connect_path(self) -> tuple[str, int | None]:
+    def _broker_connect_path(
+        self,
+        socket_name: str = _BROKER_SOCKET_NAME,
+    ) -> tuple[str, int | None]:
         """Return a short host-visible path for a possibly long session UDS.
 
         Linux limits AF_UNIX pathnames to roughly 108 bytes.  Session roots on
@@ -509,8 +589,103 @@ class ApptainerRuntime(BaseRuntime):
         try:
             directory_fd = os.open(self._broker_dir, os.O_RDONLY | os.O_DIRECTORY)
         except (AttributeError, OSError):
-            return str(self._broker_socket), None
-        return f"/proc/self/fd/{directory_fd}/{_BROKER_SOCKET_NAME}", directory_fd
+            return str(self._broker_dir / socket_name), None
+        return f"/proc/self/fd/{directory_fd}/{socket_name}", directory_fd
+
+    @staticmethod
+    def _host_process_start_time(pid: int) -> int:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        close_paren = stat.rfind(")")
+        fields = stat[close_paren + 1 :].strip().split()
+        if close_paren <= 0 or len(fields) <= 19:
+            raise RuntimeError("protected broker peer has an invalid proc record")
+        return int(fields[19])
+
+    @staticmethod
+    def _host_process_session_id(pid: int) -> int:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        close_paren = stat_text.rfind(")")
+        fields = stat_text[close_paren + 1 :].strip().split()
+        if close_paren <= 0 or len(fields) <= 3:
+            raise RuntimeError("protected broker peer has an invalid proc record")
+        return int(fields[3])
+
+    def _validate_protected_broker_peer(self, peer: tuple[int, int, int]) -> tuple[int, int]:
+        pid, uid, _gid = peer
+        if pid <= 0 or uid != os.getuid():
+            raise RuntimeError("protected broker peer credentials are invalid")
+        command_line = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        if not command_line or command_line[0] != b"polar-broker":
+            raise RuntimeError("protected broker peer process profile is invalid")
+        if not any(item.endswith(b"apptainer_broker.py") for item in command_line):
+            raise RuntimeError("protected broker peer script profile is invalid")
+        return pid, self._host_process_start_time(pid)
+
+    async def _protected_broker_rpc(
+        self,
+        request: dict[str, object],
+        *,
+        socket_timeout: float | None,
+        pin: bool = False,
+    ) -> dict[str, Any]:
+        """Send secrets only after SO_PEERCRED matches the pinned broker."""
+
+        connect_path, directory_fd = self._broker_connect_path(
+            self._protected_broker_socket_name
+        )
+        writer: asyncio.StreamWriter | None = None
+        try:
+            connection = asyncio.open_unix_connection(path=connect_path)
+            if socket_timeout is None:
+                reader, writer = await connection
+            else:
+                reader, writer = await asyncio.wait_for(connection, timeout=socket_timeout)
+            transport_socket = writer.get_extra_info("socket")
+            if transport_socket is None or not hasattr(socket, "SO_PEERCRED"):
+                raise RuntimeError("protected broker peer credentials are unavailable")
+            import struct
+
+            peer = struct.unpack(
+                "3i",
+                transport_socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12),
+            )
+            identity = self._validate_protected_broker_peer(peer)
+            if pin:
+                if self._protected_broker_identity not in (None, identity):
+                    raise RuntimeError("protected broker identity changed during pinning")
+                self._protected_broker_identity = identity
+                self._known_runtime_sessions.add(
+                    self._host_process_session_id(identity[0])
+                )
+            elif identity != self._protected_broker_identity:
+                raise RuntimeError("protected broker identity changed")
+
+            writer.write(json.dumps(request, separators=(",", ":")).encode() + b"\n")
+            drain = writer.drain()
+            if socket_timeout is None:
+                await drain
+                response_payload = await reader.readline()
+            else:
+                await asyncio.wait_for(drain, timeout=socket_timeout)
+                response_payload = await asyncio.wait_for(
+                    reader.readline(), timeout=socket_timeout
+                )
+            if not response_payload or len(response_payload) > _BROKER_MAX_RESPONSE_BYTES:
+                raise RuntimeError("protected broker returned an invalid response")
+            response = json.loads(response_payload)
+            if not isinstance(response, dict) or response.get("ok") is not True:
+                detail = response.get("error") if isinstance(response, dict) else None
+                raise RuntimeError(f"protected broker request failed: {detail or 'unknown error'}")
+            return response
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except (ConnectionError, OSError):
+                    pass
+            if directory_fd is not None:
+                os.close(directory_fd)
 
     async def _broker_rpc(
         self,
@@ -603,7 +778,7 @@ class ApptainerRuntime(BaseRuntime):
     def _assert_direct_broker_owner_live(self) -> None:
         """Reject recovery when the namespace owner is gone or teardown began."""
 
-        if self._destroyed:
+        if self._destroyed or self._teardown_started:
             raise RuntimeDestroyedError(
                 f"apptainer runtime {self.runtime_id} was already destroyed"
             )
@@ -658,6 +833,15 @@ class ApptainerRuntime(BaseRuntime):
         state owned by the failed runtime.  The shell supervisor has a bounded
         restart budget; this host-side lock only coalesces concurrent waiters.
         """
+
+        if self._protected_broker_identity is not None:
+            # Once the secret-bearing control plane is pinned, accepting a
+            # replacement same-UID process would make its identity ambiguous.
+            # The session must be torn down instead of recovering or replaying.
+            self._broker_recovery_failure_count += 1
+            raise RuntimeError(
+                "protected Apptainer broker identity changed; recovery is forbidden"
+            ) from error
 
         recovery_count_before = self._broker_recovery_count
         async with self._broker_recovery_lock:
@@ -736,13 +920,6 @@ class ApptainerRuntime(BaseRuntime):
         self._assert_direct_broker_owner_live()
 
     def _broker_launch_args(self) -> list[str]:
-        source = Path(__file__).with_name("apptainer_broker.py")
-        target = self._broker_dir / source.name
-        shutil.copy2(source, target)
-        supervisor_source = Path(__file__).with_name(_BROKER_SUPERVISOR_NAME)
-        supervisor_target = self._broker_dir / supervisor_source.name
-        shutil.copy2(supervisor_source, supervisor_target)
-
         broker_python = self.spec.env.get("POLAR_APPTAINER_BROKER_PYTHON", "python3").strip()
         if not broker_python:
             broker_python = "python3"
@@ -760,13 +937,12 @@ class ApptainerRuntime(BaseRuntime):
         # without the supervisor that also killed the runtime control plane and
         # turned an ordinary command failure into an infrastructure error.
         broker_command = self._shell_join(
-            ["bash", f"{_BROKER_RUNTIME_DIR}/{supervisor_source.name}"]
+            ["bash", _BROKER_TRUSTED_RUNTIME_SUPERVISOR]
         )
         broker_command = f"exec {broker_command}"
-        if self.spec.direct_exec_init_command:
-            broker_command = f"{{ {self.spec.direct_exec_init_command}; }} && {broker_command}"
-            if self.spec.workdir:
-                broker_command = f"cd {shlex.quote(self.spec.workdir)} && {broker_command}"
+        # The broker and its protected control socket must exist before any
+        # task-controlled initializer can spawn a same-UID scanner.  The init
+        # hook is executed through the pinned broker only after readiness.
         # The owner process lives for the complete rollout. Redirect its own
         # output (including initializer-started services) to a regular file so
         # the launcher does not retain an ever-growing capture buffer.
@@ -776,9 +952,20 @@ class ApptainerRuntime(BaseRuntime):
         environment = {
             **self.spec.env,
             "POLAR_ALLOW_INTERNET": "true" if self.spec.allow_internet else "false",
+            # These values select trusted control-plane code and paths.  Do not
+            # let a RuntimeSpec environment redirect the supervisor to a
+            # task-writable replacement.
+            "POLAR_APPTAINER_BROKER_RUNTIME_DIR": _BROKER_RUNTIME_DIR,
+            "POLAR_APPTAINER_BROKER_SCRIPT": _BROKER_TRUSTED_RUNTIME_SCRIPT,
+            "POLAR_APPTAINER_BROKER_INTERPRETER_FILE": (
+                f"{_BROKER_RUNTIME_DIR}/{_BROKER_INTERPRETER_NAME}"
+            ),
+            "POLAR_APPTAINER_BROKER_PROCESS_NAME": "polar-broker",
+            "POLAR_APPTAINER_PROTECTED_SOCKET_NAME": (
+                self._protected_broker_socket_name
+            ),
         }
         environment.pop("POLAR_APPTAINER_BROKER_PYTHON", None)
-        environment.pop("POLAR_APPTAINER_BROKER_INTERPRETER_FILE", None)
         shell_exports = [
             f"export {key}={shlex.quote(str(environment[key]))};"
             for key in ("HOME", "PATH")
@@ -813,9 +1000,14 @@ class ApptainerRuntime(BaseRuntime):
                 raise RuntimeError(
                     f"apptainer broker exited during startup with exit code {rc}{suffix}"
                 )
-            if self._broker_socket.exists():
+            if self._broker_socket.exists() and self._protected_broker_socket.exists():
                 try:
                     await self._broker_rpc({"operation": "ping"}, socket_timeout=0.5)
+                    await self._protected_broker_rpc(
+                        {"operation": "secure_pin"},
+                        socket_timeout=0.5,
+                        pin=True,
+                    )
                     return
                 except (OSError, RuntimeError, ValueError) as exc:
                     last_error = str(exc)
@@ -829,11 +1021,21 @@ class ApptainerRuntime(BaseRuntime):
         # parent can exit during cancellation while its FUSE helpers remain
         # reparented to PID 1; after that, no surviving process is guaranteed
         # to retain ENGINE_CONFIG for ownership discovery.
+        task = self._broker_task
+        if task is None and not self._broker_was_started and not self._known_runtime_sessions:
+            self._broker_socket.unlink(missing_ok=True)
+            self._protected_broker_socket.unlink(missing_ok=True)
+            return
         runtime_sessions, _ = await asyncio.to_thread(
             _direct_broker_process_snapshot,
             self.session_dir,
+            known_sessions=self._known_runtime_sessions,
         )
-        task = self._broker_task
+        if task is not None and not task.done() and not runtime_sessions:
+            raise RuntimeContainmentError(
+                "could not identify the live Apptainer runtime session before teardown"
+            )
+        self._known_runtime_sessions.update(runtime_sessions)
         self._broker_task = None
         if task is not None:
             if not task.done():
@@ -847,9 +1049,11 @@ class ApptainerRuntime(BaseRuntime):
         # session bind, then tear down every process in that SID/subtree.
         await asyncio.to_thread(
             self._cleanup_direct_broker_processes,
-            known_sessions=runtime_sessions,
+            known_sessions=self._known_runtime_sessions,
         )
         self._broker_socket.unlink(missing_ok=True)
+        self._protected_broker_socket.unlink(missing_ok=True)
+        self._broker_was_started = False
 
     def _cleanup_direct_broker_processes(
         self,
@@ -857,34 +1061,34 @@ class ApptainerRuntime(BaseRuntime):
         proc_root: Path = _PROC_ROOT,
         term_grace_seconds: float = _DIRECT_BROKER_TERM_GRACE_SEC,
         kill_timeout_seconds: float = _DIRECT_BROKER_KILL_TIMEOUT_SEC,
+        cleanup_timeout_seconds: float | None = None,
         known_sessions: set[int] | None = None,
     ) -> None:
+        if cleanup_timeout_seconds is None:
+            cleanup_timeout_seconds = _direct_broker_cleanup_timeout_seconds()
         runtime_sessions, processes = _direct_broker_process_snapshot(
             self.session_dir,
             proc_root=proc_root,
             known_sessions=known_sessions,
         )
-        if not processes:
-            return
-
-        logger.warning(
-            "Cleaning %d escaped Apptainer process(es) for %s (runtime SID(s): %s)",
-            len(processes),
-            self.session_id,
-            ",".join(str(value) for value in sorted(runtime_sessions)),
-        )
-        _signal_proc_snapshot(processes, signal.SIGTERM, proc_root=proc_root)
+        if processes:
+            logger.warning(
+                "Cleaning %d escaped Apptainer process(es) for %s (runtime SID(s): %s)",
+                len(processes),
+                self.session_id,
+                ",".join(str(value) for value in sorted(runtime_sessions)),
+            )
+            _signal_proc_snapshot(processes, signal.SIGTERM, proc_root=proc_root)
 
         term_deadline = time.monotonic() + max(0.0, term_grace_seconds)
-        while time.monotonic() < term_deadline:
-            _reap_direct_children(processes)
+        remaining = processes
+        while remaining and time.monotonic() < term_deadline:
+            _reap_direct_children(remaining)
             runtime_sessions, remaining = _direct_broker_process_snapshot(
                 self.session_dir,
                 proc_root=proc_root,
                 known_sessions=runtime_sessions,
             )
-            if not remaining:
-                return
             time.sleep(_DIRECT_BROKER_CLEANUP_POLL_SEC)
 
         runtime_sessions, remaining = _direct_broker_process_snapshot(
@@ -908,13 +1112,32 @@ class ApptainerRuntime(BaseRuntime):
                 _signal_proc_snapshot(remaining, signal.SIGKILL, proc_root=proc_root)
 
         _reap_direct_children(remaining)
-        if remaining:
-            logger.error(
-                "Failed to reap %d escaped Apptainer process(es) for %s: %s",
-                len(remaining),
-                self.session_id,
-                ",".join(str(pid) for pid in sorted(remaining)),
+        stable_empty = 0
+        proof_deadline = time.monotonic() + max(
+            _DIRECT_BROKER_CLEANUP_POLL_SEC,
+            cleanup_timeout_seconds,
+        )
+        while stable_empty < _DIRECT_BROKER_STABLE_EMPTY_PROBES:
+            runtime_sessions, residual = _direct_broker_process_snapshot(
+                self.session_dir,
+                proc_root=proc_root,
+                known_sessions=runtime_sessions,
             )
+            if residual:
+                stable_empty = 0
+                _signal_proc_snapshot(residual, signal.SIGKILL, proc_root=proc_root)
+                _reap_direct_children(residual)
+            else:
+                stable_empty += 1
+            if stable_empty >= _DIRECT_BROKER_STABLE_EMPTY_PROBES:
+                return
+            if time.monotonic() >= proof_deadline:
+                break
+            time.sleep(_DIRECT_BROKER_CLEANUP_POLL_SEC)
+        raise RuntimeContainmentError(
+            "failed to prove escaped Apptainer processes were reaped for runtime "
+            f"{self.session_id}"
+        )
 
     async def _start_direct_broker_once(self) -> None:
         """Launch one broker and wait until its control socket is responsive."""
@@ -930,6 +1153,7 @@ class ApptainerRuntime(BaseRuntime):
         self._broker_socket.unlink(missing_ok=True)
         self._broker_log.unlink(missing_ok=True)
         args = self._broker_launch_args()
+        self._broker_was_started = True
         self._broker_task = asyncio.create_task(
             self._run_local_command(
                 *args,
@@ -991,7 +1215,7 @@ class ApptainerRuntime(BaseRuntime):
         return min(delay * (1.0 + 0.25 * jitter), maximum)
 
     async def start(self) -> None:
-        if self._destroyed:
+        if self._destroyed or self._teardown_started:
             raise RuntimeError("apptainer runtime was already destroyed")
         self._overlay_dir = self.session_dir / "overlay"
         self._overlay_dir.mkdir(parents=True, exist_ok=True)
@@ -1008,6 +1232,16 @@ class ApptainerRuntime(BaseRuntime):
             for attempt in range(1, attempts + 1):
                 try:
                     await self._start_direct_broker()
+                    if self.spec.direct_exec_init_command:
+                        result = await self.exec(
+                            self.spec.direct_exec_init_command,
+                            cwd=self.spec.workdir or self.runtime_session_dir,
+                        )
+                        if result.return_code != 0:
+                            raise RuntimeError(
+                                "persistent broker init command failed with exit code "
+                                f"{result.return_code}: {result.stderr or ''}"
+                            )
                     return
                 except Exception as exc:
                     last_error = str(exc)
@@ -1075,72 +1309,79 @@ class ApptainerRuntime(BaseRuntime):
     _STOP_TIMEOUT = 30.0
 
     async def stop(self) -> None:
-        if self._destroyed:
-            return
-        self._destroyed = True
-        if not self._use_instance:
-            if not self._use_persistent_broker:
-                # No namespace owner exists. The shared overlay remains under
-                # session_dir and is removed by normal session cleanup.
+        async with self._teardown_lock:
+            if self._destroyed:
                 return
-            task = self._broker_task
-            if task is None:
-                return
-            try:
-                if not task.done():
-                    await self._broker_rpc({"operation": "shutdown"}, socket_timeout=5.0)
-                rc, stdout, stderr = await asyncio.wait_for(
-                    asyncio.shield(task), timeout=self._STOP_TIMEOUT
-                )
-                if rc != 0:
-                    diagnostic = (
-                        self._read_optional_text(self._broker_log) or stderr or stdout or ""
-                    ).strip()
+            self._teardown_started = True
+            if not self._use_instance:
+                if not self._use_persistent_broker:
+                    # No namespace owner exists. The shared overlay remains under
+                    # session_dir and is removed by normal session cleanup.
+                    self._destroyed = True
+                    return
+                task = self._broker_task
+                try:
+                    if task is not None and not task.done():
+                        await self._broker_rpc(
+                            {"operation": "shutdown"}, socket_timeout=5.0
+                        )
+                    if task is not None:
+                        rc, stdout, stderr = await asyncio.wait_for(
+                            asyncio.shield(task), timeout=self._STOP_TIMEOUT
+                        )
+                        if rc != 0:
+                            diagnostic = (
+                                self._read_optional_text(self._broker_log)
+                                or stderr
+                                or stdout
+                                or ""
+                            ).strip()
+                            logger.warning(
+                                "%s direct broker exited for %s (rc=%s): %s",
+                                self._binary,
+                                self._instance_name,
+                                rc,
+                                diagnostic,
+                            )
+                except (OSError, RuntimeError, TimeoutError) as exc:
                     logger.warning(
-                        "%s direct broker exited for %s (rc=%s): %s",
+                        "%s direct broker graceful stop failed for %s: %s",
                         self._binary,
                         self._instance_name,
-                        rc,
-                        diagnostic,
+                        exc,
                     )
-            except (OSError, RuntimeError, TimeoutError) as exc:
-                logger.warning(
-                    "%s direct broker stop failed for %s: %s",
-                    self._binary,
-                    self._instance_name,
-                    exc,
-                )
+                # This scan is the destruction proof. Run it even when an
+                # earlier cancellation already cleared `_broker_task`; a prior
+                # cleanup failure must remain retryable and observable.
                 await self._force_stop_broker()
-            finally:
-                self._broker_task = None
-                self._broker_socket.unlink(missing_ok=True)
-            return
-        rc, _, stderr = await self._run_local_command(
-            self._binary,
-            "instance",
-            "stop",
-            self._instance_name,
-            timeout=self._STOP_TIMEOUT,
-            capture=True,
-            cwd=_LOCAL_LAUNCHER_CWD,
-        )
-        if rc != 0:
-            logger.warning(
-                "%s instance stop failed for %s (rc=%s): %s",
+                self._destroyed = True
+                return
+            rc, _, stderr = await self._run_local_command(
                 self._binary,
+                "instance",
+                "stop",
                 self._instance_name,
-                rc,
-                stderr,
+                timeout=self._STOP_TIMEOUT,
+                capture=True,
+                cwd=_LOCAL_LAUNCHER_CWD,
             )
+            if rc != 0:
+                raise RuntimeContainmentError(
+                    f"{self._binary} instance stop failed for {self._instance_name} "
+                    f"with exit code {rc}: {stderr or ''}"
+                )
+            self._destroyed = True
 
     async def cancel(self) -> None:
         if self._use_instance or not self._use_persistent_broker:
             await super().cancel()
             return
-        if self._destroyed:
-            return
-        self._destroyed = True
-        await self._force_stop_broker()
+        async with self._teardown_lock:
+            if self._destroyed:
+                return
+            self._teardown_started = True
+            await self._force_stop_broker()
+            self._destroyed = True
 
     async def exec(
         self,
@@ -1150,7 +1391,7 @@ class ApptainerRuntime(BaseRuntime):
         env: dict[str, str] | None = None,
         timeout_sec: float | None = None,
     ) -> ExecResult:
-        if self._destroyed:
+        if self._destroyed or self._teardown_started:
             raise RuntimeDestroyedError(
                 f"apptainer runtime {self.runtime_id} was already destroyed"
             )
@@ -1214,6 +1455,62 @@ class ApptainerRuntime(BaseRuntime):
                 cancelled=cancelled,
             )
 
+    async def exec_protected(
+        self,
+        argv: list[str],
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        protected_env: dict[str, str] | None = None,
+        protected_file_digests: dict[str, str] | None = None,
+        timeout_sec: float | None = None,
+    ) -> ExecResult:
+        if self._destroyed or self._teardown_started:
+            raise RuntimeDestroyedError(
+                f"apptainer runtime {self.runtime_id} was already destroyed"
+            )
+        if self._use_instance or not self._use_persistent_broker:
+            raise RuntimeError(
+                "protected exec requires the persistent Apptainer broker backend"
+            )
+        if not protected_env:
+            raise RuntimeError("protected exec requires protected environment values")
+        if not protected_file_digests:
+            raise RuntimeError("protected exec requires pinned file digests")
+        effective_env = {**self.spec.env, **(env or {})}
+        for key in protected_env:
+            effective_env.pop(key, None)
+        effective_workdir = cwd or self.spec.workdir or self.runtime_session_dir
+        started_at = time.perf_counter()
+        return_code: int | None = None
+        raised_exception = False
+        cancelled = False
+        try:
+            rc, stdout, stderr = await self._broker_protected_exec(
+                argv,
+                cwd=effective_workdir,
+                env=effective_env,
+                protected_env=protected_env,
+                protected_file_digests=protected_file_digests,
+                timeout_sec=timeout_sec,
+            )
+            return_code = rc
+            return ExecResult(stdout=stdout, stderr=stderr, return_code=rc)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except Exception:
+            raised_exception = True
+            raise
+        finally:
+            self._record_exec_timing(
+                "protected_exec",
+                started_at,
+                return_code,
+                raised_exception=raised_exception,
+                cancelled=cancelled,
+            )
+
     async def _broker_exec(
         self,
         command: str,
@@ -1224,8 +1521,6 @@ class ApptainerRuntime(BaseRuntime):
     ) -> tuple[int, str | None, str | None]:
         await self._ensure_direct_broker_ready_for_exec()
         request_id = uuid.uuid4().hex
-        stdout_path = self._broker_results_dir / f"{request_id}.stdout"
-        stderr_path = self._broker_results_dir / f"{request_id}.stderr"
         request: dict[str, object] = {
             "operation": "exec",
             "id": request_id,
@@ -1234,20 +1529,66 @@ class ApptainerRuntime(BaseRuntime):
             "env": env,
             "timeout_sec": timeout_sec,
         }
-        # The broker enforces the command timeout.  Leave a modest grace for
-        # process-group teardown and response delivery at the RPC layer.
+        return await self._broker_exec_request(
+            request_id,
+            request,
+            timeout_sec=timeout_sec,
+            protected=False,
+        )
+
+    async def _broker_protected_exec(
+        self,
+        argv: list[str],
+        *,
+        cwd: str | None,
+        env: dict[str, str],
+        protected_env: dict[str, str],
+        protected_file_digests: dict[str, str],
+        timeout_sec: float | None,
+    ) -> tuple[int, str | None, str | None]:
+        self._assert_direct_broker_owner_live()
+        request_id = uuid.uuid4().hex
+        request: dict[str, object] = {
+            "operation": "exec_protected",
+            "id": request_id,
+            "argv": argv,
+            "cwd": cwd,
+            "env": env,
+            "protected_env": dict(protected_env),
+            "file_digests": dict(protected_file_digests),
+            "timeout_sec": timeout_sec,
+        }
+        try:
+            return await self._broker_exec_request(
+                request_id,
+                request,
+                timeout_sec=timeout_sec,
+                protected=True,
+            )
+        finally:
+            protected_values = request.get("protected_env")
+            if isinstance(protected_values, dict):
+                protected_values.clear()
+
+    async def _broker_exec_request(
+        self,
+        request_id: str,
+        request: dict[str, object],
+        *,
+        timeout_sec: float | None,
+        protected: bool,
+    ) -> tuple[int, str | None, str | None]:
+        stdout_path = self._broker_results_dir / f"{request_id}.stdout"
+        stderr_path = self._broker_results_dir / f"{request_id}.stderr"
         socket_timeout = None if timeout_sec is None else timeout_sec + 30.0
-        rpc_task = asyncio.create_task(self._broker_rpc(request, socket_timeout=socket_timeout))
+        rpc = self._protected_broker_rpc if protected else self._broker_rpc
+        rpc_task = asyncio.create_task(rpc(request, socket_timeout=socket_timeout))
         try:
             response = await asyncio.shield(rpc_task)
         except asyncio.CancelledError:
-            # Keep the exec RPC alive long enough to receive the command's
-            # terminal response, while a separate control RPC kills its
-            # foreground process group.  The completion callback consumes the
-            # response and removes any result files after this caller returns.
             try:
                 await asyncio.shield(
-                    self._broker_rpc(
+                    rpc(
                         {"operation": "cancel", "id": request_id},
                         socket_timeout=5.0,
                     )
@@ -1269,24 +1610,23 @@ class ApptainerRuntime(BaseRuntime):
             rpc_task.add_done_callback(consume_rpc_result)
             raise
         except (_BrokerDisconnectedError, OSError) as exc:
-            # The in-container shell supervisor keeps the Apptainer namespace
-            # alive and restarts a killed Python broker.  The command that
-            # killed it has an unknowable exit status, so surface a regular
-            # non-zero command result after recovery instead of failing the
-            # complete rollout with a null reward.
+            if protected:
+                stdout_path.unlink(missing_ok=True)
+                stderr_path.unlink(missing_ok=True)
+                raise RuntimeError("protected broker channel disconnected") from exc
             self._broker_disconnect_count += 1
             try:
                 await self._recover_live_broker(trigger="mid_exec_disconnect", error=exc)
                 stdout = await asyncio.to_thread(self._read_optional_text, stdout_path)
                 stderr = await asyncio.to_thread(self._read_optional_text, stderr_path)
-                recovery_diagnostic = (
+                diagnostic = (
                     "polar apptainer broker recovered after the command terminated "
                     f"its control process: {exc}"
                 )
                 stderr = (
-                    f"{stderr.rstrip()}\n{recovery_diagnostic}\n"
+                    f"{stderr.rstrip()}\n{diagnostic}\n"
                     if stderr
-                    else f"{recovery_diagnostic}\n"
+                    else f"{diagnostic}\n"
                 )
                 return 125, stdout, stderr
             finally:

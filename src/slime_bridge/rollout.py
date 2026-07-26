@@ -23,6 +23,7 @@ import statistics
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -46,8 +47,175 @@ from slime_bridge.config import (
     render_task_payload,
     resolve_polar_slime_config,
 )
+from slime_bridge.partial_rollout import (
+    PartialRolloutError,
+    PartialRolloutStore,
+    STATE_DROP,
+    STATE_KEEP,
+    STATE_PREPARED,
+    STATE_RESULT_READY,
+    maybe_open_partial_rollout_store,
+)
 
 logger = logging.getLogger(__name__)
+
+_WEIGHT_UPDATE_GATEWAY_STATE_LOCK = threading.Lock()
+_WEIGHT_UPDATE_PAUSED_GATEWAYS: tuple[str, ...] = ()
+
+
+def _control_plane_headers() -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    token = os.environ.get("POLAR_CONTROL_PLANE_TOKEN", "").strip()
+    if token:
+        headers["X-Polar-Control-Token"] = token
+    return headers
+
+
+def _weight_update_gateway_urls(args: Any) -> tuple[str, ...]:
+    """Discover the complete registered gateway fleet from the rollout service."""
+
+    rollout_url = str(getattr(args, "polar_rollout_url", "") or "").rstrip("/")
+    if not rollout_url:
+        raise RuntimeError("polar_rollout_url is required for weight-update coordination")
+    with httpx.Client(timeout=30.0, headers=_control_plane_headers()) as client:
+        response = client.get(f"{rollout_url}/nodes")
+        response.raise_for_status()
+        nodes = response.json()
+    if not isinstance(nodes, list) or not nodes:
+        raise RuntimeError("Polar rollout service returned an empty or malformed gateway fleet")
+
+    urls: list[str] = []
+    for node in nodes:
+        gateway_url = node.get("gateway_url") if isinstance(node, dict) else None
+        if not isinstance(gateway_url, str) or not gateway_url.strip():
+            raise RuntimeError("Polar rollout service returned a node without gateway_url")
+        urls.append(gateway_url.rstrip("/"))
+    if len(set(urls)) != len(urls):
+        raise RuntimeError("Polar rollout service returned duplicate gateway URLs")
+    return tuple(urls)
+
+
+def _gateway_generation_control(
+    gateway_url: str,
+    action: str,
+    *,
+    pause_timeout_seconds: float,
+) -> dict[str, Any]:
+    request_timeout = pause_timeout_seconds + 30.0 if action == "pause" else 30.0
+    params = {"timeout_seconds": pause_timeout_seconds} if action == "pause" else None
+    with httpx.Client(
+        timeout=request_timeout,
+        headers=_control_plane_headers(),
+    ) as client:
+        response = client.post(
+            f"{gateway_url}/admin/inference/{action}",
+            params=params,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Gateway {gateway_url} returned malformed {action} status")
+    expected_paused = action == "pause"
+    if payload.get("paused") is not expected_paused:
+        raise RuntimeError(
+            f"Gateway {gateway_url} did not enter expected paused={expected_paused} state"
+        )
+    inflight = payload.get("inflight")
+    if action == "pause" and (type(inflight) is not int or inflight != 0):
+        raise RuntimeError(
+            f"Gateway {gateway_url} pause returned nonzero or malformed inflight={inflight!r}"
+        )
+    return payload
+
+
+def _control_gateway_fleet(
+    gateway_urls: tuple[str, ...],
+    action: str,
+    *,
+    pause_timeout_seconds: float,
+) -> None:
+    errors: list[str] = []
+    with ThreadPoolExecutor(
+        max_workers=len(gateway_urls),
+        thread_name_prefix=f"polar-gateway-{action}",
+    ) as executor:
+        futures = {
+            executor.submit(
+                _gateway_generation_control,
+                url,
+                action,
+                pause_timeout_seconds=pause_timeout_seconds,
+            ): url
+            for url in gateway_urls
+        }
+        for future in as_completed(futures):
+            url = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                errors.append(f"{url}: {type(exc).__name__}: {exc}")
+    if errors:
+        raise RuntimeError(
+            f"Failed to {action} Polar gateway inference fleet: " + "; ".join(errors)
+        )
+
+
+def pause_for_weight_update(args: Any) -> None:
+    """Freeze new Router generations and drain every gateway before weight sync.
+
+    Slime may keep a fully-async Polar window alive after ``generate`` returns.
+    Draining the gateway proxies closes that race before SGLang's destructive
+    pause/flush cycle.  A partial pause is rolled back before the error is
+    surfaced, so a failed precondition cannot strand rollout traffic.
+    """
+
+    global _WEIGHT_UPDATE_PAUSED_GATEWAYS
+    timeout = float(getattr(args, "polar_weight_update_pause_timeout", 300.0))
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("polar_weight_update_pause_timeout must be positive and finite")
+    with _WEIGHT_UPDATE_GATEWAY_STATE_LOCK:
+        if _WEIGHT_UPDATE_PAUSED_GATEWAYS:
+            raise RuntimeError("Polar gateway fleet is already paused for a weight update")
+    gateway_urls = _weight_update_gateway_urls(args)
+    try:
+        _control_gateway_fleet(
+            gateway_urls,
+            "pause",
+            pause_timeout_seconds=timeout,
+        )
+    except Exception:
+        try:
+            _control_gateway_fleet(
+                gateway_urls,
+                "resume",
+                pause_timeout_seconds=timeout,
+            )
+        except Exception:
+            logger.exception("Failed to roll back a partial Polar gateway pause")
+        raise
+    with _WEIGHT_UPDATE_GATEWAY_STATE_LOCK:
+        _WEIGHT_UPDATE_PAUSED_GATEWAYS = gateway_urls
+    logger.info("Paused and drained %d Polar gateways for weight update", len(gateway_urls))
+
+
+def resume_after_weight_update(args: Any) -> None:
+    """Resume the exact gateway fleet frozen by :func:`pause_for_weight_update`."""
+
+    global _WEIGHT_UPDATE_PAUSED_GATEWAYS
+    timeout = float(getattr(args, "polar_weight_update_pause_timeout", 300.0))
+    with _WEIGHT_UPDATE_GATEWAY_STATE_LOCK:
+        gateway_urls = _WEIGHT_UPDATE_PAUSED_GATEWAYS
+    if not gateway_urls:
+        raise RuntimeError("Polar gateway fleet was not paused for a weight update")
+    _control_gateway_fleet(
+        gateway_urls,
+        "resume",
+        pause_timeout_seconds=timeout,
+    )
+    with _WEIGHT_UPDATE_GATEWAY_STATE_LOCK:
+        _WEIGHT_UPDATE_PAUSED_GATEWAYS = ()
+    logger.info("Resumed %d Polar gateways after weight update", len(gateway_urls))
+
 
 _POLL_INTERVAL = 2.0  # seconds between task-status polls (eval / no-callback path)
 _CALLBACK_FALLBACK_POLL_SECONDS = 60.0  # defensive backstop for dropped callbacks
@@ -142,8 +310,20 @@ class PolarRolloutSchedulerError(RuntimeError):
     """Raised when the async Polar scheduler cannot safely make progress."""
 
 
+class PolarUntrainableGroupError(PolarRolloutSchedulerError):
+    """Raised when a completed group contains no loss-bearing tokens."""
+
+    def __init__(self, message: str, *, infrastructure_only: bool) -> None:
+        super().__init__(message)
+        self.infrastructure_only = infrastructure_only
+
+
 class PolarLowCompleteAcceptFractionError(PolarRolloutSchedulerError):
     """Raised when a completed task has too few trainable completed sessions."""
+
+
+class CandidatePoolHealthGateError(PolarRolloutSchedulerError):
+    """Raised before training when one required pool candidate is unavailable."""
 
 
 class PolarEvalDataIntegrityError(ValueError):
@@ -154,6 +334,9 @@ class PolarEvalDataIntegrityError(ValueError):
 class _DeferredGroup:
     group: list[Any]
     reservation_id: int | None = None
+    submitted_rollout_id: int | None = None
+    policy_version: int | None = None
+    partial_store: PartialRolloutStore | None = None
 
 
 @dataclass(slots=True)
@@ -164,6 +347,7 @@ class _PendingGroup:
     submitted_rollout_id: int
     policy_version: int
     session_cost: int
+    partial_store: PartialRolloutStore | None = None
     submitted_at: float = field(default_factory=time.monotonic)
 
 
@@ -182,6 +366,20 @@ class _CompletedGroup:
     service_time_seconds: float = 0.0
     sample_conversion_seconds: float = 0.0
     output_queue_wait_seconds: float = 0.0
+    partial_store: PartialRolloutStore | None = None
+
+
+@dataclass(slots=True)
+class _PartialRecoveryPlan:
+    store: PartialRolloutStore | None = None
+    kept: list[_CompletedGroup] = field(default_factory=list)
+    result_ready: list[_CompletedGroup] = field(default_factory=list)
+    deferred: list[_DeferredGroup] = field(default_factory=list)
+    candidate_only: list[_CompletedGroup] = field(default_factory=list)
+    dropped_count: int = 0
+    resume_duplicate_count: int = 0
+    dynamic_filter_metrics: dict[str, float] = field(default_factory=dict)
+    reservation_metrics: dict[str, float] = field(default_factory=dict)
 
 
 _WASTED_TIMING_FIELDS: tuple[str, ...] = (
@@ -209,12 +407,29 @@ _global_async_worker: "AsyncPolarRolloutWorker | None" = None
 _worker_lock = threading.Lock()
 
 
-def get_global_async_worker(args: Any, data_source: Any) -> "AsyncPolarRolloutWorker":
+def get_global_async_worker(
+    args: Any,
+    data_source: Any,
+    partial_recovery: _PartialRecoveryPlan | None = None,
+    rollout_id: int | None = None,
+) -> "AsyncPolarRolloutWorker":
     global _global_async_worker
     with _worker_lock:
         if _global_async_worker is None or not _global_async_worker.is_alive():
             logger.info("Creating new async Polar rollout worker")
-            _global_async_worker = AsyncPolarRolloutWorker(args, data_source)
+            recovery = partial_recovery or _PartialRecoveryPlan()
+            _global_async_worker = AsyncPolarRolloutWorker(
+                args,
+                data_source,
+                partial_store=recovery.store,
+            )
+            if rollout_id is not None:
+                _global_async_worker.set_rollout_context(rollout_id)
+            _global_async_worker.bootstrap_partial_recovery(
+                deferred=recovery.deferred,
+                completed=recovery.result_ready,
+                held_keep_count=len(recovery.kept),
+            )
             _global_async_worker.start()
         return _global_async_worker
 
@@ -437,7 +652,7 @@ async def _submit_and_wait_for_task(
     resp = await client.post(
         f"{base_url}/rollout/task/submit",
         json=payload,
-        headers={"Content-Type": "application/json"},
+        headers=_control_plane_headers(),
     )
     resp.raise_for_status()
     task_id = resp.json()["task_id"]
@@ -467,19 +682,46 @@ async def _submit_and_wait_for_task(
 
 
 def _resolve_max_tokens(args: Any) -> int | None:
-    """Resolve the per-sample trajectory cap without conflating packing.
+    """Resolve the safe per-sample trajectory cap.
 
-    ``max_tokens_per_gpu`` is Slime's multi-sample micro-batch packing target.
-    Its scheduler deliberately puts an individual sample above that target in
-    a singleton micro-batch. ``seq_length`` remains the hard model bound.
-
-    With no explicit Polar cap we retain the conservative smaller default. An
-    explicit cap may exceed the packing target, but never ``seq_length``.
+    By default the dynamic microbatch budget is also treated as a per-sample
+    bound.  Slime's scheduler can instead admit an oversize individual sample
+    in a microbatch by itself; an explicit opt-in then leaves ``seq_length`` as
+    the hard trajectory bound while ``max_tokens_per_gpu`` controls only the
+    aggregate tokens packed into a microbatch.
     """
     mtpg = getattr(args, "max_tokens_per_gpu", None)
     seq_length = getattr(args, "seq_length", None)
+    raw_allow_oversize = getattr(
+        args,
+        "polar_allow_single_sample_over_token_cap",
+        False,
+    )
+    if isinstance(raw_allow_oversize, bool):
+        allow_oversize = raw_allow_oversize
+    elif isinstance(raw_allow_oversize, int) and raw_allow_oversize in (0, 1):
+        allow_oversize = bool(raw_allow_oversize)
+    elif isinstance(raw_allow_oversize, str) and raw_allow_oversize.strip().lower() in {
+        "0",
+        "1",
+        "false",
+        "true",
+        "no",
+        "yes",
+        "off",
+        "on",
+    }:
+        allow_oversize = raw_allow_oversize.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    else:
+        raise ValueError("polar_allow_single_sample_over_token_cap must be a boolean")
+
     caps: list[int] = []
-    if mtpg:
+    if mtpg and not allow_oversize:
         cp_size = int(getattr(args, "context_parallel_size", 1) or 1)
         caps.append(int(mtpg) * cp_size)
     if seq_length:
@@ -496,8 +738,11 @@ def _resolve_max_tokens(args: Any) -> int | None:
     model_cap = int(seq_length) if seq_length and int(seq_length) > 0 else None
     if model_cap is not None and configured > model_cap:
         raise ValueError(
-            "polar_max_trajectory_tokens exceeds model sequence length: "
-            f"configured={configured}, seq_length={model_cap}"
+            "polar_max_trajectory_tokens exceeds trainer capacity: "
+            f"configured={configured}, capacity={hard_cap} "
+            f"(max_tokens_per_gpu={mtpg}, context_parallel_size="
+            f"{getattr(args, 'context_parallel_size', 1)}, seq_length={seq_length}, "
+            f"allow_single_sample_over_token_cap={allow_oversize})"
         )
     return configured
 
@@ -707,6 +952,18 @@ def _is_zero_trainable_error(exc: BaseException) -> bool:
     return "zero trainable tokens" in str(exc)
 
 
+def _task_result_is_infrastructure_only(task_result: TaskResult) -> bool:
+    if not task_result.results:
+        return False
+    for result in task_result.results:
+        if _status_value(result.status).upper() != "ERROR":
+            return False
+        trajectory = getattr(result, "trajectory", None)
+        if getattr(trajectory, "traces", None):
+            return False
+    return True
+
+
 def _annotate_accepted_samples(
     samples: list[Any],
     *,
@@ -757,7 +1014,13 @@ class AsyncPolarRolloutWorker:
     ``drain_completed()`` to collect finished groups.
     """
 
-    def __init__(self, args: Any, data_source: Any) -> None:
+    def __init__(
+        self,
+        args: Any,
+        data_source: Any,
+        *,
+        partial_store: PartialRolloutStore | None = None,
+    ) -> None:
         self.args = args
         self.data_source = data_source
         self.config = resolve_polar_slime_config(args)
@@ -766,6 +1029,11 @@ class AsyncPolarRolloutWorker:
         # `_completed_buffer`, which is drained in bounded chunks by training.
         queue_maxsize = max(32, batch_size * self.config.max_async_level * 2)
         self.output_queue: queue.Queue[_CompletedGroup] = queue.Queue(maxsize=queue_maxsize)
+        # Rejected groups can still contain the only trustworthy evidence that
+        # a frozen candidate is unavailable.  Keep that evidence on a separate
+        # unbounded handoff: it is consumed by the trainer immediately and is
+        # never eligible for optimizer input.
+        self.health_output_queue: queue.Queue[_CompletedGroup] = queue.Queue()
         self.deferred_queue: queue.Queue[_DeferredGroup] = queue.Queue()
         self._completed_buffer: deque[_CompletedGroup] = deque()
         self._running = True
@@ -783,6 +1051,7 @@ class AsyncPolarRolloutWorker:
         self._fully_async_request_count = 0
         self._fully_async_admission_credit = 0
         self._fatal_error: BaseException | None = None
+        self._consecutive_infrastructure_failures = 0
         self._state_lock = threading.RLock()
         self._metrics: dict[str, float] = {}
         self._last_reported_counters: dict[str, float] = {}
@@ -794,6 +1063,14 @@ class AsyncPolarRolloutWorker:
         self._task_events: dict[str, asyncio.Event] = {}
         self._task_results: dict[str, TaskResult] = {}
         self._callback_url: str | None = None
+        self._partial_store = partial_store
+        self._resume_committed_reservation_ids = (
+            partial_store.committed_reservation_ids if partial_store is not None else frozenset()
+        )
+        # Recovered KEEP groups live in generate_rollout_polar_async rather
+        # than a worker queue, but they still own reservations and must count
+        # against the bounded async window until the complete batch commits.
+        self._recovered_held_groups = 0
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -817,20 +1094,51 @@ class AsyncPolarRolloutWorker:
         with self._state_lock:
             self._current_rollout_id = int(rollout_id)
 
+    def bootstrap_partial_recovery(
+        self,
+        *,
+        deferred: list[_DeferredGroup],
+        completed: list[_CompletedGroup],
+        held_keep_count: int,
+    ) -> None:
+        """Seed reconstructed work before the background thread starts."""
+
+        if self._thread is not None:
+            raise RuntimeError("partial recovery must be bootstrapped before worker start")
+        with self._state_lock:
+            self._recovered_held_groups = int(held_keep_count)
+            for item in deferred:
+                self.deferred_queue.put_nowait(item)
+            for item in completed:
+                self.output_queue.put_nowait(item)
+
+    def release_recovered_holds(self) -> None:
+        with self._state_lock:
+            self._recovered_held_groups = 0
+
     def request_groups(self, count: int) -> None:
-        if count <= 0:
+        count = int(count)
+        if count < 0:
             return
         with self._state_lock:
-            count = int(count)
             self._requested_groups += count
             if self.config.fully_async:
                 if self._fully_async_request_count == 0:
-                    self._fully_async_admission_credit += (
-                        self._batch_size * self.config.max_async_level
+                    max_window = self._batch_size * self.config.max_async_level
+                    reconstructed_owned = (
+                        self._recovered_held_groups
+                        + self.deferred_queue.qsize()
+                        + self.output_queue.qsize()
+                        + self._completed_buffer_size
                     )
-                else:
+                    self._fully_async_admission_credit += max(
+                        0,
+                        max_window - reconstructed_owned,
+                    )
+                    self._fully_async_request_count += 1
+                elif count > 0:
                     self._fully_async_admission_credit += count
-                self._fully_async_request_count += 1
+                    self._fully_async_request_count += 1
 
     def raise_if_failed(self) -> None:
         if self._fatal_error is not None:
@@ -875,7 +1183,14 @@ class AsyncPolarRolloutWorker:
                     completed.task_id,
                     reason,
                 )
+                self._emit_health_observation(completed)
                 self._record_wasted_samples(completed.samples)
+                if completed.partial_store is not None:
+                    completed.partial_store.record_drop(
+                        completed.reservation_id,
+                        outcome="stale",
+                        reason=reason,
+                    )
                 self._consume_reservation(completed.reservation_id, outcome="stale")
                 self._restore_fully_async_admission_credit(1)
                 continue
@@ -894,6 +1209,20 @@ class AsyncPolarRolloutWorker:
         with self._state_lock:
             self._completed_buffer_size = len(self._completed_buffer)
         return accepted
+
+    def drain_health_observations(self) -> list[_CompletedGroup]:
+        """Drain rejected pre-filter groups for fail-closed pool monitoring."""
+
+        observations: list[_CompletedGroup] = []
+        while True:
+            try:
+                observations.append(self.health_output_queue.get_nowait())
+            except queue.Empty:
+                return observations
+
+    def _emit_health_observation(self, completed: _CompletedGroup) -> None:
+        if self.config.candidate_pool_health_gate_enabled:
+            self.health_output_queue.put_nowait(completed)
 
     def queue_size(self) -> int:
         with self._state_lock:
@@ -921,6 +1250,12 @@ class AsyncPolarRolloutWorker:
             completed.task_id,
             reason or "unspecified",
         )
+        if completed.partial_store is not None:
+            completed.partial_store.record_drop(
+                completed.reservation_id,
+                outcome="dynamic_filter",
+                reason=reason,
+            )
         return self._consume_reservation(
             completed.reservation_id,
             outcome="dynamic_filter",
@@ -935,6 +1270,7 @@ class AsyncPolarRolloutWorker:
             out["polar/scheduler/completed_buffer"] = float(self._completed_buffer_size)
             out["polar/scheduler/output_queue"] = float(self.output_queue.qsize())
             out["polar/scheduler/deferred_queue"] = float(self.deferred_queue.qsize())
+            out["polar/scheduler/recovered_held_groups"] = float(self._recovered_held_groups)
             out["polar/scheduler/requested_groups"] = float(self._requested_groups)
             if self.config.fully_async:
                 out["polar/scheduler/admission_credit"] = float(self._fully_async_admission_credit)
@@ -1034,7 +1370,17 @@ class AsyncPolarRolloutWorker:
 
                         gid = self._group_counter
                         self._group_counter += 1
-                        submitted_rollout_id, policy_version = self._rollout_context()
+                        current_rollout_id, current_policy_version = self._rollout_context()
+                        submitted_rollout_id = (
+                            current_rollout_id
+                            if next_group.submitted_rollout_id is None
+                            else int(next_group.submitted_rollout_id)
+                        )
+                        policy_version = (
+                            current_policy_version
+                            if next_group.policy_version is None
+                            else int(next_group.policy_version)
+                        )
                         pending = _PendingGroup(
                             group_id=gid,
                             group=next_group.group,
@@ -1042,6 +1388,7 @@ class AsyncPolarRolloutWorker:
                             submitted_rollout_id=submitted_rollout_id,
                             policy_version=policy_version,
                             session_cost=session_cost,
+                            partial_store=next_group.partial_store,
                         )
                         task = asyncio.create_task(
                             self._submit_and_collect(client, pending),
@@ -1136,19 +1483,30 @@ class AsyncPolarRolloutWorker:
         if not self._running:
             return
 
+        fuse_error: PolarRolloutSchedulerError | None = None
         if _is_zero_trainable_error(last_error):
             category_metric = "polar/dropped_zero_trainable_groups"
             reason = "zero trainable tokens"
             permanently_consumed = True
+            if (
+                isinstance(last_error, PolarUntrainableGroupError)
+                and last_error.infrastructure_only
+            ):
+                fuse_error = self._note_infrastructure_failure()
+            else:
+                self._reset_infrastructure_failures()
         elif isinstance(last_error, PolarLowCompleteAcceptFractionError):
+            self._reset_infrastructure_failures()
             category_metric = "polar/dropped_low_complete_fraction_groups"
             reason = "low complete accept fraction"
             permanently_consumed = True
         elif isinstance(last_error, RolloutLogprobError):
+            self._reset_infrastructure_failures()
             category_metric = "polar/dropped_logprob_error_groups"
             reason = "rollout logprob error"
             permanently_consumed = True
         else:
+            self._reset_infrastructure_failures()
             category_metric = "polar/dropped_failed_groups"
             reason = "task failure"
             permanently_consumed = False
@@ -1163,8 +1521,17 @@ class AsyncPolarRolloutWorker:
             last_error,
         )
         if permanently_consumed:
+            if pending.partial_store is not None:
+                pending.partial_store.record_drop(
+                    pending.reservation_id,
+                    outcome="permanent_drop",
+                    reason=reason,
+                )
             self._consume_reservation(pending.reservation_id, outcome="permanent_drop")
             self._restore_fully_async_admission_credit(1)
+            if fuse_error is not None:
+                self._set_fatal(fuse_error)
+                self._running = False
         else:
             if pending.reservation_id is not None:
                 self._inc_metric("polar/replay_on_resume_groups")
@@ -1225,21 +1592,7 @@ class AsyncPolarRolloutWorker:
             raise PolarRolloutSchedulerError(
                 f"Task {task_result.task_id} converted to zero samples"
             )
-        if not _has_trainable_tokens(group_samples):
-            self._record_wasted_samples(group_samples)
-            raise PolarRolloutSchedulerError(
-                f"Task {task_result.task_id} produced zero trainable tokens"
-            )
-        rejection_reason = _low_complete_accept_fraction_rejection_reason(
-            self.config, task_result, group_samples
-        )
-        if rejection_reason is not None:
-            self._record_wasted_samples(group_samples)
-            raise PolarLowCompleteAcceptFractionError(
-                f"Task {task_result.task_id} cannot be accepted: {rejection_reason}"
-            )
-
-        return _CompletedGroup(
+        completed = _CompletedGroup(
             group_id=pending.group_id,
             group=pending.group,
             reservation_id=pending.reservation_id,
@@ -1252,7 +1605,27 @@ class AsyncPolarRolloutWorker:
             completed_at=completed_at,
             service_time_seconds=service_time_seconds,
             sample_conversion_seconds=sample_conversion_seconds,
+            partial_store=pending.partial_store,
         )
+        if not _has_trainable_tokens(group_samples):
+            self._emit_health_observation(completed)
+            self._record_wasted_samples(group_samples)
+            raise PolarUntrainableGroupError(
+                f"Task {task_result.task_id} produced zero trainable tokens",
+                infrastructure_only=_task_result_is_infrastructure_only(task_result),
+            )
+        rejection_reason = _low_complete_accept_fraction_rejection_reason(
+            self.config, task_result, group_samples
+        )
+        if rejection_reason is not None:
+            self._emit_health_observation(completed)
+            self._record_wasted_samples(group_samples)
+            raise PolarLowCompleteAcceptFractionError(
+                f"Task {task_result.task_id} cannot be accepted: {rejection_reason}"
+            )
+        if pending.partial_store is not None:
+            pending.partial_store.record_result_ready(completed)
+        return completed
 
     async def _emit_completed(self, completed: _CompletedGroup) -> None:
         wait_started = time.perf_counter()
@@ -1260,6 +1633,7 @@ class AsyncPolarRolloutWorker:
             try:
                 completed.output_queue_wait_seconds = time.perf_counter() - wait_started
                 self.output_queue.put_nowait(completed)
+                self._reset_infrastructure_failures()
                 self._inc_metric("polar/completed_groups")
                 return
             except queue.Full:
@@ -1274,26 +1648,98 @@ class AsyncPolarRolloutWorker:
         except queue.Empty:
             pass
 
-        reservation_getter = getattr(self.data_source, "get_samples_with_reservation", None)
-        if callable(reservation_getter):
-            reservations = reservation_getter(1)
-            if not reservations:
-                return None
-            if len(reservations) != 1:
+        while True:
+            reservation_getter = getattr(
+                self.data_source,
+                "get_samples_with_reservation",
+                None,
+            )
+            if callable(reservation_getter):
+                reservations = reservation_getter(1)
+                if not reservations:
+                    return None
+                if len(reservations) != 1:
+                    raise PolarRolloutSchedulerError(
+                        "Slime data source returned an invalid reservation batch"
+                    )
+                reservation_id, group = reservations[0]
+            else:
+                groups = self.data_source.get_samples(1)
+                if not groups:
+                    return None
+                reservation_id = None
+                group = groups[0]
+            if not group:
                 raise PolarRolloutSchedulerError(
-                    "Slime data source returned an invalid reservation batch"
+                    "Slime data source returned an empty sample group"
                 )
-            reservation_id, group = reservations[0]
-        else:
-            groups = self.data_source.get_samples(1)
-            if not groups:
-                return None
-            reservation_id = None
-            group = groups[0]
-        if not group:
-            raise PolarRolloutSchedulerError("Slime data source returned an empty sample group")
-        self._consume_fully_async_admission_credit()
-        return _DeferredGroup(group=group, reservation_id=reservation_id)
+            submitted_rollout_id, policy_version = self._rollout_context()
+            partial_store = self._partial_store
+            if partial_store is not None and partial_store.sealed:
+                partial_store = None
+
+            if (
+                reservation_id is not None
+                and int(reservation_id) in self._resume_committed_reservation_ids
+            ):
+                self._skip_resume_duplicate(
+                    reservation_id=int(reservation_id),
+                    group=group,
+                    submitted_rollout_id=submitted_rollout_id,
+                    policy_version=policy_version,
+                    partial_store=partial_store,
+                )
+                # A replay skip never owned remote work and therefore consumes
+                # no fully-async admission credit. Continue synchronously until
+                # the first genuinely admissible reservation is found.
+                continue
+
+            if partial_store is not None:
+                if reservation_id is None:
+                    raise PolarRolloutSchedulerError(
+                        "partial rollout WAL requires reservation-aware data source"
+                    )
+                partial_store.record_prepared(
+                    reservation_id=reservation_id,
+                    group=group,
+                    submitted_rollout_id=submitted_rollout_id,
+                    policy_version=policy_version,
+                )
+            self._consume_fully_async_admission_credit()
+            return _DeferredGroup(
+                group=group,
+                reservation_id=reservation_id,
+                submitted_rollout_id=submitted_rollout_id,
+                policy_version=policy_version,
+                partial_store=partial_store,
+            )
+
+    def _skip_resume_duplicate(
+        self,
+        *,
+        reservation_id: int,
+        group: list[Any],
+        submitted_rollout_id: int,
+        policy_version: int,
+        partial_store: PartialRolloutStore | None,
+    ) -> None:
+        """Consume a base-checkpoint duplicate before any remote submission."""
+
+        if partial_store is not None:
+            partial_store.record_prepared(
+                reservation_id=reservation_id,
+                group=group,
+                submitted_rollout_id=submitted_rollout_id,
+                policy_version=policy_version,
+            )
+            partial_store.record_resume_duplicate(reservation_id)
+        self._consume_reservation(reservation_id, outcome="resume_duplicate")
+        self._inc_metric("polar/resume_duplicate_groups")
+        self._inc_metric("polar/resume_duplicate_sessions", len(group))
+        logger.info(
+            "Skipping reservation %s already committed by the base checkpoint",
+            reservation_id,
+        )
 
     def _can_admit_group(
         self,
@@ -1315,7 +1761,11 @@ class AsyncPolarRolloutWorker:
 
             max_window = self._batch_size * self.config.max_async_level
             active_or_deferred = len(active) + deferred_groups
-            completed_backlog = self.output_queue.qsize() + self._completed_buffer_size
+            completed_backlog = (
+                self.output_queue.qsize()
+                + self._completed_buffer_size
+                + self._recovered_held_groups
+            )
             owned_groups = active_or_deferred + completed_backlog
             if owned_groups >= max_window:
                 return False
@@ -1479,6 +1929,27 @@ class AsyncPolarRolloutWorker:
             if self._fatal_error is None:
                 self._fatal_error = exc
 
+    def _note_infrastructure_failure(self) -> PolarRolloutSchedulerError | None:
+        with self._state_lock:
+            self._consecutive_infrastructure_failures += 1
+            count = self._consecutive_infrastructure_failures
+            self._metrics["polar/consecutive_infrastructure_failures"] = float(count)
+            limit = self.config.max_consecutive_infrastructure_failures
+        if limit > 0 and count >= limit:
+            return PolarRolloutSchedulerError(
+                "Polar rollout stopped after "
+                f"{count} consecutive infrastructure-only untrainable groups "
+                f"(limit={limit})"
+            )
+        return None
+
+    def _reset_infrastructure_failures(self) -> None:
+        with self._state_lock:
+            if self._consecutive_infrastructure_failures == 0:
+                return
+            self._consecutive_infrastructure_failures = 0
+            self._metrics["polar/consecutive_infrastructure_failures"] = 0.0
+
     async def _submit_with_callback(
         self, client: httpx.AsyncClient, payload: dict[str, Any]
     ) -> TaskResult:
@@ -1493,7 +1964,7 @@ class AsyncPolarRolloutWorker:
             resp = await client.post(
                 f"{base_url}/rollout/task/submit",
                 json=payload,
-                headers={"Content-Type": "application/json"},
+                headers=_control_plane_headers(),
             )
             resp.raise_for_status()
             return await self._await_task_result(client, task_id, event)
@@ -2365,6 +2836,595 @@ _CANDIDATE_SESSION_COUNT_METRICS = {
     "timeout_masked_sessions": "polar/timeout_masked_sessions",
 }
 
+_CANDIDATE_DECOMPOSED_METRICS = {
+    name: (
+        f"polar/spilot_router/{name}_accounted_session_count",
+        f"polar/spilot_router/{name}_mean",
+        f"polar/spilot_router/{name}_std",
+    )
+    for name in (
+        "accuracy_outcome",
+        "total_cost",
+        "cost_penalty_fraction",
+        "cost_penalty_reward_delta",
+        "cost_adjusted_reward",
+        "total_latency_seconds",
+        "latency_penalty_fraction",
+        "latency_penalty_reward_delta",
+    )
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidatePoolHealthGateConfig:
+    candidate_aliases: tuple[str, ...]
+    min_observed_sessions: int
+    min_completion_fraction: float
+
+
+def _candidate_pool_health_gate_config(
+    config: Any,
+) -> _CandidatePoolHealthGateConfig | None:
+    """Validate the opt-in candidate-availability gate and its model identities."""
+
+    enabled = getattr(config, "candidate_pool_health_gate_enabled", False)
+    if type(enabled) is not bool:
+        raise ValueError("candidate_pool_health_gate_enabled must be a boolean")
+    if not enabled:
+        return None
+
+    raw_min_sessions = getattr(config, "candidate_pool_health_min_observed_sessions", 16)
+    if isinstance(raw_min_sessions, bool):
+        raise ValueError("candidate_pool_health_min_observed_sessions must be an integer")
+    try:
+        min_observed_sessions = int(raw_min_sessions)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "candidate_pool_health_min_observed_sessions must be an integer"
+        ) from exc
+    if min_observed_sessions <= 0 or min_observed_sessions != raw_min_sessions:
+        raise ValueError("candidate_pool_health_min_observed_sessions must be positive")
+
+    raw_min_fraction = getattr(config, "candidate_pool_health_min_completion_fraction", 0.1)
+    if isinstance(raw_min_fraction, bool):
+        raise ValueError("candidate_pool_health_min_completion_fraction must be numeric")
+    try:
+        min_completion_fraction = float(raw_min_fraction)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "candidate_pool_health_min_completion_fraction must be numeric"
+        ) from exc
+    if not math.isfinite(min_completion_fraction) or not 0.0 <= min_completion_fraction <= 1.0:
+        raise ValueError(
+            "candidate_pool_health_min_completion_fraction must be between 0 and 1"
+        )
+
+    task_template = getattr(config, "task_template", None)
+    agent = task_template.get("agent") if isinstance(task_template, dict) else None
+    settings = agent.get("settings") if isinstance(agent, dict) else None
+    raw_pool = settings.get("model_pool") if isinstance(settings, dict) else None
+    if isinstance(raw_pool, dict):
+        raw_candidates = list(raw_pool.values())
+    elif isinstance(raw_pool, list):
+        raw_candidates = list(raw_pool)
+    else:
+        raise ValueError(
+            "candidate pool health gate requires agent.settings.model_pool"
+        )
+
+    aliases: list[str] = []
+    for candidate in raw_candidates:
+        alias = candidate if isinstance(candidate, str) else None
+        if isinstance(candidate, dict):
+            alias = candidate.get("model")
+        if not isinstance(alias, str) or not alias.strip():
+            raise ValueError(
+                "candidate pool health gate requires a model alias for every candidate"
+            )
+        aliases.append(alias.strip())
+    if len(aliases) < 2 or len(set(aliases)) != len(aliases):
+        raise ValueError(
+            "candidate pool health gate requires at least two unique model aliases"
+        )
+    return _CandidatePoolHealthGateConfig(
+        candidate_aliases=tuple(sorted(aliases)),
+        min_observed_sessions=min_observed_sessions,
+        min_completion_fraction=min_completion_fraction,
+    )
+
+
+@dataclass(slots=True)
+class _CandidatePoolHealthAccumulator:
+    """Retain per-session pool availability before dynamic sampling selection."""
+
+    expected_aliases: tuple[str, ...]
+    sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    conflicting_sessions: set[str] = field(default_factory=set)
+    missing_session_id_telemetry_count: int = 0
+    group_count: int = 0
+    reservation_ids: set[int] = field(default_factory=set)
+    policy_versions: set[int] = field(default_factory=set)
+
+    def add(self, completed: _CompletedGroup) -> None:
+        self.group_count += 1
+        if completed.reservation_id is not None:
+            self.reservation_ids.add(int(completed.reservation_id))
+        self.policy_versions.add(int(completed.policy_version))
+        for sample in completed.samples:
+            sample_metadata = getattr(sample, "metadata", None)
+            polar = sample_metadata.get("polar") if isinstance(sample_metadata, dict) else None
+            if not isinstance(polar, dict):
+                continue
+            trajectory = polar.get("trajectory_metadata")
+            evaluation = (
+                trajectory.get("evaluation") if isinstance(trajectory, dict) else None
+            )
+            router = evaluation.get("spilot_router") if isinstance(evaluation, dict) else None
+            if not isinstance(router, dict):
+                continue
+            session_id = polar.get("session_id")
+            if not isinstance(session_id, str) or not session_id:
+                self.missing_session_id_telemetry_count += 1
+                continue
+            if session_id in self.conflicting_sessions:
+                continue
+            previous = self.sessions.get(session_id)
+            if previous is None:
+                self.sessions[session_id] = router
+            elif not _strict_telemetry_equal(previous, router):
+                self.sessions.pop(session_id, None)
+                self.conflicting_sessions.add(session_id)
+
+    def report(
+        self,
+        gate_config: _CandidatePoolHealthGateConfig,
+        *,
+        rollout_id: int,
+        accepted_group_count: int,
+    ) -> dict[str, Any]:
+        expected = set(self.expected_aliases)
+        if tuple(sorted(expected)) != gate_config.candidate_aliases:
+            raise ValueError("candidate pool health accumulator/config aliases differ")
+
+        labels = {
+            alias: f"C{index}" for index, alias in enumerate(gate_config.candidate_aliases)
+        }
+        candidate_stats: dict[str, dict[str, Any]] = {
+            alias: {
+                "label": labels[alias],
+                "alias": alias,
+                "observed_session_count": 0,
+                "available_session_count": 0,
+                "unavailable_session_count": 0,
+                "telemetry_error_session_count": 0,
+                "attempted_call_count": 0,
+                "completed_call_count": 0,
+                "failed_call_count": 0,
+                "timeout_call_count": 0,
+                "unknown_status_call_count": 0,
+                "skipped_call_count": 0,
+                "admission_failure_session_count": 0,
+                "pre_call_infrastructure_failure_session_count": 0,
+            }
+            for alias in gate_config.candidate_aliases
+        }
+        globally_invalid_sessions: set[str] = set(self.conflicting_sessions)
+        unattributed_observation_sessions: set[str] = set()
+        observed_session_ids: set[str] = set()
+
+        for session_id, router in self.sessions.items():
+            aliases_by_slot: dict[str, str] = {}
+            slot_mapping = router.get("slot_mapping")
+            if isinstance(slot_mapping, dict):
+                for raw_slot, raw_candidate in slot_mapping.items():
+                    alias = (
+                        raw_candidate.get("model")
+                        if isinstance(raw_candidate, dict)
+                        else None
+                    )
+                    if isinstance(alias, str) and alias:
+                        aliases_by_slot[str(raw_slot).upper()] = alias
+            mapping_valid = (
+                len(aliases_by_slot) == len(expected)
+                and set(aliases_by_slot.values()) == expected
+            )
+            expected_action_calls: list[tuple[str, str, str]] = []
+            actions = router.get("actions")
+            if actions is not None and not isinstance(actions, list):
+                globally_invalid_sessions.add(session_id)
+                actions = []
+            route_actions_seen = 0
+            for action in actions or []:
+                if not isinstance(action, dict) or action.get("valid") is not True:
+                    continue
+                action_name = str(action.get("action") or "").upper()
+                if action_name not in {"ROUTE", "VERIFY"}:
+                    continue
+                action_slot = str(action.get("model_slot") or "").upper()
+                action_alias = aliases_by_slot.get(action_slot)
+                if action_alias not in expected:
+                    globally_invalid_sessions.add(session_id)
+                    unattributed_observation_sessions.add(session_id)
+                    continue
+                if action_name == "ROUTE":
+                    # Task-level episodes have one ROUTE ("solve"); turn-level
+                    # episodes route every pool call, and every ROUTE after the
+                    # first runs a continuation agent.
+                    role = "solve" if route_actions_seen == 0 else "continue"
+                    route_actions_seen += 1
+                else:
+                    role = "verify"
+                expected_action_calls.append((role, action_slot, action_alias))
+
+            evidence: dict[str, dict[str, bool]] = {
+                alias: {
+                    "completed": False,
+                    "unavailable": False,
+                    "telemetry_error": False,
+                }
+                for alias in gate_config.candidate_aliases
+            }
+            covered_action_keys: set[tuple[str, str]] = set()
+            calls = router.get("calls")
+            if calls is not None and not isinstance(calls, list):
+                globally_invalid_sessions.add(session_id)
+                calls = []
+            for call in calls or []:
+                if not isinstance(call, dict):
+                    globally_invalid_sessions.add(session_id)
+                    continue
+                call_model = call.get("model")
+                model_alias = call_model if call_model in expected else None
+                call_slot = str(call.get("slot") or "").upper()
+                slot_alias = aliases_by_slot.get(call_slot)
+                alias = model_alias if model_alias == slot_alias else None
+                if alias is None:
+                    globally_invalid_sessions.add(session_id)
+                    if model_alias is not None:
+                        evidence[model_alias]["telemetry_error"] = True
+                    if slot_alias in expected:
+                        evidence[slot_alias]["telemetry_error"] = True
+
+                attempted = call.get("attempted")
+                if attempted is False:
+                    if alias is not None:
+                        candidate_stats[alias]["skipped_call_count"] += 1
+                    continue
+                if attempted is not True:
+                    globally_invalid_sessions.add(session_id)
+                    if alias is not None:
+                        evidence[alias]["telemetry_error"] = True
+                    continue
+                if alias is None:
+                    unattributed_observation_sessions.add(session_id)
+                    continue
+
+                observed_session_ids.add(session_id)
+                role = str(call.get("role") or "").lower()
+                if role in {"solve", "verify", "continue"}:
+                    covered_action_keys.add((role, call_slot))
+                else:
+                    globally_invalid_sessions.add(session_id)
+                    evidence[alias]["telemetry_error"] = True
+                stats = candidate_stats[alias]
+                stats["attempted_call_count"] += 1
+                status = str(call.get("status") or "").lower()
+                if status == "completed":
+                    stats["completed_call_count"] += 1
+                    evidence[alias]["completed"] = True
+                elif status in {"failed", "timeout"}:
+                    stats[f"{status}_call_count"] += 1
+                    evidence[alias]["unavailable"] = True
+                else:
+                    stats["unknown_status_call_count"] += 1
+                    evidence[alias]["unavailable"] = True
+                    evidence[alias]["telemetry_error"] = True
+                    globally_invalid_sessions.add(session_id)
+
+            admission_failure = router.get("admission_failure")
+            if isinstance(admission_failure, dict):
+                failure_model = admission_failure.get("model")
+                if failure_model in expected:
+                    evidence[failure_model]["unavailable"] = True
+                    candidate_stats[failure_model]["admission_failure_session_count"] += 1
+                    observed_session_ids.add(session_id)
+                    # Admission fails before a call record exists. Attribute it
+                    # to the latest unmatched action for that stable alias so
+                    # the infrastructure reconciliation below does not count
+                    # the same failure twice.
+                    for role, slot, alias in reversed(expected_action_calls):
+                        key = (role, slot)
+                        if alias == failure_model and key not in covered_action_keys:
+                            covered_action_keys.add(key)
+                            break
+                else:
+                    globally_invalid_sessions.add(session_id)
+                    unattributed_observation_sessions.add(session_id)
+
+            if router.get("termination_reason") == "infrastructure_error":
+                pre_call_failure_aliases: set[str] = set()
+                for role, slot, alias in expected_action_calls:
+                    if (role, slot) not in covered_action_keys:
+                        evidence[alias]["unavailable"] = True
+                        pre_call_failure_aliases.add(alias)
+                        observed_session_ids.add(session_id)
+                for alias in pre_call_failure_aliases:
+                    candidate_stats[alias][
+                        "pre_call_infrastructure_failure_session_count"
+                    ] += 1
+                if not expected_action_calls:
+                    globally_invalid_sessions.add(session_id)
+                    unattributed_observation_sessions.add(session_id)
+
+            has_candidate_evidence = any(
+                item["completed"] or item["unavailable"] for item in evidence.values()
+            )
+            if not mapping_valid and has_candidate_evidence:
+                globally_invalid_sessions.add(session_id)
+                for alias, item in evidence.items():
+                    if item["completed"] or item["unavailable"]:
+                        item["telemetry_error"] = True
+
+            for alias, item in evidence.items():
+                if not (item["completed"] or item["unavailable"]):
+                    continue
+                stats = candidate_stats[alias]
+                stats["observed_session_count"] += 1
+                if item["completed"]:
+                    stats["available_session_count"] += 1
+                else:
+                    stats["unavailable_session_count"] += 1
+                if item["telemetry_error"]:
+                    stats["telemetry_error_session_count"] += 1
+
+        triggered_candidates: list[str] = []
+        trigger_reasons: list[str] = []
+        for alias in gate_config.candidate_aliases:
+            stats = candidate_stats[alias]
+            observed = int(stats["observed_session_count"])
+            available = int(stats["available_session_count"])
+            fraction = available / observed if observed else None
+            eligible = observed >= gate_config.min_observed_sessions
+            stats["completion_fraction"] = fraction
+            stats["eligible"] = eligible
+            stats["insufficient_evidence"] = not eligible
+            stats["triggered"] = False
+            reasons: list[str] = []
+            if eligible and fraction is not None:
+                if fraction < gate_config.min_completion_fraction:
+                    reasons.append("completion_fraction_below_threshold")
+                if int(stats["telemetry_error_session_count"]) > 0:
+                    reasons.append("candidate_telemetry_integrity_error")
+            if reasons:
+                stats["triggered"] = True
+                stats["trigger_reasons"] = reasons
+                triggered_candidates.append(labels[alias])
+                trigger_reasons.extend(f"{labels[alias]}:{reason}" for reason in reasons)
+
+        total_observed_sessions = len(observed_session_ids)
+        health_evidence_sessions = (
+            observed_session_ids
+            | globally_invalid_sessions
+            | unattributed_observation_sessions
+        )
+        if (
+            len(health_evidence_sessions) >= gate_config.min_observed_sessions
+            and globally_invalid_sessions
+        ):
+            trigger_reasons.append("global:candidate_telemetry_integrity_error")
+        if len(unattributed_observation_sessions) >= gate_config.min_observed_sessions:
+            trigger_reasons.append("global:unattributed_candidate_observations")
+        if self.missing_session_id_telemetry_count >= gate_config.min_observed_sessions:
+            trigger_reasons.append("global:missing_session_identity_telemetry")
+
+        return {
+            "schema_version": 1,
+            "rollout_id": int(rollout_id),
+            "accepted_group_count": int(accepted_group_count),
+            "decision_window_group_count": int(self.group_count),
+            "decision_window_session_count": len(self.sessions),
+            "reservation_ids": sorted(self.reservation_ids),
+            "policy_versions": sorted(self.policy_versions),
+            "thresholds": {
+                "min_observed_sessions": gate_config.min_observed_sessions,
+                "min_completion_fraction": gate_config.min_completion_fraction,
+            },
+            "candidates": {
+                labels[alias]: candidate_stats[alias]
+                for alias in gate_config.candidate_aliases
+            },
+            "telemetry": {
+                "conflicting_session_count": len(self.conflicting_sessions),
+                "globally_invalid_session_count": len(globally_invalid_sessions),
+                "missing_session_id_telemetry_count": self.missing_session_id_telemetry_count,
+                "unattributed_observation_session_count": len(
+                    unattributed_observation_sessions
+                ),
+                "total_observed_session_count": total_observed_sessions,
+            },
+            "triggered": bool(trigger_reasons),
+            "triggered_candidates": triggered_candidates,
+            "trigger_reasons": trigger_reasons,
+        }
+
+
+def _candidate_pool_health_metrics(report: dict[str, Any]) -> dict[str, float]:
+    prefix = "polar/candidate_pool_health"
+    metrics = {
+        f"{prefix}/gate_triggered": float(bool(report.get("triggered"))),
+        f"{prefix}/decision_window_group_count": float(
+            report.get("decision_window_group_count", 0)
+        ),
+    }
+    for label, raw_stats in (report.get("candidates") or {}).items():
+        if not isinstance(label, str) or not isinstance(raw_stats, dict):
+            continue
+        candidate_prefix = f"{prefix}/{label.lower()}"
+        for field_name in (
+            "observed_session_count",
+            "available_session_count",
+            "unavailable_session_count",
+            "telemetry_error_session_count",
+            "attempted_call_count",
+            "completed_call_count",
+            "failed_call_count",
+            "timeout_call_count",
+            "unknown_status_call_count",
+            "skipped_call_count",
+            "admission_failure_session_count",
+            "pre_call_infrastructure_failure_session_count",
+        ):
+            metrics[f"{candidate_prefix}/{field_name}"] = float(
+                raw_stats.get(field_name, 0)
+            )
+        metrics[f"{candidate_prefix}/eligible"] = float(bool(raw_stats.get("eligible")))
+        completion_fraction = raw_stats.get("completion_fraction")
+        if completion_fraction is not None:
+            metrics[f"{candidate_prefix}/completion_fraction"] = float(completion_fraction)
+    return metrics
+
+
+def _persist_candidate_pool_health_incident(
+    args: Any,
+    report: dict[str, Any],
+) -> Path:
+    save_root = getattr(args, "save", None)
+    state_file = os.environ.get("TMAX_RUN_STATE_FILE")
+    incident_dirs: list[Path] = []
+    if save_root:
+        incident_dirs.append(
+            Path(save_root) / "rollout" / "candidate_pool_health_incidents"
+        )
+    if state_file:
+        # This independent lineage-scoped location is a durability fallback if
+        # the checkpoint tree itself becomes temporarily unwritable.  The
+        # watcher scans both locations and still binds payloads to SLURM_JOB_ID.
+        incident_dirs.append(
+            Path(f"{state_file}.candidate_pool_health_incidents")
+        )
+    incident_dirs = list(dict.fromkeys(incident_dirs))
+    if not incident_dirs:
+        raise OSError(
+            "candidate-pool health incident has neither args.save nor "
+            "TMAX_RUN_STATE_FILE storage"
+        )
+
+    rollout_id = int(report["rollout_id"])
+    payload = dict(report)
+    payload["created_unix_time"] = time.time()
+    # The watcher must only latch an incident produced by the terminal Slurm
+    # job it is accounting.  Keeping the scheduler identity in the durable
+    # payload lets a later, explicitly restarted job reuse the same SAVE_DIR
+    # without being blocked by a stale incident from an older attempt.
+    payload["slurm_job_id"] = os.environ.get("SLURM_JOB_ID")
+
+    failures: list[Exception] = []
+    for incident_dir in incident_dirs:
+        destination = incident_dir / f"rollout_{rollout_id:07d}.json"
+        temporary = incident_dir / (
+            f".{destination.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+        )
+        try:
+            incident_dir.mkdir(parents=True, exist_ok=True)
+            with temporary.open("x", encoding="utf-8") as stream:
+                json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+            directory_fd = os.open(incident_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            return destination
+        except Exception as exc:
+            failures.append(exc)
+            logger.exception(
+                "Failed to persist candidate-pool health incident under %s",
+                incident_dir,
+            )
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                # The directory itself may be the failed component.  Cleanup
+                # must not suppress the attempt at the independent fallback.
+                pass
+    raise OSError(
+        "candidate-pool health incident could not be persisted to any durable location"
+    ) from failures[-1]
+
+
+def _enforce_candidate_pool_health_gate(
+    args: Any,
+    accumulator: _CandidatePoolHealthAccumulator,
+    gate_config: _CandidatePoolHealthGateConfig,
+    *,
+    rollout_id: int,
+    accepted_group_count: int,
+    partial_store: PartialRolloutStore | None = None,
+) -> dict[str, Any]:
+    report = accumulator.report(
+        gate_config,
+        rollout_id=rollout_id,
+        accepted_group_count=accepted_group_count,
+    )
+    if not report["triggered"]:
+        return report
+
+    try:
+        stop_global_worker()
+    except Exception:
+        logger.exception("Failed to stop Polar worker after candidate-pool health gate")
+    # Accepted groups have durable KEEP records before the complete decision
+    # window is available.  They are intentionally not sealed with READY, but
+    # ordinary partial recovery would still reuse those bad provider results.
+    # Quarantine the whole uncommitted WAL so the exact checkpoint cursor
+    # regenerates the batch after the backend is healthy.
+    wal_quarantine_succeeded: bool | None = None
+    wal_quarantine_error_type: str | None = None
+    if partial_store is not None:
+        try:
+            partial_store.quarantine(
+                "candidate-pool health gate rejected the uncommitted decision window"
+            )
+            wal_quarantine_succeeded = True
+        except Exception as exc:
+            wal_quarantine_succeeded = False
+            wal_quarantine_error_type = type(exc).__name__
+            report["trigger_reasons"].append(
+                "global:partial_wal_quarantine_failed"
+            )
+            logger.exception(
+                "Failed to quarantine partial rollout WAL after candidate-pool health gate"
+            )
+    report["partial_wal"] = {
+        "present": partial_store is not None,
+        "quarantine_succeeded": wal_quarantine_succeeded,
+        "quarantine_error_type": wal_quarantine_error_type,
+    }
+    try:
+        incident_path = _persist_candidate_pool_health_incident(args, report)
+    except Exception as exc:
+        logger.exception(
+            "Candidate-pool health incident persistence failed in every durable location"
+        )
+        raise CandidatePoolHealthGateError(
+            f"candidate-pool health gate rejected rollout {rollout_id}, but its "
+            "incident could not be persisted; refusing to continue"
+        ) from exc
+    logger.error(
+        "Candidate-pool health gate rejected rollout %d before training: %s incident=%s",
+        rollout_id,
+        ", ".join(report["trigger_reasons"]),
+        incident_path or "unavailable",
+    )
+    raise CandidatePoolHealthGateError(
+        f"candidate-pool health gate rejected rollout {rollout_id}: "
+        + ", ".join(report["trigger_reasons"])
+    )
+
 
 @dataclass(slots=True)
 class _CandidateQualityAccumulator:
@@ -2382,6 +3442,15 @@ class _CandidateQualityAccumulator:
     group_reward_square_sum: float = 0.0
     trainable_samples: int = 0
     trainable_reward_sum: float = 0.0
+    decomposed_counts: dict[str, float] = field(
+        default_factory=lambda: {name: 0.0 for name in _CANDIDATE_DECOMPOSED_METRICS}
+    )
+    decomposed_sums: dict[str, float] = field(
+        default_factory=lambda: {name: 0.0 for name in _CANDIDATE_DECOMPOSED_METRICS}
+    )
+    decomposed_square_sums: dict[str, float] = field(
+        default_factory=lambda: {name: 0.0 for name in _CANDIDATE_DECOMPOSED_METRICS}
+    )
     session_counts: dict[str, float] = field(
         default_factory=lambda: {name: 0.0 for name in _CANDIDATE_SESSION_COUNT_METRICS}
     )
@@ -2435,6 +3504,19 @@ class _CandidateQualityAccumulator:
             name: float(quality.get(source, 0.0))
             for name, source in _CANDIDATE_SESSION_COUNT_METRICS.items()
         }
+        decomposed: dict[str, tuple[float, float, float]] = {}
+        for name, (count_key, mean_key, std_key) in _CANDIDATE_DECOMPOSED_METRICS.items():
+            count = float(quality.get(count_key, 0.0))
+            mean = quality.get(mean_key)
+            if count <= 0.0 or mean is None:
+                continue
+            parsed_mean = float(mean)
+            parsed_std = float(quality.get(std_key, 0.0))
+            if not all(math.isfinite(value) for value in (count, parsed_mean, parsed_std)):
+                raise ValueError(f"non-finite candidate {name} telemetry")
+            if parsed_std < 0.0:
+                raise ValueError(f"negative candidate {name} standard deviation")
+            decomposed[name] = (count, parsed_mean, parsed_std)
 
         # Commit only after every optional extraction and conversion succeeds.
         # The caller can therefore count a telemetry error without retaining a
@@ -2445,12 +3527,14 @@ class _CandidateQualityAccumulator:
         self.trainable_reward_sum += sum(trainable_rewards)
         for name, count in session_counts.items():
             self.session_counts[name] += count
+        for name, (count, mean, std) in decomposed.items():
+            self.decomposed_counts[name] += count
+            self.decomposed_sums[name] += count * mean
+            self.decomposed_square_sums[name] += count * (std**2 + mean**2)
         if parsed_reward_mean is not None:
             self.accounted_sessions += accounted
             self.reward_sum += accounted * parsed_reward_mean
-            self.reward_square_sum += accounted * (
-                reward_std**2 + parsed_reward_mean**2
-            )
+            self.reward_square_sum += accounted * (reward_std**2 + parsed_reward_mean**2)
             self.quality_group_count += 1
             self.group_reward_sum += parsed_reward_mean
             self.group_reward_square_sum += parsed_reward_mean**2
@@ -2474,23 +3558,30 @@ class _CandidateQualityAccumulator:
             "polar/candidate/group_count": group_count,
             "polar/candidate/accepted_group_count": float(accepted_group_count),
             "polar/candidate/accept_fraction": float(accepted_group_count) / group_count,
-            "polar/candidate/dynamic_filter_eligible_group_count": group_count,
-            "polar/candidate/dynamic_filter_accepted_group_count": float(
-                accepted_group_count
-            ),
-            "polar/candidate/dynamic_filter_conditional_accept_fraction": (
-                float(accepted_group_count) / group_count
-            ),
             "polar/candidate/telemetry_error_count": float(self.telemetry_error_count),
             "polar/candidate/accounted_sessions": self.accounted_sessions,
             "polar/candidate/quality_eligible_sessions": self.quality_eligible_sessions,
-            "polar/candidate/early_stop_cancelled_sessions": (
-                self.early_stop_cancelled_sessions
-            ),
+            "polar/candidate/early_stop_cancelled_sessions": (self.early_stop_cancelled_sessions),
             "polar/candidate/trainable_samples": float(self.trainable_samples),
         }
         for name, count in self.session_counts.items():
             metrics[f"polar/candidate/{name}"] = count
+        for name in _CANDIDATE_DECOMPOSED_METRICS:
+            count = self.decomposed_counts[name]
+            metrics[f"polar/candidate/{name}_accounted_sessions"] = count
+            if count <= 0.0:
+                continue
+            mean = self.decomposed_sums[name] / count
+            metrics[f"polar/candidate/{name}_mean"] = mean
+            metrics[f"polar/candidate/{name}_std"] = (
+                max(
+                    0.0,
+                    self.decomposed_square_sums[name] / count - mean**2,
+                )
+                ** 0.5
+            )
+            if name in {"total_cost", "cost_penalty_reward_delta"}:
+                metrics[f"polar/candidate/{name}_total"] = self.decomposed_sums[name]
         attempted_sessions = self.session_counts["attempted_sessions"]
         total_sessions = attempted_sessions + self.early_stop_cancelled_sessions
         if total_sessions > 0.0:
@@ -2514,8 +3605,7 @@ class _CandidateQualityAccumulator:
             reward_mean = self.reward_sum / self.accounted_sessions
             metrics["polar/candidate/reward_mean"] = reward_mean
             metrics["polar/candidate/reward_std"] = (
-                max(0.0, self.reward_square_sum / self.accounted_sessions - reward_mean**2)
-                ** 0.5
+                max(0.0, self.reward_square_sum / self.accounted_sessions - reward_mean**2) ** 0.5
             )
         if self.quality_group_count > 0:
             quality_group_count = float(self.quality_group_count)
@@ -2524,8 +3614,7 @@ class _CandidateQualityAccumulator:
             metrics["polar/candidate/group_reward_std"] = (
                 max(
                     0.0,
-                    self.group_reward_square_sum / quality_group_count
-                    - group_reward_mean**2,
+                    self.group_reward_square_sum / quality_group_count - group_reward_mean**2,
                 )
                 ** 0.5
             )
@@ -2560,12 +3649,7 @@ def _candidate_quality_metrics_fail_open(
             "polar/candidate/group_count": group_count,
             "polar/candidate/accepted_group_count": accepted_count,
             "polar/candidate/accept_fraction": accept_fraction,
-            "polar/candidate/dynamic_filter_eligible_group_count": group_count,
-            "polar/candidate/dynamic_filter_accepted_group_count": accepted_count,
-            "polar/candidate/dynamic_filter_conditional_accept_fraction": accept_fraction,
-            "polar/candidate/telemetry_error_count": float(
-                accumulator.telemetry_error_count
-            ),
+            "polar/candidate/telemetry_error_count": float(accumulator.telemetry_error_count),
         }
 
 
@@ -2574,9 +3658,7 @@ def _decision_window_metrics(scheduler_metrics: dict[str, float]) -> dict[str, f
     if consumed_key not in scheduler_metrics:
         return {}
     consumed = float(scheduler_metrics[consumed_key])
-    accepted = float(
-        scheduler_metrics.get("polar/reservations/consumed_accepted_delta", 0.0)
-    )
+    accepted = float(scheduler_metrics.get("polar/reservations/consumed_accepted_delta", 0.0))
     return {
         "polar/decision_window/consumed_window_group_count": consumed,
         "polar/decision_window/accepted_group_count": accepted,
@@ -2584,6 +3666,272 @@ def _decision_window_metrics(scheduler_metrics: dict[str, float]) -> dict[str, f
             accepted / consumed if consumed > 0.0 else 0.0
         ),
     }
+
+
+def _can_bootstrap_partial_recovery() -> bool:
+    with _worker_lock:
+        return _global_async_worker is None or not _global_async_worker.is_alive()
+
+
+def _recovered_completed_group(
+    *,
+    record: dict[str, Any],
+    group: list[Any],
+    samples: list[Any],
+    store: PartialRolloutStore,
+) -> _CompletedGroup:
+    return _CompletedGroup(
+        group_id=int(record.get("scheduler_group_id", record["reservation_id"])),
+        group=group,
+        reservation_id=int(record["reservation_id"]),
+        samples=samples,
+        task_id=str(record.get("task_id", f"recovered-{record['reservation_id']}")),
+        submitted_rollout_id=int(record["submitted_rollout_id"]),
+        policy_version=int(record["policy_version"]),
+        session_count=int(record.get("session_count", len(group))),
+        # Monotonic timestamps cannot be compared across processes.  Preserve
+        # correctness by omitting cross-process service-window telemetry.
+        submitted_at=0.0,
+        completed_at=0.0,
+        service_time_seconds=0.0,
+        sample_conversion_seconds=0.0,
+        output_queue_wait_seconds=0.0,
+        partial_store=store,
+    )
+
+
+def _validate_recovered_samples(
+    *,
+    record: dict[str, Any],
+    samples: list[Any],
+    rollout_id: int,
+    max_off_policy_steps: int,
+) -> None:
+    reservation_id = int(record["reservation_id"])
+    policy_version = int(record["policy_version"])
+    staleness = int(rollout_id) - policy_version
+    if staleness < 0 or staleness > int(max_off_policy_steps):
+        raise PartialRolloutError(
+            f"reservation {reservation_id} has unsafe recovered policy staleness {staleness}"
+        )
+    if not samples:
+        raise PartialRolloutError(f"reservation {reservation_id} recovered an empty sample group")
+    for sample in samples:
+        if int(getattr(sample, "group_index", -1)) != reservation_id:
+            raise PartialRolloutError(
+                f"reservation {reservation_id} recovered a sample with group_index="
+                f"{getattr(sample, 'group_index', None)}"
+            )
+    if not _has_trainable_tokens(samples):
+        raise PartialRolloutError(f"reservation {reservation_id} recovered zero trainable tokens")
+
+    if record["state"] != STATE_KEEP:
+        return
+    if int(record.get("accepted_rollout_id", -1)) != int(rollout_id):
+        raise PartialRolloutError(f"reservation {reservation_id} KEEP belongs to another rollout")
+    for sample in samples:
+        polar_meta = (getattr(sample, "metadata", {}) or {}).get("polar", {})
+        train_meta = getattr(sample, "train_metadata", None) or {}
+        if (
+            int(polar_meta.get("accepted_rollout_id", -1)) != int(rollout_id)
+            or int(polar_meta.get("policy_version", -1)) != policy_version
+            or int(train_meta.get("policy_version", -1)) != policy_version
+        ):
+            raise PartialRolloutError(
+                f"reservation {reservation_id} KEEP sample policy metadata mismatch"
+            )
+
+
+def _prepare_partial_recovery(
+    args: Any,
+    *,
+    rollout_id: int,
+    data_source: Any,
+) -> _PartialRecoveryPlan:
+    """Load, validate, and replay a partial WAL before starting the worker."""
+
+    if not _can_bootstrap_partial_recovery():
+        return _PartialRecoveryPlan()
+    if not bool(getattr(args, "rollout_global_dataset", False)):
+        return _PartialRecoveryPlan()
+
+    config = resolve_polar_slime_config(args)
+    store = maybe_open_partial_rollout_store(args, config, rollout_id)
+    if store is None:
+        return _PartialRecoveryPlan()
+    rebuilder = getattr(data_source, "rebuild_partial_reservations", None)
+    if not callable(rebuilder):
+        logger.warning(
+            "Partial rollout recovery disabled: data source does not expose "
+            "rebuild_partial_reservations"
+        )
+        return _PartialRecoveryPlan()
+
+    try:
+        records = store.load_records()
+        committed_record_ids = {
+            int(record["reservation_id"])
+            for record in records
+            if int(record["reservation_id"]) in store.committed_reservation_ids
+        }
+        for reservation_id in sorted(committed_record_ids):
+            store.record_resume_duplicate(reservation_id)
+        if committed_record_ids:
+            records = store.load_records()
+        recovered_owned = sum(record["state"] != STATE_DROP for record in records)
+        if recovered_owned > config.max_concurrency:
+            raise PartialRolloutError(
+                f"partial WAL owns {recovered_owned} groups, exceeding async window "
+                f"{config.max_concurrency}"
+            )
+        Sample = _load_sample_type()
+        preloaded_samples: dict[int, list[Any]] = {}
+        for record in records:
+            reuse_samples = record["state"] in (STATE_RESULT_READY, STATE_KEEP) or (
+                record["state"] == STATE_DROP
+                and record.get("drop_outcome") == "dynamic_filter"
+                and record.get("sample_blob") is not None
+            )
+            if reuse_samples:
+                samples = [
+                    Sample.from_dict(sample_dict)
+                    for sample_dict in store.load_sample_dicts(record)
+                ]
+                if record["state"] == STATE_KEEP:
+                    reservation_id = int(record["reservation_id"])
+                    policy_version = int(record["policy_version"])
+                    for sample in samples:
+                        polar_meta = (getattr(sample, "metadata", {}) or {}).get("polar", {})
+                        train_meta = getattr(sample, "train_metadata", None) or {}
+                        for metadata, field_name, expected in (
+                            (
+                                polar_meta,
+                                "accepted_rollout_id",
+                                int(record["accepted_rollout_id"]),
+                            ),
+                            (polar_meta, "policy_version", policy_version),
+                            (train_meta, "policy_version", policy_version),
+                        ):
+                            present = metadata.get(field_name)
+                            if present is not None and int(present) != expected:
+                                raise PartialRolloutError(
+                                    f"reservation {reservation_id} KEEP blob has "
+                                    f"conflicting {field_name}={present}"
+                                )
+                    _annotate_accepted_samples(
+                        samples,
+                        accepted_rollout_id=int(record["accepted_rollout_id"]),
+                        staleness=int(rollout_id) - policy_version,
+                        policy_version=policy_version,
+                        scheduler_group_id=int(record.get("scheduler_group_id", reservation_id)),
+                    )
+                _validate_recovered_samples(
+                    record=record,
+                    samples=samples,
+                    rollout_id=rollout_id,
+                    max_off_policy_steps=config.max_off_policy_steps,
+                )
+                preloaded_samples[int(record["reservation_id"])] = samples
+        rebuilt = rebuilder(records)
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        try:
+            store.quarantine(reason)
+        except Exception:
+            logger.exception("Failed to quarantine invalid partial rollout WAL")
+            raise
+        # Continue with the existing at-least-once replay path and a fresh WAL.
+        return _PartialRecoveryPlan(
+            store=PartialRolloutStore(
+                store.directory,
+                store.header,
+                committed_reservation_ids=store.committed_reservation_ids,
+            )
+        )
+
+    plan = _PartialRecoveryPlan(store=store)
+    drop_records: list[dict[str, Any]] = []
+    for record, group in rebuilt:
+        state = record["state"]
+        reservation_id = int(record["reservation_id"])
+        if state == STATE_PREPARED:
+            plan.deferred.append(
+                _DeferredGroup(
+                    group=group,
+                    reservation_id=reservation_id,
+                    submitted_rollout_id=int(record["submitted_rollout_id"]),
+                    policy_version=int(record["policy_version"]),
+                    partial_store=store,
+                )
+            )
+            continue
+
+        reuse_samples = state in (STATE_RESULT_READY, STATE_KEEP) or (
+            state == STATE_DROP
+            and record.get("drop_outcome") == "dynamic_filter"
+            and record.get("sample_blob") is not None
+        )
+        if reuse_samples:
+            completed = _recovered_completed_group(
+                record=record,
+                group=group,
+                samples=preloaded_samples[reservation_id],
+                store=store,
+            )
+        else:
+            completed = None
+
+        if state == STATE_RESULT_READY:
+            assert completed is not None
+            plan.result_ready.append(completed)
+        elif state == STATE_KEEP:
+            assert completed is not None
+            plan.kept.append(completed)
+        elif state == STATE_DROP:
+            drop_records.append(record)
+            if completed is not None:
+                plan.candidate_only.append(completed)
+            if record.get("drop_outcome") == "dynamic_filter":
+                reason = record.get("drop_reason")
+                if reason:
+                    key = f"rollout/dynamic_filter/drop_{reason}"
+                    plan.dynamic_filter_metrics[key] = (
+                        plan.dynamic_filter_metrics.get(key, 0.0) + 1.0
+                    )
+        else:
+            raise PartialRolloutError(f"unsupported recovered state {state}")
+
+    marker_many = getattr(data_source, "mark_consumed_many", None)
+    marker_one = getattr(data_source, "mark_consumed", None)
+    plan.dropped_count = len(drop_records)
+    plan.resume_duplicate_count = sum(
+        record.get("drop_outcome") == "resume_duplicate" for record in drop_records
+    )
+    for record in drop_records:
+        reservation_id = int(record["reservation_id"])
+        outcome = str(record.get("drop_outcome") or "recovered_drop")
+        if callable(marker_one):
+            metrics = marker_one(reservation_id, outcome=outcome)
+        elif callable(marker_many):
+            metrics = marker_many([reservation_id], outcome=outcome)
+        else:
+            raise PartialRolloutError(
+                "data source cannot consume a reconstructed DROP reservation"
+            )
+        if isinstance(metrics, dict):
+            plan.reservation_metrics.update(metrics)
+
+    logger.info(
+        "Recovered partial rollout %s: keep=%d result_ready=%d prepared=%d "
+        "drop=%d resume_duplicate=%d",
+        rollout_id,
+        len(plan.kept),
+        len(plan.result_ready),
+        len(plan.deferred),
+        len(drop_records),
+        plan.resume_duplicate_count,
+    )
+    return plan
 
 
 def generate_rollout_polar_async(
@@ -2600,16 +3948,101 @@ def generate_rollout_polar_async(
         return asyncio.run(_run_eval_rollout(args, rollout_id, data_source))
 
     dynamic_filter = _load_training_dynamic_filter(args)
-    async_worker = get_global_async_worker(args, data_source)
+    partial_recovery = _prepare_partial_recovery(
+        args,
+        rollout_id=rollout_id,
+        data_source=data_source,
+    )
+    if partial_recovery.store is None:
+        async_worker = get_global_async_worker(args, data_source)
+    else:
+        async_worker = get_global_async_worker(
+            args,
+            data_source,
+            partial_recovery,
+            rollout_id,
+        )
+    candidate_pool_gate_config = _candidate_pool_health_gate_config(async_worker.config)
+    candidate_pool_health = (
+        _CandidatePoolHealthAccumulator(candidate_pool_gate_config.candidate_aliases)
+        if candidate_pool_gate_config is not None
+        else None
+    )
     async_worker.set_rollout_context(rollout_id)
-    target = getattr(args, "rollout_batch_size", 1)
-    async_worker.request_groups(int(target))
+    target = int(getattr(args, "rollout_batch_size", 1))
+    if len(partial_recovery.kept) > target:
+        raise PartialRolloutError(
+            f"recovered {len(partial_recovery.kept)} KEEP groups for target {target}"
+        )
 
-    data: list[list[Any]] = []
-    accepted_completions: list[_CompletedGroup] = []
+    data: list[list[Any]] = [completed.samples for completed in partial_recovery.kept]
+    accepted_completions: list[_CompletedGroup] = list(partial_recovery.kept)
+
+    def observe_candidate_health(completed: _CompletedGroup) -> None:
+        if candidate_pool_health is None or candidate_pool_gate_config is None:
+            return
+        candidate_pool_health.add(completed)
+        # Enforce incrementally, before any DROP/KEEP record is consumed or a
+        # replacement request is admitted.  Otherwise a provider outage whose
+        # groups all fail the low-complete or dynamic-sampling filters can loop
+        # forever without ever reaching a full accepted batch.
+        _enforce_candidate_pool_health_gate(
+            args,
+            candidate_pool_health,
+            candidate_pool_gate_config,
+            rollout_id=rollout_id,
+            accepted_group_count=len(data),
+            partial_store=partial_recovery.store,
+        )
+
+    def drain_candidate_health_observations() -> None:
+        drainer = getattr(async_worker, "drain_health_observations", None)
+        if not callable(drainer):
+            return
+        for observation in drainer():
+            observe_candidate_health(observation)
+
     candidate_quality = _CandidateQualityAccumulator()
-    dynamic_filter_metrics: dict[str, float] = {}
-    dynamic_filter_reservation_metrics: dict[str, float] = {}
+    for completed in (*partial_recovery.candidate_only, *partial_recovery.kept):
+        observe_candidate_health(completed)
+        try:
+            candidate_quality.add(completed, reward_key=async_worker.config.reward_key)
+        except Exception:
+            candidate_quality.record_group_error()
+            logger.warning(
+                "Recovered candidate-quality telemetry failed for Polar group %s",
+                completed.group_id,
+                exc_info=True,
+            )
+    async_worker.request_groups(target - len(partial_recovery.kept))
+    dynamic_filter_metrics: dict[str, float] = dict(partial_recovery.dynamic_filter_metrics)
+    dynamic_filter_reservation_metrics: dict[str, float] = dict(
+        partial_recovery.reservation_metrics
+    )
+    partial_recovery_metrics: dict[str, float] = {}
+    recovered_group_count = (
+        len(partial_recovery.kept)
+        + len(partial_recovery.result_ready)
+        + len(partial_recovery.deferred)
+        + partial_recovery.dropped_count
+    )
+    if recovered_group_count:
+        partial_recovery_metrics = {
+            "polar/partial_recovery/replayed_group_count": float(recovered_group_count),
+            "polar/partial_recovery/restored_keep_group_count": float(len(partial_recovery.kept)),
+            "polar/partial_recovery/restored_result_ready_group_count": float(
+                len(partial_recovery.result_ready)
+            ),
+            "polar/partial_recovery/resubmitted_prepared_group_count": float(
+                len(partial_recovery.deferred)
+            ),
+            "polar/partial_recovery/restored_drop_group_count": float(
+                partial_recovery.dropped_count
+            ),
+            "polar/partial_recovery/resume_duplicate_group_count": float(
+                partial_recovery.resume_duplicate_count
+            ),
+        }
     start = time.monotonic()
     last_progress = start
 
@@ -2621,12 +4054,21 @@ def generate_rollout_polar_async(
             stop_global_worker()
             raise TaskCancelledError(error_message="Polar rollout generation was cancelled")
         made_progress = False
+        # Permanent worker-side rejections (for example, a whole provider
+        # cohort failing the trainable-completion floor) never enter the normal
+        # completed queue.  Inspect them before raise_if_failed and before
+        # asking for any replacement work.
+        drain_candidate_health_observations()
         completed_groups = async_worker.drain_completed(
             max_groups=target - len(data),
             rollout_id=rollout_id,
         )
+        # drain_completed can itself reject stale groups and publish their
+        # pre-filter health evidence.
+        drain_candidate_health_observations()
         replacement_groups = 0
         for completed in completed_groups:
+            observe_candidate_health(completed)
             try:
                 candidate_quality.add(
                     completed,
@@ -2663,6 +4105,15 @@ def generate_rollout_polar_async(
                     replacement_groups += 1
                     made_progress = True
                     continue
+            if partial_recovery.store is not None:
+                if completed.partial_store is not partial_recovery.store:
+                    raise PartialRolloutError(
+                        "completed group is not owned by the active partial WAL"
+                    )
+                partial_recovery.store.record_keep(
+                    completed,
+                    accepted_rollout_id=rollout_id,
+                )
             data.append(completed.samples)
             accepted_completions.append(completed)
             made_progress = True
@@ -2695,12 +4146,35 @@ def generate_rollout_polar_async(
         elapsed,
         async_worker.queue_size(),
     )
+    drain_candidate_health_observations()
+    candidate_pool_health_report: dict[str, Any] | None = None
+    if candidate_pool_health is not None and candidate_pool_gate_config is not None:
+        candidate_pool_health_report = _enforce_candidate_pool_health_gate(
+            args,
+            candidate_pool_health,
+            candidate_pool_gate_config,
+            rollout_id=rollout_id,
+            accepted_group_count=len(data),
+            partial_store=partial_recovery.store,
+        )
+    if partial_recovery.store is not None:
+        partial_recovery.store.mark_ready(
+            completed.reservation_id for completed in accepted_completions
+        )
+
+    from slime_bridge.group_selection import select_training_groups
+
+    data, group_selection_metrics = select_training_groups(args, data, rollout_id=rollout_id)
 
     RolloutFnTrainOutput = _load_rollout_train_output_type()
     flat = [s for g in data for s in g]
     rewards = [_extract_sample_reward(s, async_worker.config.reward_key) for s in flat]
     metrics: dict[str, Any] = dict(dynamic_filter_metrics)
+    metrics.update(group_selection_metrics)
     metrics.update(dynamic_filter_reservation_metrics)
+    metrics.update(partial_recovery_metrics)
+    if candidate_pool_health_report is not None:
+        metrics.update(_candidate_pool_health_metrics(candidate_pool_health_report))
     metrics.update(
         _candidate_quality_metrics_fail_open(
             candidate_quality,
@@ -2709,15 +4183,91 @@ def generate_rollout_polar_async(
     )
     accepted_quality = _polar_extra_metrics(flat, rewards, async_worker.config.reward_key)
     metrics.update(accepted_quality)
+    if "polar/spilot_router/session_count" in accepted_quality:
+        metrics["polar/spilot_router/rollout_step"] = float(rollout_id)
     metrics["polar/accepted/group_count"] = float(len(data))
     for source, suffix in (
         ("polar/reward_mean", "reward_mean"),
         ("polar/reward_std", "reward_std"),
         ("polar/reward_accounted_sessions", "accounted_sessions"),
         ("polar/reward_mean_completed", "reward_mean_completed"),
+        (
+            "polar/spilot_router/accuracy_outcome_accounted_session_count",
+            "accuracy_outcome_accounted_sessions",
+        ),
+        ("polar/spilot_router/accuracy_outcome_mean", "accuracy_outcome_mean"),
+        (
+            "polar/spilot_router/total_cost_accounted_session_count",
+            "total_cost_accounted_sessions",
+        ),
+        ("polar/spilot_router/total_cost_mean", "total_cost_mean"),
+        (
+            "polar/spilot_router/cost_penalty_fraction_mean",
+            "cost_penalty_fraction_mean",
+        ),
+        (
+            "polar/spilot_router/cost_penalty_reward_delta_mean",
+            "cost_penalty_reward_delta_mean",
+        ),
+        (
+            "polar/spilot_router/cost_adjusted_reward_mean",
+            "cost_adjusted_reward_mean",
+        ),
+        (
+            "polar/spilot_router/total_latency_seconds_mean",
+            "total_latency_seconds_mean",
+        ),
+        (
+            "polar/spilot_router/latency_penalty_fraction_mean",
+            "latency_penalty_fraction_mean",
+        ),
+        (
+            "polar/spilot_router/latency_penalty_reward_delta_mean",
+            "latency_penalty_reward_delta_mean",
+        ),
     ):
         if source in accepted_quality:
             metrics[f"polar/accepted/{suffix}"] = accepted_quality[source]
+    # Slime's built-in rollout/raw_reward is intentionally trace/sample
+    # weighted and includes zero-gradient placeholders. Publish the
+    # exchangeable one-session-one-vote quality next to it so dashboards do
+    # not mistake a diagnostic transport field for Router outcome quality.
+    if "polar/reward_mean" in accepted_quality:
+        metrics["rollout/session_reward_mean"] = accepted_quality["polar/reward_mean"]
+    if "polar/reward_accounted_sessions" in accepted_quality:
+        metrics["rollout/session_reward_accounted_sessions"] = accepted_quality[
+            "polar/reward_accounted_sessions"
+        ]
+    for source, target in (
+        ("polar/spilot_router/accuracy_outcome_mean", "rollout/accuracy_outcome_mean"),
+        ("polar/spilot_router/total_cost_mean", "rollout/total_cost_mean"),
+        (
+            "polar/spilot_router/cost_penalty_fraction_mean",
+            "rollout/cost_penalty_fraction_mean",
+        ),
+        (
+            "polar/spilot_router/cost_penalty_reward_delta_mean",
+            "rollout/cost_penalty_reward_delta_mean",
+        ),
+        (
+            "polar/spilot_router/cost_adjusted_reward_mean",
+            "rollout/cost_adjusted_reward_mean",
+        ),
+        (
+            "polar/spilot_router/total_latency_seconds_mean",
+            "rollout/total_latency_seconds_mean",
+        ),
+        (
+            "polar/spilot_router/latency_penalty_fraction_mean",
+            "rollout/latency_penalty_fraction_mean",
+        ),
+        (
+            "polar/spilot_router/latency_penalty_reward_delta_mean",
+            "rollout/latency_penalty_reward_delta_mean",
+        ),
+    ):
+        if source in accepted_quality:
+            metrics[target] = accepted_quality[source]
     metrics.update(_completed_service_metrics(accepted_completions))
     metrics["timing/pipeline_ms/rollout_collect"] = elapsed * 1000.0
     output = RolloutFnTrainOutput(samples=data, metrics=metrics)
@@ -2737,6 +4287,8 @@ def generate_rollout_polar_async(
         [completed.reservation_id for completed in accepted_completions],
         outcome="accepted",
     )
+    if partial_recovery.store is not None:
+        async_worker.release_recovered_holds()
     # Snapshot exactly once per delivered rollout, after reservation commit,
     # so *_delta means "during this rollout" and lifetime counters carry an
     # explicit worker-local scope across Slurm restarts.
@@ -2766,11 +4318,7 @@ def _sample_reward_for_example(sample: Any) -> float:
         value = reward.get("score", next(iter(reward.values()), 0.0))
     else:
         value = reward
-    try:
-        parsed = float(value or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-    return parsed if math.isfinite(parsed) else 0.0
+    return _finite_float_or_zero(value)
 
 
 def _trajectory_example_payload(session_id: str, samples: list[Any]) -> dict[str, Any]:
@@ -3298,12 +4846,22 @@ def _extract_sample_reward(sample: Any, reward_key: str) -> float:
     reward = getattr(sample, "reward", None)
     if isinstance(reward, dict):
         if reward_key in reward:
-            return float(reward[reward_key])
+            return _finite_float_or_zero(reward[reward_key])
         if "score" in reward:
-            return float(reward["score"])
+            return _finite_float_or_zero(reward["score"])
     if isinstance(reward, (int, float)):
-        return float(reward)
+        return _finite_float_or_zero(reward)
     return 0.0
+
+
+def _finite_float_or_zero(value: Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
 
 
 def _is_trainable_agent_timeout_sample(sample: Any) -> bool:
@@ -3337,7 +4895,7 @@ def _effective_trainable_reward(sample: Any, reward_key: str) -> float:
     return _extract_sample_reward(sample, reward_key)
 
 
-def _sample_effective_response_length(sample: Any) -> float:
+def _sample_trainable_response_tokens(sample: Any) -> float:
     loss_mask = getattr(sample, "loss_mask", None)
     if loss_mask is None:
         return _nonnegative_finite_float(getattr(sample, "response_length", 0))
@@ -3370,6 +4928,555 @@ def _add_distribution_metrics(
     out[f"{prefix}/median"] = statistics.median(values)
     out[f"{prefix}/min"] = min(values)
     out[f"{prefix}/max"] = max(values)
+
+
+def _add_session_distribution_metrics(
+    out: dict[str, float],
+    prefix: str,
+    name: str,
+    values: list[float],
+    *,
+    include_total: bool = False,
+) -> None:
+    """Publish one-session-one-vote scalar telemetry with explicit coverage."""
+
+    out[f"{prefix}/{name}_accounted_session_count"] = float(len(values))
+    if not values:
+        return
+    out[f"{prefix}/{name}_mean"] = sum(values) / len(values)
+    out[f"{prefix}/{name}_std"] = statistics.pstdev(values) if len(values) > 1 else 0.0
+    out[f"{prefix}/{name}_median"] = statistics.median(values)
+    out[f"{prefix}/{name}_min"] = min(values)
+    out[f"{prefix}/{name}_max"] = max(values)
+    if include_total:
+        out[f"{prefix}/{name}_total"] = sum(values)
+
+
+def _strict_telemetry_equal(left: Any, right: Any) -> bool:
+    """Compare bounded telemetry without Python's ``True == 1`` coercion."""
+
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, dict) or isinstance(right, dict):
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return False
+        return left.keys() == right.keys() and all(
+            _strict_telemetry_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+        if type(left) is not type(right):
+            return False
+        return len(left) == len(right) and all(
+            _strict_telemetry_equal(left_value, right_value)
+            for left_value, right_value in zip(left, right, strict=True)
+        )
+    return left == right
+
+
+def _spilot_router_metrics(
+    sessions: dict[str, dict[str, Any]],
+    session_rewards: dict[str, float],
+    session_evaluations: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, float]:
+    """Aggregate bounded Router telemetry with one vote per session.
+
+    Model identities are deliberately absent from metric names.  Slots are the
+    stable action vocabulary, while their per-episode mapping remains available
+    in trajectory metadata for offline analysis.
+    """
+    if not sessions:
+        return {}
+
+    prefix = "polar/spilot_router"
+    candidate_alias_pairs: set[tuple[str, str]] = set()
+    for metadata in sessions.values():
+        slot_mapping = metadata.get("slot_mapping")
+        if not isinstance(slot_mapping, dict):
+            continue
+        aliases = [
+            candidate.get("model")
+            for candidate in slot_mapping.values()
+            if isinstance(candidate, dict)
+            and isinstance(candidate.get("model"), str)
+            and candidate.get("model")
+        ]
+        if len(aliases) == 2 and len(set(aliases)) == 2:
+            candidate_alias_pairs.add(tuple(sorted(aliases)))
+    # Candidate labels are meaningful only if the entire accepted batch uses
+    # one canonical pair.  A mixed pair must not silently relabel a model as
+    # C0/C1 and blend incomparable candidate aggregates.
+    canonical_candidate_aliases = (
+        next(iter(candidate_alias_pairs)) if len(candidate_alias_pairs) == 1 else None
+    )
+    action_valid_sessions = 0
+    submitted_sessions = 0
+    route_counts = {"M0": 0, "M1": 0}
+    verify_counts = {"M0": 0, "M1": 0}
+    route_candidate_counts = {"C0": 0, "C1": 0}
+    verify_candidate_counts = {"C0": 0, "C1": 0}
+    direct_submit_sessions = 0
+    pool_call_count = 0
+    pool_unattributed_call_count = 0
+    pool_status_counts = {"completed": 0, "failed": 0, "timeout": 0}
+    pool_status_candidate_counts = {
+        candidate: {"completed": 0, "failed": 0, "timeout": 0} for candidate in ("C0", "C1")
+    }
+    pool_duration_ms_by_candidate: dict[str, list[float]] = {
+        "C0": [],
+        "C1": [],
+    }
+    pool_costs: list[float] = []
+    pool_costs_by_candidate: dict[str, list[float]] = {"C0": [], "C1": []}
+    pool_costs_by_role: dict[str, list[float]] = {"solve": [], "verify": [], "continue": []}
+    pool_unattributed_cost = 0.0
+    admission_wait_ms_by_candidate: dict[str, list[float]] = {
+        "C0": [],
+        "C1": [],
+    }
+    total_cost = 0.0
+    admission_session_count = 0
+    admission_waits_ms: list[float] = []
+    admission_waited_session_count = 0
+    admission_local_caps: list[float] = []
+    admission_failure_count = 0
+    admission_failure_candidate_counts = {"C0": 0, "C1": 0}
+    admission_failure_wait_ms_by_candidate: dict[str, list[float]] = {
+        "C0": [],
+        "C1": [],
+    }
+    admission_fatal_retained_session_count = 0
+    admission_node_health_accounted_session_count = 0
+    admission_node_healthy_session_count = 0
+    initial_slot_by_session: dict[str, str] = {}
+    initial_candidate_by_session: dict[str, str] = {}
+    accuracy_outcome_by_session: dict[str, float] = {}
+    total_cost_by_session: dict[str, float] = {}
+    cost_penalty_fraction_by_session: dict[str, float] = {}
+    cost_penalty_reward_delta_by_session: dict[str, float] = {}
+    total_latency_seconds_by_session: dict[str, float] = {}
+    latency_penalty_fraction_by_session: dict[str, float] = {}
+    latency_penalty_reward_delta_by_session: dict[str, float] = {}
+
+    for session_id, metadata in sessions.items():
+        admission_enabled = metadata.get("admission_enabled") is True
+        if admission_enabled:
+            admission_session_count += 1
+            admission_wait_ms = _optional_nonnegative_finite_float(
+                metadata.get("admission_wait_ms")
+            )
+            if admission_wait_ms is not None:
+                admission_waits_ms.append(admission_wait_ms)
+                if admission_wait_ms > 0:
+                    admission_waited_session_count += 1
+            fatal_retained = metadata.get("admission_fatal_retained") is True
+            if fatal_retained:
+                admission_fatal_retained_session_count += 1
+            node_healthy = metadata.get("admission_node_healthy")
+            if node_healthy is True or node_healthy is False:
+                admission_node_health_accounted_session_count += 1
+            # Missing health telemetry is unknown, never an implicit healthy
+            # vote. This keeps partially written/legacy metadata fail closed.
+            if node_healthy is True:
+                admission_node_healthy_session_count += 1
+
+        if metadata.get("action_valid") is True:
+            action_valid_sessions += 1
+        if metadata.get("submitted") is True:
+            submitted_sessions += 1
+
+        parsed_cost = _optional_nonnegative_finite_float(metadata.get("total_cost"))
+        if parsed_cost is not None:
+            total_cost += parsed_cost
+            total_cost_by_session[session_id] = parsed_cost
+
+        evaluation = (
+            session_evaluations.get(session_id) if isinstance(session_evaluations, dict) else None
+        )
+        if isinstance(evaluation, dict):
+            accuracy_outcome = _optional_unit_interval_float(
+                evaluation.get("harbor_outcome_reward")
+            )
+            if accuracy_outcome is not None:
+                accuracy_outcome_by_session[session_id] = accuracy_outcome
+            cost_penalty_fraction = _optional_unit_interval_float(
+                evaluation.get("applied_cost_penalty")
+            )
+            if cost_penalty_fraction is not None:
+                cost_penalty_fraction_by_session[session_id] = cost_penalty_fraction
+            if accuracy_outcome is not None and cost_penalty_fraction is not None:
+                cost_penalty_reward_delta_by_session[session_id] = (
+                    accuracy_outcome * cost_penalty_fraction
+                )
+            total_latency_seconds = _optional_nonnegative_finite_float(
+                evaluation.get("total_latency_seconds")
+            )
+            if total_latency_seconds is not None:
+                total_latency_seconds_by_session[session_id] = total_latency_seconds
+            latency_penalty_fraction = _optional_unit_interval_float(
+                evaluation.get("applied_latency_penalty")
+            )
+            if latency_penalty_fraction is not None:
+                latency_penalty_fraction_by_session[session_id] = (
+                    latency_penalty_fraction
+                )
+            if accuracy_outcome is not None and latency_penalty_fraction is not None:
+                latency_penalty_reward_delta_by_session[session_id] = (
+                    accuracy_outcome * latency_penalty_fraction
+                )
+
+        candidate_by_slot: dict[str, str] = {}
+        candidate_by_alias: dict[str, str] = {}
+        slot_mapping = metadata.get("slot_mapping")
+        if isinstance(slot_mapping, dict):
+            aliases_by_slot: dict[str, str] = {}
+            for raw_slot, raw_candidate in slot_mapping.items():
+                if not isinstance(raw_candidate, dict):
+                    continue
+                alias = raw_candidate.get("model")
+                if isinstance(alias, str) and alias:
+                    aliases_by_slot[str(raw_slot).upper()] = alias
+            # Candidate labels are stable under the per-episode M0/M1 shuffle:
+            # C0 is the lexicographically first model alias, C1 the second.
+            # Duplicate aliases cannot be disambiguated safely, so omit their
+            # candidate-level attribution while retaining slot diagnostics.
+            sorted_aliases = tuple(sorted(set(aliases_by_slot.values())))
+            if (
+                len(sorted_aliases) == 2
+                and len(aliases_by_slot) == 2
+                and sorted_aliases == canonical_candidate_aliases
+            ):
+                candidate_by_alias = {
+                    alias: f"C{index}" for index, alias in enumerate(sorted_aliases)
+                }
+                candidate_by_slot = {
+                    slot: candidate_by_alias[alias]
+                    for slot, alias in aliases_by_slot.items()
+                    if alias in candidate_by_alias
+                }
+
+        admission_failure = metadata.get("admission_failure")
+        if admission_enabled and isinstance(admission_failure, dict):
+            admission_failure_count += 1
+            failure_model = admission_failure.get("model")
+            failure_candidate = (
+                candidate_by_alias.get(failure_model) if isinstance(failure_model, str) else None
+            )
+            if failure_candidate in admission_failure_candidate_counts:
+                admission_failure_candidate_counts[failure_candidate] += 1
+                failure_wait_ms = _optional_nonnegative_finite_float(
+                    admission_failure.get("wait_ms")
+                )
+                if failure_wait_ms is not None:
+                    admission_failure_wait_ms_by_candidate[failure_candidate].append(
+                        failure_wait_ms
+                    )
+
+        actions = metadata.get("actions")
+        if isinstance(actions, list):
+            initial_route: dict[str, Any] | None = None
+            submit_seen = False
+            verify_action: dict[str, Any] | None = None
+            for action in actions:
+                if not isinstance(action, dict) or action.get("valid") is not True:
+                    continue
+                action_name = str(action.get("action") or "").upper()
+                if action_name == "ROUTE" and initial_route is None:
+                    initial_route = action
+                elif action_name == "VERIFY" and verify_action is None:
+                    verify_action = action
+                elif action_name == "SUBMIT":
+                    submit_seen = True
+
+            if initial_route is not None:
+                slot = str(initial_route.get("model_slot") or "").upper()
+                if slot in route_counts:
+                    route_counts[slot] += 1
+                    initial_slot_by_session[session_id] = slot
+                    candidate = candidate_by_slot.get(slot)
+                    if candidate in route_candidate_counts:
+                        route_candidate_counts[candidate] += 1
+                        initial_candidate_by_session[session_id] = candidate
+            if verify_action is not None:
+                slot = str(verify_action.get("model_slot") or "").upper()
+                if slot in verify_counts:
+                    verify_counts[slot] += 1
+                    candidate = candidate_by_slot.get(slot)
+                    if candidate in verify_candidate_counts:
+                        verify_candidate_counts[candidate] += 1
+            if submit_seen:
+                direct_submit_sessions += 1
+
+        calls = metadata.get("calls")
+        if isinstance(calls, list):
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                pool_call_count += 1
+                status = str(call.get("status") or "").lower()
+                if status in pool_status_counts:
+                    pool_status_counts[status] += 1
+                call_model = call.get("model")
+                call_slot = str(call.get("slot") or "").upper()
+                model_candidate = (
+                    candidate_by_alias.get(call_model) if isinstance(call_model, str) else None
+                )
+                slot_candidate = candidate_by_slot.get(call_slot)
+                call_candidate = (
+                    model_candidate
+                    if model_candidate is not None and model_candidate == slot_candidate
+                    else None
+                )
+                if call_candidate in pool_status_candidate_counts:
+                    if status in pool_status_counts:
+                        pool_status_candidate_counts[call_candidate][status] += 1
+                    duration_ms = _optional_nonnegative_finite_float(call.get("duration_ms"))
+                    if duration_ms is not None:
+                        pool_duration_ms_by_candidate[call_candidate].append(duration_ms)
+                    call_admission_wait_ms = _optional_nonnegative_finite_float(
+                        call.get("admission_wait_ms")
+                    )
+                    if call_admission_wait_ms is not None:
+                        admission_wait_ms_by_candidate[call_candidate].append(
+                            call_admission_wait_ms
+                        )
+                else:
+                    pool_unattributed_call_count += 1
+                call_cost = _optional_nonnegative_finite_float(call.get("cost"))
+                if call_cost is not None:
+                    pool_costs.append(call_cost)
+                    if call_candidate in pool_costs_by_candidate:
+                        pool_costs_by_candidate[call_candidate].append(call_cost)
+                    else:
+                        pool_unattributed_cost += call_cost
+                    call_role = str(call.get("role") or "").lower()
+                    if call_role in pool_costs_by_role:
+                        pool_costs_by_role[call_role].append(call_cost)
+                if admission_enabled:
+                    local_cap = _optional_nonnegative_finite_float(call.get("admission_local_cap"))
+                    if local_cap is not None and local_cap > 0:
+                        admission_local_caps.append(local_cap)
+
+    session_count = len(sessions)
+    metrics: dict[str, float] = {
+        f"{prefix}/session_count": float(session_count),
+        f"{prefix}/action_valid_count": float(action_valid_sessions),
+        f"{prefix}/action_valid_fraction": action_valid_sessions / session_count,
+        f"{prefix}/submitted_count": float(submitted_sessions),
+        f"{prefix}/submitted_fraction": submitted_sessions / session_count,
+        f"{prefix}/candidate_alias_pair_count": float(len(candidate_alias_pairs)),
+        f"{prefix}/candidate_alias_pair_conflict": float(len(candidate_alias_pairs) > 1),
+        f"{prefix}/route_m0_count": float(route_counts["M0"]),
+        f"{prefix}/route_m1_count": float(route_counts["M1"]),
+        f"{prefix}/verify_m0_count": float(verify_counts["M0"]),
+        f"{prefix}/verify_m1_count": float(verify_counts["M1"]),
+        f"{prefix}/route_candidate_c0_count": float(route_candidate_counts["C0"]),
+        f"{prefix}/route_candidate_c1_count": float(route_candidate_counts["C1"]),
+        f"{prefix}/verify_candidate_c0_count": float(verify_candidate_counts["C0"]),
+        f"{prefix}/verify_candidate_c1_count": float(verify_candidate_counts["C1"]),
+        f"{prefix}/direct_submit_count": float(direct_submit_sessions),
+        f"{prefix}/pool_call_count": float(pool_call_count),
+        f"{prefix}/pool_unattributed_call_count": float(pool_unattributed_call_count),
+        f"{prefix}/pool_completed_count": float(pool_status_counts["completed"]),
+        f"{prefix}/pool_failed_count": float(pool_status_counts["failed"]),
+        f"{prefix}/pool_timeout_count": float(pool_status_counts["timeout"]),
+        f"{prefix}/pool_cost_accounted_call_count": float(len(pool_costs)),
+        f"{prefix}/pool_cost_total": sum(pool_costs),
+        f"{prefix}/pool_unattributed_cost_total": pool_unattributed_cost,
+        f"{prefix}/pool_cost_reconciliation_delta": total_cost - sum(pool_costs),
+        f"{prefix}/total_cost": total_cost,
+        f"{prefix}/admission_session_count": float(admission_session_count),
+        f"{prefix}/admission_wait_ms_total": sum(admission_waits_ms),
+        f"{prefix}/admission_wait_accounted_session_count": float(len(admission_waits_ms)),
+        f"{prefix}/admission_waited_session_count": float(admission_waited_session_count),
+        f"{prefix}/admission_fatal_retained_session_count": float(
+            admission_fatal_retained_session_count
+        ),
+        f"{prefix}/admission_failure_count": float(admission_failure_count),
+        f"{prefix}/admission_node_health_accounted_session_count": float(
+            admission_node_health_accounted_session_count
+        ),
+        f"{prefix}/admission_node_healthy_session_count": float(
+            admission_node_healthy_session_count
+        ),
+    }
+    if admission_waits_ms:
+        metrics[f"{prefix}/admission_wait_ms_mean"] = sum(admission_waits_ms) / len(
+            admission_waits_ms
+        )
+        metrics[f"{prefix}/admission_wait_ms_max"] = max(admission_waits_ms)
+    if admission_session_count:
+        metrics[f"{prefix}/admission_waited_session_fraction"] = (
+            admission_waited_session_count / admission_session_count
+        )
+        metrics[f"{prefix}/admission_fatal_retained_session_fraction"] = (
+            admission_fatal_retained_session_count / admission_session_count
+        )
+        metrics[f"{prefix}/admission_node_healthy_session_fraction"] = (
+            admission_node_healthy_session_count / admission_session_count
+        )
+        metrics[f"{prefix}/admission_node_health_accounted_session_fraction"] = (
+            admission_node_health_accounted_session_count / admission_session_count
+        )
+    if admission_local_caps:
+        metrics[f"{prefix}/admission_local_cap_observation_count"] = float(
+            len(admission_local_caps)
+        )
+        metrics[f"{prefix}/admission_local_cap_mean"] = sum(admission_local_caps) / len(
+            admission_local_caps
+        )
+        metrics[f"{prefix}/admission_local_cap_min"] = min(admission_local_caps)
+        metrics[f"{prefix}/admission_local_cap_max"] = max(admission_local_caps)
+
+    decomposed_metrics = {
+        "accuracy_outcome": accuracy_outcome_by_session,
+        "total_cost": total_cost_by_session,
+        "cost_penalty_fraction": cost_penalty_fraction_by_session,
+        "cost_penalty_reward_delta": cost_penalty_reward_delta_by_session,
+        "cost_adjusted_reward": session_rewards,
+        "total_latency_seconds": total_latency_seconds_by_session,
+        "latency_penalty_fraction": latency_penalty_fraction_by_session,
+        "latency_penalty_reward_delta": latency_penalty_reward_delta_by_session,
+    }
+    for metric_name, values_by_session in decomposed_metrics.items():
+        values = [
+            values_by_session[session_id]
+            for session_id in sessions
+            if session_id in values_by_session
+        ]
+        _add_session_distribution_metrics(
+            metrics,
+            prefix,
+            metric_name,
+            values,
+            include_total=metric_name in {"total_cost", "cost_penalty_reward_delta"},
+        )
+    accuracy_outcomes = list(accuracy_outcome_by_session.values())
+    metrics[f"{prefix}/accuracy_outcome_positive_count"] = float(
+        sum(value > 0.0 for value in accuracy_outcomes)
+    )
+    if accuracy_outcomes:
+        metrics[f"{prefix}/accuracy_outcome_positive_fraction"] = sum(
+            value > 0.0 for value in accuracy_outcomes
+        ) / len(accuracy_outcomes)
+
+    for breakdown_name, initial_by_session in (
+        ("m0", {key: value for key, value in initial_slot_by_session.items() if value == "M0"}),
+        ("m1", {key: value for key, value in initial_slot_by_session.items() if value == "M1"}),
+        (
+            "candidate_c0",
+            {key: value for key, value in initial_candidate_by_session.items() if value == "C0"},
+        ),
+        (
+            "candidate_c1",
+            {key: value for key, value in initial_candidate_by_session.items() if value == "C1"},
+        ),
+    ):
+        for metric_name, values_by_session in decomposed_metrics.items():
+            values = [
+                values_by_session[session_id]
+                for session_id in initial_by_session
+                if session_id in values_by_session
+            ]
+            metrics[f"{prefix}/{metric_name}_{breakdown_name}_accounted_session_count"] = float(
+                len(values)
+            )
+            if values:
+                metrics[f"{prefix}/{metric_name}_{breakdown_name}_mean"] = sum(values) / len(
+                    values
+                )
+
+    for candidate in ("C0", "C1"):
+        candidate_name = candidate.lower()
+        metrics[f"{prefix}/admission_failure_candidate_{candidate_name}_count"] = float(
+            admission_failure_candidate_counts[candidate]
+        )
+        failure_waits = admission_failure_wait_ms_by_candidate[candidate]
+        metrics[f"{prefix}/admission_failure_wait_candidate_{candidate_name}_accounted_count"] = (
+            float(len(failure_waits))
+        )
+        if failure_waits:
+            metrics[f"{prefix}/admission_failure_wait_candidate_{candidate_name}_mean_ms"] = sum(
+                failure_waits
+            ) / len(failure_waits)
+            metrics[f"{prefix}/admission_failure_wait_candidate_{candidate_name}_max_ms"] = max(
+                failure_waits
+            )
+        for status in ("completed", "failed", "timeout"):
+            metrics[f"{prefix}/pool_{status}_candidate_{candidate_name}_count"] = float(
+                pool_status_candidate_counts[candidate][status]
+            )
+        candidate_durations = pool_duration_ms_by_candidate[candidate]
+        metrics[f"{prefix}/pool_duration_candidate_{candidate_name}_count"] = float(
+            len(candidate_durations)
+        )
+        if candidate_durations:
+            metrics[f"{prefix}/pool_duration_candidate_{candidate_name}_mean_ms"] = sum(
+                candidate_durations
+            ) / len(candidate_durations)
+            metrics[f"{prefix}/pool_duration_candidate_{candidate_name}_max_ms"] = max(
+                candidate_durations
+            )
+        candidate_admission_waits = admission_wait_ms_by_candidate[candidate]
+        metrics[f"{prefix}/admission_wait_candidate_{candidate_name}_accounted_count"] = float(
+            len(candidate_admission_waits)
+        )
+        if candidate_admission_waits:
+            metrics[f"{prefix}/admission_wait_candidate_{candidate_name}_mean_ms"] = sum(
+                candidate_admission_waits
+            ) / len(candidate_admission_waits)
+            metrics[f"{prefix}/admission_wait_candidate_{candidate_name}_max_ms"] = max(
+                candidate_admission_waits
+            )
+        candidate_costs = pool_costs_by_candidate[candidate]
+        metrics[f"{prefix}/pool_cost_candidate_{candidate_name}_accounted_call_count"] = float(
+            len(candidate_costs)
+        )
+        metrics[f"{prefix}/pool_cost_candidate_{candidate_name}_total"] = sum(candidate_costs)
+        if candidate_costs:
+            metrics[f"{prefix}/pool_cost_candidate_{candidate_name}_mean"] = sum(
+                candidate_costs
+            ) / len(candidate_costs)
+
+    for role, role_costs in pool_costs_by_role.items():
+        metrics[f"{prefix}/pool_cost_{role}_accounted_call_count"] = float(len(role_costs))
+        metrics[f"{prefix}/pool_cost_{role}_total"] = sum(role_costs)
+        if role_costs:
+            metrics[f"{prefix}/pool_cost_{role}_mean"] = sum(role_costs) / len(role_costs)
+
+    router_rewards = [
+        session_rewards[session_id] for session_id in sessions if session_id in session_rewards
+    ]
+    metrics[f"{prefix}/reward_accounted_session_count"] = float(len(router_rewards))
+    if router_rewards:
+        metrics[f"{prefix}/reward_mean"] = sum(router_rewards) / len(router_rewards)
+
+    for slot in ("M0", "M1"):
+        slot_rewards = [
+            session_rewards[session_id]
+            for session_id, initial_slot in initial_slot_by_session.items()
+            if initial_slot == slot and session_id in session_rewards
+        ]
+        slot_name = slot.lower()
+        metrics[f"{prefix}/reward_{slot_name}_accounted_session_count"] = float(len(slot_rewards))
+        if slot_rewards:
+            metrics[f"{prefix}/reward_{slot_name}_mean"] = sum(slot_rewards) / len(slot_rewards)
+
+    for candidate in ("C0", "C1"):
+        candidate_rewards = [
+            session_rewards[session_id]
+            for session_id, initial_candidate in initial_candidate_by_session.items()
+            if initial_candidate == candidate and session_id in session_rewards
+        ]
+        candidate_name = candidate.lower()
+        metrics[f"{prefix}/reward_candidate_{candidate_name}_count"] = float(
+            len(candidate_rewards)
+        )
+        if candidate_rewards:
+            metrics[f"{prefix}/reward_candidate_{candidate_name}_mean"] = sum(
+                candidate_rewards
+            ) / len(candidate_rewards)
+
+    return metrics
 
 
 def _polar_extra_metrics(
@@ -3424,12 +5531,15 @@ def _polar_extra_metrics(
     timeout_agent_postprocess_sessions: set[str] = set()
     early_stop_cancelled_sessions: set[str] = set()
     early_stop_elapsed_ms: list[float] = []
-    session_effective_response_lengths: dict[str, float] = {}
-    session_raw_response_lengths: dict[str, float] = {}
+    session_trainable_response_tokens: dict[str, float] = {}
+    session_raw_response_tokens: dict[str, float] = {}
     session_real_trace_counts: dict[str, int] = {}
     session_truncated_trace_counts: dict[str, int] = {}
     session_agent_timeout_trace_counts: dict[str, int] = {}
     session_status_buckets: dict[str, str] = {}
+    spilot_router_sessions: dict[str, dict[str, Any]] = {}
+    spilot_router_evaluations: dict[str, dict[str, Any]] = {}
+    spilot_router_conflicting_sessions: set[str] = set()
     trainable_traces = 0
     trajectory_rewards_by_group: dict[Any, dict[Any, list[float]]] = {}
     for sample in flat_samples:
@@ -3494,18 +5604,53 @@ def _polar_extra_metrics(
         is_placeholder = bool(polar_meta.get("placeholder"))
         if not session_key:
             continue
+        trajectory_metadata = polar_meta.get("trajectory_metadata")
+        evaluation = (
+            trajectory_metadata.get("evaluation")
+            if isinstance(trajectory_metadata, dict)
+            else None
+        )
+        router_metadata = evaluation.get("spilot_router") if isinstance(evaluation, dict) else None
+        if (
+            isinstance(router_metadata, dict)
+            and session_key not in spilot_router_conflicting_sessions
+        ):
+            previous_router = spilot_router_sessions.get(session_key)
+            previous_evaluation = spilot_router_evaluations.get(session_key)
+            evaluation_fields = {
+                field: evaluation.get(field)
+                for field in ("harbor_outcome_reward", "applied_cost_penalty")
+            }
+            previous_evaluation_fields = (
+                {
+                    field: previous_evaluation.get(field)
+                    for field in ("harbor_outcome_reward", "applied_cost_penalty")
+                }
+                if isinstance(previous_evaluation, dict)
+                else None
+            )
+            if previous_router is None:
+                spilot_router_sessions[session_key] = router_metadata
+                spilot_router_evaluations[session_key] = evaluation
+            elif not _strict_telemetry_equal(
+                previous_router, router_metadata
+            ) or not _strict_telemetry_equal(previous_evaluation_fields, evaluation_fields):
+                # Conflicting trace copies are unsafe for one-session-one-vote
+                # telemetry. Omit the whole session rather than selecting an
+                # arbitrary first trace based on arrival order.
+                spilot_router_sessions.pop(session_key, None)
+                spilot_router_evaluations.pop(session_key, None)
+                spilot_router_conflicting_sessions.add(session_key)
         status_bucket = _session_status_bucket(session_status)
         if session_status_buckets.get(session_key, "unknown") == "unknown":
             session_status_buckets[session_key] = status_bucket
         if not is_placeholder:
-            session_effective_response_lengths[session_key] = (
-                session_effective_response_lengths.get(session_key, 0.0)
-                + _sample_effective_response_length(sample)
-            )
-            session_raw_response_lengths[session_key] = (
-                session_raw_response_lengths.get(session_key, 0.0)
-                + _nonnegative_finite_float(getattr(sample, "response_length", 0))
-            )
+            session_trainable_response_tokens[session_key] = session_trainable_response_tokens.get(
+                session_key, 0.0
+            ) + _sample_trainable_response_tokens(sample)
+            session_raw_response_tokens[session_key] = session_raw_response_tokens.get(
+                session_key, 0.0
+            ) + _nonnegative_finite_float(getattr(sample, "response_length", 0))
             session_real_trace_counts[session_key] = (
                 session_real_trace_counts.get(session_key, 0) + 1
             )
@@ -3634,7 +5779,8 @@ def _polar_extra_metrics(
         # diagnostic name. It is not an exchangeable GRPO outcome: a session
         # can emit multiple traces, while an early-stop cancellation emits a
         # synthetic zero-gradient placeholder.
-        out["polar/reward_mean_all_samples"] = sum(rewards) / len(rewards)
+        safe_rewards = [_finite_float_or_zero(reward) for reward in rewards]
+        out["polar/reward_mean_all_samples"] = sum(safe_rewards) / len(safe_rewards)
     completed_session_rewards_by_key = {
         session_id: sum(trace_rewards) / len(trace_rewards)
         for session_id, trace_rewards in completed_session_trace_rewards.items()
@@ -3649,8 +5795,18 @@ def _polar_extra_metrics(
     accounted_session_rewards_by_key.update(agent_timeout_session_rewards_by_key)
     for session_id in trusted_model_failure_sessions:
         accounted_session_rewards_by_key.setdefault(session_id, 0.0)
+    out.update(
+        _spilot_router_metrics(
+            spilot_router_sessions,
+            accounted_session_rewards_by_key,
+            spilot_router_evaluations,
+        )
+    )
+    if spilot_router_sessions or spilot_router_conflicting_sessions:
+        out["polar/spilot_router/telemetry_conflict_session_count"] = float(
+            len(spilot_router_conflicting_sessions)
+        )
     completed_session_rewards = list(completed_session_rewards_by_key.values())
-    agent_timeout_session_rewards = list(agent_timeout_session_rewards_by_key.values())
     accounted_session_rewards = list(accounted_session_rewards_by_key.values())
     if completed_session_rewards:
         reward_mean_completed = sum(completed_session_rewards) / len(completed_session_rewards)
@@ -3678,33 +5834,32 @@ def _polar_extra_metrics(
             )
         )
 
-    length_session_ids = set(session_effective_response_lengths) - early_stop_cancelled_sessions
+    length_session_ids = set(session_trainable_response_tokens) - early_stop_cancelled_sessions
     if length_session_ids:
         ordered_length_session_ids = sorted(length_session_ids)
         effective_lengths = [
-            session_effective_response_lengths[session_id]
+            session_trainable_response_tokens[session_id]
             for session_id in ordered_length_session_ids
         ]
         raw_lengths = [
-            session_raw_response_lengths[session_id]
-            for session_id in ordered_length_session_ids
+            session_raw_response_tokens[session_id] for session_id in ordered_length_session_ids
         ]
         _add_distribution_metrics(
             out,
-            "polar/session_response_len",
+            "polar/session_trainable_response_tokens",
             effective_lengths,
             include_count=True,
         )
-        _add_distribution_metrics(out, "polar/session_raw_response_len", raw_lengths)
+        _add_distribution_metrics(out, "polar/session_raw_response_tokens", raw_lengths)
 
         for status_bucket in ("completed", "timeout", "error", "unknown"):
             status_lengths = [
-                session_effective_response_lengths[session_id]
+                session_trainable_response_tokens[session_id]
                 for session_id in ordered_length_session_ids
                 if session_status_buckets.get(session_id, "unknown") == status_bucket
             ]
             if status_lengths:
-                out[f"polar/session_response_len/by_status/{status_bucket}_mean"] = (
+                out[f"polar/session_trainable_response_tokens/by_status/{status_bucket}_mean"] = (
                     sum(status_lengths) / len(status_lengths)
                 )
 
@@ -3712,8 +5867,7 @@ def _polar_extra_metrics(
             session_real_trace_counts[session_id] for session_id in length_session_ids
         )
         truncated_trace_count = sum(
-            session_truncated_trace_counts.get(session_id, 0)
-            for session_id in length_session_ids
+            session_truncated_trace_counts.get(session_id, 0) for session_id in length_session_ids
         )
         agent_timeout_trace_count = sum(
             session_agent_timeout_trace_counts.get(session_id, 0)
@@ -3727,8 +5881,8 @@ def _polar_extra_metrics(
                 agent_timeout_trace_count / real_trace_count
             )
             out["polar/trace_truncation/non_agent_timeout_fraction"] = (
-                (truncated_trace_count - agent_timeout_trace_count) / real_trace_count
-            )
+                truncated_trace_count - agent_timeout_trace_count
+            ) / real_trace_count
 
         truncated_session_ids = {
             session_id
@@ -3740,11 +5894,10 @@ def _polar_extra_metrics(
             for session_id in length_session_ids
             if session_agent_timeout_trace_counts.get(session_id, 0) > 0
         }
-        non_agent_timeout_session_ids = (
-            truncated_session_ids - agent_timeout_truncated_session_ids
-        )
+        non_agent_timeout_session_ids = truncated_session_ids - agent_timeout_truncated_session_ids
         length_session_count = len(length_session_ids)
-        out["polar/session_truncation/count"] = float(length_session_count)
+        out["polar/session_truncation/session_count"] = float(length_session_count)
+        out["polar/session_truncation/truncated_count"] = float(len(truncated_session_ids))
         out["polar/session_truncation/truncated_fraction"] = (
             len(truncated_session_ids) / length_session_count
         )
@@ -3807,11 +5960,11 @@ def _polar_extra_metrics(
                     len(session_ids) / accounted_session_count
                 )
             outcome_lengths = [
-                session_effective_response_lengths[session_id]
+                session_trainable_response_tokens[session_id]
                 for session_id in session_ids & length_session_ids
             ]
             if outcome_lengths:
-                out[f"polar/session_response_len/by_outcome/{outcome_name}_mean"] = (
+                out[f"polar/session_trainable_response_tokens/by_outcome/{outcome_name}_mean"] = (
                     sum(outcome_lengths) / len(outcome_lengths)
                 )
     if policy_staleness:
@@ -3865,9 +6018,7 @@ def _polar_extra_metrics(
         trainable_timeout_sessions = attempted_terminal_timeouts & trainable_sessions
         masked_timeout_sessions = attempted_terminal_timeouts - trainable_timeout_sessions
         out["polar/rollout_attempted_sessions"] = float(len(attempted_sessions))
-        out["polar/rollout_attempted_session_fraction"] = (
-            len(attempted_sessions) / total_sessions
-        )
+        out["polar/rollout_attempted_session_fraction"] = len(attempted_sessions) / total_sessions
         out["polar/rollout_trainable_sessions"] = float(len(attempted_trainable_sessions))
         out["polar/rollout_fully_masked_sessions"] = float(len(fully_masked_sessions))
         out["polar/terminal_timeout_sessions"] = float(len(attempted_terminal_timeouts))
@@ -3881,11 +6032,11 @@ def _polar_extra_metrics(
         out["polar/timeout_trainable_sessions"] = float(len(trainable_timeout_sessions))
         out["polar/timeout_masked_sessions"] = float(len(masked_timeout_sessions))
         if attempted_sessions:
-            out["polar/rollout_trainable_session_fraction"] = (
-                len(attempted_trainable_sessions) / len(attempted_sessions)
-            )
-            out["polar/rollout_fully_masked_session_fraction"] = (
-                len(fully_masked_sessions) / len(attempted_sessions)
+            out["polar/rollout_trainable_session_fraction"] = len(
+                attempted_trainable_sessions
+            ) / len(attempted_sessions)
+            out["polar/rollout_fully_masked_session_fraction"] = len(fully_masked_sessions) / len(
+                attempted_sessions
             )
             failed_attempted_sessions = {
                 session_id
@@ -3896,9 +6047,7 @@ def _polar_extra_metrics(
             failed_attempted_sessions |= attempted_terminal_errors
             successful_sessions = attempted_sessions - failed_attempted_sessions
             out["polar/rollout_successful_sessions"] = float(len(successful_sessions))
-            out["polar/rollout_success_rate"] = (
-                len(successful_sessions) / len(attempted_sessions)
-            )
+            out["polar/rollout_success_rate"] = len(successful_sessions) / len(attempted_sessions)
             out["polar/training_filter/parser_invalid_session_fraction"] = len(
                 parser_invalid_sessions & attempted_sessions
             ) / len(attempted_sessions)
@@ -3918,6 +6067,47 @@ def _polar_extra_metrics(
         graded_sessions = len(session_report)
         resolved = sum(1 for r in session_report.values() if r.get("resolved"))
         out["polar/resolved_rate"] = resolved / graded_sessions
+    # Realized keep/escalate/deescalate distribution across controller traces.
+    # Emitted only when a builder stamped actions, so this is inert otherwise.
+    action_counts = {action: 0 for action in ("keep", "escalate", "deescalate")}
+    for sample in flat_samples:
+        polar_meta = sample.metadata.get("polar", {})
+        trace_metadata = polar_meta.get("trace_metadata") if isinstance(polar_meta, dict) else None
+        action = trace_metadata.get("controller_actual_action") if isinstance(trace_metadata, dict) else None
+        if action in action_counts:
+            action_counts[action] += 1
+    action_total = sum(action_counts.values())
+    if action_total:
+        out["polar/routing/actual_action_count/total"] = float(action_total)
+        for action, count in action_counts.items():
+            out[f"polar/routing/actual_action_count/{action}"] = float(count)
+            out[f"polar/routing/actual_action_ratio/{action}"] = count / action_total
+    # Mean GPT cost per trajectory, taken from the evaluation metadata's real
+    # spend (``gpt_cost_usd``). The ``negative_cost`` reward component is zeroed
+    # on every fail-closed path (parser-invalid, timeout, ERROR mask), so a
+    # session that burned real GPT money before failing would otherwise be
+    # recorded as $0 and understate the mean. Aggregate once per non-placeholder
+    # session (the outcome is broadcast to every trace).
+    cost_by_session: dict[str, float] = {}
+    for sample in flat_samples:
+        polar_meta = sample.metadata.get("polar", {})
+        if not isinstance(polar_meta, dict) or polar_meta.get("placeholder"):
+            continue
+        session_id = polar_meta.get("session_id")
+        if not session_id:
+            continue
+        trajectory_metadata = polar_meta.get("trajectory_metadata")
+        evaluation = (
+            trajectory_metadata.get("evaluation")
+            if isinstance(trajectory_metadata, dict)
+            else None
+        )
+        if isinstance(evaluation, dict) and "gpt_cost_usd" in evaluation:
+            cost_by_session[str(session_id)] = _finite_float_or_zero(evaluation["gpt_cost_usd"])
+    if cost_by_session:
+        out["polar/controller/cost_usd_mean"] = sum(cost_by_session.values()) / len(
+            cost_by_session
+        )
     return out
 
 
@@ -3932,11 +6122,25 @@ def _nonnegative_finite_float(value: Any) -> float:
 
 
 def _optional_nonnegative_finite_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
         parsed = float(value)
     except (TypeError, ValueError):
         return None
     if parsed < 0.0 or not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _optional_unit_interval_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0.0 or parsed > 1.0:
         return None
     return parsed
 
@@ -4017,5 +6221,13 @@ def _load_sample_type() -> Any:
 # on a custom rollout function. Stop speculative work before it finishes W&B
 # and releases the Ray actor.
 setattr(generate_rollout_polar_async, "dispose", stop_global_worker)
+# The paired weight-update hooks freeze new gateway-to-SGLang generations and
+# drain in-flight calls before Slime performs its destructive pause/cache flush.
+setattr(generate_rollout_polar_async, "pause_for_weight_update", pause_for_weight_update)
+setattr(
+    generate_rollout_polar_async,
+    "resume_after_weight_update",
+    resume_after_weight_update,
+)
 
 atexit.register(stop_global_worker)

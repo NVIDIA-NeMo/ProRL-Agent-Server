@@ -26,6 +26,7 @@ PROJECT_ROOT="${POLAR_TRAIN_PROJECT_ROOT:-$(cd -- "${SCRIPT_DIR}/../.." && pwd)}
 # shellcheck source=./launcher_utils.sh
 source "${SCRIPT_DIR}/launcher_utils.sh"
 RUN_DIR="${RUN_DIR:-${PROJECT_ROOT}/tmp/swegym_slime_grpo}"
+export WANDB_DIR="${WANDB_DIR:-${RUN_DIR}/wandb}"
 export POLAR_ROLLOUT_SAVE_DIR="${POLAR_ROLLOUT_SAVE_DIR:-${RUN_DIR}/rollout_results}"
 export POLAR_ROLLOUT_EXAMPLES_DIR="${POLAR_ROLLOUT_EXAMPLES_DIR:-${RUN_DIR}/trajectory_examples}"
 export POLAR_ROLLOUT_EXAMPLE_INTERVAL="${POLAR_ROLLOUT_EXAMPLE_INTERVAL:-10}"
@@ -35,6 +36,13 @@ case "${POLAR_ROLLOUT_SAVE_DIR}" in
     /*) ;;
     *)
         echo "ERROR: POLAR_ROLLOUT_SAVE_DIR must be absolute: ${POLAR_ROLLOUT_SAVE_DIR}" >&2
+        exit 1
+        ;;
+esac
+case "${WANDB_DIR}" in
+    /*) ;;
+    *)
+        echo "ERROR: WANDB_DIR must be absolute: ${WANDB_DIR}" >&2
         exit 1
         ;;
 esac
@@ -59,7 +67,7 @@ case "${POLAR_ROLLOUT_EXAMPLES_WANDB}" in
         export POLAR_ROLLOUT_EXAMPLES_WANDB=1
         ;;
 esac
-mkdir -p "${RUN_DIR}" "${PROJECT_ROOT}/logs"
+mkdir -p "${RUN_DIR}" "${WANDB_DIR}"
 if [[ "${POLAR_ROLLOUT_EXAMPLES_DIR}" = /* ]] && \
    ! mkdir -p "${POLAR_ROLLOUT_EXAMPLES_DIR}"; then
     echo "WARNING: could not create trajectory-example directory; training will continue" >&2
@@ -239,7 +247,47 @@ slurm_allocation_proxy_bypass_hosts() {
 
 # ── External deps ──────────────────────────────────────────────────
 SLIME_DIR="${SLIME_DIR:-${PROJECT_ROOT}/slime}"
-if [ ! -f "${SLIME_DIR}/train_async.py" ]; then
+TMAX_TRAIN_MODE="${TMAX_TRAIN_MODE:-fully_async}"
+TMAX_PROFILE_DISABLE_CHECKPOINT="${TMAX_PROFILE_DISABLE_CHECKPOINT:-0}"
+TRAIN_MODE_ARGS=()
+case "${TMAX_TRAIN_MODE}" in
+    fully_async)
+        SLIME_TRAIN_ENTRYPOINT="${SLIME_DIR}/train_async.py"
+        ;;
+    colocate)
+        SLIME_TRAIN_ENTRYPOINT="${SLIME_DIR}/train.py"
+        TRAIN_MODE_ARGS=(--colocate)
+        if [ "${POLAR_FULLY_ASYNC:-false}" != "false" ]; then
+            echo "ERROR: TMAX_TRAIN_MODE=colocate requires POLAR_FULLY_ASYNC=false" >&2
+            exit 1
+        fi
+        if [ -n "${SLIME_GRACEFUL_EXIT_AT_UNIX_TIME:-}" ]; then
+            echo "ERROR: TMAX_TRAIN_MODE=colocate does not support graceful lifecycle arguments" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "ERROR: TMAX_TRAIN_MODE must be fully_async or colocate, got ${TMAX_TRAIN_MODE}" >&2
+        exit 1
+        ;;
+esac
+
+# TorchMemorySaver is required by Slime's colocated train/rollout path and is
+# currently incompatible with CUDA allocator expandable segments. Keep the
+# existing fully-async allocator behavior, but select a compatible allocator
+# before constructing Ray's runtime environment for colocate. An explicit
+# TMAX_PYTORCH_ALLOC_CONF remains available for controlled experiments.
+TMAX_PYTORCH_ALLOC_CONF="$(polar_select_pytorch_allocator_config \
+    "${TMAX_TRAIN_MODE}" "${TMAX_PYTORCH_ALLOC_CONF:-}")" || exit 1
+echo "Using PyTorch allocator config: ${TMAX_PYTORCH_ALLOC_CONF}"
+case "${TMAX_PROFILE_DISABLE_CHECKPOINT}" in
+    0|1) ;;
+    *)
+        echo "ERROR: TMAX_PROFILE_DISABLE_CHECKPOINT must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
+if [ ! -f "${SLIME_TRAIN_ENTRYPOINT}" ]; then
     echo "ERROR: Slime not found at ${SLIME_DIR}"
     echo "  git clone git@github.com:THUDM/slime.git ${SLIME_DIR}"
     exit 1
@@ -263,6 +311,7 @@ fi
 HF_CHECKPOINT="${HF_CHECKPOINT:-Qwen/Qwen3.5-4B}"
 REF_LOAD="${REF_LOAD:-${PROJECT_ROOT}/tmp/checkpoints/Qwen3.5-4B_torch_dist}"
 RUN_ID="${RUN_ID:-swegym-slime-grpo-$(date -u +%Y%m%dT%H%M%SZ)}"
+export WANDB_RUN_ID="${WANDB_RUN_ID:-${RUN_ID}}"
 SAVE_ROOT="${SAVE_ROOT:-${PROJECT_ROOT}/tmp/ckpt/swegym_slime_grpo_qwen35_4b}"
 SAVE_DIR="${SAVE_DIR:-${SAVE_ROOT}/${RUN_ID}}"
 mkdir -p "$SAVE_DIR"
@@ -322,10 +371,10 @@ configure_resumed_checkpoint_eval_args() {
             return 1
             ;;
     esac
-    case "${TMAX_EVAL_ENABLED:-0}" in
+    case "${TMAX_TRAINING_EVAL_ENABLED:-${TMAX_EVAL_ENABLED:-0}}" in
         1|true) ;;
         *)
-            echo "ERROR: resumed-checkpoint eval requires TMAX_EVAL_ENABLED=1" >&2
+            echo "ERROR: resumed-checkpoint eval requires training-time eval (TMAX_TRAINING_EVAL_ENABLED=1)" >&2
             return 1
             ;;
     esac
@@ -451,6 +500,9 @@ export POLAR_REQUEST_TIMEOUT="${POLAR_REQUEST_TIMEOUT:-2400}"
 export POLAR_TASK_TIMEOUT_SECONDS="${POLAR_TASK_TIMEOUT_SECONDS:-2400}"
 export POLAR_MIN_COMPLETE_ACCEPT_FRACTION="${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.6}"
 export POLAR_EARLY_STOP_GRACE_SESSIONS="${POLAR_EARLY_STOP_GRACE_SESSIONS:-0}"
+export POLAR_CANDIDATE_POOL_HEALTH_GATE_ENABLED="${POLAR_CANDIDATE_POOL_HEALTH_GATE_ENABLED:-false}"
+export POLAR_CANDIDATE_POOL_HEALTH_MIN_OBSERVED_SESSIONS="${POLAR_CANDIDATE_POOL_HEALTH_MIN_OBSERVED_SESSIONS:-16}"
+export POLAR_CANDIDATE_POOL_HEALTH_MIN_COMPLETION_FRACTION="${POLAR_CANDIDATE_POOL_HEALTH_MIN_COMPLETION_FRACTION:-0.1}"
 export POLAR_MAX_INIT_WORKERS="${POLAR_MAX_INIT_WORKERS:-32}"
 export POLAR_MAX_RUN_WORKERS="${POLAR_MAX_RUN_WORKERS:-32}"
 export POLAR_MAX_POSTRUN_WORKERS="${POLAR_MAX_POSTRUN_WORKERS:-32}"
@@ -468,12 +520,17 @@ case "${POLAR_MULTI_GATEWAY:-0}" in
         ;;
 esac
 if [ "${POLAR_MULTI_GATEWAY}" = "1" ]; then
-    export POLAR_GATEWAY_COUNT="${RAY_NUM_NODES}"
+    export POLAR_GATEWAY_COUNT="${POLAR_GATEWAY_COUNT_OVERRIDE:-${RAY_NUM_NODES}}"
 else
-    export POLAR_GATEWAY_COUNT=1
+    export POLAR_GATEWAY_COUNT="${POLAR_GATEWAY_COUNT_OVERRIDE:-1}"
 fi
-if ! [[ "${POLAR_GATEWAY_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "ERROR: gateway count must be positive, got ${POLAR_GATEWAY_COUNT}" >&2
+if ! [[ "${POLAR_GATEWAY_COUNT}" =~ ^[1-9][0-9]*$ ]] || \
+   [ "${POLAR_GATEWAY_COUNT}" -gt "${RAY_NUM_NODES}" ]; then
+    echo "ERROR: gateway count must be in [1, RAY_NUM_NODES=${RAY_NUM_NODES}], got ${POLAR_GATEWAY_COUNT}" >&2
+    exit 1
+fi
+if [ "${POLAR_MULTI_GATEWAY}" != "1" ] && [ "${POLAR_GATEWAY_COUNT}" -ne 1 ]; then
+    echo "ERROR: POLAR_GATEWAY_COUNT_OVERRIDE>1 requires POLAR_MULTI_GATEWAY=1" >&2
     exit 1
 fi
 
@@ -537,6 +594,30 @@ for _polar_capacity_pair in \
 done
 unset _polar_capacity_pair _polar_total_name _polar_per_gateway_name \
     _polar_effective_total
+if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ]; then
+    if [ "${SPILOT_EPISODE_ADMISSION_ENABLED:-false}" = "true" ]; then
+        if [ "${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT:-0}" -ne "${POLAR_GATEWAY_COUNT}" ]; then
+            echo "ERROR: persisted SPilot admission gateway count ${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT:-unset} does not match runtime gateway count ${POLAR_GATEWAY_COUNT}" >&2
+            exit 1
+        fi
+        if [ $((SPILOT_QWEN_MAX_ACTIVE_EPISODES % POLAR_GATEWAY_COUNT)) -ne 0 ] || \
+           [ $((SPILOT_GPT_MAX_ACTIVE_EPISODES % POLAR_GATEWAY_COUNT)) -ne 0 ]; then
+            echo "ERROR: SPilot aggregate episode caps must be divisible by all ${POLAR_GATEWAY_COUNT} gateways" >&2
+            exit 1
+        fi
+        _spilot_qwen_runtime_local="$((SPILOT_QWEN_MAX_ACTIVE_EPISODES / POLAR_GATEWAY_COUNT))"
+        _spilot_gpt_runtime_local="$((SPILOT_GPT_MAX_ACTIVE_EPISODES / POLAR_GATEWAY_COUNT))"
+        if [ "${SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES}" -ne "${_spilot_qwen_runtime_local}" ] || \
+           [ "${SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES}" -ne "${_spilot_gpt_runtime_local}" ] || \
+           [ "${SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY}" -ne "${_spilot_qwen_runtime_local}" ] || \
+           [ "${SPILOT_GPT_GATEWAY_MAX_CONCURRENCY}" -ne "${_spilot_gpt_runtime_local}" ]; then
+            echo "ERROR: rendered SPilot HTTP/episode caps do not match the runtime gateway split" >&2
+            exit 1
+        fi
+        echo "Using SPilot episode admission: wait_budget=${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS}s aggregate(qwen/gpt)=${SPILOT_QWEN_MAX_ACTIVE_EPISODES}/${SPILOT_GPT_MAX_ACTIVE_EPISODES} effective=${SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES}/${SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES} per_gateway=${SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES}/${SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES}"
+        unset _spilot_qwen_runtime_local _spilot_gpt_runtime_local
+    fi
+fi
 echo "Using Polar gateway fleet: count=${POLAR_GATEWAY_COUNT} per_gateway(init/run/post)=${POLAR_GATEWAY_MAX_INIT_WORKERS}/${POLAR_GATEWAY_MAX_RUN_WORKERS}/${POLAR_GATEWAY_MAX_POSTRUN_WORKERS} completion(queue/writers)=${POLAR_GATEWAY_COMPLETION_QUEUE_SIZE}/${POLAR_GATEWAY_COMPLETION_WRITE_WORKERS}"
 POLAR_ROLLOUT_LOCAL_URL="${POLAR_ROLLOUT_LOCAL_URL:-http://127.0.0.1:${POLAR_ROLLOUT_PORT}}"
 POLAR_GATEWAY_LOCAL_URL="${POLAR_GATEWAY_LOCAL_URL:-http://127.0.0.1:${POLAR_GATEWAY_PORT}}"
@@ -577,6 +658,7 @@ for name in (
     "POLAR_GATEWAY_HOST",
     "POLAR_GATEWAY_PORT",
     "POLAR_GATEWAY_URL",
+    "POLAR_MODEL_POOL_BASE_URL",
     "POLAR_SANDBOX_NETWORK",
     "POLAR_UDS_DIR",
     "POLAR_GATEWAY_UDS_DIR",
@@ -600,11 +682,32 @@ for name in (
     "TMAX_TRAIN_AGENT_TIMEOUT_SECONDS",
     "POLAR_MIN_COMPLETE_ACCEPT_FRACTION",
     "POLAR_EARLY_STOP_GRACE_SESSIONS",
+    "POLAR_CANDIDATE_POOL_HEALTH_GATE_ENABLED",
+    "POLAR_CANDIDATE_POOL_HEALTH_MIN_OBSERVED_SESSIONS",
+    "POLAR_CANDIDATE_POOL_HEALTH_MIN_COMPLETION_FRACTION",
     "TMAX_MAX_TOTAL_RESPONSE_LEN",
     "TMAX_TRAIN_PACK_LENGTH",
+    "TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP",
+    "SPILOT_QWEN_COST_WEIGHT",
+    "SPILOT_GPT_COST_WEIGHT",
+    "SPILOT_COST_PENALTY_LAMBDA",
+    "SPILOT_COST_PENALTY_MODE",
+    "SPILOT_COST_NORMALIZER",
+    "SPILOT_DIFFICULTY_LEDGER_PATH",
+    "SPILOT_DIFFICULTY_EASY_MULT",
+    "SPILOT_DIFFICULTY_HARD_MULT",
+    "SPILOT_LATENCY_PENALTY_LAMBDA",
+    "SPILOT_LATENCY_NORMALIZER",
+    "SPILOT_SLOT_LABEL_MODE",
+    "SPILOT_ROUTING_MODE",
+    "SPILOT_CONTEXT_HANDOFF",
+    "SPILOT_ROUTER_MEMORY",
+    "SPILOT_MAX_POOL_CALLS",
+    "SPILOT_ROUTER_OBS_MAX_CHARS",
     "POLAR_MAX_INIT_WORKERS",
     "POLAR_MAX_RUN_WORKERS",
     "POLAR_MAX_POSTRUN_WORKERS",
+    "POLAR_MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES",
     "POLAR_GATEWAY_MAX_INIT_WORKERS",
     "POLAR_GATEWAY_MAX_RUN_WORKERS",
     "POLAR_GATEWAY_MAX_POSTRUN_WORKERS",
@@ -612,11 +715,21 @@ for name in (
     "POLAR_COMPLETION_WRITE_WORKERS",
     "POLAR_GATEWAY_COMPLETION_QUEUE_SIZE",
     "POLAR_GATEWAY_COMPLETION_WRITE_WORKERS",
+    "SPILOT_EPISODE_ADMISSION_ENABLED",
+    "SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS",
+    "SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES",
+    "SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES",
+    "SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY",
+    "SPILOT_GPT_GATEWAY_MAX_CONCURRENCY",
+    "CONTROLLER_V3_SMALL_ROUTER_BASE_URL",
+    "CONTROLLER_V3_QWEN_GATEWAY_MAX_CONCURRENCY",
+    "CONTROLLER_V3_GPT_GATEWAY_MAX_CONCURRENCY",
     "POLAR_COMPLETION_BATCH_SIZE",
     "POLAR_COMPLETION_WRITE_MAX_ATTEMPTS",
     "POLAR_COMPLETION_RETRY_BACKOFF_SECONDS",
     "POLAR_AGENT_HARNESS",
     "POLAR_AGENT_MODEL_NAME",
+    "HF_CHECKPOINT",
     "POLAR_AGENT_PATH",
     "POLAR_AGENT_RUNTIME_VOLUME",
     "POLAR_AGENT_STEP_LIMIT",
@@ -626,16 +739,7 @@ for name in (
     "POLAR_AGENT_MAX_TOKENS",
     "POLAR_AGENT_ENABLE_THINKING",
     "TMAX_EVAL_DATASET_NAME",
-    "TMAX_EVAL_WEIGHT",
     "TMAX_EXTERNAL_EVAL_DATASET_NAME",
-    "TMAX_EXTERNAL_EVAL_WEIGHT",
-    "PRM_BASE_URL",
-    "PRM_MODEL",
-    "PRM_RUBRIC_COEFFICIENT",
-    "PRM_TIMEOUT_SECONDS",
-    "PRM_INCLUDE_TOOL_OUTPUTS",
-    "PRM_TOOL_OUTPUT_MAX_CHARS",
-    "PRM_MAX_TRACES_PER_CALL",
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
     "MKL_NUM_THREADS",
@@ -680,10 +784,11 @@ if [ "${RAY_NODE_RANK}" = "0" ]; then
             exit 1
         fi
         mapfile -t _polar_gateway_hosts <<<"${_polar_gateway_host_output}"
-        if [ "${#_polar_gateway_hosts[@]}" -ne "${POLAR_GATEWAY_COUNT}" ]; then
-            echo "ERROR: Slurm hostlist expanded to ${#_polar_gateway_hosts[@]} hosts for ${POLAR_GATEWAY_COUNT} gateways" >&2
+        if [ "${#_polar_gateway_hosts[@]}" -lt "${POLAR_GATEWAY_COUNT}" ]; then
+            echo "ERROR: Slurm hostlist expanded to ${#_polar_gateway_hosts[@]} hosts, fewer than ${POLAR_GATEWAY_COUNT} gateways" >&2
             exit 1
         fi
+        _polar_gateway_hosts=("${_polar_gateway_hosts[@]:0:${POLAR_GATEWAY_COUNT}}")
         for _polar_gateway_host in "${_polar_gateway_hosts[@]}"; do
             _polar_topology_args+=(--gateway-host "${_polar_gateway_host}")
         done
@@ -711,6 +816,10 @@ echo "Using Polar config: ${CUSTOM_CONFIG_PATH}"
 echo "Using Apptainer image dir: ${APPTAINER_IMAGE_DIR}"
 echo "Using run id: ${RUN_ID}"
 echo "Using save dir: ${SAVE_DIR}"
+if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ] && \
+   [ "${SPILOT_EPISODE_ADMISSION_ENABLED:-false}" = "true" ]; then
+    echo "[spilot admission run metric] fatal_job_count_total=${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT:-0}"
+fi
 echo "Using SGLang router URL for Polar gateway: ${SGLANG_ROUTER_BASE_URL}"
 echo "Using Polar rollout URL: ${POLAR_ROLLOUT_URL}"
 echo "Using Polar gateway URL: ${POLAR_GATEWAY_URL}"
@@ -727,6 +836,30 @@ PROCESS_GROUPS=()
 POLAR_ROLLOUT_PID=""
 POLAR_GATEWAY_PID=""
 POLAR_UDS_TUNNEL_PID=""
+POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS="${POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS:-120}"
+if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ] && \
+   ! [[ "${POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: formal SPilot requires POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS to be a positive integer" >&2
+    exit 1
+fi
+export POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS
+_POLAR_GATEWAY_MIN_SHUTDOWN_GRACE_SECONDS=210
+if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ]; then
+    # The outer process bound must not kill the gateway while its fail-closed
+    # runtime-containment proof is still within budget.
+    _POLAR_GATEWAY_MIN_SHUTDOWN_GRACE_SECONDS=$((60 + POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS + 30))
+fi
+POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS="${POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS:-${_POLAR_GATEWAY_MIN_SHUTDOWN_GRACE_SECONDS}}"
+if ! [[ "${POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS must be a non-negative integer" >&2
+    exit 1
+fi
+if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ] && \
+   [ "${POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS}" -lt "${_POLAR_GATEWAY_MIN_SHUTDOWN_GRACE_SECONDS}" ]; then
+    echo "ERROR: formal SPilot requires POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS>=${_POLAR_GATEWAY_MIN_SHUTDOWN_GRACE_SECONDS} (60s HTTP drain + ${POLAR_DISPATCHER_SHUTDOWN_TIMEOUT_SECONDS}s runtime proof + 30s margin)" >&2
+    exit 1
+fi
+unset _POLAR_GATEWAY_MIN_SHUTDOWN_GRACE_SECONDS
 
 polar_pid_is_active() {
     local pid="$1" proc_stat remainder state
@@ -875,10 +1008,50 @@ polar_stop_ray_bounded() {
     polar_terminate_pids_bounded 2 "$ray_stop_pid"
 }
 
+polar_shutdown_gateway_bounded() {
+    local pid="$1" grace_seconds="$2" term_already_sent="${3:-0}"
+    local kill_grace_seconds rc timed_out=0
+    [ -n "${pid}" ] || return 0
+    [[ "${grace_seconds}" =~ ^[0-9]+$ ]] || grace_seconds=210
+    kill_grace_seconds="${POLAR_BACKGROUND_KILL_GRACE_SECONDS:-2}"
+    [[ "${kill_grace_seconds}" =~ ^[0-9]+$ ]] || kill_grace_seconds=2
+
+    # cleanup() starts gateway shutdown before the potentially-slow Ray stop
+    # so both drains overlap. Do not deliver a second SIGTERM afterwards: it
+    # can interrupt Uvicorn's already-running graceful shutdown and turn a
+    # successful exit into status 143.
+    if [ "${term_already_sent}" != 1 ]; then
+        kill -TERM "${pid}" 2>/dev/null || true
+    fi
+    if ! polar_wait_for_pids_bounded "${grace_seconds}" "${pid}"; then
+        timed_out=1
+        echo "ERROR: Polar gateway shutdown exceeded ${grace_seconds}s; sending SIGKILL" >&2
+        kill -KILL "${pid}" 2>/dev/null || true
+        polar_wait_for_pids_bounded "${kill_grace_seconds}" "${pid}" || true
+    fi
+    if polar_pid_is_active "${pid}"; then
+        echo "ERROR: Polar gateway pid ${pid} survived shutdown escalation" >&2
+        return 1
+    fi
+    if wait "${pid}"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    if [ "${timed_out}" -ne 0 ]; then
+        return 1
+    fi
+    if [ "${rc}" -ne 0 ]; then
+        echo "ERROR: Polar gateway exited with status ${rc}; runtime teardown may be unproven" >&2
+        return 1
+    fi
+    return 0
+}
+
 cleanup() {
-    local status=$?
-    local pid background_grace_seconds
-    local -a background_pids=("${PIDS[@]}")
+    local status=$? final_status gateway_shutdown_failed=0
+    local pid background_grace_seconds gateway_term_sent=0
+    local -a background_pids=()
     local -a process_groups=("${PROCESS_GROUPS[@]}")
     trap - EXIT
     echo "Shutting down..."
@@ -889,6 +1062,10 @@ cleanup() {
     # even the monitor's process group. Snapshot descendants before TERM can
     # reparent them, then include every recorded PID in the bounded teardown.
     for pid in "${PIDS[@]}"; do
+        if [ -n "${POLAR_GATEWAY_PID}" ] && [ "${pid}" = "${POLAR_GATEWAY_PID}" ]; then
+            continue
+        fi
+        background_pids+=("${pid}")
         polar_append_descendant_pids "$pid" background_pids
     done
     # Ask sidecars and Polar services to stop before Ray cleanup. This lets the
@@ -899,7 +1076,17 @@ cleanup() {
     for pid in "${process_groups[@]}"; do
         kill -TERM -- "-$pid" 2>/dev/null || true
     done
+    if [ -n "${POLAR_GATEWAY_PID}" ]; then
+        if kill -TERM "${POLAR_GATEWAY_PID}" 2>/dev/null; then
+            gateway_term_sent=1
+        fi
+    fi
     polar_stop_ray_bounded
+    if ! polar_shutdown_gateway_bounded \
+        "${POLAR_GATEWAY_PID}" "${POLAR_GATEWAY_SHUTDOWN_GRACE_SECONDS}" \
+        "${gateway_term_sent}"; then
+        gateway_shutdown_failed=1
+    fi
     background_grace_seconds="${POLAR_BACKGROUND_SHUTDOWN_GRACE_SECONDS:-20}"
     polar_terminate_pids_bounded "$background_grace_seconds" "${background_pids[@]}"
     # Groups received TERM before Ray shutdown and the per-PID grace above.
@@ -908,7 +1095,20 @@ cleanup() {
     polar_terminate_process_groups_bounded 0 "${process_groups[@]}"
     PIDS=()
     PROCESS_GROUPS=()
-    return "$status"
+    final_status="${status}"
+    if [ "${gateway_shutdown_failed}" -ne 0 ] && [ "${final_status}" -eq 0 ]; then
+        # Only SPilot escalates an unprovable gateway teardown to a failed
+        # allocation: router runs must not risk unaccounted provider spend
+        # from leaked pool runtimes. Direct training keeps its outcome — a
+        # completed run is not retroactively failed by teardown noise; the
+        # ERROR lines above remain for operators.
+        if [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ]; then
+            final_status=70
+        else
+            echo "WARNING: gateway teardown was unprovable; keeping allocation exit status ${final_status} (non-SPilot harness)" >&2
+        fi
+    fi
+    exit "${final_status}"
 }
 trap cleanup EXIT
 
@@ -926,6 +1126,7 @@ start_gpu_monitor() {
     fi
 
     local monitor_dir metric_prefix csv_path node_role train_gpus rollout_gpus monitor_pid
+    local -a static_metric_args=()
     monitor_dir="${RUN_DIR}/gpu_monitor"
     mkdir -p "$monitor_dir"
     metric_prefix="${GPU_MONITOR_PREFIX:-polar_system}"
@@ -967,7 +1168,7 @@ start_gpu_monitor() {
     local wandb_args=("--no-wandb")
     if [ -n "${WANDB_API_KEY:-}" ] && [ "${WANDB_MODE:-offline}" != "disabled" ]; then
         wandb_args=(
-            "--wandb-run-id" "$RUN_ID"
+            "--wandb-run-id" "$WANDB_RUN_ID"
             "--wandb-project" "${WANDB_PROJECT:-polar-swegym-grpo}"
             "--wandb-group" "${WANDB_GROUP:-swegym-qwen35-4b-async-grpo}"
             "--wandb-mode" "${GPU_MONITOR_WANDB_MODE:-shared}"
@@ -975,6 +1176,15 @@ start_gpu_monitor() {
         if [ -n "${WANDB_ENTITY:-}" ]; then
             wandb_args+=("--wandb-entity" "$WANDB_ENTITY")
         fi
+    fi
+    if [ "${RAY_NODE_RANK}" = "0" ] && \
+       [ "${TMAX_AGENT_HARNESS:-}" = "spilot_router" ] && \
+       [ "${SPILOT_EPISODE_ADMISSION_ENABLED:-false}" = "true" ] && \
+       [[ "${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT:-0}" =~ ^[0-9]+$ ]]; then
+        static_metric_args=(
+            --static-metric
+            "polar/spilot_router/admission_fatal_job_count_total=${TMAX_SPILOT_ADMISSION_FATAL_JOB_COUNT:-0}"
+        )
     fi
 
     local -a monitor_command=(
@@ -986,6 +1196,7 @@ start_gpu_monitor() {
         --wandb-finish-timeout-s "${GPU_MONITOR_WANDB_FINISH_TIMEOUT_S:-15}"
         --train-gpus "$train_gpus"
         --rollout-gpus "$rollout_gpus"
+        "${static_metric_args[@]}"
         "${wandb_args[@]}"
     )
     if command -v setsid >/dev/null 2>&1; then
@@ -1093,7 +1304,9 @@ start_polar_gateway() {
         node_id="localhost-node-01"
     fi
     echo "=== Starting Polar gateway node_id=${node_id} host=$(hostname) ip=${RAY_NODE_IP} local=${POLAR_GATEWAY_LOCAL_URL} quotas=${POLAR_GATEWAY_MAX_INIT_WORKERS}/${POLAR_GATEWAY_MAX_RUN_WORKERS}/${POLAR_GATEWAY_MAX_POSTRUN_WORKERS} ==="
-    polar serve_gateway -c "${TOPOLOGY_PATH}" --node-id "${node_id}" &
+    PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+        "${PYTHON_BIN}" -m polar.cli serve_gateway \
+        -c "${TOPOLOGY_PATH}" --node-id "${node_id}" &
     POLAR_GATEWAY_PID=$!
     PIDS+=("${POLAR_GATEWAY_PID}")
     wait_http_ok "Polar gateway ${node_id}" "${POLAR_GATEWAY_LOCAL_URL}/health" 60
@@ -1139,6 +1352,9 @@ assert actual_ids == expected_ids
 wait_for_run_done_with_sidecars() {
     local pid
     while [ ! -f "${RUN_DONE_FILE}" ]; do
+        if ! polar_check_spilot_admission_health; then
+            return 1
+        fi
         for pid in "${POLAR_GATEWAY_PID}" "${POLAR_UDS_TUNNEL_PID}"; do
             [ -n "${pid}" ] || continue
             if ! polar_pid_is_active "${pid}"; then
@@ -1196,21 +1412,6 @@ EVAL_GLOBAL_BATCH_SIZE="${EVAL_GLOBAL_BATCH_SIZE:-${GLOBAL_BATCH_SIZE}}"
 CUSTOM_ROLLOUT_LOG_FUNCTION_PATH="${CUSTOM_ROLLOUT_LOG_FUNCTION_PATH:-slime_bridge.rollout.log_rollout_trajectory_examples}"
 echo "Using rollout/global batch: ${ROLLOUT_BATCH_SIZE}x${N_SAMPLES_PER_PROMPT}/${NUM_STEPS_PER_ROLLOUT}=${GLOBAL_BATCH_SIZE}, eval=${EVAL_GLOBAL_BATCH_SIZE}"
 TRAIN_LENGTH_ARGS=(--num-epoch "${NUM_EPOCH:-1}")
-case "${TMAX_EVAL_ONLY:-0}" in
-    1|true)
-        if [ -n "${TMAX_NUM_ROLLOUT:-}" ]; then
-            echo "ERROR: TMAX_EVAL_ONLY cannot be combined with TMAX_NUM_ROLLOUT" >&2
-            exit 1
-        fi
-        TRAIN_LENGTH_ARGS=(--num-rollout 0)
-        echo "Using eval-only mode: no rollout generation or optimizer step"
-        ;;
-    0|false) ;;
-    *)
-        echo "ERROR: TMAX_EVAL_ONLY must be 0/1/false/true" >&2
-        exit 1
-        ;;
-esac
 if [ -n "${TMAX_NUM_ROLLOUT:-}" ]; then
     if ! [[ "${TMAX_NUM_ROLLOUT}" =~ ^[1-9][0-9]*$ ]]; then
         echo "ERROR: TMAX_NUM_ROLLOUT must be a positive integer" >&2
@@ -1301,6 +1502,92 @@ case "${GRPO_STD_NORMALIZATION:-1}" in
         exit 1
         ;;
 esac
+DVAO_REWARD_ARGS=()
+if [ -n "${DVAO_REWARD_KEY_1:-}" ] || [ -n "${DVAO_REWARD_KEY_2:-}" ]; then
+    if [ -z "${DVAO_REWARD_KEY_1:-}" ] || [ -z "${DVAO_REWARD_KEY_2:-}" ]; then
+        echo "ERROR: DVAO_REWARD_KEY_1 and DVAO_REWARD_KEY_2 must be set together" >&2
+        exit 1
+    fi
+    if [ "${DVAO_REWARD_KEY_1}" = "${DVAO_REWARD_KEY_2}" ]; then
+        echo "ERROR: DVAO reward keys must be distinct" >&2
+        exit 1
+    fi
+    DVAO_REWARD_ARGS=(
+        --dvao-reward-keys
+        "${DVAO_REWARD_KEY_1}"
+        "${DVAO_REWARD_KEY_2}"
+    )
+    echo "Using DVAO rewards: ${DVAO_REWARD_KEY_1}, ${DVAO_REWARD_KEY_2}"
+fi
+GDPO_REWARD_ARGS=()
+if [ -n "${GDPO_REWARD_KEY_1:-}" ] || [ -n "${GDPO_REWARD_KEY_2:-}" ]; then
+    if [ -z "${GDPO_REWARD_KEY_1:-}" ] || [ -z "${GDPO_REWARD_KEY_2:-}" ]; then
+        echo "ERROR: GDPO_REWARD_KEY_1 and GDPO_REWARD_KEY_2 must be set together" >&2
+        exit 1
+    fi
+    if [ "${GDPO_REWARD_KEY_1}" = "${GDPO_REWARD_KEY_2}" ]; then
+        echo "ERROR: GDPO reward keys must be distinct" >&2
+        exit 1
+    fi
+    GDPO_REWARD_ARGS=(
+        --gdpo-reward-keys
+        "${GDPO_REWARD_KEY_1}"
+        "${GDPO_REWARD_KEY_2}"
+    )
+    echo "Using GDPO rewards: ${GDPO_REWARD_KEY_1}, ${GDPO_REWARD_KEY_2}"
+fi
+if [ "${#DVAO_REWARD_ARGS[@]}" -ne 0 ] && [ "${#GDPO_REWARD_ARGS[@]}" -ne 0 ]; then
+    echo "ERROR: DVAO and GDPO reward modes are mutually exclusive" >&2
+    exit 1
+fi
+POLAR_CONTROLLER_ARGS=()
+if [ -n "${POLAR_CONTROLLER_INVALID_TURN_PENALTY:-}" ]; then
+    POLAR_CONTROLLER_ARGS+=(
+        --polar-controller-invalid-turn-penalty
+        "${POLAR_CONTROLLER_INVALID_TURN_PENALTY}"
+    )
+    echo "Using controller invalid-turn penalty: ${POLAR_CONTROLLER_INVALID_TURN_PENALTY}"
+fi
+if [ -n "${POLAR_CONTROLLER_CREDIT_MODE:-}" ]; then
+    POLAR_CONTROLLER_ARGS+=(
+        --polar-controller-credit-mode
+        "${POLAR_CONTROLLER_CREDIT_MODE}"
+    )
+    echo "Using controller credit mode: ${POLAR_CONTROLLER_CREDIT_MODE}"
+fi
+if [ "${POLAR_GDPO_COST_GATE_ALL_CORRECT:-}" = "1" ]; then
+    POLAR_CONTROLLER_ARGS+=(--polar-gdpo-cost-gate-all-correct)
+    echo "Using GDPO cost gate: cost applies only to fully-correct groups"
+fi
+if [ "${POLAR_DROP_ALL_WRONG_GROUPS:-}" = "1" ]; then
+    POLAR_CONTROLLER_ARGS+=(--polar-drop-all-wrong-groups)
+    echo "Group selection: dropping all-wrong groups"
+fi
+if [ "${POLAR_DROP_ALL_KEEP_GROUPS:-}" = "1" ]; then
+    POLAR_CONTROLLER_ARGS+=(--polar-drop-all-keep-groups)
+    echo "Group selection: dropping groups with no realized escalate/deescalate"
+fi
+if [ "${POLAR_BALANCE_ALL_CORRECT_GROUPS:-}" = "1" ]; then
+    POLAR_CONTROLLER_ARGS+=(--polar-balance-all-correct-groups)
+    echo "Group selection: downsampling all-correct groups to mixed count"
+fi
+OPTIMIZER_MEMORY_ARGS=()
+case "${TMAX_OPTIMIZER_CPU_OFFLOAD:-0}" in
+    0) ;;
+    1)
+        OPTIMIZER_MEMORY_ARGS=(
+            --optimizer-cpu-offload
+            --optimizer-offload-fraction 1.0
+            --overlap-cpu-optimizer-d2h-h2d
+            --use-precision-aware-optimizer
+        )
+        echo "Using full-precision CPU-offloaded optimizer state"
+        ;;
+    *)
+        echo "ERROR: TMAX_OPTIMIZER_CPU_OFFLOAD must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
 KL_LOSS_ARGS=()
 if ! "${PYTHON_BIN}" -c \
     'import math,sys; value=float(sys.argv[1]); assert math.isfinite(value) and value >= 0' \
@@ -1378,28 +1665,20 @@ case "${CALCULATE_PER_TOKEN_LOSS:-0}" in
         ;;
 esac
 PRETRAIN_EVAL_ARGS=()
-case "${TMAX_SKIP_EVAL_BEFORE_TRAIN:-0}" in
+case "${TMAX_CONCURRENT_PRETRAIN_EVAL:-1}" in
     1|true)
-        PRETRAIN_EVAL_ARGS=(--skip-eval-before-train)
-        PRETRAIN_EVAL_MODE=skipped-for-preemptible-training
+        if [ "${TMAX_TRAIN_MODE}" = "colocate" ]; then
+            echo "ERROR: TMAX_TRAIN_MODE=colocate requires TMAX_CONCURRENT_PRETRAIN_EVAL=0" >&2
+            exit 1
+        fi
+        PRETRAIN_EVAL_ARGS=(--concurrent-pretrain-eval)
+        PRETRAIN_EVAL_MODE=concurrent-with-rollout-0
         ;;
     0|false)
-        case "${TMAX_CONCURRENT_PRETRAIN_EVAL:-1}" in
-            1|true)
-                PRETRAIN_EVAL_ARGS=(--concurrent-pretrain-eval)
-                PRETRAIN_EVAL_MODE=concurrent-with-rollout-0
-                ;;
-            0|false)
-                PRETRAIN_EVAL_MODE=synchronous-before-rollout-0
-                ;;
-            *)
-                echo "ERROR: TMAX_CONCURRENT_PRETRAIN_EVAL must be 0/1/false/true" >&2
-                exit 1
-                ;;
-        esac
+        PRETRAIN_EVAL_MODE=synchronous-before-rollout-0
         ;;
     *)
-        echo "ERROR: TMAX_SKIP_EVAL_BEFORE_TRAIN must be 0/1/false/true" >&2
+        echo "ERROR: TMAX_CONCURRENT_PRETRAIN_EVAL must be 0/1/false/true" >&2
         exit 1
         ;;
 esac
@@ -1521,11 +1800,14 @@ PY
         echo "Using fixed eval: ${TMAX_EVAL_DATASET_NAME} (${TMAX_EVAL_DATA}, baseline + every ${TMAX_EVAL_INTERVAL} rollout(s) + final)"
     fi
     echo "Pretrain eval scheduling: ${PRETRAIN_EVAL_MODE}"
-    if [ -n "${FINAL_EVAL_COMPLETE_MARKER:-}" ]; then
+    if [ -n "${FINAL_EVAL_COMPLETE_MARKER:-}" ] && \
+       [ "${TMAX_TRAIN_MODE}" = "fully_async" ]; then
         EVAL_ARGS+=(
             --final-eval-complete-marker "${FINAL_EVAL_COMPLETE_MARKER}"
             --final-eval-data-sha256 "${FINAL_EVAL_DATA_SHA256}"
         )
+    elif [ -n "${FINAL_EVAL_COMPLETE_MARKER:-}" ]; then
+        echo "Sync colocate mode will run eval without an async final-eval marker."
     fi
 else
     echo "Training-time eval disabled; holdout remains available for data-split and integrity checks."
@@ -1536,6 +1818,19 @@ if [ -z "$RAY_NUM_GPUS_PER_NODE" ]; then
         RAY_NUM_GPUS_PER_NODE=8
     else
         RAY_NUM_GPUS_PER_NODE=$((ACTOR_NUM_GPUS_PER_NODE + ROLLOUT_NUM_GPUS))
+    fi
+fi
+RAY_TOTAL_GPUS="$((RAY_NUM_NODES * RAY_NUM_GPUS_PER_NODE))"
+if [ -n "${RAY_LAST_NODE_NUM_GPUS:-}" ]; then
+    if ! [[ "${RAY_LAST_NODE_NUM_GPUS}" =~ ^[1-9][0-9]*$ ]] || \
+       [ "${RAY_LAST_NODE_NUM_GPUS}" -gt "${RAY_NUM_GPUS_PER_NODE}" ] || \
+       [ "${RAY_NUM_NODES}" -lt 2 ]; then
+        echo "ERROR: RAY_LAST_NODE_NUM_GPUS must be positive, no larger than RAY_NUM_GPUS_PER_NODE, and used with at least two nodes" >&2
+        exit 1
+    fi
+    RAY_TOTAL_GPUS="$(((RAY_NUM_NODES - 1) * RAY_NUM_GPUS_PER_NODE + RAY_LAST_NODE_NUM_GPUS))"
+    if [ "${RAY_NODE_RANK}" = "$((RAY_NUM_NODES - 1))" ]; then
+        RAY_NUM_GPUS_PER_NODE="${RAY_LAST_NODE_NUM_GPUS}"
     fi
 fi
 
@@ -1615,7 +1910,7 @@ if [ "${RAY_NODE_RANK}" = "0" ]; then
     fi
     ray status || true
     wait_ray_dashboard
-    "${PYTHON_BIN}" - "${RAY_NUM_NODES}" "$((RAY_NUM_NODES * RAY_NUM_GPUS_PER_NODE))" <<'PY'
+    "${PYTHON_BIN}" - "${RAY_NUM_NODES}" "${RAY_TOTAL_GPUS}" <<'PY'
 import sys
 import time
 
@@ -1643,13 +1938,13 @@ PY
 
     # Keep one authoritative rollout server. Gateway processes on every rank
     # register with it and retain their node-local sandbox/UDS lifecycle.
-    export SLIME_POLAR_ROLLOUT_START_UNIX_NS="$(date +%s%N)"
+    export SLIME_ROLLOUT_SERVICE_START_UNIX_NS="$(date +%s%N)"
     echo "=== Starting Polar rollout server (${POLAR_ROLLOUT_URL}) ==="
-    polar serve_rollout -c "${TOPOLOGY_PATH}" &
+    "${PYTHON_BIN}" -m polar.cli serve_rollout -c "${TOPOLOGY_PATH}" &
     POLAR_ROLLOUT_PID=$!
     PIDS+=("${POLAR_ROLLOUT_PID}")
     wait_http_ok "Polar rollout server" "${POLAR_ROLLOUT_LOCAL_URL}/health" 60
-    export SLIME_POLAR_ROLLOUT_READY_UNIX_NS="$(date +%s%N)"
+    export SLIME_ROLLOUT_SERVICE_READY_UNIX_NS="$(date +%s%N)"
     touch "${RAY_READY_DIR}/polar_rollout_ready"
 else
     wait_for_shared_marker \
@@ -1660,10 +1955,15 @@ else
 fi
 
 # ── Step 2: Polar gateway fleet (node-local CPU + UDS) ─────────────
-if [ "${POLAR_MULTI_GATEWAY}" = "1" ] || [ "${RAY_NODE_RANK}" = "0" ]; then
+_polar_gateway_rank=0
+if [ "${RAY_NODE_RANK}" = "0" ] || { \
+   [ "${POLAR_MULTI_GATEWAY}" = "1" ] && \
+   [ "${RAY_NODE_RANK}" -lt "${POLAR_GATEWAY_COUNT}" ];
+}; then
+    _polar_gateway_rank=1
     if [ "${RAY_NODE_RANK}" = "0" ]; then
-        export SLIME_POLAR_GATEWAY_START_UNIX_NS="$(date +%s%N)"
-        export SLIME_POLAR_UDS_START_UNIX_NS="${SLIME_POLAR_GATEWAY_START_UNIX_NS}"
+        export SLIME_GATEWAY_START_UNIX_NS="$(date +%s%N)"
+        export SLIME_UDS_TUNNEL_START_UNIX_NS="${SLIME_GATEWAY_START_UNIX_NS}"
     fi
     start_polar_gateway
     touch "${RAY_READY_DIR}/gateway_ready_rank_${RAY_NODE_RANK}"
@@ -1671,11 +1971,12 @@ fi
 
 if [ "${RAY_NODE_RANK}" = "0" ]; then
     wait_gateway_fleet_ready "${POLAR_GATEWAY_COUNT}"
-    export SLIME_POLAR_GATEWAY_READY_UNIX_NS="$(date +%s%N)"
-    export SLIME_POLAR_UDS_READY_UNIX_NS="${SLIME_POLAR_GATEWAY_READY_UNIX_NS}"
-    export SLIME_POLAR_READY_UNIX_NS="${SLIME_POLAR_GATEWAY_READY_UNIX_NS}"
+    export SLIME_GATEWAY_READY_UNIX_NS="$(date +%s%N)"
+    export SLIME_UDS_TUNNEL_READY_UNIX_NS="${SLIME_GATEWAY_READY_UNIX_NS}"
+    export SLIME_SERVICES_READY_UNIX_NS="${SLIME_GATEWAY_READY_UNIX_NS}"
 else
-    if [ "${POLAR_MULTI_GATEWAY}" = "1" ]; then
+    if [ "${POLAR_MULTI_GATEWAY}" = "1" ] && \
+       [ "${_polar_gateway_rank}" = "1" ]; then
         wait_for_run_done_with_sidecars
     else
         while [ ! -f "${RUN_DONE_FILE}" ]; do
@@ -1684,6 +1985,7 @@ else
     fi
     exit 0
 fi
+unset _polar_gateway_rank
 
 # ── Step 3: Slime (manages SGLang engines + training) ──────────────
 
@@ -1709,13 +2011,13 @@ RUNTIME_ENV_JSON="{
     \"SLIME_CONTAINER_ENTRY_UNIX_NS\": \"${SLIME_CONTAINER_ENTRY_UNIX_NS:-}\",
     \"SLIME_JOB_SCRIPT_START_UNIX_NS\": \"${SLIME_JOB_SCRIPT_START_UNIX_NS}\",
     \"SLIME_RAY_READY_UNIX_NS\": \"${SLIME_RAY_READY_UNIX_NS}\",
-    \"SLIME_POLAR_ROLLOUT_START_UNIX_NS\": \"${SLIME_POLAR_ROLLOUT_START_UNIX_NS}\",
-    \"SLIME_POLAR_ROLLOUT_READY_UNIX_NS\": \"${SLIME_POLAR_ROLLOUT_READY_UNIX_NS}\",
-    \"SLIME_POLAR_GATEWAY_START_UNIX_NS\": \"${SLIME_POLAR_GATEWAY_START_UNIX_NS}\",
-    \"SLIME_POLAR_GATEWAY_READY_UNIX_NS\": \"${SLIME_POLAR_GATEWAY_READY_UNIX_NS}\",
-    \"SLIME_POLAR_UDS_START_UNIX_NS\": \"${SLIME_POLAR_UDS_START_UNIX_NS}\",
-    \"SLIME_POLAR_UDS_READY_UNIX_NS\": \"${SLIME_POLAR_UDS_READY_UNIX_NS}\",
-    \"SLIME_POLAR_READY_UNIX_NS\": \"${SLIME_POLAR_READY_UNIX_NS}\",
+    \"SLIME_ROLLOUT_SERVICE_START_UNIX_NS\": \"${SLIME_ROLLOUT_SERVICE_START_UNIX_NS}\",
+    \"SLIME_ROLLOUT_SERVICE_READY_UNIX_NS\": \"${SLIME_ROLLOUT_SERVICE_READY_UNIX_NS}\",
+    \"SLIME_GATEWAY_START_UNIX_NS\": \"${SLIME_GATEWAY_START_UNIX_NS}\",
+    \"SLIME_GATEWAY_READY_UNIX_NS\": \"${SLIME_GATEWAY_READY_UNIX_NS}\",
+    \"SLIME_UDS_TUNNEL_START_UNIX_NS\": \"${SLIME_UDS_TUNNEL_START_UNIX_NS}\",
+    \"SLIME_UDS_TUNNEL_READY_UNIX_NS\": \"${SLIME_UDS_TUNNEL_READY_UNIX_NS}\",
+    \"SLIME_SERVICES_READY_UNIX_NS\": \"${SLIME_SERVICES_READY_UNIX_NS}\",
     \"SLIME_RAY_JOB_SUBMIT_UNIX_NS\": \"${SLIME_RAY_JOB_SUBMIT_UNIX_NS}\",
     \"SLIME_TRAIN_PROGRESS_FILE\": \"${SLIME_TRAIN_PROGRESS_FILE}\",
     \"GPU_MONITOR_PREFIX\": \"${GPU_MONITOR_PREFIX:-polar_system}\",
@@ -1733,16 +2035,16 @@ RUNTIME_ENV_JSON="{
     \"WANDB_MODE\": \"${WANDB_MODE:-offline}\",
     \"WANDB_PROJECT\": \"${WANDB_PROJECT:-polar-swegym-grpo}\",
     \"WANDB_GROUP\": \"${WANDB_GROUP:-swegym-qwen35-4b-async-grpo}\",
-    \"WANDB_RUN_ID\": \"${RUN_ID}\",
+    \"WANDB_RUN_ID\": \"${WANDB_RUN_ID}\",
     \"WANDB_RESUME\": \"${WANDB_RESUME:-allow}\",
     \"HF_TOKEN\": \"${HF_TOKEN:-}\",
     \"HUGGINGFACE_HUB_TOKEN\": \"${HUGGINGFACE_HUB_TOKEN:-${HF_TOKEN:-}}\",
-    \"WANDB_DIR\": \"${PROJECT_ROOT}/logs\",
+    \"WANDB_DIR\": \"${WANDB_DIR}\",
     \"TORCHINDUCTOR_CACHE_DIR\": \"${TORCHINDUCTOR_CACHE_DIR}\",
     \"TRITON_CACHE_DIR\": \"${TRITON_CACHE_DIR}\",
     \"LD_LIBRARY_PATH\": \"${RUNTIME_LD_LIBRARY_PATH}\",
-    \"PYTORCH_ALLOC_CONF\": \"max_split_size_mb:2048,expandable_segments:True\",
-    \"PYTORCH_CUDA_ALLOC_CONF\": \"max_split_size_mb:2048,expandable_segments:True\",
+    \"PYTORCH_ALLOC_CONF\": \"${TMAX_PYTORCH_ALLOC_CONF}\",
+    \"PYTORCH_CUDA_ALLOC_CONF\": \"${TMAX_PYTORCH_ALLOC_CONF}\",
     \"TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD\": \"${TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD:-}\",
     \"SLIME_PROFILE_CUDA_PHASES\": \"${SLIME_PROFILE_CUDA_PHASES:-0}\",
     \"SLIME_ROLLOUT_BASE_PORT\": \"${SLIME_ROLLOUT_BASE_PORT:-2048}\",
@@ -1760,13 +2062,92 @@ RAY_JOB_ADDRESS="http://${RAY_HEAD_IP}:8265"
 RAY_JOB_SUBMISSION_ID="${RAY_JOB_SUBMISSION_ID:-polar-${SLURM_JOB_ID:-$$}}"
 TRAIN_PROGRESS_ENV_JSON="$("${PYTHON_BIN}" -c 'import json, os; print(json.dumps({"SLIME_TRAIN_PROGRESS_FILE": os.environ["SLIME_TRAIN_PROGRESS_FILE"]}))')"
 TRAINING_LIFECYCLE_ARGS=()
-if [ -n "${SLIME_GRACEFUL_EXIT_AT_UNIX_TIME:-}" ]; then
-    TRAINING_LIFECYCLE_ARGS+=(--graceful-exit-at-unix-time "${SLIME_GRACEFUL_EXIT_AT_UNIX_TIME}")
+if [ "${TMAX_TRAIN_MODE}" = "fully_async" ] && \
+   [ "${TMAX_PROFILE_DISABLE_CHECKPOINT}" = "0" ]; then
+    if [ -n "${SLIME_GRACEFUL_EXIT_AT_UNIX_TIME:-}" ]; then
+        TRAINING_LIFECYCLE_ARGS+=(--graceful-exit-at-unix-time "${SLIME_GRACEFUL_EXIT_AT_UNIX_TIME}")
+    fi
+    if [ -n "${TRAINING_COMPLETE_MARKER:-}" ]; then
+        TRAINING_LIFECYCLE_ARGS+=(--training-complete-marker "${TRAINING_COMPLETE_MARKER}")
+    fi
+elif [ "${TMAX_PROFILE_DISABLE_CHECKPOINT}" = "1" ]; then
+    echo "WARNING: profiling model checkpoint arguments and async lifecycle markers are disabled"
+else
+    echo "Sync colocate mode does not emit async lifecycle markers; do not use the checkpoint watcher for this run."
 fi
-if [ -n "${TRAINING_COMPLETE_MARKER:-}" ]; then
-    TRAINING_LIFECYCLE_ARGS+=(--training-complete-marker "${TRAINING_COMPLETE_MARKER}")
+SAVE_RETENTION_ARGS=()
+if [ -n "${SAVE_RETAIN_INTERVAL:-}" ]; then
+    SAVE_RETENTION_ARGS+=(--save-retain-interval "${SAVE_RETAIN_INTERVAL}")
 fi
-echo "=== Launching train_async.py (Ray submission ${RAY_JOB_SUBMISSION_ID}) ==="
+# Checkpoint formats. The HuggingFace safetensors export is written at every
+# save so evaluation never needs a separate torch_dist->HF conversion job; the
+# Megatron torch_dist checkpoint additionally carries fp32 optimizer state
+# (roughly 10x the HF export) and is only required to resume training exactly.
+# The raw Megatron-to-HF exporter copies tokenizer/config assets from
+# HF_CHECKPOINT, so it needs a local snapshot directory rather than a hub id.
+SAVE_FORMAT_ARGS=()
+if [ -n "${SAVE_HF_ENABLED:-}" ]; then
+    SAVE_HF_EFFECTIVE="${SAVE_HF_ENABLED}"
+elif [ -d "${HF_CHECKPOINT}" ]; then
+    SAVE_HF_EFFECTIVE=1
+else
+    SAVE_HF_EFFECTIVE=0
+    echo "WARNING: HF safetensors export disabled: HF_CHECKPOINT=${HF_CHECKPOINT} is not a local directory" >&2
+fi
+case "${SAVE_HF_EFFECTIVE}" in
+    1|true)
+        if [ ! -d "${HF_CHECKPOINT}" ]; then
+            echo "ERROR: SAVE_HF_ENABLED=1 requires HF_CHECKPOINT to be a local directory, got ${HF_CHECKPOINT}" >&2
+            exit 1
+        fi
+        # A literal closing brace inside a ${VAR:-default} word terminates the
+        # expansion early, so assign the default template separately.
+        if [ -z "${SAVE_HF_TEMPLATE:-}" ]; then
+            SAVE_HF_TEMPLATE="${SAVE_DIR}/hf/iter_{rollout_id:07d}"
+        fi
+        # Qwen3.5 checkpoints are VLM containers trained text-only: the frozen
+        # vision/mtp tensors live only in the origin snapshot and must be
+        # copied in for the export to be loadable standalone.
+        SAVE_FORMAT_ARGS+=(--save-hf "${SAVE_HF_TEMPLATE}" --save-hf-add-missing-from-origin)
+        ;;
+    0|false) ;;
+    *)
+        echo "ERROR: SAVE_HF_ENABLED must be 0/1/false/true, got ${SAVE_HF_ENABLED}" >&2
+        exit 1
+        ;;
+esac
+case "${SAVE_MEGATRON:-1}" in
+    1|true) ;;
+    0|false)
+        case "${SAVE_HF_EFFECTIVE}" in
+            1|true) ;;
+            *)
+                echo "ERROR: SAVE_MEGATRON=0 requires the HF safetensors export to stay enabled, or nothing is saved" >&2
+                exit 1
+                ;;
+        esac
+        SAVE_FORMAT_ARGS+=(--no-save-megatron)
+        echo "WARNING: Megatron torch_dist checkpointing disabled (SAVE_MEGATRON=0); this run cannot resume exactly - a resubmitted allocation restarts from the seed checkpoint" >&2
+        ;;
+    *)
+        echo "ERROR: SAVE_MEGATRON must be 0/1/false/true, got ${SAVE_MEGATRON}" >&2
+        exit 1
+        ;;
+esac
+SAVE_PATH_ARGS=(--save "${SAVE_DIR}")
+SAVE_INTERVAL_ARGS=()
+if [ "${TMAX_PROFILE_DISABLE_CHECKPOINT}" = "0" ]; then
+    SAVE_INTERVAL_ARGS=(--save-interval "${SAVE_INTERVAL:-10}")
+else
+    # Megatron requires --save-interval whenever --save is present, and Slime
+    # forces a final save even when the interval exceeds the short profile.
+    # Omit every model-checkpoint argument; rollout telemetry has independent
+    # paths and fully-async metrics fall back to the rollout manager commit.
+    SAVE_PATH_ARGS=()
+    SAVE_RETENTION_ARGS=()
+    SAVE_FORMAT_ARGS=()
+fi
+echo "=== Launching $(basename "${SLIME_TRAIN_ENTRYPOINT}") mode=${TMAX_TRAIN_MODE} (Ray submission ${RAY_JOB_SUBMISSION_ID}) ==="
 # The custom reward post-processor already computes prompt-local GRPO
 # advantages.  Slime's --normalize-advantages whitens them again across every
 # response token in the global batch; with dynamic-history traces that leaks
@@ -1775,12 +2156,14 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     --submission-id "${RAY_JOB_SUBMISSION_ID}" \
     --no-wait \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
-    -- "${PYTHON_BIN}" "${SLIME_DIR}/train_async.py" \
+    -- "${PYTHON_BIN}" "${SLIME_TRAIN_ENTRYPOINT}" \
     --actor-num-nodes "$ACTOR_NUM_NODES" \
     --actor-num-gpus-per-node "$ACTOR_NUM_GPUS_PER_NODE" \
+    "${TRAIN_MODE_ARGS[@]}" \
     --train-env-vars "$TRAIN_PROGRESS_ENV_JSON" \
     --rollout-num-gpus "$ROLLOUT_NUM_GPUS" \
     --rollout-num-gpus-per-engine "$ROLLOUT_NUM_GPUS_PER_ENGINE" \
+    --num-gpus-per-node "$RAY_NUM_GPUS_PER_NODE" \
     "${MODEL_ARGS[@]}" \
     --hf-checkpoint "$HF_CHECKPOINT" \
     --ref-load "$REF_LOAD" \
@@ -1788,8 +2171,10 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     "${LOAD_CHECKPOINT_ARGS[@]}" \
     --dist-ckpt-strictness "${DIST_CKPT_STRICTNESS:-assume_ok_unexpected}" \
     "${OPT_PARAM_SCHEDULER_ARGS[@]}" \
-    --save "$SAVE_DIR" \
-    --save-interval "${SAVE_INTERVAL:-10}" \
+    "${SAVE_PATH_ARGS[@]}" \
+    "${SAVE_INTERVAL_ARGS[@]}" \
+    "${SAVE_RETENTION_ARGS[@]}" \
+    "${SAVE_FORMAT_ARGS[@]}" \
     "${TRAINING_LIFECYCLE_ARGS[@]}" \
     --update-weights-interval 1 \
     --rollout-function-path slime_bridge.rollout.generate_rollout_polar_async \
@@ -1804,6 +2189,9 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     --metadata-key metadata \
     --rollout-shuffle \
     --reward-key score \
+    "${DVAO_REWARD_ARGS[@]}" \
+    "${GDPO_REWARD_ARGS[@]}" \
+    "${POLAR_CONTROLLER_ARGS[@]}" \
     "${TRAIN_LENGTH_ARGS[@]}" \
     --rollout-batch-size "$ROLLOUT_BATCH_SIZE" \
     --n-samples-per-prompt "$N_SAMPLES_PER_PROMPT" \
@@ -1820,7 +2208,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     "${SEQUENCE_PARALLEL_ARGS[@]}" \
     --pipeline-model-parallel-size "$ACTOR_PIPELINE_MODEL_PARALLEL_SIZE" \
     --context-parallel-size "$CONTEXT_PARALLEL_SIZE" \
-    --expert-model-parallel-size 1 \
+    --expert-model-parallel-size "${EXPERT_MODEL_PARALLEL_SIZE:-1}" \
     --expert-tensor-parallel-size 1 \
     --recompute-granularity full \
     --recompute-method uniform \
@@ -1846,6 +2234,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     --weight-decay 0.1 \
     --adam-beta1 0.9 \
     --adam-beta2 0.98 \
+    "${OPTIMIZER_MEMORY_ARGS[@]}" \
     --attention-dropout 0.0 \
     --hidden-dropout 0.0 \
     --accumulate-allreduce-grads-in-fp32 \
@@ -1864,7 +2253,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
     --use-wandb \
     "${WANDB_STEP_ARGS[@]}" \
     --wandb-mode "${WANDB_MODE:-offline}" \
-    --wandb-run-id "$RUN_ID" \
+    --wandb-run-id "$WANDB_RUN_ID" \
     --wandb-project "${WANDB_PROJECT:-polar-swegym-grpo}" \
     --wandb-group "${WANDB_GROUP:-swegym-qwen35-4b-async-grpo}" \
     --disable-wandb-random-suffix \
@@ -1880,6 +2269,11 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
 RAY_JOB_WAITER_PID=$!
 PIDS+=("${RAY_JOB_WAITER_PID}")
 while polar_pid_is_active "${RAY_JOB_WAITER_PID}"; do
+    if ! polar_check_spilot_admission_health; then
+        kill -TERM "${RAY_JOB_WAITER_PID}" 2>/dev/null || true
+        wait "${RAY_JOB_WAITER_PID}" 2>/dev/null || true
+        exit 1
+    fi
     for _polar_control_pid in \
         "${POLAR_ROLLOUT_PID}" \
         "${POLAR_GATEWAY_PID}" \

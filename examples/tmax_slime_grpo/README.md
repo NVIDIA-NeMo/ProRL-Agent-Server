@@ -1,5 +1,10 @@
 # TMax Slime GRPO
 
+Short GPU-allocation experiments are documented in
+[`profile/README.md`](profile/README.md). The profiler compares fully async
+train/rollout splits with collocation without touching production run state or
+writing model checkpoints.
+
 This example trains Qwen3.5-9B with Slime GRPO while Polar runs each TMax
 trajectory in its task-specific Apptainer SIF. The Harbor evaluator injects
 the task's `tests/` directory into the live sandbox and returns its 0/1 reward.
@@ -128,6 +133,17 @@ Defaults are in `env.cwdfw.sh`:
   in SIF environment scripts therefore cannot collide or leak state across
   concurrent replicas.
 - checkpoint cadence: every ten completed rollouts (`SAVE_INTERVAL=10`), plus the graceful-exit save
+- checkpoint formats: every save writes a complete HF safetensors export to
+  `${SAVE_DIR}/hf/iter_XXXXXXX` (`SAVE_HF_ENABLED=1` by default when
+  `HF_CHECKPOINT` is a local snapshot), including the frozen vision/mtp
+  tensors copied from the origin snapshot, staged and published atomically
+  with an `.export_complete.json` marker — so `export_hf_checkpoint.sh`
+  conversion jobs are only needed for pre-existing runs. The Megatron
+  torch_dist checkpoint (fp32 optimizer state, ~10x the HF export size) is
+  still written by default because it is the only exact resume point;
+  `SAVE_MEGATRON=0` drops it for disposable runs, and `SAVE_RETAIN_INTERVAL`
+  bounds its disk usage while keeping resumability by pruning older
+  torch_dist iterations
 - SGLang ports: a different 320-port block is derived from each Slurm job id
   and kept strictly below the node's kernel ephemeral-port range. This avoids
   outbound connections taking a checked-but-not-yet-bound SGLang port during

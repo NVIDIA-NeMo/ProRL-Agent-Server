@@ -1,13 +1,137 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import signal
 from types import SimpleNamespace
 
 from fastapi.responses import Response
 import orjson
 import pytest
+import uvicorn
 
 from polar.gateway.detection import APIType
 from polar.gateway import server
+
+
+class _FakeUvicornServer:
+    def __init__(
+        self,
+        *,
+        signals: list[int] | None = None,
+        started: bool = True,
+        force_exit: bool = False,
+        shutdown_failed: bool = False,
+    ) -> None:
+        self.started = started
+        self.force_exit = force_exit
+        self.lifespan = SimpleNamespace(shutdown_failed=shutdown_failed)
+        self._captured_signals: list[int] = []
+        self._signals_to_capture = list(signals or [])
+        self.reraised_signals: list[int] = []
+
+    @contextmanager
+    def capture_signals(self):
+        yield
+        # Model Uvicorn 0.44's post-context behavior without sending a real
+        # signal to pytest. The gateway wrapper must clear the source list
+        # before control reaches this point.
+        self.reraised_signals.extend(reversed(self._captured_signals))
+        if self._captured_signals:
+            raise AssertionError("Uvicorn would have re-raised a captured signal")
+
+    def run(self) -> None:
+        with self.capture_signals():
+            self._captured_signals.extend(self._signals_to_capture)
+
+
+def _patch_gateway_server(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_server: _FakeUvicornServer,
+) -> dict:
+    config_kwargs: dict = {}
+    monkeypatch.setattr(server, "configure_server", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "get_state",
+        lambda: SimpleNamespace(node=SimpleNamespace(host="127.0.0.1", port=8081)),
+    )
+
+    def fake_config(*_args, **kwargs):
+        config_kwargs.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(uvicorn, "Config", fake_config)
+    monkeypatch.setattr(uvicorn, "Server", lambda *, config: fake_server)
+    return config_kwargs
+
+
+def test_serve_exits_nonzero_when_lifespan_shutdown_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_server = _FakeUvicornServer(shutdown_failed=True)
+    config_kwargs = _patch_gateway_server(monkeypatch, fake_server)
+
+    with pytest.raises(SystemExit) as error:
+        server.serve("topology.yaml")
+
+    assert error.value.code == 1
+    assert config_kwargs["timeout_graceful_shutdown"] == 60
+
+
+@pytest.mark.parametrize("signals", [[], [signal.SIGTERM]])
+def test_serve_accepts_only_normal_or_single_sigterm_clean_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+    signals: list[int],
+) -> None:
+    fake_server = _FakeUvicornServer(signals=signals)
+    _patch_gateway_server(monkeypatch, fake_server)
+
+    server.serve("topology.yaml")
+
+    assert fake_server.reraised_signals == []
+    assert fake_server._captured_signals == []
+
+
+@pytest.mark.parametrize(
+    "signals",
+    [
+        [signal.SIGINT],
+        [signal.SIGTERM, signal.SIGTERM],
+        [signal.SIGTERM, signal.SIGINT],
+    ],
+)
+def test_serve_rejects_unexpected_or_repeated_shutdown_signals(
+    monkeypatch: pytest.MonkeyPatch,
+    signals: list[int],
+) -> None:
+    fake_server = _FakeUvicornServer(signals=signals)
+    _patch_gateway_server(monkeypatch, fake_server)
+
+    with pytest.raises(SystemExit) as error:
+        server.serve("topology.yaml")
+
+    assert error.value.code == 1
+    assert fake_server.reraised_signals == []
+
+
+@pytest.mark.parametrize(
+    "server_state",
+    [
+        {"started": False},
+        {"force_exit": True},
+    ],
+)
+def test_serve_rejects_unproven_server_state_after_sigterm(
+    monkeypatch: pytest.MonkeyPatch,
+    server_state: dict,
+) -> None:
+    fake_server = _FakeUvicornServer(signals=[signal.SIGTERM], **server_state)
+    _patch_gateway_server(monkeypatch, fake_server)
+
+    with pytest.raises(SystemExit) as error:
+        server.serve("topology.yaml")
+
+    assert error.value.code == 1
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,12 @@ interpreter_file="${POLAR_APPTAINER_BROKER_INTERPRETER_FILE:-${runtime_dir}/inte
 broker_process_name="${POLAR_APPTAINER_BROKER_PROCESS_NAME:-polar-broker}"
 max_restarts="${POLAR_APPTAINER_BROKER_MAX_RESTARTS:-3}"
 socket_path="${runtime_dir}/control.sock"
+protected_socket_name="${POLAR_APPTAINER_PROTECTED_SOCKET_NAME:-}"
+case "${protected_socket_name}" in
+    p-[a-f0-9]*.sock) ;;
+    *) printf 'broker supervisor: invalid protected socket name\n' >&2; exit 64 ;;
+esac
+protected_socket_path="${runtime_dir}/${protected_socket_name}"
 result_dir="${runtime_dir}/results"
 active_dir="${runtime_dir}/active"
 broker_pid_file="${runtime_dir}/broker.pid"
@@ -40,6 +46,7 @@ if [ -z "${broker_python}" ]; then
     # long-lived Apptainer/supervisor argv inspected by agent cleanup commands.
     broker_python="${POLAR_APPTAINER_BROKER_PYTHON:-python3}"
 fi
+broker_launcher="${runtime_dir}/${broker_process_name}"
 
 mkdir -p "${result_dir}" "${active_dir}"
 printf '0\n' >"${generation_file}"
@@ -76,6 +83,7 @@ cleanup_crashed_broker() {
     done
     kill_pid_file "${proxy_pid_file}" 0
     rm -f "${socket_path}"
+    rm -f "${protected_socket_path}"
 }
 
 terminate_supervisor() {
@@ -91,12 +99,16 @@ trap terminate_supervisor TERM INT HUP
 while :; do
     generation="$((generation + 1))"
     printf '%s\n' "${generation}" >"${generation_file}"
-    # exec -a removes the interpreter path from /proc/<pid>/cmdline.  The
-    # broker also sets PR_SET_NAME immediately so both pkill -f python and
-    # pkill python leave the runtime control plane alone.
+    # Launch through a basename-only symlink so CPython can still resolve its
+    # standard library under ``-I`` while neither argv[0] nor PR_SET_NAME
+    # matches broad task cleanup such as ``pkill -f python``. A protected
+    # caller pins the first broker PID/starttime, so a later supervisor restart
+    # is never trusted with secrets even if this task-visible symlink changes.
+    ln -sfn -- "${broker_python}" "${broker_launcher}"
     (
-        exec -a "${broker_process_name}" "${broker_python}" -I "${broker_script}" \
+        PATH="${runtime_dir}:${PATH}" exec "${broker_process_name}" -I "${broker_script}" \
             --socket "${socket_path}" \
+            --protected-socket "${protected_socket_path}" \
             --result-dir "${result_dir}"
     ) &
     broker_pid="$!"
@@ -109,6 +121,10 @@ while :; do
     # A clean exit is the explicit shutdown RPC.  Signal/non-zero exits are
     # control-plane crashes, usually caused by an agent cleanup command.
     if [ "${status}" -eq 0 ]; then
+        # Normal broker teardown removes these markers.  If a proxy resisted
+        # TERM/KILL long enough for close() to return, its PID marker is kept
+        # deliberately so the supervisor can make this final cleanup attempt.
+        cleanup_crashed_broker
         exit 0
     fi
     restart_count="$((restart_count + 1))"

@@ -54,6 +54,19 @@ case "${POLAR_MULTI_GATEWAY:-${_tmax_multi_gateway_default}}" in
         ;;
 esac
 unset _tmax_multi_gateway_default
+export POLAR_GATEWAY_COUNT_OVERRIDE="${POLAR_GATEWAY_COUNT_OVERRIDE:-}"
+if [ -n "${POLAR_GATEWAY_COUNT_OVERRIDE}" ]; then
+    if ! [[ "${POLAR_GATEWAY_COUNT_OVERRIDE}" =~ ^[1-9][0-9]*$ ]] || \
+       [ "${POLAR_GATEWAY_COUNT_OVERRIDE}" -gt "${NUM_NODES}" ]; then
+        echo "ERROR: POLAR_GATEWAY_COUNT_OVERRIDE must be in [1, NUM_NODES=${NUM_NODES}]" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    if [ "${POLAR_MULTI_GATEWAY}" != "1" ] && \
+       [ "${POLAR_GATEWAY_COUNT_OVERRIDE}" -ne 1 ]; then
+        echo "ERROR: POLAR_GATEWAY_COUNT_OVERRIDE>1 requires POLAR_MULTI_GATEWAY=1" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+fi
 _tmax_total_gpus="$((NUM_NODES * SLURM_GPUS))"
 _tmax_short_limit_seconds="$((2 * 60 * 60))"
 
@@ -107,6 +120,11 @@ unset -f _tmax_partition_list_contains
 unset _tmax_wall_seconds _tmax_min_wall_seconds _tmax_total_gpus _tmax_short_limit_seconds
 export CPUS_PER_TASK="${CPUS_PER_TASK:-128}"
 export SLURM_STEP_CPUS_PER_TASK="${SLURM_STEP_CPUS_PER_TASK:-120}"
+export POLAR_SLURM_MEM_PER_NODE="${POLAR_SLURM_MEM_PER_NODE:-0}"
+if ! [[ "${POLAR_SLURM_MEM_PER_NODE}" =~ ^(0|[1-9][0-9]*[KMGTP]?)$ ]]; then
+    echo "ERROR: POLAR_SLURM_MEM_PER_NODE must be 0 or a positive Slurm memory value (for example 250G)" >&2
+    return 1 2>/dev/null || exit 1
+fi
 export SUBMIT_BACKEND="${SUBMIT_BACKEND:-sbatch}"
 
 DEFAULT_TRAIN_SQSH="${TMAX_SOURCE_DATA_ROOT}/container/flappydora-ubuntu22.04-cuda13.3.sqsh"
@@ -216,6 +234,7 @@ export ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-24}"
 export ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
 export RAY_NUM_GPUS_PER_NODE="${RAY_NUM_GPUS_PER_NODE:-8}"
 export TMAX_REQUIRE_FULL_GPU_ALLOCATION="${TMAX_REQUIRE_FULL_GPU_ALLOCATION:-1}"
+export TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL="${TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL:-0}"
 export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-32}"
 export NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
@@ -234,12 +253,21 @@ for _tmax_token_budget_name in ROLLOUT_MAX_PROMPT_LEN ROLLOUT_MAX_RESPONSE_LEN T
     fi
 done
 unset _tmax_token_budget_name _tmax_token_budget_value
-export TMAX_TRAIN_PACK_LENGTH="$((ROLLOUT_MAX_PROMPT_LEN + TMAX_MAX_TOTAL_RESPONSE_LEN))"
+if [ "${TMAX_AGENT_HARNESS:-}" = "controller_v3" ]; then
+    export TMAX_TRAIN_PACK_LENGTH="$((ROLLOUT_MAX_PROMPT_LEN + ROLLOUT_MAX_RESPONSE_LEN))"
+else
+    export TMAX_TRAIN_PACK_LENGTH="$((ROLLOUT_MAX_PROMPT_LEN + TMAX_MAX_TOTAL_RESPONSE_LEN))"
+fi
 export SEQ_LENGTH="${SEQ_LENGTH:-${TMAX_TRAIN_PACK_LENGTH}}"
 # Slime's dynamic scheduler multiplies this cap by CP, not TP. With CP=1 it
 # must therefore admit one complete 67,584-token pack. TP4 sequence
 # parallelism and full recomputation provide the per-GPU memory reduction.
 export MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${TMAX_TRAIN_PACK_LENGTH}}"
+# The dynamic scheduler safely places an individual sample that exceeds its
+# token cap in a microbatch by itself.  TMax keeps this opt-in disabled because
+# a full 65k trajectory can be expensive; short-action harnesses such as
+# SPilot may opt in to use the cap strictly as an aggregate microbatch bound.
+export TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP="${TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP:-0}"
 # Qwen3.5-9B declares a native 262,144-token context, and the observed TP=2
 # SGLang engine KV pool holds about 1.568M tokens. A native-length request is
 # therefore admissible without lowering the current static-memory fraction.
@@ -256,8 +284,62 @@ export SGLANG_ENABLE_FP32_LM_HEAD="${SGLANG_ENABLE_FP32_LM_HEAD:-1}"
 export SEQUENCE_PARALLEL="${SEQUENCE_PARALLEL:-1}"
 export DIST_CKPT_STRICTNESS="${DIST_CKPT_STRICTNESS:-log_all}"
 export ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
-export SAVE_INTERVAL="${SAVE_INTERVAL:-1}"
-export LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-64}"
+export SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
+export SAVE_RETAIN_INTERVAL="${SAVE_RETAIN_INTERVAL:-}"
+if ! [[ "${SAVE_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: SAVE_INTERVAL must be a positive integer, got ${SAVE_INTERVAL}" >&2
+    return 1 2>/dev/null || exit 1
+fi
+if [ -n "${SAVE_RETAIN_INTERVAL}" ]; then
+    if ! [[ "${SAVE_RETAIN_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: SAVE_RETAIN_INTERVAL must be a positive integer, got ${SAVE_RETAIN_INTERVAL}" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    if [ "$((SAVE_RETAIN_INTERVAL % SAVE_INTERVAL))" -ne 0 ]; then
+        echo "ERROR: SAVE_RETAIN_INTERVAL=${SAVE_RETAIN_INTERVAL} must be divisible by SAVE_INTERVAL=${SAVE_INTERVAL}" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+fi
+# Checkpoint formats. SAVE_HF_ENABLED=1 (default) writes an HF safetensors
+# export to ${SAVE_DIR}/hf/iter_XXXXXXX at every save interval, so evaluation
+# no longer needs export_hf_checkpoint.sh conversion jobs. SAVE_MEGATRON=0
+# drops the Megatron torch_dist checkpoint (fp32 optimizer state, ~10x the HF
+# export size); the run then cannot resume exactly after preemption or a
+# graceful-deadline exit, and the lifecycle watchers never see a checkpoint
+# tracker advance, so only disable it for runs that are disposable.
+# Default the HF export on only when the exporter can actually run: it copies
+# tokenizer/config assets from HF_CHECKPOINT, so a hub id (legacy run states)
+# must degrade to the pre-HF-export behaviour instead of failing the run.
+if [ -z "${SAVE_HF_ENABLED:-}" ]; then
+    if [ -d "${HF_CHECKPOINT}" ]; then
+        SAVE_HF_ENABLED=1
+    else
+        SAVE_HF_ENABLED=0
+        echo "[tmax env] WARNING: HF safetensors export disabled: HF_CHECKPOINT=${HF_CHECKPOINT} is not a local directory" >&2
+    fi
+fi
+export SAVE_HF_ENABLED
+export SAVE_MEGATRON="${SAVE_MEGATRON:-1}"
+case "${SAVE_HF_ENABLED}" in
+    0|1|true|false) ;;
+    *)
+        echo "ERROR: SAVE_HF_ENABLED must be 0/1/false/true, got ${SAVE_HF_ENABLED}" >&2
+        return 1 2>/dev/null || exit 1
+        ;;
+esac
+case "${SAVE_MEGATRON}" in
+    0|1|true|false) ;;
+    *)
+        echo "ERROR: SAVE_MEGATRON must be 0/1/false/true, got ${SAVE_MEGATRON}" >&2
+        return 1 2>/dev/null || exit 1
+        ;;
+esac
+case "${SAVE_MEGATRON}:${SAVE_HF_ENABLED}" in
+    0:0|0:false|false:0|false:false)
+        echo "ERROR: SAVE_MEGATRON=0 requires SAVE_HF_ENABLED=1, or nothing is saved at save time" >&2
+        return 1 2>/dev/null || exit 1
+        ;;
+esac
 export NUM_EPOCH="${NUM_EPOCH:-1}"
 # Optional absolute rollout-loop boundary. Slime treats --num-rollout as an
 # exclusive upper bound, so the matching final checkpoint/watcher target is
@@ -308,6 +390,23 @@ export GRPO_STD_NORMALIZATION="${GRPO_STD_NORMALIZATION:-0}"
 # policy lag, but stops batches whose average token probability ratio is
 # already far outside the useful TIS range before any gradient is applied.
 export MAX_TRAIN_ROLLOUT_LOGPROB_ABS_DIFF="${MAX_TRAIN_ROLLOUT_LOGPROB_ABS_DIFF:-1.0}"
+export TMAX_OPTIMIZER_CPU_OFFLOAD="${TMAX_OPTIMIZER_CPU_OFFLOAD:-0}"
+if ! [[ "${TMAX_OPTIMIZER_CPU_OFFLOAD}" =~ ^[01]$ ]]; then
+    echo "ERROR: TMAX_OPTIMIZER_CPU_OFFLOAD must be 0 or 1" >&2
+    return 1 2>/dev/null || exit 1
+fi
+
+# ``fully_async`` is the production default.  ``colocate`` is an explicit
+# synchronous profiling mode: Slime's asynchronous driver intentionally does
+# not support sharing actor and rollout GPUs, while train.py does.
+export TMAX_TRAIN_MODE="${TMAX_TRAIN_MODE:-fully_async}"
+case "${TMAX_TRAIN_MODE}" in
+    fully_async|colocate) ;;
+    *)
+        echo "ERROR: TMAX_TRAIN_MODE must be fully_async or colocate, got ${TMAX_TRAIN_MODE}" >&2
+        return 1 2>/dev/null || exit 1
+        ;;
+esac
 
 _tmax_validate_resource_topology() {
     local name value
@@ -328,13 +427,16 @@ _tmax_validate_resource_topology() {
         fi
     done
 
-    if ! [[ "$TMAX_REQUIRE_FULL_GPU_ALLOCATION" =~ ^[01]$ ]]; then
-        echo "ERROR: TMAX_REQUIRE_FULL_GPU_ALLOCATION must be 0 or 1" >&2
+    if ! [[ "$TMAX_REQUIRE_FULL_GPU_ALLOCATION" =~ ^[01]$ ]] || \
+       ! [[ "$TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL" =~ ^[01]$ ]] || \
+       ! [[ "$TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP" =~ ^[01]$ ]]; then
+        echo "ERROR: TMAX_REQUIRE_FULL_GPU_ALLOCATION, TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL, and TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP must be 0 or 1" >&2
         return 1
     fi
 
-    local actor_gpus actor_parallel_size capacity allocated_gpus rollout_product expected_global_batch
-    local global_batch actor_dp train_rollouts_per_dp
+    local actor_gpus actor_parallel_size capacity allocated_gpus rollout_product expected_global_batch expected_train_pack_length
+    local required_gpus
+    local global_batch actor_dp train_rollouts_per_dp min_train_rollouts_per_dp
     actor_gpus="$((ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE))"
     capacity="$((NUM_NODES * RAY_NUM_GPUS_PER_NODE))"
     allocated_gpus="$((NUM_NODES * SLURM_GPUS))"
@@ -349,16 +451,25 @@ _tmax_validate_resource_topology() {
         echo "ERROR: actor topology does not fit NUM_NODES=${NUM_NODES} x RAY_NUM_GPUS_PER_NODE=${RAY_NUM_GPUS_PER_NODE}" >&2
         return 1
     fi
-    if [ "$((actor_gpus + ROLLOUT_NUM_GPUS))" -gt "$capacity" ]; then
-        echo "ERROR: actor (${actor_gpus}) + rollout (${ROLLOUT_NUM_GPUS}) GPUs exceed Ray capacity ${capacity}" >&2
+    if [ "${TMAX_TRAIN_MODE}" = "colocate" ]; then
+        if [ "${actor_gpus}" -gt "${ROLLOUT_NUM_GPUS}" ]; then
+            required_gpus="${actor_gpus}"
+        else
+            required_gpus="${ROLLOUT_NUM_GPUS}"
+        fi
+    else
+        required_gpus="$((actor_gpus + ROLLOUT_NUM_GPUS))"
+    fi
+    if [ "${required_gpus}" -gt "$capacity" ]; then
+        echo "ERROR: ${TMAX_TRAIN_MODE} actor (${actor_gpus}) / rollout (${ROLLOUT_NUM_GPUS}) require ${required_gpus} GPUs, exceeding Ray capacity ${capacity}" >&2
         echo "  For one node, explicitly use e.g. ACTOR_NUM_GPUS_PER_NODE=4 ROLLOUT_NUM_GPUS=4." >&2
         return 1
     fi
     if [ "$TMAX_REQUIRE_FULL_GPU_ALLOCATION" = "1" ] && {
        [ "$capacity" -ne "$allocated_gpus" ] ||
-       [ "$((actor_gpus + ROLLOUT_NUM_GPUS))" -ne "$allocated_gpus" ];
+       [ "${required_gpus}" -ne "$allocated_gpus" ];
     }; then
-        echo "ERROR: actor (${actor_gpus}) + rollout (${ROLLOUT_NUM_GPUS}) must use all ${allocated_gpus} allocated GPUs" >&2
+        echo "ERROR: ${TMAX_TRAIN_MODE} actor (${actor_gpus}) / rollout (${ROLLOUT_NUM_GPUS}) use ${required_gpus} GPUs and must use all ${allocated_gpus} allocated GPUs" >&2
         echo "  Set TMAX_REQUIRE_FULL_GPU_ALLOCATION=0 only for an intentional under-allocation experiment." >&2
         return 1
     fi
@@ -366,8 +477,10 @@ _tmax_validate_resource_topology() {
         echo "ERROR: ROLLOUT_NUM_GPUS must be divisible by ROLLOUT_NUM_GPUS_PER_ENGINE" >&2
         return 1
     fi
-    if [ "$((ACTOR_NUM_GPUS_PER_NODE % ACTOR_TENSOR_MODEL_PARALLEL_SIZE))" -ne 0 ]; then
+    if [ "$((ACTOR_NUM_GPUS_PER_NODE % ACTOR_TENSOR_MODEL_PARALLEL_SIZE))" -ne 0 ] && \
+       [ "${TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL}" != "1" ]; then
         echo "ERROR: actor GPUs per node ${ACTOR_NUM_GPUS_PER_NODE} must be divisible by tensor parallel size ${ACTOR_TENSOR_MODEL_PARALLEL_SIZE}" >&2
+        echo "  Set TMAX_ALLOW_CROSS_NODE_TENSOR_PARALLEL=1 only when TP ranks intentionally span nodes." >&2
         return 1
     fi
     actor_parallel_size="$((ACTOR_TENSOR_MODEL_PARALLEL_SIZE * ACTOR_PIPELINE_MODEL_PARALLEL_SIZE * CONTEXT_PARALLEL_SIZE))"
@@ -383,14 +496,22 @@ _tmax_validate_resource_topology() {
         echo "ERROR: per-turn ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN} exceeds cumulative TMAX_MAX_TOTAL_RESPONSE_LEN=${TMAX_MAX_TOTAL_RESPONSE_LEN}" >&2
         return 1
     fi
-    if [ "${TMAX_TRAIN_PACK_LENGTH}" -ne "$((ROLLOUT_MAX_PROMPT_LEN + TMAX_MAX_TOTAL_RESPONSE_LEN))" ] || \
+    if [ "${TMAX_AGENT_HARNESS:-}" = "controller_v3" ]; then
+        expected_train_pack_length="$((ROLLOUT_MAX_PROMPT_LEN + ROLLOUT_MAX_RESPONSE_LEN))"
+    else
+        expected_train_pack_length="$((ROLLOUT_MAX_PROMPT_LEN + TMAX_MAX_TOTAL_RESPONSE_LEN))"
+    fi
+    if [ "${TMAX_TRAIN_PACK_LENGTH}" -ne "${expected_train_pack_length}" ] || \
        [ "${SEQ_LENGTH}" -ne "${TMAX_TRAIN_PACK_LENGTH}" ]; then
-        echo "ERROR: TMax requires SEQ_LENGTH=prompt+total_response=${TMAX_TRAIN_PACK_LENGTH}, got SEQ_LENGTH=${SEQ_LENGTH}" >&2
+        echo "ERROR: TMax requires SEQ_LENGTH=${expected_train_pack_length} for harness ${TMAX_AGENT_HARNESS:-default}, got SEQ_LENGTH=${SEQ_LENGTH}" >&2
         return 1
     fi
-    # MAX_TOKENS_PER_GPU controls multi-sample micro-batch packing. Slime
-    # intentionally schedules a single sample longer than the cap alone, so
-    # this may be lower than TMAX_TRAIN_PACK_LENGTH without truncating it.
+    if [ "$((MAX_TOKENS_PER_GPU * CONTEXT_PARALLEL_SIZE))" -lt "${TMAX_TRAIN_PACK_LENGTH}" ] && \
+       [ "${TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP}" -ne 1 ]; then
+        echo "ERROR: trainer token capacity MAX_TOKENS_PER_GPU*CP=$((MAX_TOKENS_PER_GPU * CONTEXT_PARALLEL_SIZE)) is smaller than the complete TMax pack ${TMAX_TRAIN_PACK_LENGTH}" >&2
+        echo "  Set TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP=1 only when the harness bounds individual trajectories independently; oversize samples run alone." >&2
+        return 1
+    fi
     if [ "$((rollout_product % NUM_STEPS_PER_ROLLOUT))" -ne 0 ]; then
         echo "ERROR: rollout batch product must be divisible by NUM_STEPS_PER_ROLLOUT" >&2
         return 1
@@ -411,8 +532,9 @@ _tmax_validate_resource_topology() {
         return 1
     fi
     train_rollouts_per_dp="$((global_batch / actor_dp))"
-    if [ "$train_rollouts_per_dp" -lt 8 ]; then
-        echo "ERROR: global batch gives only ${train_rollouts_per_dp} trajectories per actor DP rank; require at least 8 to avoid underfilled trainer GPUs" >&2
+    min_train_rollouts_per_dp="${TMAX_MIN_TRAIN_ROLLOUTS_PER_DP:-8}"
+    if [ "$train_rollouts_per_dp" -lt "$min_train_rollouts_per_dp" ]; then
+        echo "ERROR: global batch gives only ${train_rollouts_per_dp} trajectories per actor DP rank; require at least ${min_train_rollouts_per_dp}" >&2
         return 1
     fi
 }
@@ -424,6 +546,26 @@ unset -f _tmax_validate_resource_topology
 export TMAX_GRACEFUL_EXIT_BUFFER_SECONDS="${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS:-3600}"
 export TMAX_ENABLE_GRACEFUL_EXIT="${TMAX_ENABLE_GRACEFUL_EXIT:-1}"
 export POLAR_FULLY_ASYNC="${POLAR_FULLY_ASYNC:-true}"
+export TMAX_PROFILE_DISABLE_CHECKPOINT="${TMAX_PROFILE_DISABLE_CHECKPOINT:-0}"
+if ! [[ "${TMAX_PROFILE_DISABLE_CHECKPOINT}" =~ ^[01]$ ]]; then
+    echo "ERROR: TMAX_PROFILE_DISABLE_CHECKPOINT must be 0 or 1" >&2
+    return 1 2>/dev/null || exit 1
+fi
+if [ "${TMAX_PROFILE_DISABLE_CHECKPOINT}" = "1" ] && \
+   [ "${TMAX_ENABLE_GRACEFUL_EXIT}" != "0" ]; then
+    echo "ERROR: TMAX_PROFILE_DISABLE_CHECKPOINT=1 requires TMAX_ENABLE_GRACEFUL_EXIT=0" >&2
+    return 1 2>/dev/null || exit 1
+fi
+if [ "${TMAX_TRAIN_MODE}" = "colocate" ]; then
+    if [ "${POLAR_FULLY_ASYNC}" != "false" ]; then
+        echo "ERROR: TMAX_TRAIN_MODE=colocate requires POLAR_FULLY_ASYNC=false" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    if [ "${TMAX_ENABLE_GRACEFUL_EXIT}" != "0" ]; then
+        echo "ERROR: TMAX_TRAIN_MODE=colocate requires TMAX_ENABLE_GRACEFUL_EXIT=0; sync train.py has no graceful lifecycle support" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+fi
 export TMAX_MIN_ASYNC_LEVEL="${TMAX_MIN_ASYNC_LEVEL:-4}"
 export POLAR_MAX_ASYNC_LEVEL="${POLAR_MAX_ASYNC_LEVEL:-${TMAX_MIN_ASYNC_LEVEL}}"
 if ! [[ "${TMAX_MIN_ASYNC_LEVEL}" =~ ^[1-9][0-9]*$ ]] || \
@@ -578,6 +720,21 @@ unset -f _tmax_validate_async_capacity
 
 export TMAX_AGENT_HARNESS="${TMAX_AGENT_HARNESS:-${POLAR_AGENT_HARNESS:-mini_swe_agent}}"
 export POLAR_AGENT_HARNESS="${TMAX_AGENT_HARNESS}"
+if [ "${TMAX_AGENT_HARNESS}" = "spilot_router" ] || \
+   [ "${TMAX_AGENT_HARNESS}" = "controller_v3" ]; then
+    for _tmax_spilot_isolation_name in \
+        POLAR_APPTAINER_NO_MOUNT_HOSTFS \
+        POLAR_APPTAINER_NO_MOUNT_TMP \
+        POLAR_APPTAINER_ISOLATE_PID \
+        POLAR_APPTAINER_ISOLATE_IPC \
+        POLAR_APPTAINER_CLEANENV; do
+        if [ "${!_tmax_spilot_isolation_name:-}" != 1 ]; then
+            echo "ERROR: formal SPilot requires ${_tmax_spilot_isolation_name}=1 at allocation startup" >&2
+            return 1 2>/dev/null || exit 1
+        fi
+    done
+    unset _tmax_spilot_isolation_name
+fi
 export POLAR_AGENT_MODEL_NAME="${POLAR_AGENT_MODEL_NAME:-Qwen/Qwen3.5-9B}"
 # Qwen3.5's tokenizer supports interleaved reasoning natively. Explicit model
 # kwargs keep that behavior through LiteLLM and the gateway; the qwen3 parser
@@ -602,7 +759,7 @@ if ! [[ "${POLAR_AGENT_MAX_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
     return 1 2>/dev/null || exit 1
 fi
 case "${TMAX_AGENT_HARNESS}" in
-    mini_swe_agent|vanillux2)
+    controller_v3|mini_swe_agent|spilot_router|vanillux2)
         export POLAR_AGENT_PATH="${MINI_SWE_AGENT_CONTAINER_DIR}/bin:/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         printf -v POLAR_AGENT_RUNTIME_VOLUME '        - %s:%s:ro' \
             "${MINI_SWE_AGENT_RUNTIME_DIR}" "${MINI_SWE_AGENT_CONTAINER_DIR}"
@@ -617,6 +774,153 @@ case "${TMAX_AGENT_HARNESS}" in
         return 1 2>/dev/null || exit 1
         ;;
 esac
+
+_tmax_validate_spilot_episode_admission() {
+    local name value expected_qwen expected_gpt expected_agent expected_task
+    local expected_request wall_seconds required_buffer_seconds required_wall_seconds
+    local runtime_gateway_count
+    if [ "${TMAX_AGENT_HARNESS}" != "spilot_router" ]; then
+        return 0
+    fi
+
+    runtime_gateway_count=1
+    if [ "${POLAR_MULTI_GATEWAY}" = "1" ]; then
+        runtime_gateway_count="${POLAR_GATEWAY_COUNT_OVERRIDE:-${NUM_NODES}}"
+    fi
+
+    # Generic/legacy SPilot entrypoints fail safe to the pre-admission
+    # behavior. The canonical SPilot wrapper opts in explicitly and persists
+    # the complete contract in run state.
+    export SPILOT_EPISODE_ADMISSION_ENABLED="${SPILOT_EPISODE_ADMISSION_ENABLED:-false}"
+    export SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT="${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT:-${runtime_gateway_count}}"
+    if ! [[ "${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT must be a positive integer" >&2
+        return 1
+    fi
+    case "${SPILOT_EPISODE_ADMISSION_ENABLED}" in
+        true)
+            for name in \
+                SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS \
+                SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT \
+                SPILOT_QWEN_MAX_ACTIVE_EPISODES \
+                SPILOT_GPT_MAX_ACTIVE_EPISODES \
+                SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES \
+                SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES \
+                SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY \
+                SPILOT_GPT_GATEWAY_MAX_CONCURRENCY \
+                SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES \
+                SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES; do
+                value="${!name:-}"
+                if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "ERROR: ${name} must be a positive integer when SPilot episode admission is enabled" >&2
+                    return 1
+                fi
+            done
+            if [ "${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS}" -gt 86400 ]; then
+                echo "ERROR: SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS must be at most 86400" >&2
+                return 1
+            fi
+            if [ "${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT}" -ne "${runtime_gateway_count}" ]; then
+                echo "ERROR: SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT must equal runtime gateway count ${runtime_gateway_count}" >&2
+                return 1
+            fi
+            if [ $((SPILOT_QWEN_MAX_ACTIVE_EPISODES % SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT)) -ne 0 ] || \
+               [ $((SPILOT_GPT_MAX_ACTIVE_EPISODES % SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT)) -ne 0 ]; then
+                echo "ERROR: both SPilot aggregate model-pool caps must be divisible by all ${SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT} gateways" >&2
+                return 1
+            fi
+            expected_qwen="$((SPILOT_QWEN_MAX_ACTIVE_EPISODES / SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT))"
+            expected_gpt="$((SPILOT_GPT_MAX_ACTIVE_EPISODES / SPILOT_EPISODE_ADMISSION_GATEWAY_COUNT))"
+            if [ "${SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES}" -ne "${expected_qwen}" ] || \
+               [ "${SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES}" -ne "${expected_gpt}" ]; then
+                echo "ERROR: SPilot per-gateway active-episode caps do not match the exact aggregate split" >&2
+                return 1
+            fi
+            if [ "${SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY}" -ne "${expected_qwen}" ] || \
+               [ "${SPILOT_GPT_GATEWAY_MAX_CONCURRENCY}" -ne "${expected_gpt}" ]; then
+                echo "ERROR: each SPilot pool HTTP max_concurrency must equal its local episode cap" >&2
+                return 1
+            fi
+            if [ "${SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES}" -ne "${SPILOT_QWEN_MAX_ACTIVE_EPISODES}" ] || \
+               [ "${SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES}" -ne "${SPILOT_GPT_MAX_ACTIVE_EPISODES}" ]; then
+                echo "ERROR: persisted SPilot effective caps must equal the configured aggregate caps" >&2
+                return 1
+            fi
+            # The runner's internal total remains 3,000 seconds and credits
+            # measured queue time. Provider admission has its own explicit wait
+            # budget and therefore must not depend on the gateway worker-pool
+            # shape used by the controlled Qwen3.5 training comparison. A
+            # saturated provider queue may exceed Q; that admission expiry is
+            # an infrastructure-masked outcome, not a synthetic reward sample.
+            expected_agent="$((3300 + SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS))"
+            expected_task="$((4500 + SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS + expected_agent))"
+            expected_request="$((5100 + SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS + expected_agent))"
+            if [ "${TMAX_TRAIN_AGENT_TIMEOUT_SECONDS}" -ne "${expected_agent}" ] || \
+               [ "${POLAR_TASK_TIMEOUT_FLOOR_SECONDS}" -ne "${expected_task}" ] || \
+               [ "${POLAR_REQUEST_TIMEOUT}" -ne "${expected_request}" ]; then
+                echo "ERROR: SPilot admission timeout formula requires agent/task/request=${expected_agent}/${expected_task}/${expected_request}" >&2
+                return 1
+            fi
+            if [ "${TMAX_PROFILE_DISABLE_CHECKPOINT}" = "0" ]; then
+                if [ "${PARTITION}" != backfill ]; then
+                    echo "ERROR: canonical SPilot admission requires PARTITION=backfill because batch is limited to four hours" >&2
+                    return 1
+                fi
+                # Once Slime enters its graceful window it must have enough
+                # time for the longest in-flight request plus one hour reserved
+                # for the final checkpoint and process teardown. The allocation
+                # itself must also have room for one complete request before
+                # that window.
+                required_buffer_seconds="$((POLAR_REQUEST_TIMEOUT + 3600))"
+                if [ "${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS}" -lt "${required_buffer_seconds}" ]; then
+                    echo "ERROR: SPilot TMAX_GRACEFUL_EXIT_BUFFER_SECONDS must cover POLAR_REQUEST_TIMEOUT + 3600 (${TMAX_GRACEFUL_EXIT_BUFFER_SECONDS} < ${required_buffer_seconds})" >&2
+                    return 1
+                fi
+                if ! wall_seconds="$(tmax_slurm_duration_seconds "${WALL_TIME}")"; then
+                    echo "ERROR: unsupported SPilot WALL_TIME=${WALL_TIME}" >&2
+                    return 1
+                fi
+                required_wall_seconds="$((TMAX_GRACEFUL_EXIT_BUFFER_SECONDS + POLAR_REQUEST_TIMEOUT))"
+                if [ "${wall_seconds}" -lt "${required_wall_seconds}" ]; then
+                    echo "ERROR: SPilot WALL_TIME must cover POLAR_REQUEST_TIMEOUT + TMAX_GRACEFUL_EXIT_BUFFER_SECONDS (${wall_seconds} < ${required_wall_seconds})" >&2
+                    return 1
+                fi
+            else
+                echo "[tmax env] disposable profile: skipping durable admission wall/checkpoint reserve checks" >&2
+            fi
+            ;;
+        false)
+            export SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS="${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS:-0}"
+            export SPILOT_QWEN_MAX_ACTIVE_EPISODES="${SPILOT_QWEN_MAX_ACTIVE_EPISODES:-0}"
+            export SPILOT_GPT_MAX_ACTIVE_EPISODES="${SPILOT_GPT_MAX_ACTIVE_EPISODES:-0}"
+            export SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES="${SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES:-null}"
+            export SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES="${SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES:-null}"
+            export SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY="${SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY:-32}"
+            export SPILOT_GPT_GATEWAY_MAX_CONCURRENCY="${SPILOT_GPT_GATEWAY_MAX_CONCURRENCY:-32}"
+            export SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES="${SPILOT_QWEN_EFFECTIVE_MAX_ACTIVE_EPISODES:-0}"
+            export SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES="${SPILOT_GPT_EFFECTIVE_MAX_ACTIVE_EPISODES:-0}"
+            if ! [[ "${SPILOT_QWEN_GATEWAY_MAX_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] || \
+               ! [[ "${SPILOT_GPT_GATEWAY_MAX_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
+                echo "ERROR: disabled SPilot HTTP max_concurrency values must remain positive integers" >&2
+                return 1
+            fi
+            if [ "${SPILOT_EPISODE_ADMISSION_WAIT_BUDGET_SECONDS}" != 0 ] || \
+               [ "${SPILOT_QWEN_GATEWAY_MAX_ACTIVE_EPISODES}" != null ] || \
+               [ "${SPILOT_GPT_GATEWAY_MAX_ACTIVE_EPISODES}" != null ]; then
+                echo "ERROR: disabled SPilot episode admission requires zero wait and null caps for both aliases" >&2
+                return 1
+            fi
+            ;;
+        *)
+            echo "ERROR: SPILOT_EPISODE_ADMISSION_ENABLED must be true or false" >&2
+            return 1
+            ;;
+    esac
+}
+if ! _tmax_validate_spilot_episode_admission; then
+    return 1 2>/dev/null || exit 1
+fi
+unset -f _tmax_validate_spilot_episode_admission
 
 # Missing SIFs are fatal by default. The dual-eval contract rejects partial
 # mode: every task in the deterministic train+holdout population must have a
@@ -680,8 +984,8 @@ export TMAX_EXTERNAL_EVAL_MAX_TASKS="${TMAX_EXTERNAL_EVAL_MAX_TASKS:-89}"
 export TMAX_EXTERNAL_EVAL_DATASET_NAME="${TMAX_EXTERNAL_EVAL_DATASET_NAME:-terminal_bench_2_0}"
 # Periodic eval uses one attempt per task so it does not consume five complete
 # Terminal-Bench passes at every checkpoint. For a paper-comparable final
-# evaluation, explicitly set this to 5; the dataset mean still weights every
-# attempt equally and the aggregate keeps its 89-task dataset weight.
+# evaluation, explicitly set this to 5. Every accounted attempt contributes
+# one vote to the aggregate reward metric.
 export TMAX_EXTERNAL_EVAL_SAMPLES_PER_PROMPT="${TMAX_EXTERNAL_EVAL_SAMPLES_PER_PROMPT:-1}"
 export TMAX_EXTERNAL_EVAL_TEMPERATURE="${TMAX_EXTERNAL_EVAL_TEMPERATURE:-0.7}"
 export TMAX_EXTERNAL_EVAL_TOP_P="${TMAX_EXTERNAL_EVAL_TOP_P:-0.95}"
@@ -690,8 +994,6 @@ if [ -z "${TMAX_EXTERNAL_EVAL_MIN_VALID_SAMPLES+x}" ]; then
     TMAX_EXTERNAL_EVAL_MIN_VALID_SAMPLES="$((TMAX_EXTERNAL_EVAL_MAX_TASKS * TMAX_EXTERNAL_EVAL_SAMPLES_PER_PROMPT))"
 fi
 export TMAX_EXTERNAL_EVAL_MIN_VALID_SAMPLES
-export TMAX_EVAL_WEIGHT="${TMAX_EVAL_WEIGHT:-${TMAX_EVAL_MAX_TASKS}}"
-export TMAX_EXTERNAL_EVAL_WEIGHT="${TMAX_EXTERNAL_EVAL_WEIGHT:-${TMAX_EXTERNAL_EVAL_MAX_TASKS}}"
 # Cluster-local, revision-pinned Terminal-Bench 2.0 assets. Harbor's immutable
 # ``terminal-bench@2.0`` registry entry pins all 89 tasks to the commit below;
 # do not substitute the repository's moving main branch or TB2.1 task files.
@@ -818,8 +1120,7 @@ _tmax_validate_dataset_split() {
     for name in TMAX_TOTAL_TASKS TMAX_EVAL_MAX_TASKS TMAX_EVAL_INTERVAL \
         TMAX_EVAL_SAMPLES_PER_PROMPT TMAX_EVAL_MIN_VALID_SAMPLES \
         TMAX_EXTERNAL_EVAL_MAX_TASKS TMAX_EXTERNAL_EVAL_SAMPLES_PER_PROMPT \
-        TMAX_EXTERNAL_EVAL_MIN_VALID_SAMPLES TMAX_EXTERNAL_EVAL_WEIGHT \
-        TMAX_EVAL_WEIGHT; do
+        TMAX_EXTERNAL_EVAL_MIN_VALID_SAMPLES; do
         value="${!name}"
         if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
             echo "ERROR: ${name} must be a positive integer, got ${value}" >&2
@@ -926,7 +1227,9 @@ export TRAINING_COMPLETE_MARKER="${TRAINING_COMPLETE_MARKER:-${SAVE_DIR}/TRAININ
 export FINAL_EVAL_COMPLETE_MARKER="${FINAL_EVAL_COMPLETE_MARKER:-${SAVE_DIR}/FINAL_EVAL_COMPLETE}"
 export TMAX_RUN_STATE_FILE="${TMAX_RUN_STATE_FILE:-${POLAR_DATA_ROOT}/runs/tmax_slime_grpo/current_run.env}"
 export TMAX_SUBMIT_RECEIPT_FILE="${TMAX_SUBMIT_RECEIPT_FILE:-${POLAR_DATA_ROOT}/runs/${RUN_ID}/submit/last_submission.env}"
-export WANDB_PROJECT="${WANDB_PROJECT:-polar-tmax-grpo}"
+# All SPilot-repo experiments log to the shared SPilot project by default;
+# in-flight logical runs keep their serialized project from run state.
+export WANDB_PROJECT="${WANDB_PROJECT:-SPilot}"
 export WANDB_GROUP="${WANDB_GROUP:-tmax-mini-swe-qwen35-9b-full-async-8t24r}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
 export WANDB_ALWAYS_USE_TRAIN_STEP="${WANDB_ALWAYS_USE_TRAIN_STEP:-1}"
@@ -943,10 +1246,10 @@ _polar_load_export_from_zshrc() {
     local name="$1"
     local line value
     if [ -n "${!name:-}" ] || [ ! -f "$HOME/.zshrc" ]; then
-        return
+        return 0
     fi
     line="$(grep -E "^export ${name}=" "$HOME/.zshrc" 2>/dev/null | tail -n 1 || true)"
-    [ -n "$line" ] || return
+    [ -n "$line" ] || return 0
     value="${line#export ${name}=}"
     eval "export ${name}=${value}"
 }
@@ -984,6 +1287,6 @@ mkdir -p \
 
 echo "[tmax env] nodes=${NUM_NODES} gpus/node=${SLURM_GPUS} partition=${PARTITION} no_instance=${POLAR_APPTAINER_NO_INSTANCE} network=${POLAR_SANDBOX_NETWORK}"
 echo "[tmax env] dataset=${TMAX_DATASET_DIR} sif_dir=${APPTAINER_IMAGE_DIR} train_data=${TMAX_TRAIN_DATA}"
-echo "[tmax env] actor=${ACTOR_NUM_NODES}x${ACTOR_NUM_GPUS_PER_NODE}/tp${ACTOR_TENSOR_MODEL_PARALLEL_SIZE}/pp${ACTOR_PIPELINE_MODEL_PARALLEL_SIZE}/cp${CONTEXT_PARALLEL_SIZE} rollout_gpus=${ROLLOUT_NUM_GPUS}/tp${ROLLOUT_NUM_GPUS_PER_ENGINE} batch=${ROLLOUT_BATCH_SIZE}x${N_SAMPLES_PER_PROMPT}/${NUM_STEPS_PER_ROLLOUT} fully_async=${POLAR_FULLY_ASYNC}/${POLAR_MAX_ASYNC_LEVEL} active_sessions=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT * POLAR_MAX_ASYNC_LEVEL)) run_workers=${POLAR_MAX_RUN_WORKERS}"
+echo "[tmax env] mode=${TMAX_TRAIN_MODE} actor=${ACTOR_NUM_NODES}x${ACTOR_NUM_GPUS_PER_NODE}/tp${ACTOR_TENSOR_MODEL_PARALLEL_SIZE}/cp${CONTEXT_PARALLEL_SIZE} rollout_gpus=${ROLLOUT_NUM_GPUS}/tp${ROLLOUT_NUM_GPUS_PER_ENGINE} batch=${ROLLOUT_BATCH_SIZE}x${N_SAMPLES_PER_PROMPT}/${NUM_STEPS_PER_ROLLOUT} fully_async=${POLAR_FULLY_ASYNC}/${POLAR_MAX_ASYNC_LEVEL} active_sessions=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT * POLAR_MAX_ASYNC_LEVEL)) run_workers=${POLAR_MAX_RUN_WORKERS}"
 echo "[tmax env] harness=${TMAX_AGENT_HARNESS} runtime=${MINI_SWE_AGENT_RUNTIME_DIR}"
 echo "[tmax env] train_sqsh=${POLR_TRAIN_SQSH} slime=${SLIME_DIR} ref_load=${REF_LOAD} run_id=${RUN_ID} sglang_base_port=${SLIME_ROLLOUT_BASE_PORT:-allocation-scoped}"

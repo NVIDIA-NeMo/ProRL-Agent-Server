@@ -1,5 +1,52 @@
 #!/usr/bin/env bash
 
+TMAX_LIFECYCLE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+
+tmax_require_spilot_credentials() {
+    local stage="${1:-operation}"
+    if [ "${TMAX_AGENT_HARNESS:-}" != "spilot_router" ]; then
+        return 0
+    fi
+    if [ -z "${POLAR_CONTROL_PLANE_TOKEN:-}" ]; then
+        echo "ERROR: ${stage}: SPilot Router requires POLAR_CONTROL_PLANE_TOKEN; use the SPilot submit wrapper" >&2
+        return 1
+    fi
+    if ! [[ "${POLAR_CONTROL_PLANE_TOKEN}" =~ ^[0-9A-Za-z_-]{32,128}$ ]]; then
+        echo "ERROR: ${stage}: POLAR_CONTROL_PLANE_TOKEN must be a 32-128 character opaque token" >&2
+        return 1
+    fi
+    if [ -z "${POLAR_NVIDIA_API_KEY:-}" ]; then
+        echo "ERROR: ${stage}: SPilot Router requires POLAR_NVIDIA_API_KEY; use the SPilot submit wrapper" >&2
+        return 1
+    fi
+    if [ -z "${POLAR_MODEL_POOL_BASE_URL:-}" ]; then
+        echo "ERROR: ${stage}: SPilot Router requires POLAR_MODEL_POOL_BASE_URL; use the SPilot submit wrapper" >&2
+        return 1
+    fi
+}
+
+tmax_require_spilot_entrypoints() {
+    local stage="${1:-operation}"
+    local spilot_dir entrypoint name file expected
+    if [ "${TMAX_AGENT_HARNESS:-}" != "spilot_router" ]; then
+        return 0
+    fi
+    spilot_dir="$(cd -- "${TMAX_LIFECYCLE_DIR}/../spilot_router_slime_grpo" &>/dev/null && pwd)"
+    for entrypoint in \
+        "TMAX_SUBMIT_SCRIPT:submit_slurm.sh" \
+        "POLAR_TRAIN_RUN_SCRIPT:run.sh" \
+        "POLAR_CONFIG_TEMPLATE:polar_config.yaml" \
+        "TOPOLOGY_TEMPLATE:topology.yaml"; do
+        name="${entrypoint%%:*}"
+        file="${entrypoint#*:}"
+        expected="${spilot_dir}/${file}"
+        if [ "${!name:-}" != "${expected}" ]; then
+            echo "ERROR: ${stage}: SPilot Router requires ${name}=${expected}; got ${!name:-unset}" >&2
+            return 1
+        fi
+    done
+}
+
 tmax_slurm_duration_seconds() {
     local spec="$1" rest days=0 has_days=0
     local -a fields
@@ -70,4 +117,52 @@ tmax_configure_graceful_deadline() {
         echo "ERROR: graceful checkpoint deadline has already passed; reduce TMAX_GRACEFUL_EXIT_BUFFER_SECONDS or startup time" >&2
         return 1
     fi
+}
+
+tmax_validate_numbered_checkpoint() {
+    local root="${1:?missing checkpoint root}"
+    local context="${2:-ERROR: checkpoint}"
+    local pointer value iteration_dir model_dir path state_path validation_error
+
+    pointer="${root}/latest_checkpointed_iteration.txt"
+    if [ ! -f "${pointer}" ] || [ ! -s "${pointer}" ]; then
+        echo "${context}: checkpoint pointer is missing or empty: ${pointer}" >&2
+        return 1
+    fi
+    value="$(tr -d '[:space:]' <"${pointer}")"
+    if ! [[ "${value}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+        echo "${context}: invalid checkpoint iteration in ${pointer}: ${value}" >&2
+        return 1
+    fi
+
+    printf -v iteration_dir 'iter_%07s' "${value}"
+    iteration_dir="${iteration_dir// /0}"
+    model_dir="${root}/${iteration_dir}"
+    if [ ! -d "${model_dir}" ]; then
+        echo "${context}: tracker ${value} has no matching model checkpoint directory" >&2
+        echo "  Missing: ${model_dir}" >&2
+        return 1
+    fi
+    for path in "${model_dir}/common.pt" "${model_dir}/.metadata"; do
+        if [ ! -f "${path}" ] || [ ! -s "${path}" ]; then
+            echo "${context}: model checkpoint ${value} is incomplete" >&2
+            echo "  Missing or empty regular file: ${path}" >&2
+            return 1
+        fi
+    done
+    if ! validation_error="$(python3 "${TMAX_LIFECYCLE_DIR}/validate_torch_dist_checkpoint.py" "${model_dir}" 2>&1)"; then
+        echo "${context}: model checkpoint ${value} has inconsistent distcp metadata" >&2
+        if [ -n "${validation_error}" ]; then
+            printf '  %s\n' "${validation_error}" >&2
+        fi
+        return 1
+    fi
+
+    state_path="${root}/rollout/global_dataset_state_dict_${value}.pt"
+    if [ ! -f "${state_path}" ] || [ ! -s "${state_path}" ]; then
+        echo "${context}: checkpoint ${value} has no matching rollout state" >&2
+        echo "  Missing or empty regular file: ${state_path}" >&2
+        return 1
+    fi
+    printf '%s\n' "${value}"
 }

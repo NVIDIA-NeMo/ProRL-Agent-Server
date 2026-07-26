@@ -14,6 +14,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+# shellcheck source=../path_safety.sh
+source "${SCRIPT_DIR}/../path_safety.sh"
 TRAIN_RUN_SCRIPT="${POLAR_TRAIN_RUN_SCRIPT:-${SCRIPT_DIR}/run.sh}"
 if [ ! -f "${TRAIN_RUN_SCRIPT}" ]; then
     echo "ERROR: training run script not found: ${TRAIN_RUN_SCRIPT}" >&2
@@ -30,6 +32,11 @@ SLURM_GPUS="${SLURM_GPUS:-8}"
 SLURM_CONSTRAINT="${SLURM_CONSTRAINT:-}"   # e.g. H100/H200/B200
 SLURM_EXCLUDE="${SLURM_EXCLUDE:-}"
 SBATCH_DEPENDENCY="${SBATCH_DEPENDENCY:-}"
+POLAR_SLURM_MEM_PER_NODE="${POLAR_SLURM_MEM_PER_NODE:-0}"
+if ! [[ "${POLAR_SLURM_MEM_PER_NODE}" =~ ^(0|[1-9][0-9]*[KMGTP]?)$ ]]; then
+    echo "ERROR: POLAR_SLURM_MEM_PER_NODE must be 0 or a positive Slurm memory value" >&2
+    exit 1
+fi
 
 # ── Training container ───────────────────────────────────────────────
 TRAIN_SQSH="${POLR_TRAIN_SQSH:?set POLR_TRAIN_SQSH (your train.sqsh; build via build_training_sqsh.sh)}"
@@ -69,7 +76,9 @@ case "$TRAIN_SQSH" in
         fi ;;
     *) : ;;  # docker:// or registry ref — leave it to pyxis/enroot to resolve
 esac
-LOG_DIR="${PROJECT_ROOT}/logs/slurm"; mkdir -p "${LOG_DIR}"
+LOG_DIR="${POLAR_SLURM_LOG_DIR:-${DATA_ROOT}/logs/slurm}"
+polar_require_absolute_path POLAR_SLURM_LOG_DIR "${LOG_DIR}"
+mkdir -p "${LOG_DIR}"
 POLAR_LAUNCHER_LABEL="${POLAR_LAUNCHER_LABEL:-Polar SWE-Gym Slime-GRPO (Route A)}"
 
 echo "============================================="
@@ -128,19 +137,22 @@ umask 077
 {
     while IFS= read -r name; do
         case "$name" in
-            POLAR_*|POLR_*|TMAX_*|MINI_SWE_*|PRM_*|WANDB_*|HF_*|HUGGINGFACE_*|\
-            ACTOR_*|ROLLOUT_*|RAY_NUM_*|GPU_MONITOR_*|SGLANG_*|FLASHINFER_*|\
-            APPTAINER_IMAGE_DIR|AGENT_CLI_DIR|TRAIN_CONTAINER_MOUNTS|\
+            POLAR_*|POLR_*|TMAX_*|MINI_SWE_*|WANDB_*|HF_*|HUGGINGFACE_*|\
+            APPTAINER_ENV|\
+            SPILOT_*|\
+            ACTOR_*|EXPERT_*|ROLLOUT_*|RAY_NUM_*|RAY_LAST_NODE_NUM_GPUS|GPU_MONITOR_*|SGLANG_*|FLASHINFER_*|\
+            APPTAINER_IMAGE_DIR|AGENT_CLI_DIR|TRAIN_CONTAINER_MOUNTS|TOPOLOGY_TEMPLATE|CONTROLLER_V3_*|\
             SLIME_DIR|SLIME_ROLLOUT_BASE_PORT|SLIME_ROLLOUT_BASE_PORT_FALLBACK|\
             SLIME_EPHEMERAL_PORT_LOWER_BOUND|SLIME_IP_LOCAL_PORT_RANGE_PATH|\
             SLIME_GRACEFUL_EXIT_AT_UNIX_TIME|SLIME_PROFILE_CUDA_PHASES|\
             SLIME_SUBMIT_UNIX_NS|MEGATRON_DIR|REF_LOAD|TORCH_DIST_DIR|MODEL_ARGS_FILE|\
             ACCOUNT|PARTITION|NUM_NODES|WALL_TIME|CPUS_PER_TASK|SLURM_GPUS|\
             N_SAMPLES_PER_PROMPT|NUM_STEPS_PER_ROLLOUT|NUM_EPOCH|\
-            SEQ_LENGTH|MAX_TOKENS_PER_GPU|LOG_PROBS_CHUNK_SIZE|SAVE_INTERVAL|SEQUENCE_PARALLEL|CONTEXT_PARALLEL_SIZE|\
+            SEQ_LENGTH|MAX_TOKENS_PER_GPU|LOG_PROBS_CHUNK_SIZE|SAVE_INTERVAL|SAVE_RETAIN_INTERVAL|\
+            SAVE_HF_ENABLED|SAVE_MEGATRON|SAVE_HF_TEMPLATE|SEQUENCE_PARALLEL|CONTEXT_PARALLEL_SIZE|\
             TRAIN_LR|KL_LOSS_COEF|POLICY_LOSS_TYPE|USE_TIS|GRPO_STD_NORMALIZATION|\
             DPPO_DIVERGENCE_TYPE|DPPO_DIVERGENCE_THRESHOLD|\
-            MAX_TRAIN_ROLLOUT_LOGPROB_ABS_DIFF|\
+            MAX_TRAIN_ROLLOUT_LOGPROB_ABS_DIFF|DVAO_*|GDPO_*|\
             CALCULATE_PER_TOKEN_LOSS|\
             DIST_CKPT_STRICTNESS|ATTENTION_BACKEND|\
             GLOBAL_BATCH_SIZE|EVAL_GLOBAL_BATCH_SIZE|EXPERIMENT_NAME|RUN_ID|\
@@ -165,13 +177,24 @@ printf -v ENTRY_Q '%q' "$CONTAINER_ENTRYPOINT"
 printf -v LOG_Q   '%q' "$LOG_DIR"
 SRUN_BIN="$(command -v srun)"
 printf -v SRUN_Q '%q' "$SRUN_BIN"
+BASH_BIN="$(command -v bash)"
+printf -v BASH_Q '%q' "$BASH_BIN"
+if [ "${POLAR_APPTAINER_JOB_SESSION_MOUNT:-0}" = "1" ]; then
+    APPTAINER_SESSIONDIR="${POLAR_APPTAINER_SESSIONDIR:?set POLAR_APPTAINER_SESSIONDIR}"
+    printf -v APPTAINER_SESSIONDIR_Q '%q' "${APPTAINER_SESSIONDIR}"
+    APPTAINER_SESSION_SETUP="APPTAINER_SESSION_HOST=/tmp/polar-apptainer-session-\${SLURM_JOB_ID}-\${SLURM_RESTART_COUNT:-0}-\${UID}; ${SRUN_Q} --overlap --nodes=${NUM_NODES} --ntasks=${NUM_NODES} --ntasks-per-node=1 --cpus-per-task=1 --cpu-bind=none ${BASH_Q} -c 'set -euo pipefail; root=\"\$1\"; if [ -e \"\${root}\" ] || [ -L \"\${root}\" ]; then echo \"ERROR: refusing existing Apptainer session root: \${root}\" >&2; exit 1; fi; install -d -m 700 -- \"\${root}\"' bash \"\${APPTAINER_SESSION_HOST}\"; MNT_Q_WITH_SESSION=${MNT_Q},\${APPTAINER_SESSION_HOST}:${APPTAINER_SESSIONDIR_Q}:rw"
+    MNT_ARG='${MNT_Q_WITH_SESSION}'
+else
+    APPTAINER_SESSION_SETUP=:
+    MNT_ARG="${MNT_Q}"
+fi
 CPUS_PER_TASK="${CPUS_PER_TASK:-128}"
 SLURM_STEP_CPUS_PER_TASK="${SLURM_STEP_CPUS_PER_TASK:-96}"
 # The job allocation already owns all requested CPU/GPU/memory TRES. Repeating
 # the entire 128-CPU allocation on an overlapping step makes the NVIDIA select
 # plugin reject step creation. Leave CPU headroom for the batch shell and let
 # the step inherit job-level GPU and memory TRES.
-WRAP_CMD="umask 077; chmod 600 ${LOG_Q}/\"\${SLURM_JOB_NAME}-\${SLURM_JOB_ID}.out\" ${LOG_Q}/\"\${SLURM_JOB_NAME}-\${SLURM_JOB_ID}.err\" 2>/dev/null || true; export SLIME_SLURM_BATCH_START_UNIX_NS=\$(date +%s%N); ${SRUN_Q} --overlap --nodes=${NUM_NODES} --ntasks=${NUM_NODES} --ntasks-per-node=1 --cpus-per-task=${SLURM_STEP_CPUS_PER_TASK} --cpu-bind=none --kill-on-bad-exit=1 --container-image=${SQSH_Q} --container-mounts=${MNT_Q} --container-workdir=${PR_Q} --container-writable --no-container-mount-home bash ${ENTRY_Q}"
+WRAP_CMD="set -euo pipefail; umask 077; chmod 600 ${LOG_Q}/\"\${SLURM_JOB_NAME}-\${SLURM_JOB_ID}.out\" ${LOG_Q}/\"\${SLURM_JOB_NAME}-\${SLURM_JOB_ID}.err\" 2>/dev/null || true; export SLIME_SLURM_BATCH_START_UNIX_NS=\$(date +%s%N); ${APPTAINER_SESSION_SETUP}; ${SRUN_Q} --overlap --nodes=${NUM_NODES} --ntasks=${NUM_NODES} --ntasks-per-node=1 --cpus-per-task=${SLURM_STEP_CPUS_PER_TASK} --cpu-bind=none --kill-on-bad-exit=1 --container-image=${SQSH_Q} --container-mounts=${MNT_ARG} --container-workdir=${PR_Q} --container-writable --no-container-mount-home bash ${ENTRY_Q}"
 
 SBATCH_CONSTRAINT_ARG=()
 if [ -n "${SLURM_CONSTRAINT}" ]; then
@@ -184,6 +207,20 @@ fi
 SBATCH_EXCLUDE_ARG=()
 if [ -n "${SLURM_EXCLUDE}" ]; then
     SBATCH_EXCLUDE_ARG=(--exclude="${SLURM_EXCLUDE}")
+fi
+# Cluster policy hooks (e.g. the OccupiedIdleGPUsJobReaper exemption JSON)
+# ride on the job comment. Rollout phases of pool-routed RL runs hold GPUs
+# at low utilization while remote model calls execute, so those runs must
+# declare an exemption window instead of being reaped mid-rollout.
+# Default to the idle-GPU-reaper exemption when the caller did not set
+# TMAX_SBATCH_COMMENT at all; an explicitly EMPTY value opts out (no comment).
+# ${VAR-default} (no colon) keeps the set-but-empty case distinct from unset.
+_TMAX_DEFAULT_REAPER_COMMENT='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"240","reason":"interactive","description":"Interactive and debugging sessions"}}'
+TMAX_SBATCH_COMMENT="${TMAX_SBATCH_COMMENT-${_TMAX_DEFAULT_REAPER_COMMENT}}"
+unset _TMAX_DEFAULT_REAPER_COMMENT
+SBATCH_COMMENT_ARG=()
+if [ -n "${TMAX_SBATCH_COMMENT:-}" ]; then
+    SBATCH_COMMENT_ARG=(--comment="${TMAX_SBATCH_COMMENT}")
 fi
 
 SUBMIT_BACKEND="${SUBMIT_BACKEND:-srun}"
@@ -211,6 +248,7 @@ if [ "${SUBMIT_BACKEND}" = "srun" ]; then
     SRUN_ERR="${SRUN_ERR:-${LOG_DIR}/${JOB_NAME}-srun-${SRUN_LOG_STAMP}.err}"
     SRUN_CMD=(
         "${SRUN_BIN}"
+        "${SBATCH_COMMENT_ARG[@]}"
         --account="${ACCOUNT}"
         --job-name="${JOB_NAME}"
         --partition="${PARTITION}"
@@ -219,7 +257,7 @@ if [ "${SUBMIT_BACKEND}" = "srun" ]; then
         --ntasks-per-node=1
         --cpus-per-task="${CPUS_PER_TASK}"
         --gpus="${TOTAL_GPUS}"
-        --mem=0
+        --mem="${POLAR_SLURM_MEM_PER_NODE}"
         --exclusive
         --time="${WALL_TIME}"
         --kill-on-bad-exit=1
@@ -282,7 +320,7 @@ fi
 # When a CPU watcher submits this GPU allocation, an inherited
 # SLURM_MEM_PER_NODE (for example 2 GiB) is otherwise consumed by the nested
 # srun below and shrinks that step to the watcher's memory limit even though
-# the new job itself was allocated all node memory via --mem=0.
+# the new job has its own explicit POLAR_SLURM_MEM_PER_NODE allocation.
 JOB_ID=$(env \
     -u SLURM_JOB_ID \
     -u SLURM_JOBID \
@@ -315,10 +353,11 @@ JOB_ID=$(env \
     --time="${WALL_TIME}" \
     --gres="gpu:${SLURM_GPUS}" \
     --cpus-per-task="${CPUS_PER_TASK}" \
-    --mem=0 \
+    --mem="${POLAR_SLURM_MEM_PER_NODE}" \
     "${SBATCH_CONSTRAINT_ARG[@]}" \
     "${SBATCH_DEPENDENCY_ARG[@]}" \
     "${SBATCH_EXCLUDE_ARG[@]}" \
+    "${SBATCH_COMMENT_ARG[@]}" \
     --output="${LOG_DIR}/%x-%j.out" \
     --error="${LOG_DIR}/%x-%j.err" \
     --export="POLAR_TRAIN_ENV_FILE=${POLAR_TRAIN_ENV_FILE}" \

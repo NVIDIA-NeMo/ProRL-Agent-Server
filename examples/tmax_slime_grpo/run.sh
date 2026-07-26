@@ -9,6 +9,53 @@ PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 source "${SCRIPT_DIR}/env.cwdfw.sh"
 # shellcheck source=./lifecycle.sh
 source "${SCRIPT_DIR}/lifecycle.sh"
+# shellcheck source=./run_state.sh
+source "${SCRIPT_DIR}/run_state.sh"
+
+# The long-lived Polar services must import from this allocation's PROJECT_ROOT.
+# The shared training environment is commonly an editable install whose .pth
+# points at the mutable developer checkout; without this precedence a frozen
+# profiling worktree can silently mix code from that checkout across nodes.
+PYTHON_BIN="${PYTHON_BIN:-${PROJECT_ROOT}/.venv/bin/python3}"
+if [ ! -x "${PYTHON_BIN}" ]; then
+    PYTHON_BIN="$(command -v python3 || command -v python)"
+fi
+export PYTHON_BIN
+export PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+"${PYTHON_BIN}" "${SCRIPT_DIR}/verify_python_provenance.py" \
+    --project-root "${PROJECT_ROOT}" \
+    --harness "${TMAX_AGENT_HARNESS:-}"
+
+# Repeat the submit-side guard inside the allocation.  This protects direct or
+# stale environment-file launches that bypassed the current submitter.
+tmax_require_spilot_entrypoints "allocation startup"
+tmax_require_spilot_credentials "allocation startup"
+
+_TMAX_SOURCE_LOCK_COUNT=0
+if [ -n "${TMAX_PRORL_GIT_COMMIT:-}" ]; then
+    _TMAX_SOURCE_LOCK_COUNT=$((_TMAX_SOURCE_LOCK_COUNT + 1))
+fi
+if [ -n "${TMAX_SLIME_GIT_COMMIT:-}" ]; then
+    _TMAX_SOURCE_LOCK_COUNT=$((_TMAX_SOURCE_LOCK_COUNT + 1))
+fi
+if [ -n "${TMAX_MEGATRON_GIT_COMMIT:-}" ]; then
+    _TMAX_SOURCE_LOCK_COUNT=$((_TMAX_SOURCE_LOCK_COUNT + 1))
+fi
+case "$_TMAX_SOURCE_LOCK_COUNT" in
+    0)
+        if [ "${SLURM_PROCID:-0}" = "0" ]; then
+            echo "[tmax run] WARNING: no source revision lock; continuing a legacy/manual run" >&2
+        fi
+        ;;
+    3)
+        tmax_verify_source_revisions "${PROJECT_ROOT}" "${SLIME_DIR}" "${MEGATRON_DIR}"
+        ;;
+    *)
+        echo "ERROR: partial source revision lock at allocation startup" >&2
+        exit 1
+        ;;
+esac
+unset _TMAX_SOURCE_LOCK_COUNT
 
 tmax_configure_graceful_deadline
 if [ "${SLURM_PROCID:-0}" = "0" ] && [ -n "${SLIME_GRACEFUL_EXIT_AT_UNIX_TIME:-}" ]; then

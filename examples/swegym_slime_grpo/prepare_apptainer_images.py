@@ -17,7 +17,7 @@ EXAMPLE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = EXAMPLE_DIR.parents[1]
 sys.path.insert(0, str(EXAMPLE_DIR))
 
-from sample_tasks import fetch_all_instances, registry_image_for_instance_id
+from sample_tasks import fetch_all_instances, registry_image_for_instance_id  # noqa: E402
 
 
 DEFAULT_IMAGE_DIR = PROJECT_ROOT / "tmp" / "swegym_apptainer_images"

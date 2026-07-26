@@ -61,11 +61,13 @@ def default_builder_registry() -> StrategyRegistry:
         BaseTrajectoryBuilder,
         PerRequestBuilder,
         PrefixMergingBuilder,
+        RouterPolicyBuilder,
     )
 
     registry: StrategyRegistry[BaseTrajectoryBuilder] = StrategyRegistry(BaseTrajectoryBuilder)
     registry.register("per_request", PerRequestBuilder)
     registry.register("prefix_merging", PrefixMergingBuilder)
+    registry.register("router_policy", RouterPolicyBuilder)
     return registry
 
 
@@ -76,6 +78,7 @@ def default_evaluator_registry() -> StrategyRegistry:
         HarborEvaluator,
         HarborEvaluatorWithRubric,
         SessionCompletedEvaluator,
+        SpilotHarborEvaluator,
         SwebenchHarnessEvaluator,
         TestOnOutputEvaluator,
     )
@@ -85,6 +88,5 @@ def default_evaluator_registry() -> StrategyRegistry:
     registry.register("swebench_harness", SwebenchHarnessEvaluator)
     registry.register("test_on_output", TestOnOutputEvaluator)
     registry.register("harbor", HarborEvaluator)
-    registry.register("harbor_rubric", HarborEvaluatorWithRubric)
+    registry.register("spilot_harbor", SpilotHarborEvaluator)
     return registry
-

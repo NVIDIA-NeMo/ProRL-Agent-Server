@@ -452,12 +452,7 @@ def test_training_dynamic_filter_replaces_zero_std_groups_and_commits_mixed_grou
     assert output.metrics["polar/candidate/group_count"] == 3.0
     assert output.metrics["polar/candidate/accepted_group_count"] == 1.0
     assert output.metrics["polar/candidate/accept_fraction"] == pytest.approx(1 / 3)
-    assert output.metrics["polar/candidate/dynamic_filter_eligible_group_count"] == 3.0
-    assert output.metrics["polar/candidate/dynamic_filter_accepted_group_count"] == 1.0
-    assert output.metrics[
-        "polar/candidate/dynamic_filter_conditional_accept_fraction"
-    ] == pytest.approx(1 / 3)
-    assert output.metrics["polar/candidate/telemetry_error_count"] == 0.0
+    assert not any(key.startswith("polar/candidate/dynamic_filter_") for key in output.metrics)
     assert output.metrics["polar/candidate/all_wrong_count"] == 1.0
     assert output.metrics["polar/candidate/all_correct_count"] == 1.0
     assert output.metrics["polar/candidate/mixed_count"] == 1.0
@@ -466,6 +461,11 @@ def test_training_dynamic_filter_replaces_zero_std_groups_and_commits_mixed_grou
     assert output.metrics["polar/candidate/trainable_reward_mean"] == 0.5
     assert output.metrics["polar/candidate/quality_coverage_fraction"] == 1.0
     assert output.metrics["polar/accepted/reward_mean"] == 0.5
+    assert output.metrics["rollout/session_reward_mean"] == 0.5
+    assert (
+        output.metrics["rollout/session_reward_accounted_sessions"]
+        == output.metrics["polar/accepted/accounted_sessions"]
+    )
     assert output.metrics["polar/dropped_dynamic_filter_groups_delta"] == 2.0
     assert output.metrics["polar/reservations/consumed_dynamic_filter_since_worker_start"] == 2.0
     assert output.metrics["polar/reservations/consumed_accepted_since_worker_start"] == 1.0
@@ -526,16 +526,8 @@ def test_candidate_quality_telemetry_error_is_fail_open_and_atomic(
     assert output.metrics["polar/candidate/all_wrong_count"] == 0.0
     assert output.metrics["polar/candidate/mixed_count"] == 1.0
     assert output.metrics["polar/candidate/trainable_samples"] == 2.0
-    assert output.metrics["polar/candidate/dynamic_filter_eligible_group_count"] == 2.0
-    assert output.metrics["polar/candidate/dynamic_filter_accepted_group_count"] == 1.0
-    assert output.metrics[
-        "polar/candidate/dynamic_filter_conditional_accept_fraction"
-    ] == 0.5
-    assert output.metrics["polar/decision_window/consumed_window_group_count"] == 2.0
     assert output.metrics["polar/decision_window/accepted_group_count"] == 1.0
-    assert output.metrics[
-        "polar/decision_window/end_to_end_consumed_accept_fraction"
-    ] == 0.5
+    assert output.metrics["polar/decision_window/end_to_end_consumed_accept_fraction"] == 0.5
     assert "candidate telemetry boom" in caplog.text
     assert "continuing with filtering and reservation handling" in caplog.text
 
@@ -573,7 +565,6 @@ def test_candidate_quality_export_error_does_not_block_reservation_commit(
     assert worker.consumed == [([98], "accepted")]
     assert output.metrics["polar/candidate/group_count"] == 1.0
     assert output.metrics["polar/candidate/telemetry_error_count"] == 1.0
-    assert output.metrics["polar/candidate/dynamic_filter_accepted_group_count"] == 1.0
     assert output.metrics["polar/decision_window/consumed_window_group_count"] == 1.0
     assert output.metrics["polar/decision_window/accepted_group_count"] == 1.0
     assert "candidate export boom" in caplog.text

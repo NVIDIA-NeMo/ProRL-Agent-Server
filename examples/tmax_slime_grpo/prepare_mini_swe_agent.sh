@@ -5,6 +5,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # shellcheck source=./env.cwdfw.sh
 source "${SCRIPT_DIR}/env.cwdfw.sh"
+# shellcheck source=../path_safety.sh
+source "${SCRIPT_DIR}/../path_safety.sh"
+
+MINI_SWE_AGENT_RUNTIME_ROOT="${MINI_SWE_AGENT_RUNTIME_ROOT:-${POLAR_DATA_ROOT}}"
+polar_validate_removal_path MINI_SWE_AGENT_RUNTIME_DIR "${MINI_SWE_AGENT_RUNTIME_DIR}" "${MINI_SWE_AGENT_RUNTIME_ROOT}" >/dev/null
 
 UV_BIN="${UV_BIN:-${POLR_TRAIN_VENV}/bin/uv}"
 TIMING_MODULE_SOURCE="${PROJECT_ROOT}/src/polar/agent/presets/mini_swe_timing.py"
@@ -81,10 +86,12 @@ runtime_ready=0
 cleanup() {
     local status=$?
     if [ -n "${staging}" ] && [ -d "${staging}" ]; then
-        rm -rf "${staging}"
+        polar_safe_remove_tree \
+            staging "${staging}" "${runtime_parent}" .mini-swe-agent-runtime.
     fi
     if [ "${status}" -ne 0 ] && [ "${runtime_activated}" = "1" ] && [ "${runtime_ready}" != "1" ]; then
-        rm -rf "${MINI_SWE_AGENT_RUNTIME_DIR}"
+        polar_safe_remove_tree \
+            MINI_SWE_AGENT_RUNTIME_DIR "${MINI_SWE_AGENT_RUNTIME_DIR}" "${MINI_SWE_AGENT_RUNTIME_ROOT}"
         if [ -n "${backup}" ] && [ -e "${backup}" ]; then
             mv "${backup}" "${MINI_SWE_AGENT_RUNTIME_DIR}"
         fi
@@ -172,7 +179,9 @@ if ! "${MINI_SWE_AGENT_BIN}" --help >/dev/null || \
 fi
 runtime_ready=1
 if [ -n "${backup}" ]; then
-    rm -rf "${backup}"
+    polar_safe_remove_tree \
+        backup "${backup}" "${runtime_parent}" \
+        "$(basename "${MINI_SWE_AGENT_RUNTIME_DIR}").backup."
 fi
 
 echo "mini-swe-agent runtime ready: ${MINI_SWE_AGENT_RUNTIME_DIR}"

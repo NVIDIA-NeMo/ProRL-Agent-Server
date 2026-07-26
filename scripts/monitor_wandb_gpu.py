@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import shutil
 import signal
@@ -35,6 +36,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT_DIR = ROOT / "tmp" / "gpu_monitor"
 QUERY = "timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw"
+NVIDIA_SMI_WARNING_INTERVAL_S = 60.0
 CSV_FIELDS = [
     "sample_time",
     "timestamp",
@@ -79,6 +81,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--metric-prefix", default="polar_system")
     parser.add_argument(
+        "--static-metric",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="stable run-level metric added to every W&B sample; repeatable",
+    )
+    parser.add_argument(
+        "--one-shot-static",
+        action="store_true",
+        help=(
+            "publish static metrics once without sampling GPUs; intended for "
+            "terminal watcher events after an allocation has exited"
+        ),
+    )
+    parser.add_argument(
         "--train-progress-file",
         default=os.environ.get("SLIME_TRAIN_PROGRESS_FILE", ""),
         help="shared file containing the latest completed train/step",
@@ -99,6 +116,42 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--interval-s must be greater than 0")
     if args.wandb_finish_timeout_s <= 0:
         raise SystemExit("--wandb-finish-timeout-s must be greater than 0")
+    static_metrics = _parse_static_metrics(args.static_metric)
+    train_progress_file = Path(args.train_progress_file) if args.train_progress_file else None
+    if args.one_shot_static:
+        if not static_metrics:
+            raise SystemExit("--one-shot-static requires at least one --static-metric")
+        if args.no_wandb or not args.wandb_run_id:
+            raise SystemExit("--one-shot-static requires an attached W&B run")
+        wandb_run = _init_wandb(args)
+        step_metric = f"{args.metric_prefix}/train_step"
+        metrics: dict[str, float | int] = {
+            step_metric: _read_train_step(train_progress_file, default=0),
+            **static_metrics,
+        }
+        _define_exact_wandb_axes(
+            metrics,
+            step_metric=step_metric,
+            defined_metrics=set(),
+        )
+        wandb_run.log(metrics)
+        if not _finish_wandb_with_timeout(
+            wandb_run,
+            timeout_s=args.wandb_finish_timeout_s,
+        ):
+            print(
+                f"W&B one-shot finish exceeded {args.wandb_finish_timeout_s:g}s; forcing process exit",
+                file=sys.stderr,
+                flush=True,
+            )
+            # The watcher uses this process status as the publication
+            # acknowledgement.  A timed-out finish is not proof that W&B
+            # committed the metric, so fail rather than printing a false
+            # success while still using os._exit to preserve the hard bound.
+            os._exit(75)
+        print("published one-shot W&B metrics")
+        return 0
+
     if shutil.which("nvidia-smi") is None:
         raise SystemExit("nvidia-smi not found")
 
@@ -123,15 +176,26 @@ def main(argv: list[str] | None = None) -> int:
 
     start_monotonic = time.monotonic()
     sample_index = 0
-    train_progress_file = Path(args.train_progress_file) if args.train_progress_file else None
     train_step = 0
+    next_nvidia_smi_warning = 0.0
     with csv_path.open("a", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
         if fh.tell() == 0:
             writer.writeheader()
 
         while not stop:
-            rows = _sample_nvidia_smi()
+            try:
+                rows = _sample_nvidia_smi()
+            except (subprocess.TimeoutExpired, RuntimeError) as exc:
+                now = time.monotonic()
+                if now >= next_nvidia_smi_warning:
+                    print(
+                        f"warning: nvidia-smi sampling failed ({exc}); retrying",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    next_nvidia_smi_warning = now + NVIDIA_SMI_WARNING_INTERVAL_S
+                rows = []
             wall_time_unix_s = time.time()
             train_step = _read_train_step(train_progress_file, default=train_step)
             for row in rows:
@@ -151,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
                     train_gpus=train_gpus,
                     rollout_gpus=rollout_gpus,
                 )
+                metrics.update(static_metrics)
                 _define_exact_wandb_axes(
                     metrics,
                     step_metric=f"{args.metric_prefix}/train_step",
@@ -251,6 +316,29 @@ def _read_train_step(path: Path | None, *, default: int) -> int:
     # A stale/replaced progress file must not make a resumed W&B series move
     # backwards. Atomic trainer writes ensure readers never see partial text.
     return max(default, step)
+
+
+def _parse_static_metrics(values: list[str]) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for raw in values:
+        name, separator, value_text = raw.partition("=")
+        name = name.strip()
+        if not separator or not name or any(character.isspace() for character in name):
+            raise SystemExit(f"invalid --static-metric {raw!r}; expected NAME=VALUE")
+        try:
+            value = float(value_text)
+        except ValueError as exc:
+            raise SystemExit(
+                f"invalid --static-metric {raw!r}; VALUE must be numeric"
+            ) from exc
+        if not math.isfinite(value):
+            raise SystemExit(
+                f"invalid --static-metric {raw!r}; VALUE must be finite"
+            )
+        if name in metrics:
+            raise SystemExit(f"duplicate --static-metric name: {name}")
+        metrics[name] = value
+    return metrics
 
 
 def _sample_nvidia_smi() -> list[dict[str, Any]]:

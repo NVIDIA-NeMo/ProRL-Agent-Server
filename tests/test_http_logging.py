@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +30,23 @@ def test_access_log_is_disabled_by_default(monkeypatch, value: str | None) -> No
 
 def test_gateway_server_passes_access_log_policy(monkeypatch) -> None:
     captured: dict[str, object] = {}
+
+    class FakeServer:
+        started = True
+        force_exit = False
+        lifespan = SimpleNamespace(shutdown_failed=False)
+
+        def __init__(self, *, config) -> None:
+            self._captured_signals: list[int] = []
+
+        @contextmanager
+        def capture_signals(self):
+            yield
+
+        def run(self) -> None:
+            with self.capture_signals():
+                pass
+
     monkeypatch.delenv("POLAR_UVICORN_ACCESS_LOG", raising=False)
     monkeypatch.setattr(gateway_server, "configure_server", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -36,7 +54,13 @@ def test_gateway_server_passes_access_log_policy(monkeypatch) -> None:
         "get_state",
         lambda: SimpleNamespace(node=SimpleNamespace(host="127.0.0.1", port=8100)),
     )
-    monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: captured.update(kwargs))
+
+    def fake_config(*args, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(uvicorn, "Config", fake_config)
+    monkeypatch.setattr(uvicorn, "Server", FakeServer)
 
     gateway_server.serve("unused.yaml", node_id="node-0")
 

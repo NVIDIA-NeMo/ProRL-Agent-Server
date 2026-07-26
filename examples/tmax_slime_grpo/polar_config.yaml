@@ -17,6 +17,10 @@ polar_early_stop_grace_sessions: ${POLAR_EARLY_STOP_GRACE_SESSIONS}
 # Exact trainer-side acceptance cap. This is prompt (2,048) plus the complete
 # multi-turn response budget (65,536), not Slime's per-turn generation cap.
 polar_max_trajectory_tokens: ${TMAX_TRAIN_PACK_LENGTH}
+# The profiling launcher deliberately lowers the aggregate microbatch cap to
+# 32,768 tokens. A complete 67,584-token trajectory is still valid and must be
+# admitted as a one-sample microbatch; the task harness bounds it separately.
+polar_allow_single_sample_over_token_cap: ${TMAX_ALLOW_SINGLE_SAMPLE_OVER_TOKEN_CAP}
 polar_agent_cli_dir: ${AGENT_CLI_DIR}
 polar_apptainer_image_dir: ${APPTAINER_IMAGE_DIR}
 

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
+import subprocess
 from argparse import Namespace
 from pathlib import Path
 
@@ -23,6 +25,100 @@ def _prepare_data_module(monkeypatch):
     monkeypatch.syspath_prepend(str(TMAX_GRPO_DIR))
     sys.modules.pop("prepare_data", None)
     return importlib.import_module("prepare_data")
+
+
+def test_prepare_data_role_flags_do_not_inherit_global_environment(
+    monkeypatch, tmp_path: Path
+) -> None:
+    prepare_data = _prepare_data_module(monkeypatch)
+    holdout = tmp_path / "holdout.jsonl"
+    holdout.write_text("{}\n")
+    monkeypatch.setenv("TMAX_EXCLUDE_DATA", str(holdout))
+    monkeypatch.setenv("TMAX_ONLY_READY", "1")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["prepare_data.py", "--exclude-data", str(holdout), "--only-ready"],
+    )
+    train_args = prepare_data.parse_args()
+    assert train_args.exclude_data == [str(holdout)]
+    assert train_args.only_ready is True
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["prepare_data.py", "--start-index", "900", "--max-tasks", "100"],
+    )
+    eval_args = prepare_data.parse_args()
+    assert eval_args.exclude_data == []
+    assert eval_args.only_ready is False
+
+
+def test_complement_train_and_fixed_eval_survive_deep_validation(
+    tmp_path: Path,
+) -> None:
+    dataset_dir = tmp_path / "dataset"
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    for name in ("task_a", "task_b", "task_c"):
+        _write_task(dataset_dir, name)
+        (image_dir / f"{name}.sif").write_bytes(b"sif")
+
+    holdout = tmp_path / "holdout.jsonl"
+    _write_prompt_row(holdout, "task_b", image_dir / "task_b.sif")
+    train_output = tmp_path / "train.jsonl"
+    eval_output = tmp_path / "eval.jsonl"
+    common = [
+        sys.executable,
+        str(TMAX_GRPO_DIR / "prepare_data.py"),
+        "--dataset-dir",
+        str(dataset_dir),
+        "--image-dir",
+        str(image_dir),
+        "--expected-total-tasks",
+        "3",
+    ]
+    train_command = common + [
+        "--output",
+        str(train_output),
+        "--start-index",
+        "0",
+        "--max-tasks",
+        "-1",
+        "--exclude-data",
+        str(holdout),
+        "--only-ready",
+    ]
+    eval_command = common + [
+        "--output",
+        str(eval_output),
+        "--start-index",
+        "1",
+        "--max-tasks",
+        "1",
+    ]
+    env = os.environ.copy()
+    # These global launcher values must not leak into the eval role.
+    env.update(TMAX_EXCLUDE_DATA=str(holdout), TMAX_ONLY_READY="1")
+
+    for command in (train_command, eval_command):
+        subprocess.run(command, check=True, env=env, cwd=TMAX_GRPO_DIR)
+        subprocess.run(
+            [*command, "--validate-existing"],
+            check=True,
+            env=env,
+            cwd=TMAX_GRPO_DIR,
+        )
+
+    train_tasks = [
+        json.loads(line)["metadata"]["task_name"] for line in train_output.read_text().splitlines()
+    ]
+    eval_tasks = [
+        json.loads(line)["metadata"]["task_name"] for line in eval_output.read_text().splitlines()
+    ]
+    assert train_tasks == ["task_a", "task_c"]
+    assert eval_tasks == ["task_b"]
 
 
 def _write_task(root: Path, name: str, *, task_toml: str = "") -> None:

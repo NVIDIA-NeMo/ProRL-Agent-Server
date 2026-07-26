@@ -11,7 +11,8 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any
+from typing import Any, Mapping
+from urllib.parse import urlparse
 
 import httpx
 import orjson
@@ -70,9 +71,26 @@ class InferenceClient:
     _LIVENESS_TIMEOUT_SECONDS = 900.0
     _WORKER_CACHE_TTL_SECONDS = 5.0
 
-    def __init__(self, base_url: str, engine: InferenceEngine):
+    def __init__(
+        self,
+        base_url: str,
+        engine: InferenceEngine,
+        *,
+        default_headers: Mapping[str, str] | None = None,
+        max_concurrency: int | None = None,
+    ):
+        if max_concurrency is not None and max_concurrency <= 0:
+            raise ValueError("max_concurrency must be a positive integer")
         self.base_url = base_url.rstrip("/")
         self.engine = engine
+        # These headers are supplied only by trusted gateway configuration.
+        # In particular, callers' sandbox Authorization header (which carries
+        # the Polar session ID) is never copied into this client.
+        self._default_headers = dict(default_headers or {})
+        self._max_concurrency = max_concurrency
+        self._completion_semaphore = (
+            asyncio.Semaphore(max_concurrency) if max_concurrency is not None else None
+        )
         self._client: httpx.AsyncClient | None = None
         self._generation_paused = False
         self._inflight_generations = 0
@@ -88,6 +106,7 @@ class InferenceClient:
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 timeout=httpx.Timeout(self._LIVENESS_TIMEOUT_SECONDS, connect=30),
+                headers=self._default_headers,
             )
         return self._client
 
@@ -122,6 +141,15 @@ class InferenceClient:
     async def completion(self, request: dict[str, Any]) -> dict[str, Any]:
         """Non-streaming chat completion. Returns the full JSON response."""
         await self._acquire_generation_slot()
+        try:
+            if self._completion_semaphore is not None:
+                async with self._completion_semaphore:
+                    return await self._completion(request)
+            return await self._completion(request)
+        finally:
+            await self._release_generation_slot()
+
+    async def _completion(self, request: dict[str, Any]) -> dict[str, Any]:
         client = await self._get_client()
         from copy import deepcopy
 
@@ -134,18 +162,46 @@ class InferenceClient:
             resp = await client.post(
                 completion_url,
                 json=request_copy,
-                headers={"Content-Type": "application/json"},
+                headers=self._json_headers(),
             )
         except httpx.RequestError as exc:
             raise self._translate_transport_error(exc) from exc
-        finally:
-            await self._release_generation_slot()
 
         await self._raise_for_status(resp)
         # Completion payloads can contain hundreds of thousands of token and
         # logprob values.  orjson materially shortens this synchronous decode
         # section on the gateway's event-loop thread.
         return self.engine.normalize_response(orjson.loads(resp.content))
+
+    async def responses(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Non-streaming OpenAI Responses request for a native upstream."""
+        await self._acquire_generation_slot()
+        try:
+            if self._completion_semaphore is not None:
+                async with self._completion_semaphore:
+                    return await self._responses(request)
+            return await self._responses(request)
+        finally:
+            await self._release_generation_slot()
+
+    async def _responses(self, request: dict[str, Any]) -> dict[str, Any]:
+        client = await self._get_client()
+        from copy import deepcopy
+
+        request_copy = deepcopy(request)
+        request_copy["stream"] = False
+        request_copy = self.engine.prepare_request(request_copy)
+        try:
+            resp = await client.post(
+                self._v1_endpoint("responses"),
+                json=request_copy,
+                headers=self._json_headers(),
+            )
+        except httpx.RequestError as exc:
+            raise self._translate_transport_error(exc) from exc
+
+        await self._raise_for_status(resp)
+        return orjson.loads(resp.content)
 
     async def tokenize(self, request: dict[str, Any]) -> dict[str, Any]:
         """Tokenize a prompt with the inference server's exact chat template.
@@ -164,7 +220,7 @@ class InferenceClient:
             resp = await client.post(
                 tokenize_url,
                 json=request,
-                headers={"Content-Type": "application/json"},
+                headers=self._json_headers(),
             )
         except httpx.RequestError as exc:
             raise self._translate_transport_error(exc) from exc
@@ -176,13 +232,24 @@ class InferenceClient:
         """Resolve tokenization to a regular SGLang worker when available."""
 
         if self.engine.name != "sglang":
-            return "/v1/tokenize"
+            return self._v1_endpoint("tokenize")
         worker_urls = await self._regular_worker_urls(client)
         if not worker_urls:
-            return "/v1/tokenize"
+            return self._v1_endpoint("tokenize")
         index = self._next_tokenizer_index
         self._next_tokenizer_index += 1
         return f"{worker_urls[index % len(worker_urls)]}/v1/tokenize"
+
+    def _json_headers(self) -> dict[str, str]:
+        return {"Content-Type": "application/json", **self._default_headers}
+
+    def _v1_endpoint(self, endpoint: str) -> str:
+        """Avoid duplicating ``/v1`` when a provider includes it in base_url."""
+
+        base_path = urlparse(self.base_url).path.rstrip("/")
+        if base_path.endswith("/v1"):
+            return endpoint.lstrip("/")
+        return f"/v1/{endpoint.lstrip('/')}"
 
     async def _completion_url(self, client: httpx.AsyncClient) -> str:
         """Resolve SGLang routers to regular workers, with a short-lived cache.
@@ -195,11 +262,11 @@ class InferenceClient:
         """
 
         if self.engine.name != "sglang":
-            return "/v1/chat/completions"
+            return self._v1_endpoint("chat/completions")
 
         worker_urls = await self._regular_worker_urls(client)
         if not worker_urls:
-            return "/v1/chat/completions"
+            return self._v1_endpoint("chat/completions")
 
         index = self._next_worker_index
         self._next_worker_index += 1
@@ -288,7 +355,7 @@ class InferenceClient:
         """Passthrough GET /v1/models."""
         client = await self._get_client()
         try:
-            resp = await client.get("/v1/models")
+            resp = await client.get(self._v1_endpoint("models"))
         except httpx.RequestError as exc:
             raise self._translate_transport_error(exc) from exc
         await self._raise_for_status(resp)

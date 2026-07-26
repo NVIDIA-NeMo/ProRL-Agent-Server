@@ -5,6 +5,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 cd "${PROJECT_ROOT}"
+# shellcheck source=../path_safety.sh
+source "${SCRIPT_DIR}/../path_safety.sh"
 
 TMAX_DATA_ROOT="${TMAX_DATA_ROOT:-/lustre/fsw/portfolios/nvr/projects/nvr_lpr_llm/users/jiaruiy/spilot/data}"
 TMAX_DATASET_DIR="${TMAX_DATASET_DIR:-${TMAX_DATA_ROOT}/tmax-15k}"
@@ -44,7 +46,7 @@ if [ "${TMAX_SIF_MKSQUASHFS_ARGS+x}" != "x" ]; then
 fi
 
 export POLAR_JOB_CACHE_ROOT="${POLAR_JOB_CACHE_ROOT:-/tmp/polar-tmax-sifbuild-${SLURM_JOB_ID:-manual}-${TMAX_SIF_SHARD_INDEX}}"
-rm -rf "${POLAR_JOB_CACHE_ROOT}"
+polar_safe_remove_tree POLAR_JOB_CACHE_ROOT "${POLAR_JOB_CACHE_ROOT}" /tmp polar-
 mkdir -p \
     "${POLAR_JOB_CACHE_ROOT}/home" \
     "${POLAR_JOB_CACHE_ROOT}/apptainer-cache" \

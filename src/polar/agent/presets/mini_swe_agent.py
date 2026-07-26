@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import shlex
@@ -16,6 +17,7 @@ from polar.runtime.models import ExecInput
 
 
 MINI_SWE_TIMING_PATH = f"{RUNTIME_AGENT_LOG_DIR}/mini-swe-command-timing.jsonl"
+MINI_SWE_TASK_B64_ENV = "POLAR_MINI_SWE_TASK_B64"
 
 
 class MiniSweAgentHarness(BaseHarness):
@@ -85,7 +87,6 @@ class MiniSweAgentHarness(BaseHarness):
             "--yolo",
             f"--environment-class {shlex.quote(environment_class)}",
             f"--model={shlex.quote(f'openai/{model_id}')}",
-            f"--task={shlex.quote(instruction)}",
             f"--cost-limit {shlex.quote(str(cost_limit))}",
             "--exit-immediately",
         ]
@@ -133,11 +134,47 @@ class MiniSweAgentHarness(BaseHarness):
                     'export PATH="$HOME/.local/bin:$PATH" && '
                     # LiteLLM reads OPENAI_API_BASE; the gateway only sets OPENAI_BASE_URL.
                     'export OPENAI_API_BASE="$OPENAI_BASE_URL" && '
+                    # MANDATORY fail-closed task-protocol preflight. The task
+                    # travels only in POLAR_MINI_SWE_TASK_B64 (never argv), and
+                    # it is injected by polar_mini_swe_runner, through which the
+                    # mini-swe-agent entry point must dispatch. A runtime that
+                    # does not inject it runs every session with an EMPTY task
+                    # (zero-trace training, observed on cont300 2026-07-20).
+                    # Two independent guarantees, both required:
+                    #   (1) ROUTING — the resolved entry point actually
+                    #       dispatches through polar_mini_swe_runner (the
+                    #       portable wrapper execs `-m polar_mini_swe_runner`; a
+                    #       upstream/uv-tool console script that does not
+                    #       reference it never injects, even if the module is
+                    #       importable in the same venv);
+                    #   (2) VERSION — that runner exposes _inject_task_from_env
+                    #       (older builds predate the B64 protocol).
+                    # Availability of the module alone is NOT sufficient.
+                    '_mswea_bin="$(command -v mini-swe-agent)" || '
+                    '{ echo "FATAL: mini-swe-agent is not on PATH" >&2; exit 64; }; '
+                    'if ! grep -q polar_mini_swe_runner "${_mswea_bin}"; then '
+                    'echo "FATAL: mini-swe-agent does not dispatch through '
+                    "polar_mini_swe_runner; POLAR_MINI_SWE_TASK_B64 would not be injected "
+                    '(taskless rollout). Rebuild the runtime with prepare_mini_swe_agent.sh" >&2; '
+                    "exit 64; fi; "
+                    '_mswea_py="$(dirname "${_mswea_bin}")/../venv/bin/python"; '
+                    '[ -x "${_mswea_py}" ] || '
+                    "_mswea_py=\"$(sed -n '1{s/^#! *//;s/ .*//;p}' \"${_mswea_bin}\")\"; "
+                    'if [ ! -x "${_mswea_py}" ] || ! "${_mswea_py}" -c '
+                    "'import sys, polar_mini_swe_runner as r; "
+                    "sys.exit(0 if hasattr(r, \"_inject_task_from_env\") else 64)'; then "
+                    'echo "FATAL: polar_mini_swe_runner predates the '
+                    "POLAR_MINI_SWE_TASK_B64 task protocol; rebuild the runtime with "
+                    'prepare_mini_swe_agent.sh (otherwise it trains on empty tasks)" >&2; '
+                    "exit 64; fi && "
                     f"mini-swe-agent {flags_str} "
                     f"2>&1 | tee {RUNTIME_AGENT_LOG_DIR}/mini-swe-agent.txt"
                 ),
                 env={
                     **self.env,
+                    MINI_SWE_TASK_B64_ENV: base64.b64encode(
+                        instruction.encode("utf-8")
+                    ).decode("ascii"),
                     "MSWEA_CONFIGURED": "true",
                     "MSWEA_COST_TRACKING": "ignore_errors",
                     "MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT": str(model_retry_attempts),

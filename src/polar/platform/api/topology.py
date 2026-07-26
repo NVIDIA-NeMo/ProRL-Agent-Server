@@ -7,6 +7,8 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
+from polar.platform.upstream import UpstreamClient
+
 router = APIRouter(prefix="/api")
 
 

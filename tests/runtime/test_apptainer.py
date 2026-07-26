@@ -14,7 +14,11 @@ import pytest
 
 from polar.runtime import apptainer
 from polar.runtime.apptainer import ApptainerRuntime
-from polar.runtime.base import BaseRuntime, RuntimeDestroyedError
+from polar.runtime.base import (
+    BaseRuntime,
+    RuntimeContainmentError,
+    RuntimeDestroyedError,
+)
 from polar.runtime.models import ExecResult, RuntimeSpec
 
 
@@ -32,6 +36,7 @@ def _runtime(
         "POLAR_APPTAINER_ISOLATE_PID",
         "POLAR_APPTAINER_ISOLATE_IPC",
         "POLAR_APPTAINER_PERSISTENT_BROKER",
+        "POLAR_APPTAINER_BROKER_CLEANUP_TIMEOUT_SEC",
     ):
         monkeypatch.delenv(name, raising=False)
     if direct:
@@ -83,6 +88,26 @@ def _write_fake_proc_process(
     remainder.append(str(start_time))
     (process_dir / "stat").write_text(f"{pid} (runtime parent) {' '.join(remainder)}\n")
     (process_dir / "environ").write_bytes(environ)
+
+
+def test_direct_broker_cleanup_timeout_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_name = "POLAR_APPTAINER_BROKER_CLEANUP_TIMEOUT_SEC"
+    monkeypatch.delenv(env_name, raising=False)
+    assert apptainer._direct_broker_cleanup_timeout_seconds() == 15.0  # noqa: SLF001
+
+    for valid, expected in (("1", 1.0), ("7.5", 7.5), ("60", 60.0)):
+        monkeypatch.setenv(env_name, valid)
+        assert (  # noqa: SLF001
+            apptainer._direct_broker_cleanup_timeout_seconds() == expected
+        )
+
+    for invalid in ("0", "0.99", "60.01", "nan", "inf", "not-a-number"):
+        monkeypatch.setenv(env_name, invalid)
+        assert (  # noqa: SLF001
+            apptainer._direct_broker_cleanup_timeout_seconds() == 15.0
+        )
 
 
 def test_broker_rpc_concurrency_is_independent_of_blocked_default_executor(
@@ -476,6 +501,173 @@ def test_direct_broker_process_snapshot_tracks_escaped_session_tree(
     }
 
 
+def test_containment_snapshot_fails_closed_when_procfs_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(RuntimeContainmentError, match="could not read procfs"):
+        apptainer._direct_broker_process_snapshot(  # noqa: SLF001
+            tmp_path / "missing-proc",
+            proc_root=tmp_path / "missing-proc",
+        )
+
+
+def test_containment_snapshot_ignores_process_that_exits_during_stat_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    pid = 8_225_001
+    _write_fake_proc_process(
+        proc_root,
+        pid=pid,
+        ppid=1,
+        session_id=pid,
+        start_time=1,
+    )
+    process_stat = proc_root / str(pid) / "stat"
+    real_read_text = Path.read_text
+
+    def exited_stat(path: Path, *args, **kwargs) -> str:
+        if path == process_stat:
+            raise ProcessLookupError("synthetic procfs ESRCH")
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", exited_stat)
+
+    sessions, processes = apptainer._direct_broker_process_snapshot(  # noqa: SLF001
+        tmp_path / "session",
+        proc_root=proc_root,
+    )
+
+    assert sessions == set()
+    assert processes == {}
+
+
+def test_containment_ownership_scan_ignores_process_that_exits_during_stat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    pid = 8_225_002
+    _write_fake_proc_process(
+        proc_root,
+        pid=pid,
+        ppid=1,
+        session_id=pid,
+        start_time=1,
+    )
+    process_dir = proc_root / str(pid)
+    real_stat = Path.stat
+
+    def exited_process(path: Path, *args, **kwargs):
+        if path == process_dir:
+            raise ProcessLookupError("synthetic procfs ESRCH")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", exited_process)
+
+    sessions, processes = apptainer._direct_broker_process_snapshot(  # noqa: SLF001
+        tmp_path / "session",
+        proc_root=proc_root,
+    )
+
+    assert sessions == set()
+    assert processes == {}
+
+
+def test_containment_ownership_scan_ignores_process_that_exits_during_environ_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    pid = 8_225_003
+    _write_fake_proc_process(
+        proc_root,
+        pid=pid,
+        ppid=1,
+        session_id=pid,
+        start_time=1,
+    )
+    process_environ = proc_root / str(pid) / "environ"
+    real_read_bytes = Path.read_bytes
+
+    def exited_environ(path: Path) -> bytes:
+        if path == process_environ:
+            raise ProcessLookupError("synthetic procfs ESRCH")
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", exited_environ)
+
+    sessions, processes = apptainer._direct_broker_process_snapshot(  # noqa: SLF001
+        tmp_path / "session",
+        proc_root=proc_root,
+    )
+
+    assert sessions == set()
+    assert processes == {}
+
+
+def test_containment_ownership_scan_fails_closed_on_unreadable_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    _write_fake_proc_process(
+        proc_root,
+        pid=8_250_001,
+        ppid=1,
+        session_id=8_250_001,
+        start_time=1,
+    )
+    real_read_bytes = Path.read_bytes
+
+    def unreadable_environ(path: Path) -> bytes:
+        if path.name == "environ":
+            raise PermissionError("synthetic hidepid")
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", unreadable_environ)
+    with pytest.raises(RuntimeContainmentError, match="process environment"):
+        apptainer._direct_broker_process_snapshot(  # noqa: SLF001
+            tmp_path / "session",
+            proc_root=proc_root,
+        )
+
+
+def test_force_stop_refuses_to_cancel_live_owner_before_sid_is_known(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(monkeypatch, tmp_path, direct=True)
+
+    class LiveOwnerTask:
+        def done(self) -> bool:
+            return False
+
+    async def immediate_to_thread(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    async def scenario() -> None:
+        task = LiveOwnerTask()
+        runtime._broker_task = task  # noqa: SLF001
+        monkeypatch.setattr(
+            apptainer,
+            "_direct_broker_process_snapshot",
+            lambda *_args, **_kwargs: (set(), {}),
+        )
+        monkeypatch.setattr(apptainer.asyncio, "to_thread", immediate_to_thread)
+        with pytest.raises(RuntimeContainmentError, match="identify the live"):
+            await runtime._force_stop_broker()  # noqa: SLF001
+        assert runtime._broker_task is task  # noqa: SLF001
+        assert not task.done()
+
+    asyncio.run(scenario())
+
+
 def test_direct_broker_cleanup_uses_captured_sid_after_parent_exits(
     monkeypatch,
     tmp_path: Path,
@@ -541,6 +733,7 @@ def test_force_stop_scans_for_runtime_after_launcher_task_is_gone(
     tmp_path: Path,
 ) -> None:
     runtime = _runtime(monkeypatch, tmp_path, direct=True)
+    runtime._broker_was_started = True  # noqa: SLF001
     cleanup_called = threading.Event()
     observed_sessions: list[set[int]] = []
 
@@ -558,6 +751,33 @@ def test_force_stop_scans_for_runtime_after_launcher_task_is_gone(
 
     assert cleanup_called.is_set()
     assert observed_sessions == [{8_500_001}]
+
+
+def test_failed_cancel_keeps_destruction_unproven_and_stop_retries_cleanup(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(monkeypatch, tmp_path, direct=True)
+    cleanup_attempts = 0
+
+    async def flaky_force_stop() -> None:
+        nonlocal cleanup_attempts
+        cleanup_attempts += 1
+        if cleanup_attempts == 1:
+            raise RuntimeContainmentError("synthetic residual process")
+
+    runtime._force_stop_broker = flaky_force_stop  # type: ignore[method-assign]  # noqa: SLF001,E501
+
+    with pytest.raises(RuntimeContainmentError, match="residual process"):
+        asyncio.run(runtime.cancel())
+    assert runtime.destroyed is False
+    with pytest.raises(RuntimeDestroyedError, match="already destroyed"):
+        asyncio.run(runtime.exec("echo must-not-run-during-failed-teardown"))
+
+    asyncio.run(runtime.stop())
+
+    assert cleanup_attempts == 2
+    assert runtime.destroyed is True
 
 
 def test_instance_mode_remains_the_default(monkeypatch, tmp_path: Path) -> None:
@@ -613,6 +833,45 @@ def test_direct_exec_reuses_overlay_and_skips_instance_lifecycle(
             None,
         )
     ]
+
+
+def test_direct_broker_control_sources_are_read_only_and_not_redirectable(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(monkeypatch, tmp_path, direct=True)
+    runtime.spec = runtime.spec.model_copy(
+        update={
+            "env": {
+                "POLAR_APPTAINER_BROKER_RUNTIME_DIR": "/task/runtime",
+                "POLAR_APPTAINER_BROKER_SCRIPT": "/task/broker.py",
+                "POLAR_APPTAINER_BROKER_INTERPRETER_FILE": "/task/python",
+                "POLAR_APPTAINER_BROKER_PROCESS_NAME": "task-broker",
+            }
+        }
+    )
+
+    launch = _direct_launch_args(runtime)
+    trusted_source = Path(apptainer.__file__).resolve().parent
+    assert (
+        f"{trusted_source}:{apptainer._BROKER_TRUSTED_RUNTIME_DIR}:ro"  # noqa: SLF001
+        in launch
+    )
+    assert not (runtime._broker_dir / "apptainer_broker.py").exists()  # noqa: SLF001
+    assert not (runtime._broker_dir / "apptainer_broker_supervisor.sh").exists()  # noqa: SLF001,E501
+    assert (
+        f"POLAR_APPTAINER_BROKER_RUNTIME_DIR={apptainer._BROKER_RUNTIME_DIR}"  # noqa: SLF001
+        in launch
+    )
+    assert (
+        "POLAR_APPTAINER_BROKER_SCRIPT="
+        f"{apptainer._BROKER_TRUSTED_RUNTIME_SCRIPT}"  # noqa: SLF001
+        in launch
+    )
+    assert "POLAR_APPTAINER_BROKER_PROCESS_NAME=polar-broker" in launch
+    assert apptainer._BROKER_TRUSTED_RUNTIME_SUPERVISOR in launch[-1]  # noqa: SLF001
+    assert "/task/broker.py" not in launch
+    assert "/task/runtime" not in launch
 
 
 def test_legacy_direct_exec_reuses_overlay_without_broker_lifecycle(
@@ -761,7 +1020,7 @@ def test_legacy_direct_upload_and_download_use_fresh_exec(
         assert kwargs["cwd"] == "/"
 
 
-def test_direct_exec_initializer_runs_inside_workload_shell(
+def test_direct_exec_initializer_runs_once_after_broker_is_pinned(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -785,23 +1044,28 @@ def test_direct_exec_initializer_runs_inside_workload_shell(
         broker_commands.append(command)
         return 0, "", ""
 
+    async def fake_start_direct_broker() -> None:
+        return None
+
     runtime._broker_exec = fake_broker_exec  # type: ignore[method-assign]
+    runtime._start_direct_broker = fake_start_direct_broker  # type: ignore[method-assign]
     launch = _direct_launch_args(runtime)
+    asyncio.run(runtime.start())
     asyncio.run(runtime.exec("echo ok"))
     asyncio.run(runtime.exec("echo again"))
 
-    assert "99-rogue.sh" in launch[-1]
-    assert launch[-1].count("99-rogue.sh") == 2  # test and source in one hook
+    assert "99-rogue.sh" not in launch[-1]
     assert not any("POLAR_APPTAINER_BROKER_PYTHON=" in argument for argument in launch)
     assert runtime._broker_interpreter_file.read_text() == "/portable/venv/bin/python\n"  # noqa: SLF001
     assert "apptainer_broker_supervisor.sh" in launch[-1]
-    assert "cd /work &&" in launch[-1]
+    assert "cd /work &&" not in launch[-1]
     assert "export HOME=/polar/session/home" in launch[-1]
     assert "export PATH=/portable/bin:/usr/bin:/bin" in launch[-1]
-    assert len(broker_commands) == 2
-    assert broker_commands[0].endswith("echo ok")
-    assert broker_commands[1].endswith("echo again")
-    assert all("99-rogue.sh" not in command for command in broker_commands)
+    assert len(broker_commands) == 3
+    assert broker_commands[0].count("99-rogue.sh") == 2  # test and source in one hook
+    assert broker_commands[1].endswith("echo ok")
+    assert broker_commands[2].endswith("echo again")
+    assert all("99-rogue.sh" not in command for command in broker_commands[1:])
 
 
 def test_direct_exec_initializer_is_not_repeated_in_persistent_instance(
@@ -1228,6 +1492,14 @@ def test_broker_start_defaults_are_slow_mount_safe(monkeypatch, tmp_path: Path) 
 
     runtime._run_local_command = fake_run  # type: ignore[method-assign]
     runtime._wait_for_broker_ready = fake_ready  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        apptainer,
+        "_direct_broker_process_snapshot",
+        lambda *_args, **_kwargs: ({8_600_001}, {}),
+    )
+    runtime._cleanup_direct_broker_processes = (  # type: ignore[method-assign]  # noqa: SLF001
+        lambda *, known_sessions: None
+    )
 
     async def exercise() -> None:
         await runtime._start_direct_broker_once()  # noqa: SLF001
@@ -1245,6 +1517,14 @@ def test_broker_readiness_wait_survives_concurrent_task_clear(
     tmp_path: Path,
 ) -> None:
     runtime = _runtime(monkeypatch, tmp_path, direct=True)
+    monkeypatch.setattr(
+        apptainer,
+        "_direct_broker_process_snapshot",
+        lambda *_args, **_kwargs: ({8_600_002}, {}),
+    )
+    runtime._cleanup_direct_broker_processes = (  # type: ignore[method-assign]  # noqa: SLF001
+        lambda *, known_sessions: None
+    )
 
     async def exercise() -> None:
         broker_task = asyncio.create_task(asyncio.Event().wait())

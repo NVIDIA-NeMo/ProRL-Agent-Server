@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -38,7 +39,42 @@ class EvalResult(BaseModel):
 
     outcome_reward: float | None = None
     trace_rewards: list[float | None] | None = None
+    outcome_reward_components: dict[str, float] | None = None
+    trace_reward_components: list[dict[str, float] | None] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("outcome_reward", mode="before")
+    @classmethod
+    def _validate_outcome_reward(cls, value: Any) -> float | None:
+        return _finite_reward_or_none(value)
+
+    @field_validator("trace_rewards", mode="before")
+    @classmethod
+    def _validate_trace_rewards(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if not isinstance(value, (list, tuple)):
+            return value
+        return [_finite_reward_or_none(item) for item in value]
+
+    @field_validator("outcome_reward_components", mode="before")
+    @classmethod
+    def _validate_outcome_reward_components(
+        cls, value: Any
+    ) -> dict[str, float] | None:
+        return _finite_reward_components_or_none(value)
+
+    @field_validator("trace_reward_components", mode="before")
+    @classmethod
+    def _validate_trace_reward_components(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if not isinstance(value, (list, tuple)):
+            return value
+        return [
+            _finite_reward_components_or_none(components)
+            for components in value
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +134,18 @@ class Trace(BaseModel):
     finish_reason: str | None = None
     response_logprobs: list[float] | None = None
     reward: float | None = None
+    reward_components: dict[str, float] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("reward", mode="before")
+    @classmethod
+    def _validate_reward(cls, value: Any) -> float | None:
+        return _finite_reward_or_none(value)
+
+    @field_validator("reward_components", mode="before")
+    @classmethod
+    def _validate_reward_components(cls, value: Any) -> dict[str, float]:
+        return _finite_reward_components_or_none(value) or {}
 
     @field_validator("loss_mask")
     @classmethod
@@ -115,12 +162,44 @@ class Trace(BaseModel):
     def _validate_response_lengths(self) -> "Trace":
         if self.loss_mask and len(self.loss_mask) != len(self.response_ids):
             raise ValueError("loss_mask length must match response_ids length")
-        if (
-            self.response_logprobs is not None
-            and len(self.response_logprobs) != len(self.response_ids)
+        if self.response_logprobs is not None and len(self.response_logprobs) != len(
+            self.response_ids
         ):
             raise ValueError("response_logprobs length must match response_ids length")
         return self
+
+
+def _finite_reward_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("reward must be numeric, not boolean")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("reward must be numeric") from exc
+    if not math.isfinite(parsed):
+        raise ValueError("reward must be finite")
+    return parsed
+
+
+def _finite_reward_components_or_none(
+    value: Any,
+) -> dict[str, float] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("reward components must be a mapping")
+
+    normalized: dict[str, float] = {}
+    for key, component in value.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("reward component names must be non-empty strings")
+        parsed = _finite_reward_or_none(component)
+        if parsed is None:
+            raise ValueError(f"reward component {key!r} must not be null")
+        normalized[key] = parsed
+    return normalized
 
 
 class Trajectory(BaseModel):

@@ -218,3 +218,57 @@ async def test_lost_dispatch_ack_retries_confirmation_on_same_gateway() -> None:
     client.post.assert_awaited_once()
     assert client.get.await_count == 3
     assert session.gateway_url == "http://gateway-a"
+
+
+@pytest.mark.asyncio
+async def test_read_error_with_confirmed_404_retries_instead_of_failing_closed() -> None:
+    """A confirm GET answering 404 proves the POST never landed.
+
+    Regression: the 404 response object used to leak into the confirmation
+    path, whose body (no task_id) was misread as a duplicate session owned by
+    "task None" and escalated to the fatal ambiguous-dispatch RuntimeError.
+    """
+    node_a = SimpleNamespace(node_id="node-a", gateway_url="http://gateway-a")
+    node_b = SimpleNamespace(node_id="node-b", gateway_url="http://gateway-b")
+    scheduler = SimpleNamespace(
+        acquire_node=Mock(side_effect=[node_a, node_b]),
+        release_reservation=Mock(),
+        mark_unhealthy=Mock(),
+    )
+    post_request = httpx.Request("POST", "http://gateway-a/sessions")
+    get_request = httpx.Request("GET", "http://gateway-a/sessions/eval-session")
+    not_found = httpx.Response(
+        404,
+        request=get_request,
+        json={"detail": "Session not found"},
+    )
+    accepted = SimpleNamespace(raise_for_status=Mock())
+    client = SimpleNamespace(
+        post=AsyncMock(
+            side_effect=[
+                httpx.ReadError("connection reset mid-dispatch", request=post_request),
+                accepted,
+            ]
+        ),
+        get=AsyncMock(return_value=not_found),
+    )
+    pipeline = Pipeline(
+        callback_url="http://rollout/callback",
+        save_dir=None,
+        scheduler=scheduler,
+        dispatch_poll_interval_seconds=0.001,
+    )
+    pipeline._client = client
+    session = _session()
+
+    dispatch = await pipeline._dispatch_session(session)
+
+    assert dispatch.session_id == session.session_id
+    assert scheduler.acquire_node.call_count == 2
+    scheduler.release_reservation.assert_called_once_with("node-a")
+    scheduler.mark_unhealthy.assert_called_once_with("node-a")
+    assert client.post.await_count == 2
+    # A single authoritative 404 must end confirmation immediately.
+    assert client.get.await_count == 1
+    assert session.gateway_url == "http://gateway-b"
+    assert session.dispatch_confirmed_not_landed is False

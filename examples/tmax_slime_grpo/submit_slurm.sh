@@ -3,6 +3,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+# shellcheck source=./lifecycle.sh
+source "${SCRIPT_DIR}/lifecycle.sh"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 # shellcheck source=../swegym_slime_grpo/launcher_utils.sh
 source "${PROJECT_ROOT}/examples/swegym_slime_grpo/launcher_utils.sh"
@@ -20,6 +22,13 @@ fi
 source "${SCRIPT_DIR}/env.cwdfw.sh"
 # shellcheck source=./run_state.sh
 source "${SCRIPT_DIR}/run_state.sh"
+
+# The SPilot wrapper creates an allocation-local control token and normalizes
+# the model-pool credential under POLAR_*.  Fail before requesting GPUs if a
+# caller bypasses that wrapper; otherwise the rollout service would start and
+# reject every task with 503 only after the expensive model startup.
+tmax_require_spilot_entrypoints "submission preflight"
+tmax_require_spilot_credentials "submission preflight"
 
 if [ "${TMAX_PERSIST_RUN_STATE:-1}" = "1" ] && \
    [ "${SUBMIT_DRY_RUN:-0}" != "1" ] && \
@@ -149,7 +158,7 @@ if [ "${TMAX_EVAL_ENABLED}" = "1" ]; then
         --check-paths-only
 fi
 case "${TMAX_AGENT_HARNESS}" in
-    mini_swe_agent|vanillux2)
+    mini_swe_agent|spilot_router|vanillux2)
         _mini_swe_python="${MINI_SWE_AGENT_RUNTIME_DIR}/venv/bin/python"
         _mini_swe_timing_source="${PROJECT_ROOT}/src/polar/agent/presets/mini_swe_timing.py"
         _mini_swe_runner_source="${PROJECT_ROOT}/src/polar/agent/presets/mini_swe_runner.py"
@@ -205,6 +214,27 @@ case "${TMAX_AGENT_HARNESS}" in
             _mini_swe_vanillux_config_source _mini_swe_vanillux_config_installed \
             _mini_swe_site_packages _mini_swe_site_packages_candidates
         ;;
+    controller_v3)
+        _controller_v3_python="${MINI_SWE_AGENT_RUNTIME_DIR}/python/bin/python3.10"
+        _controller_v3_manifest="${MINI_SWE_AGENT_RUNTIME_DIR}/.polar-mini-runtime-manifest.json"
+        if [ ! -x "${_controller_v3_python}" ] || \
+           [ ! -f "${_controller_v3_manifest}" ] || \
+           ! "${_controller_v3_python}" -I - "${_controller_v3_manifest}" <<'PY'
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+assert manifest["python_version"] == "3.10.20"
+assert manifest["mini_swe_agent_version"] == "2.4.0"
+import minisweagent
+assert minisweagent.__version__ == "2.4.0"
+PY
+        then
+            echo "ERROR: Controller V3 requires the pinned Python 3.10 / Mini-SWE-Agent 2.4.0 runtime at ${MINI_SWE_AGENT_RUNTIME_DIR}" >&2
+            exit 1
+        fi
+        unset _controller_v3_python _controller_v3_manifest
+        ;;
     codex)
         if [ ! -x "${AGENT_CLI_DIR}/bin/codex" ]; then
             echo "ERROR: shared Codex CLI not found at ${AGENT_CLI_DIR}/bin/codex" >&2
@@ -231,13 +261,12 @@ if [ -n "${LOAD_DIR:-}" ] && \
         echo "  Reuse the exact prompt JSONL whose data-source state is stored in the checkpoint." >&2
         exit 1
     fi
-    if [ ! -s "${LOAD_DIR}/latest_checkpointed_iteration.txt" ] || [ ! -s "${TMAX_TRAIN_DATA}" ]; then
-        echo "ERROR: LOAD_DIR checkpoint or TMAX_TRAIN_DATA is missing" >&2
+    if [ ! -s "${TMAX_TRAIN_DATA}" ]; then
+        echo "ERROR: TMAX_TRAIN_DATA is missing or empty: ${TMAX_TRAIN_DATA}" >&2
         exit 1
     fi
-    _tmax_seed_iter="$(tr -d '[:space:]' <"${LOAD_DIR}/latest_checkpointed_iteration.txt")"
-    if ! [[ "${_tmax_seed_iter}" =~ ^(0|[1-9][0-9]*)$ ]]; then
-        echo "ERROR: LOAD_DIR must point to a numbered training checkpoint" >&2
+    if ! _tmax_seed_iter="$(tmax_validate_numbered_checkpoint \
+        "${LOAD_DIR}" "ERROR: numbered LOAD_DIR")"; then
         exit 1
     fi
     # Format the already-canonical decimal tracker as a fixed-width string.
@@ -434,13 +463,15 @@ fi
 export PROMPT_DATA="${TMAX_TRAIN_DATA}"
 export TMAX_PREPARE_DATA=0
 export TMAX_PREPARE_EVAL_DATA=0
-export POLAR_TRAIN_RUN_SCRIPT="${SCRIPT_DIR}/run.sh"
+export POLAR_TRAIN_RUN_SCRIPT="${POLAR_TRAIN_RUN_SCRIPT:-${SCRIPT_DIR}/run.sh}"
 export POLAR_LAUNCHER_LABEL="Polar TMax Slime-GRPO"
 export JOB_NAME="${JOB_NAME:-polar-tmax-${RUN_ID}}"
 export POLAR_SUBMIT_RECEIPT_FILE="${TMAX_SUBMIT_RECEIPT_FILE}"
+export WANDB_RUN_ID="${WANDB_RUN_ID:-${RUN_ID}}"
 export WANDB_PROJECT WANDB_GROUP RUN_ID SAVE_DIR LOAD_DIR
 
 if [ "${TMAX_PERSIST_RUN_STATE:-1}" = "1" ] && [ "${SUBMIT_DRY_RUN:-0}" != "1" ]; then
+    tmax_pin_source_revisions "${PROJECT_ROOT}" "${SLIME_DIR}" "${MEGATRON_DIR}"
     tmax_write_run_state "${TMAX_RUN_STATE_FILE}"
     echo "[tmax submit] run state: ${TMAX_RUN_STATE_FILE}"
 fi
