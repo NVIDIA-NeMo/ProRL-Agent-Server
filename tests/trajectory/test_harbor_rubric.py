@@ -201,6 +201,46 @@ def test_rubric_absent_degrades_to_plain_harbor(tmp_path: Path) -> None:
     assert result.metadata["rubric_applied"] is False
 
 
+def test_fallback_rubric_scores_task_without_rubric_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tests_dir = _make_task_dir(tmp_path, with_rubric=False)
+    evaluator = _make_evaluator(
+        tests_dir,
+        fallback_rubric="## Generic process rubric\n- make efficient, verified progress",
+        require_rubric=True,
+    )
+    seen_prompts: list[str] = []
+    _patch_judge(monkeypatch, [2, -1], seen_prompts)
+
+    result = asyncio.run(
+        evaluator.evaluate(
+            _make_trajectory(), **_runtime_kwargs(tmp_path, FakeRuntime(tmp_path))
+        )
+    )
+
+    assert result.trace_rewards == pytest.approx([1.08, 0.96])
+    assert result.metadata["rubric_applied"] is True
+    assert result.metadata["rubric_source"] == "fallback"
+    assert "Generic process rubric" in seen_prompts[0]
+
+
+def test_required_rubric_rejects_missing_task_and_fallback_rubric(
+    tmp_path: Path,
+) -> None:
+    evaluator = _make_evaluator(
+        _make_task_dir(tmp_path, with_rubric=False),
+        require_rubric=True,
+    )
+
+    with pytest.raises(RuntimeError, match="fallback_rubric"):
+        asyncio.run(
+            evaluator.evaluate(
+                _make_trajectory(), **_runtime_kwargs(tmp_path, FakeRuntime(tmp_path))
+            )
+        )
+
+
 def test_missing_scores_fall_back_to_outcome_reward(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -221,7 +261,7 @@ def test_missing_scores_fall_back_to_outcome_reward(
     assert result.metadata["judge_failures"] == 1
 
 
-def test_non_per_request_builder_records_warning(
+def test_prefix_merging_builder_is_supported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tests_dir = _make_task_dir(tmp_path)
@@ -235,7 +275,24 @@ def test_non_per_request_builder_records_warning(
         )
     )
 
-    assert "prefix_merging" in result.metadata["builder_warning"]
+    assert "builder_warning" not in result.metadata
+
+
+def test_unknown_builder_records_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tests_dir = _make_task_dir(tmp_path)
+    evaluator = _make_evaluator(tests_dir)
+    _patch_judge(monkeypatch, [0, 0])
+
+    result = asyncio.run(
+        evaluator.evaluate(
+            _make_trajectory(builder="unknown"),
+            **_runtime_kwargs(tmp_path, FakeRuntime(tmp_path)),
+        )
+    )
+
+    assert "unknown" in result.metadata["builder_warning"]
 
 
 def test_render_traces_keeps_tool_calls(tmp_path: Path) -> None:
@@ -326,6 +383,76 @@ def test_render_traces_tool_outputs_default_off(tmp_path: Path) -> None:
     rendered = evaluator._render_traces(traces)
 
     assert "secret output" not in rendered
+    assert "<tool_outputs>" not in rendered
+
+
+def test_render_prefix_merged_trace_attaches_interstitial_tool_output_once(
+    tmp_path: Path,
+) -> None:
+    evaluator = _make_evaluator(
+        _make_task_dir(tmp_path),
+        judge_include_tool_outputs=True,
+    )
+    traces = [
+        Trace(
+            response_messages=[
+                {
+                    "role": "assistant",
+                    "content": "inspect",
+                    "tool_calls": [
+                        {
+                            "id": "merged-call",
+                            "function": {"name": "bash", "arguments": '{"cmd":"ls"}'},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "merged-call",
+                    "content": "merged-result.txt",
+                },
+                {"role": "assistant", "content": "use the result"},
+            ]
+        )
+    ]
+
+    rendered = evaluator._render_traces(traces)
+
+    assert rendered.count("merged-result.txt") == 1
+    assert (
+        '<tool_output tool_call_id="merged-call" tool_name="bash">'
+        in rendered
+    )
+
+
+def test_render_prefix_merged_trace_hides_tool_output_when_disabled(
+    tmp_path: Path,
+) -> None:
+    evaluator = _make_evaluator(_make_task_dir(tmp_path))
+    traces = [
+        Trace(
+            response_messages=[
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "merged-call",
+                            "function": {"name": "bash", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "merged-call",
+                    "content": "merged secret",
+                },
+            ]
+        )
+    ]
+
+    rendered = evaluator._render_traces(traces)
+
+    assert "merged secret" not in rendered
     assert "<tool_outputs>" not in rendered
 
 

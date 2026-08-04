@@ -1,6 +1,6 @@
 # Tool-output rubric PRM report
 
-Date: 2026-07-22
+Date: 2026-07-24
 
 ## Question
 
@@ -164,6 +164,90 @@ partition: batch
 request:   4 nodes x 8 H100, 04:00:00
 ```
 
-At report time both jobs are valid and pending solely on scheduler priority.
-Startup, rollout/judge, log-prob guard, and first-step evidence will be appended
-once Slurm allocates their nodes.
+Both jobs received their requested allocation and exercised the real
+rollout/judge/training path. They were later cancelled by the cluster's
+occupied-idle job reaper rather than by an application exception:
+
+| Job | Runtime | Progress before cancellation | Scheduler reason |
+|---|---:|---|---|
+| `14277208` (8 node) | 1h25m55s | completed optimizer step 0; began rollout/train iteration 1 | 48/64 GPUs reported idle for 30m |
+| `14278458` (4 node) | 50m30s | log-prob guard passed; actor train reached microbatch 247/260 for step 0 | 11/32 GPUs reported idle for 30m |
+
+The eight-node job is the requested full-training startup proof. Its first
+accepted batch contained 16 groups / 128 sessions. All 128 sessions were
+successful and trainable, with no timeout, terminal-error, or fully-masked
+session. Mean accepted reward was `0.523726` (standard deviation `0.271050`),
+and the batch contained 3,796 trainable traces. The trainer/rollout log-prob
+guard passed with `masked_mean_abs_diff=0.00845339` against the `0.5`
+threshold. The resulting dPPO update reported:
+
+```text
+train/loss              0.02092314
+train/ppo_kl            0.00031643
+train/grad_norm         0.05403605
+train/global_batch_size 128
+```
+
+The next eight-node batch also passed the log-prob guard
+(`masked_mean_abs_diff=0.00727092`) before the scheduler cancellation. Rollout
+cursor states for iterations 0 and 1 were written, but no resumable model
+checkpoint pointer was committed before cancellation.
+
+The four-node run likewise reached real actor training: its first log-prob
+guard passed with `masked_mean_abs_diff=0.00896798`. It was cancelled at
+microbatch 247/260, before step-0 metrics or a resumable model checkpoint were
+committed.
+
+These cancellations expose a cluster-policy incompatibility with the
+colocated fully-asynchronous topology: while the learner performs a long
+update, many rollout GPUs become idle long enough for the occupied-idle reaper
+to reclaim the allocation. They do not contradict the smoke result or the
+eight-node evidence that rubric-judged trajectories correctly enter and update
+the learner.
+
+## Four-node prefix-merging timing
+
+Job `14314119` ran the same four-node topology with
+`builder.strategy: prefix_merging`. Successful sessions merged their
+append-only completion chains into normally one trainable trace; the observed
+completed-session distribution during the first batch was predominantly one
+trace, with a small number of two-chain/two-trace sessions. For example, one
+session merged all 16 of its raw completions into one trace with
+`chains_reconstructed_full=1` and `completions_merged=16`.
+
+The first complete optimizer step produced:
+
+| Measurement | Per-request 4-node baseline | Prefix merging |
+|---|---:|---:|
+| rollout groups / trajectories | 8 / 64 | 8 / 64 |
+| rollout collection | 318.5s | 226.5s |
+| learner microbatches | 260 | 15 |
+| learner log-prob pass | 572.0s | 140.3s |
+| full learner train | approximately 42m from measured baseline progress | 433.6s |
+
+Prefix merging therefore reduced the measured learner time to about 17% of
+the old projected four-node time, approximately a 5.8x speedup. The step
+completed normally with `train_rollout_logprob_abs_diff=0.0`, loss
+`-0.00185875`, PPO KL `0.00067145`, and global batch size 64.
+
+This timing run also revealed two external-data/service issues unrelated to
+prefix merging:
+
+- one PostgreSQL task group had a corrupt SIF and was dropped after Apptainer
+  reported a squashfs read failure; and
+- the configured `openai/openai/gpt-5.1-codex` judge began returning HTTP 404
+  because that model was deprecated. Its scores therefore fell back to the
+  verifier outcome in this timing run.
+
+The timing job was cancelled after step 0 to avoid spending more allocation on
+the deprecated judge. `PRM_MODEL` now defaults to the endpoint-verified
+`azure/openai/gpt-5.3-codex` (HTTP 200 in the submission preflight), and a
+replacement valid-PRM run was submitted:
+
+```text
+Slurm job: 14314401
+run id:    skill2env-qwen35-4b-gpt53-rubric-prm-prefix-merging-4n-full-20260724T095914Z
+account:   nvr_lpr_llm
+partition: batch
+request:   4 nodes x 8 H100, 04:00:00
+```

@@ -54,6 +54,10 @@ def test_default_evaluator_registry_exposes_spilot_harbor() -> None:
     assert "spilot_harbor" in default_evaluator_registry().list_strategies()
 
 
+def test_default_evaluator_registry_exposes_harbor_rubric() -> None:
+    assert "harbor_rubric" in default_evaluator_registry().list_strategies()
+
+
 def test_unknown_strategy_raises_clear_error() -> None:
     registry: StrategyRegistry[BaseTrajectoryBuilder] = StrategyRegistry(BaseTrajectoryBuilder)
 

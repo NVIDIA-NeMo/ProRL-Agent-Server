@@ -10,21 +10,24 @@ export NUM_NODES=4
 export PARTITION="batch"
 export WALL_TIME="${WALL_TIME:-4:00:00}"
 export TMAX_MIN_WALL_TIME="${TMAX_MIN_WALL_TIME:-4:00:00}"
-export ACTOR_NUM_NODES=1
-export ACTOR_NUM_GPUS_PER_NODE=8
-export ROLLOUT_NUM_GPUS=24
-export ROLLOUT_BATCH_SIZE=8
-export N_SAMPLES_PER_PROMPT=8
-export GLOBAL_BATCH_SIZE=64
-export EVAL_GLOBAL_BATCH_SIZE=64
+export ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-1}"
+export ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
+export ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-24}"
+export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
+export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
+export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"
+export EVAL_GLOBAL_BATCH_SIZE="${EVAL_GLOBAL_BATCH_SIZE:-64}"
 export POLAR_MULTI_GATEWAY=1
 export PRM_INCLUDE_TOOL_OUTPUTS=true
 export PRM_TOOL_OUTPUT_MAX_CHARS="${PRM_TOOL_OUTPUT_MAX_CHARS:-12000}"
 export PRM_MAX_TRACES_PER_CALL="${PRM_MAX_TRACES_PER_CALL:-32}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
 
-# No TMAX_NUM_ROLLOUT override: submit_slurm.sh derives the complete one-epoch
-# schedule from all prepared Skill2Env tasks.
-unset TMAX_NUM_ROLLOUT TMAX_TARGET_ITER
+# The standard full run derives a complete one-epoch schedule from all prepared
+# Skill2Env tasks. Dedicated fixed-step launchers can opt into preserving an
+# explicit trainer/watcher boundary.
+if [ "${SKILL2ENV_PRESERVE_NUM_ROLLOUT:-0}" != "1" ]; then
+    unset TMAX_NUM_ROLLOUT TMAX_TARGET_ITER
+fi
 
 exec bash "${SCRIPT_DIR}/submit_slurm.sh"

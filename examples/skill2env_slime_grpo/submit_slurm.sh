@@ -16,12 +16,20 @@ if [ -z "${PRM_KEY:-}" ]; then
 fi
 export PRM_KEY
 export PRM_BASE_URL="${PRM_BASE_URL:-https://inference-api.nvidia.com/v1/responses}"
-export PRM_MODEL="${PRM_MODEL:-openai/openai/gpt-5.1-codex}"
+export PRM_MODEL="${PRM_MODEL:-azure/openai/gpt-5.3-codex}"
 export PRM_RUBRIC_COEFFICIENT="${PRM_RUBRIC_COEFFICIENT:-0.2}"
 export PRM_TIMEOUT_SECONDS="${PRM_TIMEOUT_SECONDS:-180}"
 export PRM_INCLUDE_TOOL_OUTPUTS="${PRM_INCLUDE_TOOL_OUTPUTS:-true}"
 export PRM_TOOL_OUTPUT_MAX_CHARS="${PRM_TOOL_OUTPUT_MAX_CHARS:-12000}"
 export PRM_MAX_TRACES_PER_CALL="${PRM_MAX_TRACES_PER_CALL:-32}"
+export POLAR_TRAJECTORY_BUILDER="${POLAR_TRAJECTORY_BUILDER:-per_request}"
+case "${POLAR_TRAJECTORY_BUILDER}" in
+    per_request|prefix_merging) ;;
+    *)
+        echo "ERROR: POLAR_TRAJECTORY_BUILDER must be per_request or prefix_merging" >&2
+        exit 1
+        ;;
+esac
 
 export POLAR_DATA_ROOT="${POLAR_DATA_ROOT:-${PROJECT_ROOT}/local_data}"
 export POLR_TRAIN_VENV="${POLR_TRAIN_VENV:-${POLAR_DATA_ROOT}/train_runtime_venv}"

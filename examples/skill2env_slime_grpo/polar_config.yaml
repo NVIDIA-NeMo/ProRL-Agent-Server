@@ -72,7 +72,7 @@ ${POLAR_INTERNET_RUNTIME_VOLUME}
           chat_template_kwargs:
             enable_thinking: ${POLAR_AGENT_ENABLE_THINKING}
   builder:
-    strategy: "per_request"
+    strategy: "${POLAR_TRAJECTORY_BUILDER}"
   evaluator:
     strategy: "harbor_rubric"
     refresh_runtime: false

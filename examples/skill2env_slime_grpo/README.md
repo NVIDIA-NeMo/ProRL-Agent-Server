@@ -3,7 +3,7 @@
 This experiment fine-tunes Qwen3.5-4B on the locally available Skill2Env
 tasks. Polar executes each task in its matching SIF, runs the deterministic
 Harbor verifier, and then uses `harbor_rubric` to assign per-trace process
-rewards with `openai/openai/gpt-5.1-codex` through NVIDIA Inference Hub's
+rewards with `azure/openai/gpt-5.3-codex` through NVIDIA Inference Hub's
 Responses API.
 
 The reward for trace `i` is:
@@ -27,6 +27,7 @@ matching SIF:
 
 ```bash
 bash examples/skill2env_slime_grpo/run_4node_full.sh
+bash examples/skill2env_slime_grpo/run_4node_prefix_merging.sh
 bash examples/skill2env_slime_grpo/run_8node_full.sh
 ```
 
@@ -40,6 +41,11 @@ included in the rubric judge input by default for this experiment; set
 `PRM_INCLUDE_TOOL_OUTPUTS=false` to recover the original response-only judge.
 Long trajectories are judged in chunks of at most 32 traces by default; set
 `PRM_MAX_TRACES_PER_CALL=0` to restore a single call per trajectory.
+
+`run_4node_prefix_merging.sh` is the four-node timing comparison. It stitches
+an append-only agent request chain into one token-level trace while preserving
+sampled-token log probabilities and zero-masking interstitial/tool-result
+tokens. The rubric judge still receives matched tool outputs exactly once.
 
 The implementation, controlled A/B comparison, smoke evidence, and full-job
 topology are documented in [tool_output_prm_report.md](tool_output_prm_report.md).

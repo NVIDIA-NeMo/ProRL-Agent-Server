@@ -88,5 +88,6 @@ def default_evaluator_registry() -> StrategyRegistry:
     registry.register("swebench_harness", SwebenchHarnessEvaluator)
     registry.register("test_on_output", TestOnOutputEvaluator)
     registry.register("harbor", HarborEvaluator)
+    registry.register("harbor_rubric", HarborEvaluatorWithRubric)
     registry.register("spilot_harbor", SpilotHarborEvaluator)
     return registry

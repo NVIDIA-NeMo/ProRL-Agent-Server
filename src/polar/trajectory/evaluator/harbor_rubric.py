@@ -34,6 +34,12 @@ Config schema (extends the ``harbor`` evaluator config)
   ``chat_completions`` or ``responses``.
 - ``rubric_coefficient`` *(float, default 0.2)* — weight of the normalized
   judge score.
+- ``fallback_rubric`` *(str, default empty)* — rubric text used when the task
+  has no ``tests/rubric.md``. This is useful for datasets such as TMax-15K
+  whose tasks provide programmatic verifiers but no task-specific rubric.
+- ``require_rubric`` *(bool, default false)* — fail the evaluation when neither
+  ``tests/rubric.md`` nor ``fallback_rubric`` is available, instead of silently
+  degrading to plain Harbor reward.
 - ``judge_api_key_env`` *(str, default ``JUDGE_API_KEY``)* — env var holding
   the API key; resolved from the evaluator's env, then the process env.
 - ``judge_timeout`` *(float, default 60)* — per-request timeout, clamped to
@@ -42,7 +48,8 @@ Config schema (extends the ``harbor`` evaluator config)
 - ``judge_max_output_tokens`` *(int, default 8192)* — judge response budget.
 - ``judge_temperature`` *(float, default 0.0)*.
 - ``judge_include_tool_outputs`` *(bool, default false)* — attach each tool
-  result observed in the following prompt to the trace that issued the call.
+  result observed in the following prompt, or in a prefix-merged trace's
+  interstitial messages, to the trace that issued the call.
 - ``judge_tool_output_max_chars`` *(int, default 12000)* — middle-truncation
   cap for each individual tool result when tool outputs are enabled.
 - ``judge_max_traces_per_call`` *(int, default 0)* — split long rollouts into
@@ -137,6 +144,8 @@ class HarborEvaluatorWithRubric(HarborEvaluator):
         judge_model: str,
         judge_api: str = "chat_completions",
         rubric_coefficient: float = 0.2,
+        fallback_rubric: str = "",
+        require_rubric: bool = False,
         judge_api_key_env: str = "JUDGE_API_KEY",
         judge_timeout: float = 60.0,
         judge_max_retries: int = 2,
@@ -161,6 +170,10 @@ class HarborEvaluatorWithRubric(HarborEvaluator):
                 "harbor_rubric 'judge_api' must be 'chat_completions' or 'responses'"
             )
         self.rubric_coefficient = float(rubric_coefficient)
+        self.fallback_rubric = str(fallback_rubric).strip()
+        if not isinstance(require_rubric, bool):
+            raise ValueError("require_rubric must be a boolean")
+        self.require_rubric = require_rubric
         self.judge_api_key_env = judge_api_key_env
         self.judge_timeout = float(judge_timeout)
         if self.judge_timeout <= 0:
@@ -186,20 +199,33 @@ class HarborEvaluatorWithRubric(HarborEvaluator):
         outcome = base.outcome_reward if base.outcome_reward is not None else 0.0
 
         rubric_path = Path(self.tests_dir) / "rubric.md"
-        if not rubric_path.is_file() or not trajectory.traces:
+        if rubric_path.is_file():
+            rubric = rubric_path.read_text()
+            rubric_source = "task"
+        elif self.fallback_rubric:
+            rubric = self.fallback_rubric
+            rubric_source = "fallback"
+        elif self.require_rubric:
+            raise RuntimeError(
+                "harbor_rubric requires tests/rubric.md or a non-empty fallback_rubric"
+            )
+        else:
             base.metadata["rubric_applied"] = False
+            return base
+        if not trajectory.traces:
+            base.metadata["rubric_applied"] = False
+            base.metadata["rubric_source"] = rubric_source
             return base
 
         builder = trajectory.metadata.get("builder")
         builder_warning: str | None = None
-        if builder != "per_request":
+        if builder not in {"per_request", "prefix_merging"}:
             builder_warning = (
-                "harbor_rubric expects per_request-built trajectories so traces "
-                f"are chronological agent turns; got builder={builder!r}"
+                "harbor_rubric expects per_request or prefix_merging trajectories; "
+                f"got builder={builder!r}"
             )
             logger.warning("%s", builder_warning)
 
-        rubric = rubric_path.read_text()
         instruction_path = Path(self.tests_dir).parent / "instruction.md"
         if instruction_path.is_file():
             instruction = instruction_path.read_text()
@@ -225,6 +251,7 @@ class HarborEvaluatorWithRubric(HarborEvaluator):
             **base.metadata,
             "mode": self.MODE,
             "rubric_applied": True,
+            "rubric_source": rubric_source,
             "rubric_coefficient": self.rubric_coefficient,
             "judge_model": self.judge_model,
             "judge_scores": scores,
@@ -268,7 +295,18 @@ class HarborEvaluatorWithRubric(HarborEvaluator):
             )
         blocks: list[str] = []
         for index, trace in enumerate(traces):
-            body = _render_messages(trace.response_messages)
+            # Tool-role messages are rendered only through the explicit
+            # tool-output association below. This keeps the option genuinely
+            # optional for prefix-merged traces, whose response_messages also
+            # contain interstitial tool results, and avoids rendering the same
+            # result twice when the option is enabled.
+            body = _render_messages(
+                [
+                    message
+                    for message in trace.response_messages
+                    if message.get("role") != "tool"
+                ]
+            )
             outputs = tool_outputs.get(index, [])
             if outputs:
                 rendered_outputs = []
@@ -483,11 +521,12 @@ def _tool_outputs_by_trace(
 ) -> dict[int, list[tuple[str, str, str]]]:
     """Associate observed tool results with the trace that issued each call.
 
-    Agent traces store a turn's assistant response separately, while its tool
-    result first appears in the *next* trace's cumulative ``prompt_messages``.
-    Match by tool-call id rather than prompt position so parallel/multi-tool
-    turns remain unambiguous, and keep only the first observation to avoid
-    duplicating results repeated in every later cumulative prompt.
+    Per-request traces store a turn's assistant response separately, while its
+    tool result first appears in the *next* trace's cumulative
+    ``prompt_messages``. Prefix-merged traces instead place tool results among
+    the same trace's interstitial ``response_messages``. Match both forms by
+    tool-call id rather than prompt position so parallel/multi-tool turns remain
+    unambiguous, and keep only the first observation to avoid duplication.
     """
 
     calls: dict[str, tuple[int, str]] = {}
@@ -507,7 +546,7 @@ def _tool_outputs_by_trace(
 
     observed: dict[str, str] = {}
     for trace in traces:
-        for message in trace.prompt_messages:
+        for message in [*trace.prompt_messages, *trace.response_messages]:
             if message.get("role") != "tool":
                 continue
             tool_call_id = message.get("tool_call_id")
