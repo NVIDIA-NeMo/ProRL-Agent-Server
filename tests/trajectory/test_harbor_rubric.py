@@ -147,11 +147,12 @@ def test_rubric_present_blends_outcome_and_judge_scores(
     )
 
     assert result.outcome_reward == 1.0
-    assert result.trace_rewards == pytest.approx([1.2, 0.8])
+    assert result.trace_rewards == pytest.approx([1.0, 0.0])
     assert result.metadata["rubric_applied"] is True
     assert result.metadata["judge_scores"] == [5, -5]
     assert result.metadata["judge_failures"] == 0
     assert result.metadata["judge_model"] == "judge-1"
+    assert result.metadata["judge_calibration"] == "trace_behavior_alignment"
     assert "builder_warning" not in result.metadata
     # One judge call for the whole rollout; the debug record is persisted.
     assert len(seen_prompts) == 1
@@ -159,7 +160,34 @@ def test_rubric_present_blends_outcome_and_judge_scores(
     assert record["scores"] == [5, -5]
 
 
-def test_judge_prompt_contains_reward_json_and_trace_ids(
+@pytest.mark.parametrize(
+    ("outcome", "score", "expected"),
+    [
+        (1.0, 0, 0.8),
+        (1.0, -4, 0.64),
+        (0.0, 5, 0.2),
+        (0.0, -1, 0.0),
+        (0.5, None, 0.5),
+        (1.0, -5, 0.0),
+    ],
+)
+def test_calibrated_reward_is_bounded(
+    tmp_path: Path, outcome: float, score: int | None, expected: float
+) -> None:
+    evaluator = _make_evaluator(_make_task_dir(tmp_path))
+
+    assert evaluator._calibrate_reward(outcome, score) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("coefficient", [-0.1, 1.1])
+def test_rubric_coefficient_must_be_between_zero_and_one(
+    tmp_path: Path, coefficient: float
+) -> None:
+    with pytest.raises(ValueError, match="rubric_coefficient must be between 0 and 1"):
+        _make_evaluator(_make_task_dir(tmp_path), rubric_coefficient=coefficient)
+
+
+def test_judge_prompt_calibrates_trace_behavior_without_step_assumptions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tests_dir = _make_task_dir(tmp_path)
@@ -177,11 +205,19 @@ def test_judge_prompt_contains_reward_json_and_trace_ids(
     assert REWARD_JSON in prompt
     assert '<trace id="trace_0">' in prompt
     assert '<trace id="trace_1">' in prompt
-    # Chronological response messages, without prompt-side observation turns.
+    # Response messages retain builder-provided order, without prompt-side turns.
     assert prompt.index("ALPHA step") < prompt.index("BETA done")
-    assert "observation" not in prompt
+    assert "### TOOL\nobservation" not in prompt
     assert "## Meta rubric" in prompt
-    assert "Reward hacking is a strict -5" in prompt
+    assert "Reward hacking or solution gaming is a strict -5" in prompt
+    assert "Must-do requirements or Best-practice" in prompt
+    assert "explicit Must-avoid violation" in prompt
+    assert "Trace ids are labels, not guaranteed chronological steps" in prompt
+    assert "do not treat trace ids as solution steps" in prompt
+    assert "Do not require a trace to finish the whole task" in prompt
+    assert "loops of the same failed action" in prompt
+    assert "how critically it contributes" not in prompt
+    assert "one agent turn, in chronological order" not in prompt
     assert "Build the chart pack." in prompt
 
 
@@ -220,12 +256,13 @@ def test_missing_scores_fall_back_to_outcome_reward(
     assert result.metadata["judge_failures"] == 1
 
 
-def test_non_per_request_builder_records_warning(
+def test_non_per_request_builder_uses_same_trace_behavior_calibration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tests_dir = _make_task_dir(tmp_path)
     evaluator = _make_evaluator(tests_dir)
-    _patch_judge(monkeypatch, [0, 0])
+    seen_prompts: list[str] = []
+    _patch_judge(monkeypatch, [0, 0], seen_prompts)
 
     result = asyncio.run(
         evaluator.evaluate(
@@ -234,7 +271,10 @@ def test_non_per_request_builder_records_warning(
         )
     )
 
-    assert "prefix_merging" in result.metadata["builder_warning"]
+    assert "builder_warning" not in result.metadata
+    assert result.metadata["judge_calibration"] == "trace_behavior_alignment"
+    assert "Depending on the builder" in seen_prompts[0]
+    assert "a complete rollout, or a parallel branch" in seen_prompts[0]
 
 
 def test_render_traces_keeps_tool_calls(tmp_path: Path) -> None:

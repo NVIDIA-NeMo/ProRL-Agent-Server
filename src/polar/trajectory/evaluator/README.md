@@ -11,7 +11,7 @@ onto the trajectory's traces.
 - `test_on_output.py`: apply the agent's changes and grade test output.
 - `swebench_harness.py`: grade a patch with the SWE-bench harness.
 - `harbor.py`: run a Harbor task's `tests/test.sh` in the live runtime.
-- `harbor_rubric.py`: Harbor outcome plus a rubric-based LLM judge process reward.
+- `harbor_rubric.py`: Harbor outcome plus rubric-based trace behavior calibration.
 - `_patch_utils.py`: `BasePatchEvaluator` — the shared extract → filter → apply →
   test flow both grading evaluators build on.
 
@@ -43,21 +43,26 @@ runtime, runs `bash /tests/test.sh`, and reads the reward back (the Harbor
 verifier contract). Requires `refresh_runtime: false`. Config: `tests_dir`
 (required), `verifier_timeout`, `tests_target`, `verifier_dir`, `test_command`.
 
-**`harbor_rubric`** — everything `harbor` does, plus a rubric-based process
-reward when the task ships `tests/rubric.md`. One judge call per rollout: an
-OpenAI-compatible endpoint sees the task's `instruction.md`, a unified meta
-rubric (efficiency, no reward hacking, outcome-independent step judging), the
-task rubric, the verifier's raw scoring (`reward.json` when present), and every
-trace's `response_messages` in chronological order tagged `trace_0`,
-`trace_1`, … (assumes the `per_request` builder; warns otherwise). The judge
-returns one JSON object mapping each trace id to an integer score in `[-5, 5]`
-and each trace gets `outcome_reward + rubric_coefficient * (score / 5)`. Fails
-open: no rubric, a judge failure, or a missing trace id falls back to the
-outcome reward. Extra config: `judge_base_url` and `judge_model` (required),
-`rubric_coefficient` (default `0.2`), `judge_api_key_env` (default
-`JUDGE_API_KEY`, resolved from the evaluator `env` then the process env),
-`judge_timeout`, `judge_max_retries`, `judge_temperature`,
-`max_section_chars`.
+**`harbor_rubric`** — everything `harbor` does, plus rubric-based trace behavior
+calibration when the task ships `tests/rubric.md`. One judge call per rollout:
+an OpenAI-compatible endpoint sees the task's `instruction.md`, a unified meta
+rubric (Must-do/Best-practice alignment, Must-avoid violations, efficiency,
+honesty, and strict punishment for reward hacking), the task rubric, the
+verifier's raw scoring (`reward.json` when present), and every trace's
+`response_messages` tagged `trace_0`, `trace_1`, …. Each trace is treated as an
+opaque builder-produced unit: one completion, a merged multi-turn chain, a
+whole rollout, or a parallel branch. The judge scores behavior evidenced within
+that unit, not chronological step contribution, so no builder strategy is
+assumed. It returns one JSON object mapping each trace id to an integer score in
+`[-5, 5]`. Except for a catastrophic score of `-5`, which forces the trace
+reward to `0`, each trace gets
+`clip((1 - rubric_coefficient) * outcome_reward + rubric_coefficient * (score / 5), 0, 1)`.
+Fails open: no rubric, a judge failure, or a missing trace id falls back to the
+unscaled outcome reward. Extra config: `judge_base_url` and `judge_model`
+(required), `rubric_coefficient` (range `[0, 1]`, default `0.2`),
+`judge_api_key_env` (default `JUDGE_API_KEY`, resolved from the evaluator `env`
+then the process env), `judge_timeout`, `judge_max_retries`,
+`judge_temperature`, `max_section_chars`.
 
 Both grading evaluators need a live runtime (and a `fresh_eval_runtime` when the
 task sets `refresh_runtime`); an empty diff scores `0.0`.
