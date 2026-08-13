@@ -60,6 +60,7 @@ falls back to `rollout.public_url` when omitted.
 | `public_url` | str | derived from `host:port` |
 | `model_served` | str | `""` |
 | `inference.engine` | `sglang` \| `vllm` | `sglang` |
+| `inference.scheduler` | `none` \| `thunderagent` | `none` |
 | `inference.base_url` | str | `http://127.0.0.1:8000` |
 | `max_init_workers` | int | `4` |
 | `max_run_workers` | int | `2` |
@@ -88,8 +89,53 @@ gateway:
       max_postrun_workers: 4
       inference:
         engine: sglang   # or vllm
+        scheduler: none  # or thunderagent; opt-in
         base_url: http://127.0.0.1:8000
 ```
+
+## ThunderAgent scheduler
+
+ThunderAgent runs as an external OpenAI-compatible proxy; Polar does not start
+or configure it. `inference.engine` remains `sglang` or `vllm` (matching the
+backend behind ThunderAgent), while `inference.base_url` points to the
+ThunderAgent listener. The default `scheduler: none` keeps the direct inference
+path unchanged. Polar uses `<gateway-node-id>:<session-id>` as the stable
+ThunderAgent program identity, so gateways sharing one proxy remain isolated.
+
+Install the external ThunderAgent checkout in editable mode if needed:
+
+```bash
+python -m pip install -e /path/to/ThunderAgent
+```
+
+For example, with a vLLM server on port 8000, start ThunderAgent with the fixed
+rollout settings:
+
+```bash
+thunderagent \
+  --backend-type vllm \
+  --backends http://127.0.0.1:8000 \
+  --port 9000 \
+  --router tr \
+  --metrics \
+  --acting-token-weight 0.0
+```
+
+Then opt the gateway node in and point it at that proxy:
+
+```yaml
+inference:
+  engine: vllm
+  scheduler: thunderagent
+  base_url: http://127.0.0.1:9000
+```
+
+When gateways share a ThunderAgent instance, coordinate each weight update as
+one shared operation: pause and drain all gateways, call
+`POST /weight_sync/begin` once per ThunderAgent instance, update the weights,
+call `POST /weight_sync/end` once per instance, and then resume all gateways.
+Do not map each gateway's pause/resume pair to its own ThunderAgent begin/end
+pair, which can release the shared barrier too early.
 
 ## Reachable URLs and multi-node
 
