@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-import hashlib
 import json
 import logging
 import os
@@ -42,7 +41,6 @@ from polar.gateway.transform import TransformManager
 from polar.gateway.transform.base import BaseTransformer
 from polar.platform.events import SSE_HEADERS, EventBus
 from polar.rollout.models import SessionDispatchRequest, SessionDispatchResponse, SessionStatus
-from polar.runtime.models import RuntimeSpec
 from polar.trajectory.registry import default_builder_registry, default_evaluator_registry
 
 logging.basicConfig(
@@ -81,7 +79,12 @@ def configure_server(topology_path: str = "topology.yaml", *, node_id: str | Non
 
 def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
     node = topology.select_gateway_node(node_id)
-    inference = InferenceClient(node.inference_base_url, get_engine(node.engine))
+    inference = InferenceClient(
+        node.inference_base_url,
+        get_engine(node.engine),
+        scheduler=node.inference.scheduler,
+        program_namespace=node.id,
+    )
     persistence_config = topology.gateway.completion_persistence
     save_dir = topology.rollout.save_dir
     completion_writer = CompletionWriter(
@@ -111,6 +114,9 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
         default_runtime=node.default_runtime,
         rollout_server_url=topology.gateway.rollout_server_url or None,
         heartbeat_interval_seconds=topology.gateway.heartbeat_interval_seconds,
+        program_releaser=(
+            inference.release_program if node.inference.scheduler == "thunderagent" else None
+        ),
     )
     return GatewayState(
         topology=topology,
@@ -187,10 +193,16 @@ async def _lifespan(_: FastAPI):
     try:
         yield
     finally:
-        await state.node_manager.close()
-        await state.inference.close()
-        state.storage.close()
-        await state.completion_writer.close()
+        try:
+            await state.node_manager.close()
+        finally:
+            try:
+                await state.inference.close()
+            finally:
+                try:
+                    state.storage.close()
+                finally:
+                    await state.completion_writer.close()
 
 
 app = FastAPI(title="Polar Gateway", version="0.1.0", lifespan=_lifespan)
@@ -598,6 +610,10 @@ async def delete_session(session_id: str):
     if info is None and deleted_count == 0:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    await state.node_manager.release_program(safe_session_id)
+    # A completion that was already in flight may have persisted after the
+    # first delete but before scheduler draining finished.
+    deleted_count += state.storage.delete_session(safe_session_id)
     state.session_registry.remove(safe_session_id)
     return SessionDeleteResponse(
         session_id=safe_session_id,
@@ -680,7 +696,7 @@ async def _handle_non_streaming(
 ) -> JSONResponse:
     state = get_state()
     try:
-        response = await state.inference.completion(openai_request)
+        response = await state.inference.completion(openai_request, session_id=session_id)
     except UpstreamError as exc:
         logger.warning("Non-streaming upstream error for session %s: %s", session_id, exc)
         return _upstream_error_response(api_type, exc)
@@ -715,7 +731,7 @@ async def _handle_streaming(
     non_stream_request = {k: v for k, v in openai_request.items() if k != "stream_options"}
     non_stream_request["stream"] = False
     try:
-        response = await state.inference.completion(non_stream_request)
+        response = await state.inference.completion(non_stream_request, session_id=session_id)
     except UpstreamError as exc:
         logger.warning("Upstream error for streaming session %s: %s", session_id, exc)
         return _upstream_error_response(api_type, exc)

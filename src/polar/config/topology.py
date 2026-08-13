@@ -21,6 +21,7 @@ class _StrictModel(BaseModel):
 
 class _InferenceConfig(_StrictModel):
     engine: Literal["sglang", "vllm"] = "sglang"
+    scheduler: Literal["none", "thunderagent"] = "none"
     base_url: str = "http://127.0.0.1:8000"
 
     @field_validator("base_url")
