@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 
 import pytest
@@ -11,6 +12,8 @@ from slime_bridge.adapter import RolloutLogprobError, session_result_to_samples
 
 
 class FakeSample:
+    __dataclass_fields__ = {"rollout_id": None}
+
     class Status(str, Enum):
         COMPLETED = "completed"
         ABORTED = "aborted"
@@ -22,7 +25,7 @@ class FakeSample:
         *,
         group_index: int,
         index: int,
-        group_id: int,
+        rollout_id: int,
         prompt,
         tokens: list[int],
         response: str,
@@ -37,7 +40,7 @@ class FakeSample:
     ) -> None:
         self.group_index = group_index
         self.index = index
-        self.group_id = group_id
+        self.rollout_id = rollout_id
         self.prompt = prompt
         self.tokens = tokens
         self.response = response
@@ -49,6 +52,17 @@ class FakeSample:
         self.session_id = session_id
         self.metadata = metadata
         self.remove_sample = remove_sample
+
+
+def test_make_sample_supports_slime_v030_group_id() -> None:
+    @dataclass
+    class V030Sample:
+        index: int
+        group_id: int
+
+    sample = adapter._make_sample(V030Sample, index=3, trajectory_id=7)
+
+    assert sample.group_id == 7
 
 
 def _session_result(
@@ -99,7 +113,7 @@ def test_session_result_to_samples_converts_trace_to_slime_like_sample(monkeypat
     sample = samples[0]
     assert sample.group_index == 11
     assert sample.index == 2
-    assert sample.group_id == 2
+    assert sample.rollout_id == 2
     assert sample.prompt == [{"role": "user", "content": "Say hi"}]
     assert sample.tokens == [1, 2, 3, 4]
     assert sample.response == "[assistant] Hi"
@@ -113,7 +127,7 @@ def test_session_result_to_samples_converts_trace_to_slime_like_sample(monkeypat
     assert sample.metadata["polar"]["rollout_step"] == 7
 
 
-def test_session_result_to_samples_shares_group_id_across_trace_siblings(monkeypatch) -> None:
+def test_session_result_to_samples_shares_rollout_id_across_trace_siblings(monkeypatch) -> None:
     monkeypatch.setattr(adapter, "_load_sample_type", lambda: FakeSample)
     traces = [
         Trace(
@@ -140,7 +154,7 @@ def test_session_result_to_samples_shares_group_id_across_trace_siblings(monkeyp
 
     assert len(samples) == 2
     assert [sample.index for sample in samples] == [7, 7]
-    assert [sample.group_id for sample in samples] == [7, 7]
+    assert [sample.rollout_id for sample in samples] == [7, 7]
     assert [sample.metadata["polar"]["trace_index"] for sample in samples] == [0, 1]
 
 
@@ -160,7 +174,7 @@ def test_session_result_to_samples_emits_placeholder_when_trace_is_unusable(monk
 
     assert len(samples) == 1
     assert samples[0].remove_sample is True
-    assert samples[0].group_id == 2
+    assert samples[0].rollout_id == 2
     assert samples[0].loss_mask == [0]
     assert samples[0].metadata["polar"]["placeholder"] is True
 

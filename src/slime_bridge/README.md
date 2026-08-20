@@ -17,8 +17,9 @@ Slime calls one entry point, `generate_rollout_polar_async`, wired in via
   (`group_id`, `policy_version`, `rollout_step`) onto every task, and keeps
   async admission bounded to the current Slime rollout request;
 - converts each Polar `Trajectory` back into Slime `Sample`s (one per trace,
-  grouped with Slime 0.3.0 `group_id` so all traces from a trajectory count
-  once), dropping empty or oversized traces;
+  grouped with the installed Slime trajectory-id field (`group_id` in the
+  v0.3.0 tag, `rollout_id` in ea9819f8/v0.3.1+) so all traces from a trajectory
+  count once), dropping empty or oversized traces;
 - computes dynamic-trace leave-one-trajectory-out advantages and zeroes out
   failed/aborted trajectories.
 
