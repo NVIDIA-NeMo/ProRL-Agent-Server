@@ -213,7 +213,7 @@ class CompletionWriter:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = dict(item.payload)
         payload.setdefault("__written_at", datetime.now(timezone.utc).isoformat())
-        path.write_text(json.dumps(payload, default=str))
+        path.write_text(json.dumps(payload, default=str, ensure_ascii=False))
 
 
 __all__ = ["CompletionWriter"]
