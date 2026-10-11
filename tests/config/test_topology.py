@@ -89,7 +89,11 @@ def test_inference_block_selects_engine_and_base_url(tmp_path: Path) -> None:
                     {
                         "id": "node-a",
                         "public_url": "http://127.0.0.1:8100",
-                        "inference": {"engine": "vllm", "base_url": "http://127.0.0.1:8000"},
+                        "inference": {
+                            "engine": "vllm",
+                            "scheduler": "thunderagent",
+                            "base_url": "http://127.0.0.1:8000",
+                        },
                     }
                 ],
             },
@@ -97,6 +101,7 @@ def test_inference_block_selects_engine_and_base_url(tmp_path: Path) -> None:
     )
     node = TopologyConfig.load(path).gateway.nodes[0]
     assert node.engine == "vllm"
+    assert node.inference.scheduler == "thunderagent"
     assert node.inference_base_url == "http://127.0.0.1:8000"
 
 
@@ -117,6 +122,7 @@ def test_inference_engine_defaults_to_sglang(tmp_path: Path) -> None:
     )
     node = TopologyConfig.load(path).gateway.nodes[0]
     assert node.engine == "sglang"
+    assert node.inference.scheduler == "none"
 
 
 def test_inference_defaults_when_block_omitted(tmp_path: Path) -> None:
@@ -145,6 +151,28 @@ def test_invalid_inference_engine_is_rejected(tmp_path: Path) -> None:
         },
     )
     with pytest.raises(ValueError):
+        TopologyConfig.load(path)
+
+
+def test_invalid_inference_scheduler_is_rejected(tmp_path: Path) -> None:
+    path = _write_yaml(
+        tmp_path / "topology.yaml",
+        {
+            "gateway": {
+                "nodes": [
+                    {
+                        "id": "node-a",
+                        "public_url": "http://127.0.0.1:8100",
+                        "inference": {
+                            "scheduler": "other",
+                            "base_url": "http://127.0.0.1:8000",
+                        },
+                    }
+                ],
+            },
+        },
+    )
+    with pytest.raises(ValueError, match="scheduler"):
         TopologyConfig.load(path)
 
 
