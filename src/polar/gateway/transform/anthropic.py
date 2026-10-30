@@ -87,7 +87,9 @@ class AnthropicStreamState:
 
         usage = chunk.get("usage", {})
         if usage:
-            self.output_tokens = usage.get("completion_tokens", self.output_tokens)
+            completion_tokens = usage.get("completion_tokens")
+            if isinstance(completion_tokens, int):
+                self.output_tokens = max(self.output_tokens, completion_tokens)
 
         choices = chunk.get("choices", [])
         if not choices:
