@@ -744,7 +744,45 @@ class OpenAIResponsesTransformer(BaseTransformer):
                 }
             )
 
-        return messages
+        return self._merge_assistant_text_with_tool_calls(messages)
+
+    @staticmethod
+    def _merge_assistant_text_with_tool_calls(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Replay one model turn (text followed by tool calls) as a single assistant message.
+
+        A Responses history stores the text as a ``message`` item and each call as a
+        ``function_call`` item, so conversion yields two consecutive assistant messages
+        for a turn the model produced as one. The prompt then shows a closed, text-only
+        assistant turn followed by a separate tool-call turn, which differs from what the
+        model generated (and from what the Chat and Anthropic paths send). A text-only
+        assistant message directly followed by an assistant message that carries only
+        tool calls is therefore merged into that message.
+        """
+        merged: list[dict[str, Any]] = []
+        for msg in messages:
+            prev = merged[-1] if merged else None
+            if (
+                prev is not None
+                and msg.get("role") == "assistant"
+                and msg.get("tool_calls")
+                and not msg.get("content")
+                and prev.get("role") == "assistant"
+                and not prev.get("tool_calls")
+                and prev.get("content")
+            ):
+                combined = dict(prev)
+                combined["tool_calls"] = msg["tool_calls"]
+                reasoning = [
+                    r for r in (prev.get("reasoning_content"), msg.get("reasoning_content")) if r
+                ]
+                if reasoning:
+                    combined["reasoning_content"] = "\n".join(reasoning)
+                merged[-1] = combined
+            else:
+                merged.append(msg)
+        return merged
 
     def _function_call_output_messages(self, item: dict[str, Any]) -> list[dict[str, Any]]:
         output = self._function_call_output_content(item.get("output", ""))
