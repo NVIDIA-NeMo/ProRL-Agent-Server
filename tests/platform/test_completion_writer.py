@@ -23,6 +23,22 @@ def test_truncate_value_under_budget() -> None:
     assert _truncate_value(short, max_bytes=1024) == short
 
 
+def test_truncate_value_dict_omitted_keys_include_triggering_key() -> None:
+    value = {"a": "x" * 10, "b": "y" * 10, "c": "z" * 10}
+    truncated = _truncate_value(value, max_bytes=15)
+    assert truncated["a"] == "x" * 10
+    assert truncated["__truncated"] is True
+    # "b" triggered truncation, so it is omitted and must be listed.
+    assert truncated["_truncated_keys_omitted"] == ["b", "c"]
+
+
+def test_truncate_value_dict_omitted_keys_when_first_key_overflows() -> None:
+    value = {"a": "x" * 10, "b": "y" * 10}
+    truncated = _truncate_value(value, max_bytes=5)
+    assert truncated["__truncated"] is True
+    assert truncated["_truncated_keys_omitted"] == ["a", "b"]
+
+
 @pytest.mark.asyncio
 async def test_writer_persists_records(tmp_path: Path) -> None:
     writer = CompletionWriter(save_dir=tmp_path, queue_size=8)

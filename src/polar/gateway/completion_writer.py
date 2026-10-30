@@ -65,8 +65,12 @@ def _truncate_value(value: Any, max_bytes: int) -> Any:
         for key, item in value.items():
             piece_size = _approx_byte_size(item)
             if running + piece_size > max_bytes:
+                # Snapshot the omitted keys before adding the marker:
+                # len(out) here is the count of kept keys, i.e. the index
+                # of the key that triggered truncation.
+                omitted = list(value.keys())[len(out) :]
                 out[_TRUNCATED_MARKER] = True
-                out["_truncated_keys_omitted"] = list(value.keys())[len(out):]
+                out["_truncated_keys_omitted"] = omitted
                 break
             out[key] = item
             running += piece_size
