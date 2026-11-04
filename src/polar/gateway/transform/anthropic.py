@@ -40,6 +40,34 @@ class _AnthropicToolCallState:
     started: bool = False
 
 
+def _usage_to_anthropic(usage: dict[str, Any]) -> dict[str, Any]:
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
+    cache_read = _cached_prompt_tokens(usage)
+    input_tokens = max(prompt_tokens - cache_read, 0) if cache_read else prompt_tokens
+
+    result: dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": completion_tokens,
+    }
+    if cache_read:
+        result["cache_read_input_tokens"] = cache_read
+    cache_creation = usage.get("cache_creation_input_tokens")
+    if isinstance(cache_creation, int) and cache_creation:
+        result["cache_creation_input_tokens"] = cache_creation
+    return result
+
+
+def _cached_prompt_tokens(usage: dict[str, Any]) -> int:
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        cached = details.get("cached_tokens")
+        if isinstance(cached, int):
+            return cached
+    cached = usage.get("cached_tokens")
+    return cached if isinstance(cached, int) else 0
+
+
 class AnthropicStreamState:
     """Per-request Anthropic streaming state.
 
@@ -62,6 +90,7 @@ class AnthropicStreamState:
         self.tool_calls: dict[int, _AnthropicToolCallState] = {}
         self.stop_reason = "end_turn"
         self.output_tokens = 0
+        self.usage: dict[str, Any] = {}
         self.any_block_started = False
         self.completed = False
 
@@ -87,6 +116,7 @@ class AnthropicStreamState:
 
         usage = chunk.get("usage", {})
         if usage:
+            self.usage.update({k: v for k, v in usage.items() if v is not None})
             completion_tokens = usage.get("completion_tokens")
             if isinstance(completion_tokens, int):
                 self.output_tokens = max(self.output_tokens, completion_tokens)
@@ -178,7 +208,10 @@ class AnthropicStreamState:
             {
                 "type": "message_delta",
                 "delta": {"stop_reason": self.stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": self.output_tokens},
+                "usage": {
+                    **(_usage_to_anthropic(self.usage) if "prompt_tokens" in self.usage else {}),
+                    "output_tokens": self.output_tokens,
+                },
             }
         )
         events.append({"type": "message_stop"})
@@ -650,30 +683,7 @@ class AnthropicTransformer(BaseTransformer):
             return {}
 
     def _usage_to_anthropic(self, usage: dict[str, Any]) -> dict[str, Any]:
-        prompt_tokens = usage.get("prompt_tokens", 0)
-        completion_tokens = usage.get("completion_tokens", 0)
-        cache_read = self._cached_prompt_tokens(usage)
-        input_tokens = max(prompt_tokens - cache_read, 0) if cache_read else prompt_tokens
-
-        result: dict[str, Any] = {
-            "input_tokens": input_tokens,
-            "output_tokens": completion_tokens,
-        }
-        if cache_read:
-            result["cache_read_input_tokens"] = cache_read
-        cache_creation = usage.get("cache_creation_input_tokens")
-        if isinstance(cache_creation, int) and cache_creation:
-            result["cache_creation_input_tokens"] = cache_creation
-        return result
-
-    def _cached_prompt_tokens(self, usage: dict[str, Any]) -> int:
-        details = usage.get("prompt_tokens_details")
-        if isinstance(details, dict):
-            cached = details.get("cached_tokens")
-            if isinstance(cached, int):
-                return cached
-        cached = usage.get("cached_tokens")
-        return cached if isinstance(cached, int) else 0
+        return _usage_to_anthropic(usage)
 
     def _error_response(self, message: str) -> dict[str, Any]:
         return {
