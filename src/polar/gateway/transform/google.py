@@ -366,18 +366,9 @@ class GoogleTransformer(BaseTransformer):
                 }
             )
 
-        usage = response.get("usage", {})
-        usage_metadata = {
-            "promptTokenCount": usage.get("prompt_tokens", 0),
-            "candidatesTokenCount": usage.get("completion_tokens", 0),
-            "totalTokenCount": usage.get("total_tokens", 0),
-        }
-        cached_tokens = self._cached_prompt_tokens(usage)
-        if cached_tokens:
-            usage_metadata["cachedContentTokenCount"] = cached_tokens
         result = {
             "candidates": candidates,
-            "usageMetadata": usage_metadata,
+            "usageMetadata": self._usage_metadata(response.get("usage", {})),
         }
         function_calls = self._response_function_calls(candidates)
         if function_calls:
@@ -432,11 +423,7 @@ class GoogleTransformer(BaseTransformer):
         result: dict[str, Any] = {"candidates": candidates}
         usage = chunk.get("usage")
         if usage:
-            result["usageMetadata"] = {
-                "promptTokenCount": usage.get("prompt_tokens", 0),
-                "candidatesTokenCount": usage.get("completion_tokens", 0),
-                "totalTokenCount": usage.get("total_tokens", 0),
-            }
+            result["usageMetadata"] = self._usage_metadata(usage)
         function_calls = self._response_function_calls(candidates)
         if function_calls:
             result["functionCalls"] = function_calls
@@ -648,11 +635,7 @@ class GoogleTransformer(BaseTransformer):
             )
         result: dict[str, Any] = {"candidates": [candidate]}
         if usage:
-            result["usageMetadata"] = {
-                "promptTokenCount": usage.get("prompt_tokens", 0),
-                "candidatesTokenCount": usage.get("completion_tokens", 0),
-                "totalTokenCount": usage.get("total_tokens", 0),
-            }
+            result["usageMetadata"] = self._usage_metadata(usage)
         function_calls = self._response_function_calls(result["candidates"])
         if function_calls:
             result["functionCalls"] = function_calls
@@ -689,6 +672,17 @@ class GoogleTransformer(BaseTransformer):
         if isinstance(system_instruction, list):
             return self._extract_text_from_parts(system_instruction)
         return ""
+
+    def _usage_metadata(self, usage: dict[str, Any]) -> dict[str, Any]:
+        usage_metadata = {
+            "promptTokenCount": usage.get("prompt_tokens", 0),
+            "candidatesTokenCount": usage.get("completion_tokens", 0),
+            "totalTokenCount": usage.get("total_tokens", 0),
+        }
+        cached_tokens = self._cached_prompt_tokens(usage)
+        if cached_tokens:
+            usage_metadata["cachedContentTokenCount"] = cached_tokens
+        return usage_metadata
 
     def _cached_prompt_tokens(self, usage: dict[str, Any]) -> int:
         details = usage.get("prompt_tokens_details")
