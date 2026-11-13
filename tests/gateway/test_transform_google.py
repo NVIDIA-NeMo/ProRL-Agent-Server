@@ -584,3 +584,42 @@ def test_google_direct_stream_chunk_handles_reasoning_content() -> None:
     assert candidate["content"]["parts"][0]["text"] == "Think first."
     assert candidate["content"]["parts"][1] == {"text": "Then answer."}
     assert candidate["finishReason"] == "STOP"
+
+
+_CACHED_USAGE = {
+    "prompt_tokens": 10,
+    "completion_tokens": 2,
+    "total_tokens": 12,
+    "prompt_tokens_details": {"cached_tokens": 5},
+}
+
+
+def test_google_direct_stream_chunk_preserves_cached_usage_tokens() -> None:
+    transformer = GoogleTransformer()
+
+    transformed = transformer.transform_stream_chunk(
+        {
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": _CACHED_USAGE,
+        },
+        {},
+    )
+
+    assert transformed["usageMetadata"]["cachedContentTokenCount"] == 5
+
+
+def test_google_stream_state_preserves_cached_usage_tokens() -> None:
+    transformer = GoogleTransformer()
+    state = transformer.create_stream_state({})
+
+    events = state.process_chunk(
+        {
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": _CACHED_USAGE,
+        }
+    )
+    events.extend(state.finalize())
+
+    usage_events = [event for event in events if "usageMetadata" in event]
+    assert usage_events
+    assert usage_events[-1]["usageMetadata"]["cachedContentTokenCount"] == 5
