@@ -804,3 +804,71 @@ def test_responses_stream_state_orders_reasoning_before_tool_without_text() -> N
     assert done[:2] == [(0, "reasoning"), (1, "function_call")]
     assert events[-1]["response"]["output"][0]["type"] == "reasoning"
     assert events[-1]["response"]["output"][1]["type"] == "function_call"
+
+
+def test_responses_request_merges_assistant_text_with_following_tool_call() -> None:
+    """One model turn (text, then a tool call) must replay as ONE assistant message."""
+    transformer = OpenAIResponsesTransformer()
+
+    transformed = transformer.transform_request(
+        {
+            "input": [
+                {"type": "message", "role": "user", "content": "find it"},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Let me check."}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-a",
+                    "name": "lookup",
+                    "arguments": '{"q": 1}',
+                },
+                {"type": "function_call_output", "call_id": "call-a", "output": "result"},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}],
+                },
+            ]
+        }
+    )
+
+    assert transformed["messages"] == [
+        {"role": "user", "content": "find it"},
+        {
+            "role": "assistant",
+            "content": "Let me check.",
+            "tool_calls": [
+                {
+                    "id": "call-a",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"q": 1}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-a", "content": "result"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+
+def test_responses_request_keeps_separate_text_only_assistant_turns() -> None:
+    """Text-only assistant messages not followed by tool calls stay separate."""
+    transformer = OpenAIResponsesTransformer()
+
+    transformed = transformer.transform_request(
+        {
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "message", "role": "assistant", "content": "first"},
+                {"type": "message", "role": "assistant", "content": "second"},
+            ]
+        }
+    )
+
+    assert transformed["messages"] == [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "first"},
+        {"role": "assistant", "content": "second"},
+    ]
