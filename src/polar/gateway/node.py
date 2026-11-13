@@ -8,6 +8,7 @@ import shutil
 from contextlib import suppress
 from pathlib import Path
 from tempfile import mkdtemp
+from typing import Awaitable, Callable
 
 import httpx
 
@@ -63,6 +64,7 @@ class GatewayNodeManager:
         session_base_dir: str | None = None,
         rollout_server_url: str | None = None,
         heartbeat_interval_seconds: int = 30,
+        program_releaser: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
         self.node_id = node_id
         self.gateway_url = gateway_url.rstrip("/")
@@ -90,6 +92,7 @@ class GatewayNodeManager:
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
         self._control_client: httpx.AsyncClient | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._program_releaser = program_releaser
 
     async def start(self) -> None:
         await self._dispatcher.start()
@@ -200,6 +203,21 @@ class GatewayNodeManager:
 
     async def cancel(self, session_id: str) -> bool:
         return await self._dispatcher.cancel(session_id)
+
+    async def release_program(self, session_id: str) -> None:
+        """Best-effort release of external scheduler state for one session."""
+        if self._program_releaser is None:
+            return
+        try:
+            await self._program_releaser(session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Failed to release scheduler program for session %s",
+                session_id,
+                exc_info=True,
+            )
 
     async def active_sessions(self) -> int:
         return await self._dispatcher.active_count()
@@ -552,9 +570,12 @@ class GatewayNodeManager:
                 # status/task_id visible for debugging via the polling endpoint.
                 self.session_registry.clear_result_payload(request.session_id)
         finally:
-            await self._remove_session_dir_best_effort(
-                managed.session_dir, request.session_id
-            )
+            try:
+                await self.release_program(request.session_id)
+            finally:
+                await self._remove_session_dir_best_effort(
+                    managed.session_dir, request.session_id
+                )
 
     async def _build_session_result(self, managed: ManagedSession) -> SessionResult:
         request = managed.request
