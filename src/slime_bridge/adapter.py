@@ -1,9 +1,10 @@
 """Convert Polar rollout results into Slime samples.
 
 Every trace in ``Trajectory.traces`` becomes one Slime ``Sample``.  All
-samples produced from the same session share ``Sample.group_id`` so Slime
-0.3.0's loss reducer counts the trajectory once even when it fans out into
-multiple trace samples.  Builders own trace curation and per-token loss masks
+samples produced from the same session share Slime's trajectory id
+(``group_id`` in the v0.3.0 tag, ``rollout_id`` in ea9819f8/v0.3.1+) so the
+loss reducer counts the trajectory once even when it fans out into multiple
+trace samples. Builders own trace curation and per-token loss masks
 — the adapter does not infer trainable positions from bridge details. Traces
 that lack training tokens are dropped and represented as fully masked samples
 so callers can keep the rest of the group trainable.
@@ -39,7 +40,7 @@ def session_result_to_samples(
     """Convert one Polar session result into Slime samples — one per trace.
 
     Every usable trace becomes an independent Sample sharing the same
-    ``group_id`` key. Slime's loss reducer then averages all trace
+    trajectory-id key. Slime's loss reducer then averages all trace
     contributions as one trajectory, while the reward post-processor can still
     assign each trace its own advantage.
 
@@ -160,14 +161,15 @@ def _build_sample(
     }
     polar_metadata.update(_scheduler_metadata(result, trace))
 
-    return Sample(
+    return _make_sample(
+        Sample,
+        trajectory_id=index,
         group_index=group_index,
         index=index,
         prompt=prompt_value,
         tokens=prompt_ids + response_ids,
         response=response_text,
         response_length=len(response_ids),
-        group_id=index,
         reward={reward_key: reward_value},
         loss_mask=loss_mask,
         rollout_log_probs=response_log_probs,
@@ -206,14 +208,15 @@ def _build_dummy_sample(
         "placeholder": True,
     }
     polar_metadata.update(_scheduler_metadata(result, None))
-    return Sample(
+    return _make_sample(
+        Sample,
+        trajectory_id=index,
         group_index=group_index,
         index=index,
         prompt="",
         tokens=[0, 0],
         response="",
         response_length=1,
-        group_id=index,
         reward={reward_key: 0.0},
         loss_mask=[0],
         rollout_log_probs=[0.0],
@@ -222,6 +225,18 @@ def _build_dummy_sample(
         session_id=result.session_id,
         metadata={"polar": polar_metadata},
     )
+
+
+def _make_sample(Sample: Any, *, trajectory_id: int, **kwargs: Any) -> Any:
+    """Use the trajectory-id field exposed by the installed Slime revision."""
+    fields = getattr(Sample, "__dataclass_fields__", {})
+    if "rollout_id" in fields:  # ea9819f8 and v0.3.1+
+        kwargs["rollout_id"] = trajectory_id
+    elif "group_id" in fields:  # v0.3.0 tag
+        kwargs["group_id"] = trajectory_id
+    else:
+        raise RuntimeError("Unsupported Slime Sample: missing rollout_id/group_id")
+    return Sample(**kwargs)
 
 
 def _reward_value(trace: "Trace") -> float:
