@@ -321,6 +321,87 @@ def test_google_request_maps_multi_turn_reasoning_and_parallel_tools() -> None:
     ]
 
 
+def test_google_request_keeps_tool_messages_before_tool_result_images() -> None:
+    # Gemini CLI sends an image read by a tool as an inlineData part next to
+    # its functionResponse. The tool messages must still directly follow the
+    # assistant tool_calls; the image goes in a user message after them.
+    transformer = GoogleTransformer()
+
+    transformed = transformer.transform_request(
+        {
+            "contents": [
+                {"role": "user", "parts": [{"text": "Count the stars."}]},
+                {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "id": "call-a",
+                                "name": "read_file",
+                                "args": {"file_path": "stars.png"},
+                            }
+                        },
+                        {
+                            "functionCall": {
+                                "id": "call-b",
+                                "name": "read_file",
+                                "args": {"file_path": "notes.txt"},
+                            }
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "id": "call-a",
+                                "name": "read_file",
+                                "response": {"output": "Binary content provided (1 item(s))."},
+                            }
+                        },
+                        {"inlineData": {"mimeType": "image/png", "data": IMAGE_B64}},
+                        {
+                            "functionResponse": {
+                                "id": "call-b",
+                                "name": "read_file",
+                                "response": {"output": "three stars"},
+                            }
+                        },
+                    ],
+                },
+            ]
+        }
+    )
+
+    assert transformed["messages"] == [
+        {"role": "user", "content": "Count the stars."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-a",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"file_path": "stars.png"}'},
+                },
+                {
+                    "id": "call-b",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"file_path": "notes.txt"}'},
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-a",
+            "content": '{"output": "Binary content provided (1 item(s))."}',
+        },
+        {"role": "tool", "tool_call_id": "call-b", "content": '{"output": "three stars"}'},
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": IMAGE_URL}}]},
+    ]
+
+
 def test_google_response_maps_openai_content_tools_finish_and_usage_back() -> None:
     transformer = GoogleTransformer()
 

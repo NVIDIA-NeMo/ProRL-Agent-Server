@@ -519,12 +519,15 @@ class GoogleTransformer(BaseTransformer):
             if system_text:
                 messages.append({"role": "system", "content": system_text})
         else:
+            # Tool messages must directly follow the assistant tool_calls they
+            # answer, so text/image parts sent alongside function responses
+            # (e.g. an image read by a tool) go in a user message after them.
+            messages.extend(tool_messages)
             if user_parts:
                 messages.append({
                     "role": "user",
                     "content": google_content_parts_to_openai_chat(parts),
                 })
-            messages.extend(tool_messages)
 
         return messages
 
